@@ -1,0 +1,8 @@
+waveform_params:
+
+  TDI: "XYZ"
+  modes: [[2,2], [2,1], [3,3], [3,2], [4,4], [4,3]]
+  noise: "sangria"
+  duration: 1 # weeks
+  dt: 10 # seconds
+  
