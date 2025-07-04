@@ -1,8 +1,19 @@
 waveform_params:
 
-  TDI: "XYZ"
+  TDI: "AET"
   modes: [[2,2], [2,1], [3,3], [3,2], [4,4], [4,3]]
   noise: "sangria"
-  duration: 1 # weeks
-  dt: 10 # seconds
+  duration: 4 # weeks
   
+prior:
+  "logMchirp": [5,6] # log(Mchirp/Msun)
+  "q": [1.0,5.0]
+  "chi1": [-1.0,1.0]
+  "chi2": [-1.0,1.0]
+  "dist": [4.0,40]  # cbrt(dist) in Gpc (note that we shall sample uniformly dist^3)
+  "phi": [0.0, 6.28318530718]
+  "inc": [-1.0 ,1.0]
+  "lambda": [0.0, 6.28318530718]
+  "beta": [-1.0, 1.0] # sin beta
+  "psi": [0.0, 3.14159265358979]
+  "Deltat": [ 3, 14 ] # t_merger from end of observation in days

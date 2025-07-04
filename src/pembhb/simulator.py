@@ -8,15 +8,17 @@ from bbhx.utils.constants import YRSID_SI, PC_SI
 import os
 import matplotlib.pyplot as plt
 from pembhb import ROOT_DIR
+from pembhb.sampler import UniformSampler
+import swyft
+
 gpu_available=False
 WEEK_SI = 7 * 24 * 3600  # seconds in a week
 DAY_SI = 24 * 3600  # seconds in a day
 
-class LISAMBHBSimulator():
+class LISAMBHBSimulator(swyft.Simulator):
 
     def __init__(self, conf):
-
-
+        super().__init__()
         # initialise the waveform generator
         orbits = EqualArmlengthOrbits(use_gpu=gpu_available)
         orbits.configure(linear_interp_setup=True)
@@ -39,8 +41,8 @@ class LISAMBHBSimulator():
         self.n_pt = len(self.freqs)
         self.waveform_kwargs =     {
                 "modes": conf["waveform_params"]["modes"],
-                # "t_obs_start": 0.0, 
-                # "t_obs_end": self.obs_time/ YRSID_SI,
+                "t_obs_start": 0.0, 
+                "t_obs_end": self.obs_time/ YRSID_SI,
                 "freqs": self.freqs,
                 "direct": False,
                 "squeeze": True, 
@@ -51,45 +53,56 @@ class LISAMBHBSimulator():
             "model": conf["waveform_params"]["noise"],
             "return_type": "ASD"
         }
+        ASD = np.zeros((3, self.freqs.shape[0]))
+        
         if conf["waveform_params"]["TDI"]=="AET":
-            ASD = lisasens.get_sensitivity(self.freqs, sens_fn = lisasens.A1TDISens, **psd_kwargs)
-            ASD[self.freqs<1e-5] =0.0 
+            ASD[0] = lisasens.get_sensitivity(self.freqs, sens_fn = lisasens.A1TDISens, **psd_kwargs)
+            ASD[1] = lisasens.get_sensitivity(self.freqs, sens_fn = lisasens.E1TDISens, **psd_kwargs)
+            ASD[2] = lisasens.get_sensitivity(self.freqs, sens_fn = lisasens.T1TDISens, **psd_kwargs)
+            # ASD[self.freqs<1e-5] =0.0 
         elif conf["waveform_params"]["TDI"]=="XYZ":
-            ASD = lisasens.get_sensitivity(self.freqs, sens_fn = lisasens.X1TDISens, **psd_kwargs)
+            ASD[0] = lisasens.get_sensitivity(self.freqs, sens_fn = lisasens.X1TDISens, **psd_kwargs)
+            ASD[1] = lisasens.get_sensitivity(self.freqs, sens_fn = lisasens.Y1TDISens, **psd_kwargs)
+            ASD[2] = lisasens.get_sensitivity(self.freqs, sens_fn = lisasens.Z1TDISens, **psd_kwargs)
         else:
             raise ValueError("conf['waveform_params']['TDI'] must be either XYZ or AET. ")
         self.ASD = ASD
 
-    def generate_d_f(self, injection):
+        # initialise sampler 
+        self.sampler = UniformSampler(conf["prior"])
+
+    def generate_d_f(self, injection: np.array):
+        """_summary_
+
+        :param injection: injection parameteres in LISA frame
+        :type injection: list[np.array]
+        :return: simulated data in frequency domain
+        :rtype: _type_
+        """
         # adjust sky position in the Lframe:
-        injection[-1], injection[-4], injection[-3], injection[-2] = LISA_to_SSB(injection[-1], injection[-4], injection[-3], injection[-2])
+        injection[-1] = injection[-1] + self.waveform_kwargs["t_obs_end"]*YRSID_SI
+        injection[-1], injection[-4], injection[-3],  injection[-2] = LISA_to_SSB(injection[-1], injection[-4], injection[-3], injection[-2])
         f_len = len(self.freqs)
-        print(f"f_len {f_len}")
-        noise_fft = np.random.normal(loc= 0.0,size = f_len) + 1j*np.random.normal(loc= 0.0,size = f_len)
-        print(f"noise_fft {noise_fft.shape}")
-        #apply a filter 
+        noise_fft = np.random.normal(loc= 0.0,size = (injection.shape[1], 3, f_len)) + 1j*np.random.normal(loc= 0.0,size = (injection.shape[1], 3, f_len))
         noise_fd = noise_fft * self.ASD * np.hanning(self.n_pt)
-        print(f"noise_fd {noise_fd.shape}")
-        wave_FD = self.waveform_generator(*injection,**self.waveform_kwargs) 
-        #print(f"wave_FD {wave_FD.shape}")
-        return noise_fd, wave_FD
+        # Insert a set of zeros between injection[5] and injection[6]
+        injection = np.insert(injection, 6, np.zeros(injection[5].shape), axis=0) 
+        wave_FD = self.waveform_generator(*injection, **self.waveform_kwargs) 
+
+        return (noise_fd + wave_FD)[0,:,:]
+
+    def build(self, graph) : 
+        # generate the source parameters from prior
+        inj_par = graph.node("z_tot", self.sampler.sample, 1)
+        # generate the waveform and noise
+        data_fd = graph.node("data_fd", self.generate_d_f, inj_par)
+
+
 
 
 if __name__ == "__main__":
 
-    # set parameters
-    f_ref = 0.0  # let phenom codes set f_ref -> fmax = max(f^2A(f))
-    phi_ref = 0.0 # phase at f_ref
-    m1 = 1e6
-    m2 = 5e5
-    a1 = 0.2
-    a2 = 0.4
-    dist = 18e3  * PC_SI * 1e6 # 3e3 in Mpc
-    inc = np.pi/3.
-    beta = np.pi/4.  # ecliptic latitude
-    lam = np.pi/5.  # ecliptic longitude
-    psi = np.pi/6.  # polarization angle
-    t_ref = 0.5 * YRSID_SI  # t_ref  (in the SSB reference frame)
+    from pembhb.sampler import UniformSampler
 
 
     # Load configuration from config.yaml
@@ -97,25 +110,22 @@ if __name__ == "__main__":
     with open(config_path, "r") as file:
         conf = yaml.safe_load(file)
 
-    # Initialize the simulator with the configuration
+    # Initialize the simulator and the sampler
     simulator = LISAMBHBSimulator(conf)
-
-    # Generate the waveform and noise
-    injection_params = [m1, m2, a1, a2,
-                          dist, phi_ref, f_ref, inc, lam,
-                          beta, psi, t_ref]
-    noise_fd, wave_fd = simulator.generate_d_f(injection_params)
-    print(np.allclose(np.abs(wave_fd), 0))
+    samples = simulator.sample(3, targets=["data_fd"])
+    print(samples["data_fd"].shape)
     # Example: Plot the absolute value of the noise and waveform
-    plt.plot(simulator.freqs, np.abs(noise_fd), label='Noise')
-    for i, channel in enumerate(["A", "E", "T"]):
-        plt.plot(simulator.freqs, np.abs(wave_fd[0,i,:]), label=f'Waveform {channel}')
-    plt.legend()
-    plt.xscale("log")
-    plt.yscale("log")
-    plt.xlabel("Frequency (Hz)")
-    plt.ylabel("Amplitude")
-    plt.title("Generated Waveform + Noise")
-    plt.grid()
-    plt.show()
+    # plt.plot(simulator.freqs, np.abs(noise_fd), label='Noise')
+    # for i, channel in enumerate(["A", "E", "T"]):
+    #     plt.plot(simulator.freqs, np.abs(data_fd[0,i,:]), label=f'Waveform {channel}')
+    # plt.legend()
+    # plt.xscale("log")
+    # plt.yscale("log")
+    # plt.xlabel("Frequency (Hz)")
+    # plt.ylabel("Amplitude")
+    # plt.title( "Generated Waveform + Noise" )
+    # plt.grid()
+    # plt.show()
+
+
 
