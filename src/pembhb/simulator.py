@@ -8,14 +8,12 @@ from bbhx.utils.constants import YRSID_SI, PC_SI
 import os
 import matplotlib.pyplot as plt
 from pembhb import ROOT_DIR
-from pembhb.sampler import UniformSampler
-import swyft
 
 gpu_available=False
 WEEK_SI = 7 * 24 * 3600  # seconds in a week
 DAY_SI = 24 * 3600  # seconds in a day
 
-class LISAMBHBSimulator(swyft.Simulator):
+class LISAMBHBSimulator():
 
     def __init__(self, conf):
         super().__init__()
@@ -68,8 +66,6 @@ class LISAMBHBSimulator(swyft.Simulator):
             raise ValueError("conf['waveform_params']['TDI'] must be either XYZ or AET. ")
         self.ASD = ASD
 
-        # initialise sampler 
-        self.sampler = UniformSampler(conf["prior"])
 
     def generate_d_f(self, injection: np.array):
         """_summary_
@@ -93,14 +89,6 @@ class LISAMBHBSimulator(swyft.Simulator):
         simulated_data_fd = np.concatenate((simulated_data_fd.real, simulated_data_fd.imag), axis=0)
         return simulated_data_fd
 
-    def build(self, graph) : 
-        # generate the source parameters from prior
-        z_tot = graph.node("z_tot", self.sampler.sample, 1)
-        # generate the waveform and noise
-        data_fd = graph.node("data_fd", self.generate_d_f, z_tot)
-
-
-
 
 if __name__ == "__main__":
 
@@ -114,7 +102,7 @@ if __name__ == "__main__":
 
     # Initialize the simulator and the sampler
     simulator = LISAMBHBSimulator(conf)
-    samples = simulator.sample(3, targets=["data_fd"])
+    samples = simulator.sample(  targets=["data_fd"])
     # Example: Plot the absolute value of the noise and waveform
     # plt.plot(simulator.freqs, np.abs(noise_fd), label='Noise')
     # for i, channel in enumerate(["A", "E", "T"]):

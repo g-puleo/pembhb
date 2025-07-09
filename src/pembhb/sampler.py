@@ -54,9 +54,9 @@ class UniformSampler ():
     def sample(self, n_samples: int) -> np.array:
         """_summary_
 
-        :param n_samples: _description_
+        :param n_samples: number of samples to generate
         :type n_samples: int
-        :return: _description_
+        :return: samples in bbhx input format
         :rtype: np.array
         """
 
@@ -68,11 +68,12 @@ class UniformSampler ():
         return bbhx_input 
 
     def samples_to_bbhx_input(self, samples: np.array) -> np.array:
-        """_summary_
+        """convert the sampler to the bbhx input format : 
+        
 
-        :param samples: _description_
+        :param samples: MBHB parameters in the following order: log10(chirp mass), q, chi1, chi2, dist, phi, cos(inc), lambda, sin(beta), psi, Deltat
         :type samples: np.array
-        :return: _description_
+        :return: MBHB parameters in the following order: m1, m2, chi1, chi2, distance, phase, inclination, lambda, beta, psi, Deltat
         :rtype: np.array
         """
     
@@ -83,7 +84,5 @@ class UniformSampler ():
         # 7: lambda is already in 0,2pi
         samples[8] = np.arcsin(samples[8]) # sin(beta)--> beta in [-pi/2, pi/2] (ecliptic latitude)
         # 9: psi is already in 0,pi
-        samples[10] = samples[10] # days --> seconds
-        
-   
-        return samples[:,0]
+        # 10: Deltat is already in seconds   
+        return samples
