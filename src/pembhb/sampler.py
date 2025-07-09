@@ -84,7 +84,6 @@ class UniformSampler ():
         samples[8] = np.arcsin(samples[8]) # sin(beta)--> beta in [-pi/2, pi/2] (ecliptic latitude)
         # 9: psi is already in 0,pi
         samples[10] = samples[10] # days --> seconds
-
         
    
-        return samples
+        return samples[:,0]

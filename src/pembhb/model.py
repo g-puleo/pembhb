@@ -54,8 +54,9 @@ class InferenceNetwork(swyft.SwyftModule):
     Basic FC network for TMNRE of MBHB data. 
     I wrote this function to test the swyft framework, improvements on the architecture are future work. 
     """
-    def __init__(self, num_features=10000, hlayersizes=(500,20)):  
+    def __init__(self, num_features=10000, num_channels  = 6,  hlayersizes=(500,20), lr=1e-3):  
         super().__init__()
+        self.conv1d = nn.Conv1d(num_channels, 1, kernel_size=3, stride=1, padding=1)
         self.fc_blocks = nn.Sequential()
         input_size = num_features
         for i, output_size in enumerate(hlayersizes):
@@ -65,11 +66,18 @@ class InferenceNetwork(swyft.SwyftModule):
             input_size = output_size
         
         self.logratios1 = swyft.LogRatioEstimator_1dim(num_features = 20, num_params = 11, varnames = 'z_tot')
-        self.logratios2 = swyft.LogRatioEstimator_Ndim(num_features = 20, marginals=((0,1),(7,8)))
+        self.logratios2 = swyft.LogRatioEstimator_Ndim(num_features = 20, marginals=((0,1),(7,8)), varnames= 'z_tot')
+
+        ## configure optimizer
+        self.optimizer_init = swyft.OptimizerInit(torch.optim.Adam, dict(lr = lr), # optimizer 
+              torch.optim.lr_scheduler.ReduceLROnPlateau, dict(factor = 0.3, patience=5)#scheduler
+              )
+
     def forward(self, A, B):
-        processed_x = self.fc_blocks(A["data_fd"])
-        logratios1 = self.logratios1(processed_x, B["z_tot"])
-        logratios2 = self.logratios2(processed_x, B["z_tot"])
+        x = self.conv1d(A["data_fd"]).squeeze(1)
+        x = self.fc_blocks(x)
+        logratios1 = self.logratios1(x, B["z_tot"])
+        logratios2 = self.logratios2(x, B["z_tot"])
         return logratios1, logratios2
 
 

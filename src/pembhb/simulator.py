@@ -83,19 +83,21 @@ class LISAMBHBSimulator(swyft.Simulator):
         injection[-1] = injection[-1] + self.waveform_kwargs["t_obs_end"]*YRSID_SI
         injection[-1], injection[-4], injection[-3],  injection[-2] = LISA_to_SSB(injection[-1], injection[-4], injection[-3], injection[-2])
         f_len = len(self.freqs)
-        noise_fft = np.random.normal(loc= 0.0,size = (injection.shape[1], 3, f_len)) + 1j*np.random.normal(loc= 0.0,size = (injection.shape[1], 3, f_len))
+        noise_fft = np.random.normal(loc= 0.0,size = (1,3, f_len)) + 1j*np.random.normal(loc= 0.0,size = ( 1, 3, f_len))
         noise_fd = noise_fft * self.ASD * np.hanning(self.n_pt)
         # Insert a set of zeros between injection[5] and injection[6]
         injection = np.insert(injection, 6, np.zeros(injection[5].shape), axis=0) 
         wave_FD = self.waveform_generator(*injection, **self.waveform_kwargs) 
-
-        return (noise_fd + wave_FD)[0,:,:]
+        simulated_data_fd = (noise_fd + wave_FD)[0,:,:]
+        # stack real and imaginary parts over channels
+        simulated_data_fd = np.concatenate((simulated_data_fd.real, simulated_data_fd.imag), axis=0)
+        return simulated_data_fd
 
     def build(self, graph) : 
         # generate the source parameters from prior
-        inj_par = graph.node("z_tot", self.sampler.sample, 1)
+        z_tot = graph.node("z_tot", self.sampler.sample, 1)
         # generate the waveform and noise
-        data_fd = graph.node("data_fd", self.generate_d_f, inj_par)
+        data_fd = graph.node("data_fd", self.generate_d_f, z_tot)
 
 
 
@@ -113,7 +115,6 @@ if __name__ == "__main__":
     # Initialize the simulator and the sampler
     simulator = LISAMBHBSimulator(conf)
     samples = simulator.sample(3, targets=["data_fd"])
-    print(samples["data_fd"].shape)
     # Example: Plot the absolute value of the noise and waveform
     # plt.plot(simulator.freqs, np.abs(noise_fd), label='Noise')
     # for i, channel in enumerate(["A", "E", "T"]):

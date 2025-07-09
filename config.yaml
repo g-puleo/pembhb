@@ -17,3 +17,8 @@ prior:
   "beta": [-1.0, 1.0] # sin beta
   "psi": [0.0, 3.14159265358979]
   "Deltat": [ 3, 14 ] # t_merger from end of observation in days
+
+training: 
+  batch_size: 64
+  lr_scheduler: 
+  
