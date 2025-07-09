@@ -10,8 +10,8 @@ import matplotlib.pyplot as plt
 from pembhb import ROOT_DIR
 from pembhb.sampler import UniformSampler
 import swyft
-
-gpu_available=False
+import torch
+gpu_available = torch.cuda.is_available() 
 WEEK_SI = 7 * 24 * 3600  # seconds in a week
 DAY_SI = 24 * 3600  # seconds in a day
 
