@@ -6,18 +6,19 @@ from bbhx.utils.transform import LISA_to_SSB
 import yaml
 from bbhx.utils.constants import YRSID_SI, PC_SI
 import os
-import matplotlib.pyplot as plt
 from pembhb import ROOT_DIR
 from pembhb.sampler import UniformSampler
 import swyft
-import torch
-gpu_available = torch.cuda.is_available() 
+import h5py
+from tqdm import tqdm
+
+gpu_available=False
 WEEK_SI = 7 * 24 * 3600  # seconds in a week
 DAY_SI = 24 * 3600  # seconds in a day
 
-class LISAMBHBSimulator(swyft.Simulator):
+class LISAMBHBSimulator():
 
-    def __init__(self, conf):
+    def __init__(self, conf, sampler_init_kwargs):
         super().__init__()
         # initialise the waveform generator
         orbits = EqualArmlengthOrbits(use_gpu=gpu_available)
@@ -67,17 +68,15 @@ class LISAMBHBSimulator(swyft.Simulator):
         else:
             raise ValueError("conf['waveform_params']['TDI'] must be either XYZ or AET. ")
         self.ASD = ASD
-
-        # initialise sampler 
-        self.sampler = UniformSampler(conf["prior"])
+        self.sampler = UniformSampler(**sampler_init_kwargs)
 
     def generate_d_f(self, injection: np.array):
-        """_summary_
+        """ Generate simulated data in frequency domain given the injection parameters.
 
         :param injection: injection parameteres in LISA frame
         :type injection: list[np.array]
         :return: simulated data in frequency domain
-        :rtype: _type_
+        :rtype: np.array
         """
         # adjust sky position in the Lframe:
         injection[-1] = injection[-1] + self.waveform_kwargs["t_obs_end"]*YRSID_SI
@@ -88,24 +87,49 @@ class LISAMBHBSimulator(swyft.Simulator):
         # Insert a set of zeros between injection[5] and injection[6]
         injection = np.insert(injection, 6, np.zeros(injection[5].shape), axis=0) 
         wave_FD = self.waveform_generator(*injection, **self.waveform_kwargs) 
-        simulated_data_fd = (noise_fd + wave_FD)[0,:,:]
+        simulated_data_fd = (noise_fd + wave_FD)
         # stack real and imaginary parts over channels
-        simulated_data_fd = np.concatenate((simulated_data_fd.real, simulated_data_fd.imag), axis=0)
+        simulated_data_fd = np.concatenate((simulated_data_fd.real, simulated_data_fd.imag), axis=1)
         return simulated_data_fd
 
-    def build(self, graph) : 
-        # generate the source parameters from prior
-        z_tot = graph.node("z_tot", self.sampler.sample, 1)
-        # generate the waveform and noise
-        data_fd = graph.node("data_fd", self.generate_d_f, z_tot)
+    def _sample(self, N=1): 
+        """Draw one sample from the joint distribution, first sampling parameters from the prior and then generating the data in frequency domain.
 
+        :param N: _description_, defaults to 1
+        :type N: int, optional
+        :return: z_samples, data_fd (prior samples , frequency domain data)
+        :rtype: list[np.array]
+        """
+        z_samples = self.sampler.sample(N)
+        data_fd = self.generate_d_f(z_samples)
+        out_dict = {"output_parameters": z_samples, "data_fd": data_fd}
+        return out_dict
+    
+    def sample_and_store(self, filename, N, batch_size=1000): 
+        """Sample N samples and store them in an HDF5 file.
 
+        :param filename: name of the file to store the samples
+        :type filename: str
+        :param N: number of samples to generate
+        :type N: int
+        :param batch_size: number of samples to generate in each batch, defaults to 1000
+        :type batch_size: int, optional
+        """
 
+        with h5py.File(filename, "a") as f:
+            source_params = f.create_dataset("source_parameters", shape=(N, 11), dtype=np.float32)
+            data_fd = f.create_dataset("data_fd", shape=(N, 6, self.n_pt), dtype=np.float32)
+
+            for i in tqdm(range(0, N, batch_size)):
+                batch_end = min(i + batch_size, N)
+                batch_size_actual = batch_end - i
+                out = self._sample(batch_size_actual)
+                z_samples = out["output_parameters"]
+                data_fd_batch = out["data_fd"]
+                source_params[i:batch_end] = z_samples.reshape(batch_size_actual, -1)  # Reshape to (batch_size, 11)
+                data_fd[i:batch_end] = data_fd_batch
 
 if __name__ == "__main__":
-
-    from pembhb.sampler import UniformSampler
-
 
     # Load configuration from config.yaml
     config_path = os.path.join(ROOT_DIR, "config.yaml")
@@ -114,7 +138,7 @@ if __name__ == "__main__":
 
     # Initialize the simulator and the sampler
     simulator = LISAMBHBSimulator(conf)
-    samples = simulator.sample(3, targets=["data_fd"])
+    samples = simulator.sample(  targets=["data_fd"] )
     # Example: Plot the absolute value of the noise and waveform
     # plt.plot(simulator.freqs, np.abs(noise_fd), label='Noise')
     # for i, channel in enumerate(["A", "E", "T"]):
