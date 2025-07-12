@@ -89,7 +89,7 @@ class LISAMBHBSimulator():
         wave_FD = self.waveform_generator(*injection, **self.waveform_kwargs) 
         simulated_data_fd = (noise_fd + wave_FD)
         # stack real and imaginary parts over channels
-        simulated_data_fd = np.concatenate((simulated_data_fd.real, simulated_data_fd.imag), axis=1)
+        simulated_data_fd = np.concatenate((np.abs(simulated_data_fd), np.angle(simulated_data_fd)), axis=1)
         return simulated_data_fd
 
     def _sample(self, N=1): 
@@ -100,9 +100,9 @@ class LISAMBHBSimulator():
         :return: z_samples, data_fd (prior samples , frequency domain data)
         :rtype: list[np.array]
         """
-        z_samples = self.sampler.sample(N)
+        z_samples, tmnre_input = self.sampler.sample(N)
         data_fd = self.generate_d_f(z_samples)
-        out_dict = {"output_parameters": z_samples, "data_fd": data_fd}
+        out_dict = {"output_parameters": tmnre_input, "data_fd": data_fd}
         return out_dict
     
     def sample_and_store(self, filename, N, batch_size=1000): 
@@ -129,16 +129,16 @@ class LISAMBHBSimulator():
                 source_params[i:batch_end] = z_samples.reshape(batch_size_actual, -1)  # Reshape to (batch_size, 11)
                 data_fd[i:batch_end] = data_fd_batch
 
-if __name__ == "__main__":
+# if __name__ == "__main__":
 
     # Load configuration from config.yaml
-    config_path = os.path.join(ROOT_DIR, "config.yaml")
-    with open(config_path, "r") as file:
-        conf = yaml.safe_load(file)
+    # config_path = os.path.join(ROOT_DIR, "config.yaml")
+    # with open(config_path, "r") as file:
+    #     conf = yaml.safe_load(file)
 
-    # Initialize the simulator and the sampler
-    simulator = LISAMBHBSimulator(conf)
-    samples = simulator.sample(  targets=["data_fd"] )
+    # # Initialize the simulator and the sampler
+    # simulator = LISAMBHBSimulator(conf)
+    # samples = simulator.sample(  targets=["data_fd"] )
     # Example: Plot the absolute value of the noise and waveform
     # plt.plot(simulator.freqs, np.abs(noise_fd), label='Noise')
     # for i, channel in enumerate(["A", "E", "T"]):

@@ -52,7 +52,7 @@ class UniformSampler ():
         self.n_params = self.lower_bounds.shape[0]
     
     def sample(self, n_samples: int) -> np.array:
-        """_summary_
+        """ Generate samples from the uniform prior.
 
         :param n_samples: number of samples to generate
         :type n_samples: int
@@ -61,11 +61,11 @@ class UniformSampler ():
         """
 
         unif_samples = np.random.uniform(0, 1, size=(self.n_params, n_samples))
-        rescaled_samples = unif_samples * (self.upper_bounds - self.lower_bounds) + self.lower_bounds
-        bbhx_input = self.samples_to_bbhx_input(rescaled_samples)
+        tmnre_input = unif_samples * (self.upper_bounds - self.lower_bounds) + self.lower_bounds
+        bbhx_input = self.samples_to_bbhx_input(tmnre_input)
 
         
-        return bbhx_input 
+        return bbhx_input , tmnre_input
 
     def samples_to_bbhx_input(self, samples: np.array) -> np.array:
         """convert the sampler to the bbhx input format : 

@@ -7,7 +7,7 @@ import h5py
 # optionally save and load the data to/from disk
 
 class MBHBDataset(Dataset):
-    def __init__(self, data: dict):
+    def __init__(self, data):
         """Initialize the dataset.
 
         :param data: Dictionary containing the data.
@@ -15,13 +15,30 @@ class MBHBDataset(Dataset):
         :param targets: List of keys to load from the data dictionary.
         :type targets: list[str]
         """
+        self.min_data = data["data_fd"].min(axis=0)
+        self.max_data = data["data_fd"].max(axis=0)
         self.data = data
         self.keys = list(data.keys())
+        # Check for NaNs and compute statistics for min_data and max_data
+        if torch.isnan(torch.tensor(self.min_data)).any() or torch.isnan(torch.tensor(self.max_data)).any():
+            raise ValueError("NaN values detected in min_data or max_data.")
+        
+        print(f"min_data: min={self.min_data.min()}, max={self.min_data.max()}, std={self.min_data.std()}")
+        print(f"max_data: min={self.max_data.min()}, max={self.max_data.max()}, std={self.max_data.std()}")
+        breakpoint()
+        
+    def transform(self, x) : 
+        """Transform the data using min-max scaling."""
+        x = (x - self.min_data) / (self.max_data - self.min_data)
+        return x
     def __len__(self):
         return self.data[self.keys[0]].shape[0] 
     def __getitem__(self, idx):
-        return {key: self.data[key][idx] for key in self.data}
-
+        dict_out = {}
+        dict_out["data_fd"] = self.transform(self.data["data_fd"][idx])
+        dict_out["source_parameters"] = self.data["source_parameters"][idx]
+        return dict_out
+    
 
 class MBHBDataModule( L.LightningDataModule ): 
 
@@ -40,6 +57,8 @@ class MBHBDataModule( L.LightningDataModule ):
         self.targets = targets
         self.data = self._load_data(filename)
         self.generator = torch.Generator().manual_seed(31415)
+    
+
 
     def _load_data(self, filename : str):
         with h5py.File(filename, 'r') as f:

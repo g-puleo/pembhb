@@ -89,7 +89,7 @@ class InferenceNetwork(LightningModule):
             self.fc_blocks.add_module(f"dropout_{i}", nn.Dropout(p=0.5))
             input_size = output_size
         
-        self.logratios = MarginalClassifierHead(input_size, marginals=[(0,1)], hidden_size=20)
+        self.logratios = MarginalClassifierHead(input_size, marginals=[[0,1]], hidden_size=20)
         self.loss = nn.BCEWithLogitsLoss(reduce='sum')
         self.lr = lr
         self.save_hyperparameters()
@@ -126,8 +126,6 @@ class InferenceNetwork(LightningModule):
         loss_2 = self.loss(output_scrambled, torch.zeros_like(output_scrambled))
         loss = loss_1 + loss_2
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("max(data_fd)", torch.max(data), on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log("mean(data_fd)", torch.mean(data), on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss 
     
     def validation_step(self, batch, batch_idx):
