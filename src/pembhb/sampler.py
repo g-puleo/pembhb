@@ -22,7 +22,7 @@ def lMq_m1m2(x: np.array):
 
 class UniformSampler ():
 
-    def __init__(self, prior_bounds: dict ):
+    def __init__(self, prior_bounds: dict = None ):
         """_summary_
 
         :param prior_bounds: _description_
@@ -86,3 +86,5 @@ class UniformSampler ():
         # 9: psi is already in 0,pi
         # 10: Deltat is already in seconds   
         return samples
+    
+

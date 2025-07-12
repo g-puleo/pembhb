@@ -57,7 +57,7 @@ class MarginalClassifierHead(nn.Module):
         self.classifiers = nn.ModuleList([
             nn.Sequential(
             nn.Linear(in_features + len(marginal), hidden_size),
-            nn.ReLU(),
+            nn.Sigmoid(),
             nn.Linear(hidden_size, 1)
             )
             for marginal in marginals
@@ -78,21 +78,23 @@ class InferenceNetwork(LightningModule):
     """
     def __init__(self, num_features=10000, num_channels  = 6,  hlayersizes=(500,20), lr=1e-3):  
         super().__init__()
-        self.conv1d = nn.Conv1d(num_channels, 1, kernel_size=3) 
+
+        self.normalise = nn.BatchNorm1d(num_features=num_channels, eps=1e-22)
+        self.conv1d = nn.Conv1d(num_channels, 1, kernel_size=3, padding=1) 
         self.fc_blocks = nn.Sequential()
         input_size = num_features
         for i, output_size in enumerate(hlayersizes):
             self.fc_blocks.add_module(f"fc_{i}", nn.Linear(input_size, output_size))
-            self.fc_blocks.add_module(f"relu_{i}", nn.ReLU())
+            self.fc_blocks.add_module(f"relu_{i}", nn.Sigmoid())
             self.fc_blocks.add_module(f"dropout_{i}", nn.Dropout(p=0.5))
             input_size = output_size
         
-        self.logratios = MarginalClassifierHead(input_size, marginals=[[i] for i in range(11)], hidden_size=20)
-        self.loss = nn.BCEWithLogitsLoss(reduce='mean')
+        self.logratios = MarginalClassifierHead(input_size, marginals=[(0,1)], hidden_size=20)
+        self.loss = nn.BCEWithLogitsLoss(reduce='sum')
         self.lr = lr
         self.save_hyperparameters()
 
-    def forward(self, data, parameters):
+    def forward(self, x, parameters):
         """
         Forward pass of the network.
         
@@ -100,17 +102,22 @@ class InferenceNetwork(LightningModule):
             data: Tensor of shape (batch_size, num_channels, num_features) containing the frequency domain signal in the TDI channels
             parameters: Tensor of shape (batch_size, 11) containing the parameters to be used in the classifier
         """
+        
+        data = self.normalise(x)
+        #print("data min max std mean", torch.min(data), torch.max(data), torch.std(data), torch.mean(data))
         data = self.conv1d(data)  
+        #print("data after conv1d min max std mean", torch.min(data), torch.max(data), torch.std(data), torch.mean(data))
         data = data.squeeze(1)  # (batch_size, num_features - 2)
         features = self.fc_blocks(data)  # (batch_size, hidden_size)
+        #print("features min max std mean", torch.min(features), torch.max(features), torch.std(features), torch.mean(features))
         output = self.logratios(features, parameters)  # (batch_size, num_marginals)
-
+        #print("output min max std mean", torch.min(output), torch.max(output), torch.std(output), torch.mean(output))
         return output
 
 
     def training_step(self, batch, batch_idx): 
         data = batch['data_fd']
-        parameters = batch['z_tot']
+        parameters = batch['source_parameters']
         scrambled_params = torch.roll(parameters, shifts=1, dims=0)
 
         output_joint = self(data, parameters)
@@ -119,12 +126,13 @@ class InferenceNetwork(LightningModule):
         loss_2 = self.loss(output_scrambled, torch.zeros_like(output_scrambled))
         loss = loss_1 + loss_2
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-
+        self.log("max(data_fd)", torch.max(data), on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log("mean(data_fd)", torch.mean(data), on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss 
     
     def validation_step(self, batch, batch_idx):
         data = batch['data_fd']
-        parameters = batch['z_tot']
+        parameters = batch['source_parameters']
         scrambled_params = torch.roll(parameters, shifts=1, dims=0)
 
         output_joint = self(data, parameters)
@@ -149,7 +157,7 @@ class InferenceNetwork(LightningModule):
     
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=5, verbose=True)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=5)
         return {
             'optimizer': optimizer,
             'lr_scheduler': {
@@ -159,3 +167,4 @@ class InferenceNetwork(LightningModule):
                 'frequency': 1
             }
         }
+    
