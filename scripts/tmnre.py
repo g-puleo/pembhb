@@ -16,7 +16,7 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
     print("Sampling from the simulator...")
     os.makedirs(os.path.join(ROOT_DIR, "data"), exist_ok=True)
     try: 
-        sim.sample_and_store(fname, N=500000, batch_size=2000)
+        sim.sample_and_store(fname, N=10000, batch_size=200)
         print("Data saved to", fname)
     except ValueError:
         pass
@@ -27,7 +27,7 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
         filename=fname,
         targets=['data_fd', 'source_parameters'],
         batch_size=conf["training"]["batch_size"]
-                )
+        )
 
     logger = TensorBoardLogger(os.path.join(ROOT_DIR, f"logs"), name=f"tmnre_{idx}")
     trainer = Trainer(logger=logger, max_epochs=conf["training"]["epochs"], accelerator="gpu", devices=1, enable_progress_bar=True)

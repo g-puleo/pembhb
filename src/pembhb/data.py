@@ -1,13 +1,14 @@
 from torch.utils.data import Dataset, random_split, DataLoader
 import lightning as L
 import torch
+import numpy as np
 import h5py
 # i want a class / function that can : 
 # generate data and store in memory using a sampler and a simulator 
 # optionally save and load the data to/from disk
 
 class MBHBDataset(Dataset):
-    def __init__(self, data):
+    def __init__(self, filename: str):
         """Initialize the dataset.
 
         :param data: Dictionary containing the data.
@@ -15,29 +16,40 @@ class MBHBDataset(Dataset):
         :param targets: List of keys to load from the data dictionary.
         :type targets: list[str]
         """
-        self.min_data = data["data_fd"].min(axis=0)
-        self.max_data = data["data_fd"].max(axis=0)
-        self.data = data
-        self.keys = list(data.keys())
-        # Check for NaNs and compute statistics for min_data and max_data
-        if torch.isnan(torch.tensor(self.min_data)).any() or torch.isnan(torch.tensor(self.max_data)).any():
-            raise ValueError("NaN values detected in min_data or max_data.")
+        self.filename = filename
+        with h5py.File(self.filename, 'r') as f:
+            self.keys = list(f.keys())
+            self.len = f[self.keys[0]].shape[0]
+    
+    def transform(self, data): 
+        """
+        data: np.array of shape (6, n_pt) where n_pt is the number of points in the frequency domain
+        This function transforms the data to log10 scale for the amplitude and keeps the phase.
         
-        print(f"min_data: min={self.min_data.min()}, max={self.min_data.max()}, std={self.min_data.std()}")
-        print(f"max_data: min={self.max_data.min()}, max={self.max_data.max()}, std={self.max_data.std()}")
-        breakpoint()
-        
-    def transform(self, x) : 
-        """Transform the data using min-max scaling."""
-        x = (x - self.min_data) / (self.max_data - self.min_data)
-        return x
+        :param data: Frequency domain data.
+        :type data: np.array
+        :return: Transformed data with log10 amplitude and phase.
+        :rtype: np.array
+        """
+        ## apply log10 to the amplitude of the data (channels from 0 to 2)
+        data_ampl = np.log10(data[:3]+1e-33)
+        data_phase = data[3:]
+        return np.concatenate((data_ampl, data_phase), axis=0)
+
     def __len__(self):
-        return self.data[self.keys[0]].shape[0] 
+        return self.len
+    
     def __getitem__(self, idx):
-        dict_out = {}
-        dict_out["data_fd"] = self.transform(self.data["data_fd"][idx])
-        dict_out["source_parameters"] = self.data["source_parameters"][idx]
-        return dict_out
+        
+        with h5py.File(self.filename, 'r') as f:
+            data_fd= self.transform(f["data_fd"][idx])
+            dict_out = {
+                "data_fd": data_fd,
+                "source_parameters": f["source_parameters"][idx],
+            }
+            return dict_out
+            
+
     
 
 class MBHBDataModule( L.LightningDataModule ): 
@@ -55,33 +67,25 @@ class MBHBDataModule( L.LightningDataModule ):
         super().__init__()
         self.batch_size = batch_size
         self.targets = targets
-        self.data = self._load_data(filename)
         self.generator = torch.Generator().manual_seed(31415)
-    
+        self.filename = filename
 
 
-    def _load_data(self, filename : str):
-        with h5py.File(filename, 'r') as f:
-            if not self.targets:
-                return {key: f[key][:] for key in f.keys()}
-            else:
-                return {key: f[key][:] for key in self.targets}
-        
     
     def setup(self, stage=None):
         """Setup the dataset."""
         if stage == "fit" or stage is None:
-            full_dataset = MBHBDataset(self.data)
+            full_dataset = MBHBDataset(self.filename)
             self.train, self.val = random_split(full_dataset,  [0.9,0.1], generator=self.generator)
 
         elif stage == "test":
-            self.test = MBHBDataset(self.data)
+            self.test = MBHBDataset(self.filename)
     
     def train_dataloader(self):
-        return DataLoader(self.train, batch_size=self.batch_size, shuffle=True)
+        return DataLoader(self.train, batch_size=self.batch_size, shuffle=True, num_workers=50)
     
     def val_dataloader(self):
-        return DataLoader(self.val, batch_size=self.batch_size, shuffle=False)
+        return DataLoader(self.val, batch_size=self.batch_size, shuffle=False, num_workers=50)
     
     def test_dataloader(self):
         return DataLoader(self.test, batch_size=self.batch_size, shuffle=False)

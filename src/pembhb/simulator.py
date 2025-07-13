@@ -38,9 +38,9 @@ class LISAMBHBSimulator():
 
 
         self.obs_time = int( 24*3600*7*conf["waveform_params"]["duration"])# weeks to seconds
-        self.freqs = np.logspace(-4, 0, 10000)
+        self.freqs = np.logspace(-4, -2, 10000)
         self.n_pt = len(self.freqs)
-        self.waveform_kwargs =     {
+        self.waveform_kwargs = {
                 "modes": conf["waveform_params"]["modes"],
                 "t_obs_start": 0.0, 
                 "t_obs_end": self.obs_time/ YRSID_SI,
@@ -82,13 +82,15 @@ class LISAMBHBSimulator():
         injection[-1] = injection[-1] + self.waveform_kwargs["t_obs_end"]*YRSID_SI
         injection[-1], injection[-4], injection[-3],  injection[-2] = LISA_to_SSB(injection[-1], injection[-4], injection[-3], injection[-2])
         f_len = len(self.freqs)
-        noise_fft = np.random.normal(loc= 0.0,size = (1,3, f_len)) + 1j*np.random.normal(loc= 0.0,size = ( 1, 3, f_len))
+        n_samples = injection.shape[1]
+        noise_fft = np.random.normal(loc= 0.0,size = (n_samples,3, f_len)) + 1j*np.random.normal(loc= 0.0,size = ( n_samples, 3, f_len))
         noise_fd = noise_fft * self.ASD * np.hanning(self.n_pt)
-        # Insert a set of zeros between injection[5] and injection[6]
+        # Insert a set of zeros between injection[5] and injection[6]. this is the f_ref parameter , which in bbhx can be set to 0 in order to set f_ref @ t_chirp
         injection = np.insert(injection, 6, np.zeros(injection[5].shape), axis=0) 
         wave_FD = self.waveform_generator(*injection, **self.waveform_kwargs) 
         simulated_data_fd = (noise_fd + wave_FD)
         # stack real and imaginary parts over channels
+        #breakpoint()
         simulated_data_fd = np.concatenate((np.abs(simulated_data_fd), np.angle(simulated_data_fd)), axis=1)
         return simulated_data_fd
 

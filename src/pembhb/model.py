@@ -57,7 +57,7 @@ class MarginalClassifierHead(nn.Module):
         self.classifiers = nn.ModuleList([
             nn.Sequential(
             nn.Linear(in_features + len(marginal), hidden_size),
-            nn.Sigmoid(),
+            nn.LeakyReLU(),
             nn.Linear(hidden_size, 1)
             )
             for marginal in marginals
@@ -85,7 +85,7 @@ class InferenceNetwork(LightningModule):
         input_size = num_features
         for i, output_size in enumerate(hlayersizes):
             self.fc_blocks.add_module(f"fc_{i}", nn.Linear(input_size, output_size))
-            self.fc_blocks.add_module(f"relu_{i}", nn.Sigmoid())
+            self.fc_blocks.add_module(f"relu_{i}", nn.LeakyReLU())
             self.fc_blocks.add_module(f"dropout_{i}", nn.Dropout(p=0.5))
             input_size = output_size
         
@@ -102,7 +102,6 @@ class InferenceNetwork(LightningModule):
             data: Tensor of shape (batch_size, num_channels, num_features) containing the frequency domain signal in the TDI channels
             parameters: Tensor of shape (batch_size, 11) containing the parameters to be used in the classifier
         """
-        
         data = self.normalise(x)
         #print("data min max std mean", torch.min(data), torch.max(data), torch.std(data), torch.mean(data))
         data = self.conv1d(data)  
@@ -111,6 +110,7 @@ class InferenceNetwork(LightningModule):
         features = self.fc_blocks(data)  # (batch_size, hidden_size)
         #print("features min max std mean", torch.min(features), torch.max(features), torch.std(features), torch.mean(features))
         output = self.logratios(features, parameters)  # (batch_size, num_marginals)
+        
         #print("output min max std mean", torch.min(output), torch.max(output), torch.std(output), torch.mean(output))
         return output
 
@@ -132,22 +132,16 @@ class InferenceNetwork(LightningModule):
         data = batch['data_fd']
         parameters = batch['source_parameters']
         scrambled_params = torch.roll(parameters, shifts=1, dims=0)
-
         output_joint = self(data, parameters)
         output_scrambled = self(data, scrambled_params)
-
-        # Calculate losses
         loss_1 = self.loss(output_joint, torch.ones_like(output_joint))
         loss_2 = self.loss(output_scrambled, torch.zeros_like(output_scrambled))
         loss = loss_1 + loss_2
-
-        # Calculate accuracy
         joint_preds = (torch.sigmoid(output_joint) > 0.5).float()
         scrambled_preds = (torch.sigmoid(output_scrambled) > 0.5).float()
         joint_accuracy = (joint_preds == 1).float().mean()
         scrambled_accuracy = (scrambled_preds == 0).float().mean()
         accuracy = (joint_accuracy + scrambled_accuracy) / 2
-
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         self.log('val_accuracy', accuracy, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
