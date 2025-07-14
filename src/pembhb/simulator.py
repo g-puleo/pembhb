@@ -8,7 +8,6 @@ from bbhx.utils.constants import YRSID_SI, PC_SI
 import os
 from pembhb import ROOT_DIR
 from pembhb.sampler import UniformSampler
-import swyft
 import h5py
 from tqdm import tqdm
 
@@ -175,7 +174,7 @@ class DummySimulator:
     def __init__(self, sampler_init_kwargs):
         self.sampler = DummySampler(**sampler_init_kwargs)
         self.n_samples = 10  # Number of data points per line
-        self.noise_std = 0.1  # Standard deviation of the fixed noise
+        self.noise_std = 0.01  # Standard deviation of the fixed noise
 
     def generate_d_f(self, injection: np.array):
         """Generate data samples from a line with fixed noise.

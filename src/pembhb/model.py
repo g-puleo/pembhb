@@ -79,7 +79,7 @@ class InferenceNetwork(LightningModule):
     Basic FC network for TMNRE of MBHB data. 
     I wrote this function to test the swyft framework, improvements on the architecture are future work. 
     """
-    def __init__(self, num_features: int, num_channels: int,  hlayersizes: tuple, lr=1e-3):  
+    def __init__(self, num_features: int, num_channels: int,  hlayersizes: tuple,  marginals: list[list], marginal_hidden_size: int, lr: float):  
         super().__init__()
 
         # self.normalise = nn.BatchNorm1d(num_features=num_channels, eps=1e-22)
@@ -94,7 +94,7 @@ class InferenceNetwork(LightningModule):
         
         self.hook = self.ParameterChangeTracker(self.fc_blocks)
         self.hook.attach_hook()
-        self.logratios = MarginalClassifierHead(input_size, marginals=[[0]], hidden_size=10)
+        self.logratios = MarginalClassifierHead(input_size, marginals=marginals, hidden_size=marginal_hidden_size)
         self.hook_logits  = self.ParameterChangeTracker(self.logratios)
         self.hook_logits.attach_hook()
         self.loss = nn.BCEWithLogitsLoss(reduce='sum')

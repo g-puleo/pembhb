@@ -91,8 +91,11 @@ class UniformSampler ():
 
 
 
-def hpd_thresholder(grid: np.array, fun: callable):
+def hpd_thresholder(grid: np.array, fun: callable, hpd: float = 0.9) -> int:
     f = fun(grid)
     sorted_pixels = np.sort(f)
-
-
+    cumsum = np.cumsum(sorted_pixels)
+    total_sum = cumsum[-1]
+    threshold = hpd * total_sum
+    idx = np.searchsorted(cumsum, threshold)
+    return sorted_pixels[idx]
