@@ -20,5 +20,5 @@ prior:
 
 training: 
   batch_size: 64
-  epochs: 15
+  epochs: 100
   learning_rate: 0.01

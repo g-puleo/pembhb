@@ -88,3 +88,11 @@ class UniformSampler ():
         return samples
     
 
+
+
+
+def hpd_thresholder(grid: np.array, fun: callable):
+    f = fun(grid)
+    sorted_pixels = np.sort(f)
+
+

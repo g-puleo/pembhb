@@ -156,3 +156,76 @@ class LISAMBHBSimulator():
 
 
 
+
+
+class DummySampler:
+    def __init__(self, low=0.0, high=1.0):
+        self.low = low
+        self.high = high
+
+    def sample(self, N):
+        """Sample N sets of parameters (mu, sigma) from a uniform prior."""
+        mu = np.random.uniform(self.low, self.high, size=(N, 1))
+        sigma = np.random.uniform(self.low, self.high, size=(N, 1))
+        z_samples = np.hstack((mu, sigma))
+        return z_samples, z_samples  # Return z_samples for both parameters and tmnre_input
+
+
+class DummySimulator:
+    def __init__(self, sampler_init_kwargs):
+        self.sampler = DummySampler(**sampler_init_kwargs)
+        self.n_samples = 10  # Number of data points per line
+        self.noise_std = 0.1  # Standard deviation of the fixed noise
+
+    def generate_d_f(self, injection: np.array):
+        """Generate data samples from a line with fixed noise.
+
+        :param injection: Parameters (slope, intercept) for the line
+        :type injection: np.array
+        :return: Simulated data
+        :rtype: np.array
+        """
+        n_examples = injection.shape[0]
+        x = np.linspace(0, 1, self.n_samples)
+        data_fd = np.zeros((n_examples, self.n_samples))
+        for i in range(n_examples):
+            slope, intercept = injection[i]
+            y = slope * x + intercept
+            data_fd[i] = y + np.random.normal(0, self.noise_std, self.n_samples)
+        return data_fd
+
+    def _sample(self, N=1):
+        """Draw samples from the prior and generate data.
+
+        :param N: Number of samples to generate
+        :type N: int
+        :return: z_samples, data_fd
+        :rtype: dict
+        """
+        z_samples, tmnre_input = self.sampler.sample(N)
+        data_fd = self.generate_d_f(z_samples)
+        out_dict = {"output_parameters": tmnre_input, "data_fd": data_fd}
+        return out_dict
+
+    def sample_and_store(self, filename, N, batch_size=1000):
+        """Sample N samples and store them in an HDF5 file.
+
+        :param filename: Name of the file to store the samples
+        :type filename: str
+        :param N: Number of samples to generate
+        :type N: int
+        :param batch_size: Number of samples to generate in each batch
+        :type batch_size: int
+        """
+        with h5py.File(filename, "a") as f:
+            source_params = f.create_dataset("source_parameters", shape=(N, 2), dtype=np.float32)
+            data_fd = f.create_dataset("data_fd", shape=(N, self.n_samples), dtype=np.float32)
+
+            for i in tqdm(range(0, N, batch_size)):
+                batch_end = min(i + batch_size, N)
+                batch_size_actual = batch_end - i
+                out = self._sample(batch_size_actual)
+                z_samples = out["output_parameters"]
+                data_fd_batch = out["data_fd"]
+                source_params[i:batch_end] = z_samples
+                data_fd[i:batch_end] = data_fd_batch

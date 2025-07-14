@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from lightning import LightningModule
 from torch import nn
+from torch.nn import functional as F
 # class GWTransformer(LightningModule):
 #     def __init__(self, n_chunks=100, embed_dim=512, num_heads=8, num_layers=4):
 #         super().__init__()
@@ -51,13 +52,13 @@ from torch import nn
 
 class MarginalClassifierHead(nn.Module):
 
-    def __init__(self, in_features: int , marginals: list[list], hidden_size: int = 32):
+    def __init__(self, in_features: int , marginals: list[list], hidden_size: int):
         super().__init__()
         self.marginals = marginals
         self.classifiers = nn.ModuleList([
             nn.Sequential(
             nn.Linear(in_features + len(marginal), hidden_size),
-            nn.LeakyReLU(),
+            nn.ReLU(),
             nn.Linear(hidden_size, 1)
             )
             for marginal in marginals
@@ -66,9 +67,11 @@ class MarginalClassifierHead(nn.Module):
     def forward(self, features, parameters):
         outputs = []
         for i, marginal in enumerate(self.marginals):
+            # breakpoint()
             indices = marginal
             input_data = torch.cat([features, parameters[:, indices]], dim=-1)
             outputs.append(self.classifiers[i](input_data))
+
         return torch.cat(outputs, dim=-1)
 
 class InferenceNetwork(LightningModule):
@@ -76,20 +79,24 @@ class InferenceNetwork(LightningModule):
     Basic FC network for TMNRE of MBHB data. 
     I wrote this function to test the swyft framework, improvements on the architecture are future work. 
     """
-    def __init__(self, num_features=10000, num_channels  = 6,  hlayersizes=(500,20), lr=1e-3):  
+    def __init__(self, num_features: int, num_channels: int,  hlayersizes: tuple, lr=1e-3):  
         super().__init__()
 
-        self.normalise = nn.BatchNorm1d(num_features=num_channels, eps=1e-22)
-        self.conv1d = nn.Conv1d(num_channels, 1, kernel_size=3, padding=1) 
+        # self.normalise = nn.BatchNorm1d(num_features=num_channels, eps=1e-22)
+        # self.conv1d = nn.Conv1d(num_channels, 1, kernel_size=3, padding=1) 
         self.fc_blocks = nn.Sequential()
         input_size = num_features
         for i, output_size in enumerate(hlayersizes):
             self.fc_blocks.add_module(f"fc_{i}", nn.Linear(input_size, output_size))
-            self.fc_blocks.add_module(f"relu_{i}", nn.LeakyReLU())
-            self.fc_blocks.add_module(f"dropout_{i}", nn.Dropout(p=0.5))
+            self.fc_blocks.add_module(f"relu_{i}", nn.ReLU())
+            #self.fc_blocks.add_module(f"dropout_{i}", nn.Dropout(p=0.2))
             input_size = output_size
         
-        self.logratios = MarginalClassifierHead(input_size, marginals=[[0,1]], hidden_size=20)
+        self.hook = self.ParameterChangeTracker(self.fc_blocks)
+        self.hook.attach_hook()
+        self.logratios = MarginalClassifierHead(input_size, marginals=[[0]], hidden_size=10)
+        self.hook_logits  = self.ParameterChangeTracker(self.logratios)
+        self.hook_logits.attach_hook()
         self.loss = nn.BCEWithLogitsLoss(reduce='sum')
         self.lr = lr
         self.save_hyperparameters()
@@ -102,12 +109,12 @@ class InferenceNetwork(LightningModule):
             data: Tensor of shape (batch_size, num_channels, num_features) containing the frequency domain signal in the TDI channels
             parameters: Tensor of shape (batch_size, 11) containing the parameters to be used in the classifier
         """
-        data = self.normalise(x)
-        #print("data min max std mean", torch.min(data), torch.max(data), torch.std(data), torch.mean(data))
-        data = self.conv1d(data)  
-        #print("data after conv1d min max std mean", torch.min(data), torch.max(data), torch.std(data), torch.mean(data))
-        data = data.squeeze(1)  # (batch_size, num_features - 2)
-        features = self.fc_blocks(data)  # (batch_size, hidden_size)
+        # data = self.normalise(x)
+        # #print("data min max std mean", torch.min(data), torch.max(data), torch.std(data), torch.mean(data))
+        # data = self.conv1d(data)  
+        # #print("data after conv1d min max std mean", torch.min(data), torch.max(data), torch.std(data), torch.mean(data))
+        # data = data.squeeze(1)  # (batch_size, num_features - 2)
+        features = self.fc_blocks(x)  # (batch_size, hidden_size)
         #print("features min max std mean", torch.min(features), torch.max(features), torch.std(features), torch.mean(features))
         output = self.logratios(features, parameters)  # (batch_size, num_marginals)
         
@@ -119,13 +126,22 @@ class InferenceNetwork(LightningModule):
         data = batch['data_fd']
         parameters = batch['source_parameters']
         scrambled_params = torch.roll(parameters, shifts=1, dims=0)
-
-        output_joint = self(data, parameters)
-        output_scrambled = self(data, scrambled_params)
-        loss_1 = self.loss(output_joint, torch.ones_like(output_joint))
-        loss_2 = self.loss(output_scrambled, torch.zeros_like(output_scrambled))
-        loss = loss_1 + loss_2
+        all_data = torch.cat((data, data), dim=0)
+        # the first half of all_params contains parameters from the joint, associated with the first half of all_data
+        # the second half of all_params contains parameters from the marginal, independent of the second half of all_data
+        all_params = torch.cat((parameters, scrambled_params), dim=0)
+        logits = self(all_data, all_params) 
+        shape_logits_half = (logits.shape[0] // 2, logits.shape[1])
+        labels = torch.cat((torch.ones(shape_logits_half, device="cuda"), torch.zeros(shape_logits_half, device="cuda")), dim=0)
+        loss = F.binary_cross_entropy_with_logits(logits, labels,reduction='mean') 
+        joint_preds = (logits[:shape_logits_half[0]] > 0.5).float()
+        scrambled_preds = (logits[shape_logits_half[0]:] > 0.5).float()
+        joint_accuracy = (joint_preds == 1).float().mean()
+        scrambled_accuracy = (scrambled_preds == 0).float().mean()
+        accuracy = (joint_accuracy + scrambled_accuracy) / 2
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log('train_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        # breakpoint()
         return loss 
     
     def validation_step(self, batch, batch_idx):
@@ -142,21 +158,37 @@ class InferenceNetwork(LightningModule):
         joint_accuracy = (joint_preds == 1).float().mean()
         scrambled_accuracy = (scrambled_preds == 0).float().mean()
         accuracy = (joint_accuracy + scrambled_accuracy) / 2
-        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        self.log('val_accuracy', accuracy, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log('val_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
         return loss
     
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=5)
-        return {
-            'optimizer': optimizer,
-            'lr_scheduler': {
-                'scheduler': scheduler,
-                'monitor': 'val_loss',
-                'interval': 'epoch',
-                'frequency': 1
-            }
-        }
-    
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
+        #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=5)
+        # return {
+        #     'optimizer': optimizer,
+        #     'lr_scheduler': {
+        #         'scheduler': scheduler,
+        #         'monitor': 'val_loss',
+        #         'interval': 'epoch',
+        #         'frequency': 1
+        #     }
+        # }
+        return optimizer
+
+    class ParameterChangeTracker:
+        def __init__(self, module):
+            self.module = module
+            self.initial_params = {name: param.clone().detach() for name, param in module.named_parameters() if param.requires_grad}
+            self.changes = {}
+
+        def track_changes(self):
+            for name, param in self.module.named_parameters():
+                if param.requires_grad:
+                    self.changes[name] = (param.to("cpu") - self.initial_params[name]).abs().sum().item()
+
+        def attach_hook(self):
+            def hook(module, inputs, outputs):
+                self.track_changes()
+            self.module.register_forward_hook(hook)
