@@ -31,7 +31,7 @@ class MBHBDataset(Dataset):
         :return: Transformed data with log10 amplitude and phase.
         :rtype: np.array
         """
-        ## apply log10 to the amplitude of the data (channels from 0 to 2)
+        # apply log10 to the amplitude of the data (channels from 0 to 2)
         # data_ampl = np.log10(data[:3]+1e-33)
         # data_phase = data[3:]
         # return np.concatenate((data_ampl, data_phase), axis=0)

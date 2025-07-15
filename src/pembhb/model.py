@@ -92,11 +92,7 @@ class InferenceNetwork(LightningModule):
             #self.fc_blocks.add_module(f"dropout_{i}", nn.Dropout(p=0.2))
             input_size = output_size
         
-        self.hook = self.ParameterChangeTracker(self.fc_blocks)
-        self.hook.attach_hook()
         self.logratios = MarginalClassifierHead(input_size, marginals=marginals, hidden_size=marginal_hidden_size)
-        self.hook_logits  = self.ParameterChangeTracker(self.logratios)
-        self.hook_logits.attach_hook()
         self.loss = nn.BCEWithLogitsLoss(reduce='sum')
         self.lr = lr
         self.save_hyperparameters()
@@ -134,8 +130,8 @@ class InferenceNetwork(LightningModule):
         shape_logits_half = (logits.shape[0] // 2, logits.shape[1])
         labels = torch.cat((torch.ones(shape_logits_half, device="cuda"), torch.zeros(shape_logits_half, device="cuda")), dim=0)
         loss = F.binary_cross_entropy_with_logits(logits, labels,reduction='mean') 
-        joint_preds = (logits[:shape_logits_half[0]] > 0.5).float()
-        scrambled_preds = (logits[shape_logits_half[0]:] > 0.5).float()
+        joint_preds = (logits[:shape_logits_half[0]] > 0).float()
+        scrambled_preds = (F.sigmoid(logits[shape_logits_half[0]:]) > 0).float()
         joint_accuracy = (joint_preds == 1).float().mean()
         scrambled_accuracy = (scrambled_preds == 0).float().mean()
         accuracy = (joint_accuracy + scrambled_accuracy) / 2
@@ -160,7 +156,6 @@ class InferenceNetwork(LightningModule):
         accuracy = (joint_accuracy + scrambled_accuracy) / 2
         self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('val_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-
         return loss
     
     def configure_optimizers(self):
@@ -177,18 +172,3 @@ class InferenceNetwork(LightningModule):
         # }
         return optimizer
 
-    class ParameterChangeTracker:
-        def __init__(self, module):
-            self.module = module
-            self.initial_params = {name: param.clone().detach() for name, param in module.named_parameters() if param.requires_grad}
-            self.changes = {}
-
-        def track_changes(self):
-            for name, param in self.module.named_parameters():
-                if param.requires_grad:
-                    self.changes[name] = (param.to("cpu") - self.initial_params[name]).abs().sum().item()
-
-        def attach_hook(self):
-            def hook(module, inputs, outputs):
-                self.track_changes()
-            self.module.register_forward_hook(hook)

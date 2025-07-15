@@ -19,6 +19,6 @@ prior:
   "Deltat": [ 3, 14 ] # t_merger from end of observation in days
 
 training: 
-  batch_size: 64
+  batch_size: 400
   epochs: 100
   learning_rate: 0.01
