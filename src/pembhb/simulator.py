@@ -38,6 +38,7 @@ class LISAMBHBSimulator():
 
         self.obs_time = int( 24*3600*7*conf["waveform_params"]["duration"])# weeks to seconds
         self.freqs = np.logspace(-4, -2, 10000)
+        self.df = np.diff(self.freqs, prepend=self.freqs[0])
         self.n_pt = len(self.freqs)
         self.waveform_kwargs = {
                 "modes": conf["waveform_params"]["modes"],
@@ -54,19 +55,20 @@ class LISAMBHBSimulator():
             "return_type": "ASD"
         }
         ASD = np.zeros((3, self.freqs.shape[0]))
-        
-        if conf["waveform_params"]["TDI"]=="AET":
+        self.channels = conf["waveform_params"]["TDI"]
+        if self.channels == "AET":
             ASD[0] = lisasens.get_sensitivity(self.freqs, sens_fn = lisasens.A1TDISens, **psd_kwargs)
             ASD[1] = lisasens.get_sensitivity(self.freqs, sens_fn = lisasens.E1TDISens, **psd_kwargs)
             ASD[2] = lisasens.get_sensitivity(self.freqs, sens_fn = lisasens.T1TDISens, **psd_kwargs)
             # ASD[self.freqs<1e-5] =0.0 
-        elif conf["waveform_params"]["TDI"]=="XYZ":
+        elif self.channels == "XYZ":
             ASD[0] = lisasens.get_sensitivity(self.freqs, sens_fn = lisasens.X1TDISens, **psd_kwargs)
             ASD[1] = lisasens.get_sensitivity(self.freqs, sens_fn = lisasens.Y1TDISens, **psd_kwargs)
             ASD[2] = lisasens.get_sensitivity(self.freqs, sens_fn = lisasens.Z1TDISens, **psd_kwargs)
         else:
             raise ValueError("conf['waveform_params']['TDI'] must be either XYZ or AET. ")
         self.ASD = ASD
+        self.PSD = ASD**2
         self.sampler = UniformSampler(**sampler_init_kwargs)
 
     def generate_d_f(self, injection: np.array):
@@ -90,7 +92,6 @@ class LISAMBHBSimulator():
         simulated_data_fd = (noise_fd + wave_FD)
         # stack real and imaginary parts over channels
         #breakpoint()
-        simulated_data_fd = np.concatenate((np.abs(simulated_data_fd), np.angle(simulated_data_fd)), axis=1)
         return simulated_data_fd
 
     def _sample(self, N=1): 
@@ -98,12 +99,12 @@ class LISAMBHBSimulator():
 
         :param N: _description_, defaults to 1
         :type N: int, optional
-        :return: z_samples, data_fd (prior samples , frequency domain data)
-        :rtype: list[np.array]
+        :return: out_dict {"parameters": prior samples , frequency domain data)
+        :rtype: dict
         """
         z_samples, tmnre_input = self.sampler.sample(N)
         data_fd = self.generate_d_f(z_samples)
-        out_dict = {"output_parameters": tmnre_input, "data_fd": data_fd}
+        out_dict = {"parameters": tmnre_input, "data_fd": data_fd}
         return out_dict
     
     def sample_and_store(self, filename, N, batch_size=1000): 
@@ -120,15 +121,36 @@ class LISAMBHBSimulator():
         with h5py.File(filename, "a") as f:
             source_params = f.create_dataset("source_parameters", shape=(N, 11), dtype=np.float32)
             data_fd = f.create_dataset("data_fd", shape=(N, 6, self.n_pt), dtype=np.float32)
-
+            snr = f.create_dataset("snr", shape = (N,), dtype=np.float32)
             for i in tqdm(range(0, N, batch_size)):
                 batch_end = min(i + batch_size, N)
                 batch_size_actual = batch_end - i
                 out = self._sample(batch_size_actual)
-                z_samples = out["output_parameters"]
+
+                z_samples = out["parameters"]
                 data_fd_batch = out["data_fd"]
-                source_params[i:batch_end] = z_samples.reshape(batch_size_actual, -1)  # Reshape to (batch_size, 11)
+                data_fd_batch = np.concatenate((np.abs(data_fd_batch), np.angle(data_fd_batch)), axis=1)
+                snr_batch = self.get_SNR_FD(data_fd_batch)
+                source_params[i:batch_end] = z_samples.T # Reshape to (batch_size, 11) instead of (11, batch_size)
                 data_fd[i:batch_end] = data_fd_batch
+                snr[i:batch_end] = snr_batch
+
+    def get_SNR_FD(self,
+        signal
+        ):
+        """
+        Obtain the SNR of a signal in frequency domain.
+
+        :param signal: data in frequency domain, output by bbhx with shape (n_samples, 3, n_freqs)
+        :type signal: np.array
+        :return: SNR values with shape (n_samples,)
+        :rtype: np.array
+        """
+    
+        SNR2 =  np.sum(signal*signal.conj()*self.df/self.PSD,axis=(1,2)).real * 4.0 
+        return np.sqrt(SNR2)
+
+
 
 # if __name__ == "__main__":
 
@@ -203,7 +225,7 @@ class DummySimulator:
         """
         z_samples, tmnre_input = self.sampler.sample(N)
         data_fd = self.generate_d_f(z_samples)
-        out_dict = {"output_parameters": tmnre_input, "data_fd": data_fd}
+        out_dict = {"parameters": tmnre_input, "data_fd": data_fd}
         return out_dict
 
     def sample_and_store(self, filename, N, batch_size=1000):
@@ -217,14 +239,14 @@ class DummySimulator:
         :type batch_size: int
         """
         with h5py.File(filename, "a") as f:
-            source_params = f.create_dataset("source_parameters", shape=(N, 2), dtype=np.float32)
+            source_params = f.create_dataset("parameters", shape=(N, 2), dtype=np.float32)
             data_fd = f.create_dataset("data_fd", shape=(N, self.n_samples), dtype=np.float32)
 
             for i in tqdm(range(0, N, batch_size)):
                 batch_end = min(i + batch_size, N)
                 batch_size_actual = batch_end - i
                 out = self._sample(batch_size_actual)
-                z_samples = out["output_parameters"]
+                z_samples = out["parameters"]
                 data_fd_batch = out["data_fd"]
                 source_params[i:batch_end] = z_samples
                 data_fd[i:batch_end] = data_fd_batch
