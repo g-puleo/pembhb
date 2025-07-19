@@ -129,10 +129,10 @@ class LISAMBHBSimulator():
 
                 z_samples = out["parameters"]
                 data_fd_batch = out["data_fd"]
-                data_fd_batch = np.concatenate((np.abs(data_fd_batch), np.angle(data_fd_batch)), axis=1)
                 snr_batch = self.get_SNR_FD(data_fd_batch)
+                data_fd_amp_phase = np.concatenate((np.abs(data_fd_batch), np.angle(data_fd_batch)), axis=1)
                 source_params[i:batch_end] = z_samples.T # Reshape to (batch_size, 11) instead of (11, batch_size)
-                data_fd[i:batch_end] = data_fd_batch
+                data_fd[i:batch_end] = data_fd_amp_phase
                 snr[i:batch_end] = snr_batch
 
     def get_SNR_FD(self,

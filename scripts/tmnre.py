@@ -33,7 +33,7 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
 
     logger = TensorBoardLogger(os.path.join(ROOT_DIR, f"logs"), name=f"dummy_{idx}")
     trainer = Trainer(logger=logger, max_epochs=conf["training"]["epochs"], accelerator="gpu", devices=1, enable_progress_bar=True)
-    model = InferenceNetwork(num_features=10, num_channels=6, hlayersizes=(100, 20), marginals=[[0]], marginal_hidden_size=10, lr=lr)
+    model = InferenceNetwork(num_features=10, num_channels=6, hlayersizes=(100, 20), marginals=conf["tmnre"]["marginals"], marginal_hidden_size=10, lr=lr)
     trainer.fit(model, data_module)
     #trainer.save_checkpoint(os.path.join(ROOT_DIR, "checkpoints", f"tmnre_model_{idx}.ckpt"))
     return 
