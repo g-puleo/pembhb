@@ -98,21 +98,10 @@ class InferenceNetwork(LightningModule):
     Basic FC network for TMNRE of MBHB data. 
     I wrote this function to test the swyft framework, improvements on the architecture are future work. 
     """
-    def __init__(self, num_features: int, num_channels: int,  hlayersizes: tuple,  marginals: list[list], marginal_hidden_size: int, lr: float):  
+    def __init__(self, lr: float, classifier_model: torch.nn.Module):  
         super().__init__()
-
-        # self.normalise = nn.BatchNorm1d(num_features=num_channels, eps=1e-22)
-        # self.conv1d = nn.Conv1d(num_channels, 1, kernel_size=3, padding=1) 
-        self.fc_blocks = nn.Sequential()
-        input_size = num_features
-        for i, output_size in enumerate(hlayersizes):
-            self.fc_blocks.add_module(f"fc_{i}", nn.Linear(input_size, output_size))
-            self.fc_blocks.add_module(f"relu_{i}", nn.ReLU())
-            #self.fc_blocks.add_module(f"dropout_{i}", nn.Dropout(p=0.2))
-            input_size = output_size
-        
-        self.logratios = MarginalClassifierHead(input_size, marginals=marginals, hidden_size=marginal_hidden_size)
-        self.loss = nn.BCEWithLogitsLoss(reduce='sum')
+        self.model = classifier_model
+        self.loss = nn.BCEWithLogitsLoss(reduction='mean')
         self.lr = lr
         self.save_hyperparameters()
 
@@ -124,16 +113,7 @@ class InferenceNetwork(LightningModule):
             data: Tensor of shape (batch_size, num_channels, num_features) containing the frequency domain signal in the TDI channels
             parameters: Tensor of shape (batch_size, 11) containing the parameters to be used in the classifier
         """
-        # data = self.normalise(x)
-        # #print("data min max std mean", torch.min(data), torch.max(data), torch.std(data), torch.mean(data))
-        # data = self.conv1d(data)  
-        # #print("data after conv1d min max std mean", torch.min(data), torch.max(data), torch.std(data), torch.mean(data))
-        # data = data.squeeze(1)  # (batch_size, num_features - 2)
-        features = self.fc_blocks(x)  # (batch_size, hidden_size)
-        #print("features min max std mean", torch.min(features), torch.max(features), torch.std(features), torch.mean(features))
-        output = self.logratios(features, parameters)  # (batch_size, num_marginals)
-        
-        #print("output min max std mean", torch.min(output), torch.max(output), torch.std(output), torch.mean(output))
+        output = self.model(x, parameters)  # (batch_size, num_marginals)
         return output
 
 
@@ -191,13 +171,48 @@ class InferenceNetwork(LightningModule):
         # }
         return optimizer
 
+class SimpleModel(torch.nn.Module):
+    def __init__(self, num_features: int, num_channels: int,  hlayersizes: tuple,  marginals: list[list], marginal_hidden_size: int, lr: float):  
+        super().__init__()
+
+        # self.normalise = nn.BatchNorm1d(num_features=num_channels, eps=1e-22)
+        # self.conv1d = nn.Conv1d(num_channels, 1, kernel_size=3, padding=1) 
+        self.fc_blocks = nn.Sequential()
+        input_size = num_features
+        for i, output_size in enumerate(hlayersizes):
+            self.fc_blocks.add_module(f"fc_{i}", nn.Linear(input_size, output_size))
+            self.fc_blocks.add_module(f"relu_{i}", nn.ReLU())
+            #self.fc_blocks.add_module(f"dropout_{i}", nn.Dropout(p=0.2))
+            input_size = output_size
+        
+        self.logratios = MarginalClassifierHead(input_size, marginals=marginals, hidden_size=marginal_hidden_size)
 
 
-### THIS CHUNK OF CODE IS DIRECTLY COPIED FROM PEREGRINE
-class PeregrineInferenceNetwork(LightningModule):
+    def forward(self, x, parameters):
+        """
+        Forward pass of the network.
+        
+        Args:
+            data: Tensor of shape (batch_size, num_channels, num_features) containing the frequency domain signal in the TDI channels
+            parameters: Tensor of shape (batch_size, 11) containing the parameters to be used in the classifier
+        """
+        # data = self.normalise(x)
+        # #print("data min max std mean", torch.min(data), torch.max(data), torch.std(data), torch.mean(data))
+        # data = self.conv1d(data)  
+        # #print("data after conv1d min max std mean", torch.min(data), torch.max(data), torch.std(data), torch.mean(data))
+        # data = data.squeeze(1)  # (batch_size, num_features - 2)
+        features = self.fc_blocks(x)  # (batch_size, hidden_size)
+        #print("features min max std mean", torch.min(features), torch.max(features), torch.std(features), torch.mean(features))
+        output = self.logratios(features, parameters)  # (batch_size, num_marginals)
+        
+        #print("output min max std mean", torch.min(output), torch.max(output), torch.std(output), torch.mean(output))
+        return output
+
+
+class PeregrineModel(torch.nn.Module):
     def __init__(self, conf):
         super().__init__()
-        self.batch_size = conf["hparams"]["training_batch_size"]
+        self.batch_size = conf["training"]["batch_size"]
         self.marginals = conf["tmnre"]["marginals"]
         # self.unet_t = Unet(
         #     n_in_channels=2 * len(conf["waveform_params"]["TDI"]),
@@ -217,20 +232,24 @@ class PeregrineInferenceNetwork(LightningModule):
         self.linear_f = LinearCompression()
 
         self.logratios_1d = MarginalClassifierHead(
-
-
+            n_data_features=16,
+            marginals=self.marginals, 
+            hlayersizes=(32, 16, 8, 4, 1)
         )
 
 
 
     def forward(self, d_f, parameters):
 
+        # run the fd signal through the unet (output has same shape as input)
         d_f_processed = self.unet_f(d_f)
-        features_f = self.linear_f(self.flatten(d_f_w))
+        # compress the processed signal
+        features_f = self.linear_f(self.flatten(d_f_processed))
+        # classify the  (t(d), parameters) pair
         logratios_1d = self.logratios_1d(features_f, parameters)
         return logratios_1d
 
-
+### THIS CHUNK OF CODE IS DIRECTLY COPIED FROM PEREGRINE
 # 1D Unet implementation below
 class DoubleConv(nn.Module):
     def __init__(
