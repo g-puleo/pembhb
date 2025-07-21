@@ -130,6 +130,7 @@ class LISAMBHBSimulator():
                 source_params[i:batch_end] = z_samples.reshape(batch_size_actual, -1)  # Reshape to (batch_size, 11)
                 data_fd[i:batch_end] = data_fd_batch
 
+    
 # if __name__ == "__main__":
 
     # Load configuration from config.yaml

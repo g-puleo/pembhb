@@ -3,6 +3,7 @@ import torch.nn as nn
 from lightning import LightningModule
 from torch import nn
 from torch.nn import functional as F
+from collections.abc import Iterable
 # class GWTransformer(LightningModule):
 #     def __init__(self, n_chunks=100, embed_dim=512, num_heads=8, num_layers=4):
 #         super().__init__()
@@ -52,17 +53,25 @@ from torch.nn import functional as F
 
 class MarginalClassifierHead(nn.Module):
 
-    def __init__(self, in_features: int , marginals: list[list], hidden_size: int):
+    def __init__(self, in_features: int , marginals: list[list], hlayersizes: Iterable[int]):
         super().__init__()
         self.marginals = marginals
-        self.classifiers = nn.ModuleList([
-            nn.Sequential(
-            nn.Linear(in_features + len(marginal), hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, 1)
-            )
-            for marginal in marginals
-        ])
+        self.classifiers = nn.ModuleList()
+        for marginal in marginals:
+            classifier = nn.Sequential()
+            for i, output_size in enumerate(hlayersizes):
+                if i == 0:
+                    input_size = in_features + len(marginal)
+                    output_size = hlayersizes[i]
+                else:
+                    input_size = hlayersizes[i-1]
+                    output_size = hlayersizes[i]
+            
+                classifier.add_module(f"fc_{i}", nn.Linear(input_size, output_size))
+                classifier.add_module(f"relu_{i}", nn.ReLU())
+
+            classifier.add_module("output", nn.Linear(output_size, 1)) 
+            self.classifiers.append(classifier)
 
     def forward(self, features, parameters):
         outputs = []
@@ -79,7 +88,7 @@ class InferenceNetwork(LightningModule):
     Basic FC network for TMNRE of MBHB data. 
     I wrote this function to test the swyft framework, improvements on the architecture are future work. 
     """
-    def __init__(self, num_features: int, num_channels: int,  hlayersizes: tuple,  marginals: list[list], marginal_hidden_size: int, lr: float):  
+    def __init__(self, num_features: int, num_channels: int,  hlayersizes: Iterable[int],  marginals: list[list], marginal_hidden_sizes: Iterable[int], lr: float):  
         super().__init__()
 
         # self.normalise = nn.BatchNorm1d(num_features=num_channels, eps=1e-22)
@@ -92,7 +101,7 @@ class InferenceNetwork(LightningModule):
             #self.fc_blocks.add_module(f"dropout_{i}", nn.Dropout(p=0.2))
             input_size = output_size
         
-        self.logratios = MarginalClassifierHead(input_size, marginals=marginals, hidden_size=marginal_hidden_size)
+        self.logratios = MarginalClassifierHead(input_size, marginals=marginals, hlayersizes=marginal_hidden_sizes)
         self.loss = nn.BCEWithLogitsLoss(reduce='sum')
         self.lr = lr
         self.save_hyperparameters()
@@ -117,43 +126,41 @@ class InferenceNetwork(LightningModule):
         #print("output min max std mean", torch.min(output), torch.max(output), torch.std(output), torch.mean(output))
         return output
 
+    def calc_logits_loss(self, data, parameters):
+        all_data = torch.cat((data, data), dim=0)
+        scrambled_params = torch.roll(parameters, shifts=1, dims=0)
+        all_params = torch.cat((parameters, scrambled_params), dim=0)
+        all_logits = self(all_data, all_params) 
+        shape_logits_half = (all_logits.shape[0] // 2, all_logits.shape[1])
+        labels = torch.cat((torch.ones(shape_logits_half, device="cuda"), torch.zeros(shape_logits_half, device="cuda")), dim=0)
+        loss = self.loss(all_logits, labels)
+        #breakpoint()
+        return all_logits, loss
+    
+    def calc_accuracy(self, all_logits):
+        shape_logits_half = (all_logits.shape[0] // 2, all_logits.shape[1])
+        joint_preds = (all_logits[:shape_logits_half[0]] > 0).float()
+        scrambled_preds = (all_logits[shape_logits_half[0]:] > 0).float()
+        joint_accuracy = (joint_preds == 1).float().mean()
+        scrambled_accuracy = (scrambled_preds == 0).float().mean()
+        accuracy = (joint_accuracy + scrambled_accuracy) / 2
+        return accuracy
 
     def training_step(self, batch, batch_idx): 
         data = batch['data_fd']
         parameters = batch['source_parameters']
-        scrambled_params = torch.roll(parameters, shifts=1, dims=0)
-        all_data = torch.cat((data, data), dim=0)
         # the first half of all_params contains parameters from the joint, associated with the first half of all_data
         # the second half of all_params contains parameters from the marginal, independent of the second half of all_data
-        all_params = torch.cat((parameters, scrambled_params), dim=0)
-        logits = self(all_data, all_params) 
-        shape_logits_half = (logits.shape[0] // 2, logits.shape[1])
-        labels = torch.cat((torch.ones(shape_logits_half, device="cuda"), torch.zeros(shape_logits_half, device="cuda")), dim=0)
-        loss = F.binary_cross_entropy_with_logits(logits, labels,reduction='mean') 
-        joint_preds = (logits[:shape_logits_half[0]] > 0).float()
-        scrambled_preds = (F.sigmoid(logits[shape_logits_half[0]:]) > 0).float()
-        joint_accuracy = (joint_preds == 1).float().mean()
-        scrambled_accuracy = (scrambled_preds == 0).float().mean()
-        accuracy = (joint_accuracy + scrambled_accuracy) / 2
+        all_logits, loss = self.calc_logits_loss(data, parameters)
+        accuracy = self.calc_accuracy(all_logits)
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         # breakpoint()
         return loss 
     
     def validation_step(self, batch, batch_idx):
-        data = batch['data_fd']
-        parameters = batch['source_parameters']
-        scrambled_params = torch.roll(parameters, shifts=1, dims=0)
-        output_joint = self(data, parameters)
-        output_scrambled = self(data, scrambled_params)
-        loss_1 = self.loss(output_joint, torch.ones_like(output_joint))
-        loss_2 = self.loss(output_scrambled, torch.zeros_like(output_scrambled))
-        loss = loss_1 + loss_2
-        joint_preds = (torch.sigmoid(output_joint) > 0.5).float()
-        scrambled_preds = (torch.sigmoid(output_scrambled) > 0.5).float()
-        joint_accuracy = (joint_preds == 1).float().mean()
-        scrambled_accuracy = (scrambled_preds == 0).float().mean()
-        accuracy = (joint_accuracy + scrambled_accuracy) / 2
+        all_logits, loss = self.calc_logits_loss(batch['data_fd'], batch['source_parameters'])
+        accuracy = self.calc_accuracy(all_logits)
         self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('val_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss

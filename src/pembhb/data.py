@@ -31,11 +31,10 @@ class MBHBDataset(Dataset):
         :return: Transformed data with log10 amplitude and phase.
         :rtype: np.array
         """
-        # apply log10 to the amplitude of the data (channels from 0 to 2)
-        # data_ampl = np.log10(data[:3]+1e-33)
-        # data_phase = data[3:]
-        # return np.concatenate((data_ampl, data_phase), axis=0)
-        return data
+        #apply log10 to the amplitude of the data (channels from 0 to 2)
+        data_ampl = np.log10(data[:3]+1e-33)
+        data_phase = data[3:]
+        return np.concatenate((data_ampl, data_phase), axis=0)
 
     def __len__(self):
         return self.len
@@ -43,9 +42,8 @@ class MBHBDataset(Dataset):
     def __getitem__(self, idx):
         
         with h5py.File(self.filename, 'r') as f:
-            data_fd= self.transform(f["data_fd"][idx])
             dict_out = {
-                "data_fd": data_fd,
+                "data_fd": f["data_fd"][idx],
                 "source_parameters": f["source_parameters"][idx],
             }
         return dict_out
@@ -55,7 +53,7 @@ class MBHBDataset(Dataset):
 
 class MBHBDataModule( L.LightningDataModule ): 
 
-    def __init__(self, filename: str, targets: list[str], batch_size: int = 32):
+    def __init__(self, filename: str, batch_size: int = 32):
         """Initialize the data module.
 
         :param filename: Path to the HDF5 file.
@@ -67,11 +65,12 @@ class MBHBDataModule( L.LightningDataModule ):
         """
         super().__init__()
         self.batch_size = batch_size
-        self.targets = targets
         self.generator = torch.Generator().manual_seed(31415)
         self.filename = filename
 
+    def prepare_data(self):
 
+        pass
     
     def setup(self, stage=None):
         """Setup the dataset."""
@@ -90,3 +89,16 @@ class MBHBDataModule( L.LightningDataModule ):
     
     def test_dataloader(self):
         return DataLoader(self.test, batch_size=self.batch_size, shuffle=False)
+    
+
+
+class DummyDataset(Dataset):
+    def __init__(self, params, data):
+        self.params = params
+        self.data = data
+
+    def __len__(self):
+        return len(self.params)
+
+    def __getitem__(self, idx):
+        return {'source_parameters': self.params[idx], 'data_fd': self.data[idx]}
