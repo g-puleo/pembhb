@@ -130,7 +130,7 @@ class InferenceNetwork(LightningModule):
         labels = torch.cat((torch.ones(shape_logits_half, device="cuda"), torch.zeros(shape_logits_half, device="cuda")), dim=0)
         loss = F.binary_cross_entropy_with_logits(logits, labels,reduction='mean') 
         joint_preds = (logits[:shape_logits_half[0]] > 0).float()
-        scrambled_preds = (F.sigmoid(logits[shape_logits_half[0]:]) > 0).float()
+        scrambled_preds = (logits[shape_logits_half[0]:] > 0).float()
         joint_accuracy = (joint_preds == 1).float().mean()
         scrambled_accuracy = (scrambled_preds == 0).float().mean()
         accuracy = (joint_accuracy + scrambled_accuracy) / 2
@@ -148,8 +148,8 @@ class InferenceNetwork(LightningModule):
         loss_1 = self.loss(output_joint, torch.ones_like(output_joint))
         loss_2 = self.loss(output_scrambled, torch.zeros_like(output_scrambled))
         loss = loss_1 + loss_2
-        joint_preds = (torch.sigmoid(output_joint) > 0.5).float()
-        scrambled_preds = (torch.sigmoid(output_scrambled) > 0.5).float()
+        joint_preds = (output_joint > 0.0).float()
+        scrambled_preds = (output_scrambled > 0.0).float()
         joint_accuracy = (joint_preds == 1).float().mean()
         scrambled_accuracy = (scrambled_preds == 0).float().mean()
         accuracy = (joint_accuracy + scrambled_accuracy) / 2

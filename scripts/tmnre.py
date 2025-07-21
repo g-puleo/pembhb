@@ -32,7 +32,7 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
         )
 
     logger = TensorBoardLogger(os.path.join(ROOT_DIR, f"logs"), name=f"dummy_{idx}")
-    trainer = Trainer(logger=logger, max_epochs=conf["training"]["epochs"], accelerator="cpu", devices=1, enable_progress_bar=True)
+    trainer = Trainer(logger=logger, max_epochs=conf["training"]["epochs"], accelerator="gpu", devices=1, enable_progress_bar=True)
     torch_model = PeregrineModel(conf)
     model = InferenceNetwork(lr=conf["training"]["learning_rate"], classifier_model=torch_model)
     #model = InferenceNetwork(num_features=10, num_channels=6, hlayersizes=(100, 20), marginals=conf["tmnre"]["marginals"], marginal_hidden_size=10, lr=lr)
