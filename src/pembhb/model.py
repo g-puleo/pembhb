@@ -116,43 +116,41 @@ class InferenceNetwork(LightningModule):
         output = self.model(x, parameters)  # (batch_size, num_marginals)
         return output
 
+    def calc_logits_loss(self, data, parameters):
+        all_data = torch.cat((data, data), dim=0)
+        scrambled_params = torch.roll(parameters, shifts=1, dims=0)
+        all_params = torch.cat((parameters, scrambled_params), dim=0)
+        all_logits = self(all_data, all_params) 
+        shape_logits_half = (all_logits.shape[0] // 2, all_logits.shape[1])
+        labels = torch.cat((torch.ones(shape_logits_half, device="cuda"), torch.zeros(shape_logits_half, device="cuda")), dim=0)
+        loss = self.loss(all_logits, labels)
+        #breakpoint()
+        return all_logits, loss
+    
+    def calc_accuracy(self, all_logits):
+        shape_logits_half = (all_logits.shape[0] // 2, all_logits.shape[1])
+        joint_preds = (all_logits[:shape_logits_half[0]] > 0).float()
+        scrambled_preds = (all_logits[shape_logits_half[0]:] > 0).float()
+        joint_accuracy = (joint_preds == 1).float().mean()
+        scrambled_accuracy = (scrambled_preds == 0).float().mean()
+        accuracy = (joint_accuracy + scrambled_accuracy) / 2
+        return accuracy
 
     def training_step(self, batch, batch_idx): 
         data = batch['data_fd']
         parameters = batch['source_parameters']
-        scrambled_params = torch.roll(parameters, shifts=1, dims=0)
-        all_data = torch.cat((data, data), dim=0)
         # the first half of all_params contains parameters from the joint, associated with the first half of all_data
         # the second half of all_params contains parameters from the marginal, independent of the second half of all_data
-        all_params = torch.cat((parameters, scrambled_params), dim=0)
-        logits = self(all_data, all_params) 
-        shape_logits_half = (logits.shape[0] // 2, logits.shape[1])
-        labels = torch.cat((torch.ones(shape_logits_half, device="cuda"), torch.zeros(shape_logits_half, device="cuda")), dim=0)
-        loss = F.binary_cross_entropy_with_logits(logits, labels,reduction='mean') 
-        joint_preds = (logits[:shape_logits_half[0]] > 0).float()
-        scrambled_preds = (logits[shape_logits_half[0]:] > 0).float()
-        joint_accuracy = (joint_preds == 1).float().mean()
-        scrambled_accuracy = (scrambled_preds == 0).float().mean()
-        accuracy = (joint_accuracy + scrambled_accuracy) / 2
+        all_logits, loss = self.calc_logits_loss(data, parameters)
+        accuracy = self.calc_accuracy(all_logits)
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         # breakpoint()
         return loss 
     
     def validation_step(self, batch, batch_idx):
-        data = batch['data_fd']
-        parameters = batch['source_parameters']
-        scrambled_params = torch.roll(parameters, shifts=1, dims=0)
-        output_joint = self(data, parameters)
-        output_scrambled = self(data, scrambled_params)
-        loss_1 = self.loss(output_joint, torch.ones_like(output_joint))
-        loss_2 = self.loss(output_scrambled, torch.zeros_like(output_scrambled))
-        loss = loss_1 + loss_2
-        joint_preds = (output_joint > 0.0).float()
-        scrambled_preds = (output_scrambled > 0.0).float()
-        joint_accuracy = (joint_preds == 1).float().mean()
-        scrambled_accuracy = (scrambled_preds == 0).float().mean()
-        accuracy = (joint_accuracy + scrambled_accuracy) / 2
+        all_logits, loss = self.calc_logits_loss(batch['data_fd'], batch['source_parameters'])
+        accuracy = self.calc_accuracy(all_logits)
         self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('val_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss

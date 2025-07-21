@@ -4,6 +4,7 @@ from pembhb.model import InferenceNetwork, PeregrineModel
 from pembhb.data import MBHBDataModule
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch import Trainer
+from torch.utils.data import DataLoader , random_split
 import numpy as np
 from pembhb import ROOT_DIR
 import yaml 
@@ -25,13 +26,9 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
 
 
     ######## DATA LOADING AND TRAINING THE MODEL #########
-    data_module = MBHBDataModule(
-        filename=fname,
-        targets=['data_fd', 'source_parameters'],
-        batch_size=conf["training"]["batch_size"]
-        )
 
-    logger = TensorBoardLogger(os.path.join(ROOT_DIR, f"logs"), name=f"dummy_{idx}")
+
+    logger = TensorBoardLogger(os.path.join(ROOT_DIR, f"logs_0716"), name=f"straightline_{idx}")
     trainer = Trainer(logger=logger, max_epochs=conf["training"]["epochs"], accelerator="gpu", devices=1, enable_progress_bar=True)
     torch_model = PeregrineModel(conf)
     model = InferenceNetwork(lr=conf["training"]["learning_rate"], classifier_model=torch_model)
