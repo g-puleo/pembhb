@@ -7,18 +7,19 @@ import numpy as np
 from bbhx.utils.constants import PC_SI
 DAY_SI = 24 * 3600  # seconds in a day
 
-def lMq_m1m2(x: np.array):
+def lMcq_m1m2(x: np.array):
     """Return m1, m2 from log10(chirp mass) and q
 
-    :param x: x[:,0] is log10(chirp mass) and x[:,1] is q
+    :param x: x[0] is log10(chirp mass) and x[1] is q
     :type x: :class:`np.array`
     :return: m1 and m2
     :rtype: np.array
     """
-    M = 10 ** x[0]
-    m1 = np.where(x[1] >= 1, M * x[1] / (1. + x[1]), M / (1. + x[1]))
-    m2 = M - m1
-    return np.stack((m1, m2), axis=0)
+    Mc = 10 ** x[0]
+    m1 = Mc * x[1]**1.4 * (1. + x[1])**0.2
+    m2 = Mc * x[1]**0.4 * (1. + x[1])**(-0.6)
+    return np.stack([m1, m2], axis=0)
+
 
 class UniformSampler ():
 
@@ -32,8 +33,6 @@ class UniformSampler ():
         ## value is in Gpc^3
         self.prior_bounds["dist"][0]   = self.prior_bounds["dist"][0]**3
         self.prior_bounds["dist"][1]   = self.prior_bounds["dist"][1]**3
-        self.prior_bounds["Deltat"][0] = self.prior_bounds["Deltat"][0] * DAY_SI
-        self.prior_bounds["Deltat"][1] = self.prior_bounds["Deltat"][1] * DAY_SI
         self.ordered_prior_keys = [
             "logMchirp",
             "q",
@@ -56,15 +55,14 @@ class UniformSampler ():
 
         :param n_samples: number of samples to generate
         :type n_samples: int
-        :return: samples in bbhx input format
-        :rtype: np.array
+        :return: samples in bbhx input format, samples for tmnre
+        :rtype: list[np.array]
         """
 
         unif_samples = np.random.uniform(0, 1, size=(self.n_params, n_samples))
         tmnre_input = unif_samples * (self.upper_bounds - self.lower_bounds) + self.lower_bounds
-        bbhx_input = self.samples_to_bbhx_input(tmnre_input)
-
-        
+        #NB IT IS VERY IMPORTANT TO USE .copy() OTHERWISE THE OPERATIONS WILL BE PERFORMED IN-PLACE
+        bbhx_input = self.samples_to_bbhx_input(tmnre_input.copy())
         return bbhx_input , tmnre_input
 
     def samples_to_bbhx_input(self, samples: np.array) -> np.array:
@@ -77,7 +75,7 @@ class UniformSampler ():
         :rtype: np.array
         """
     
-        samples[0:2] = lMq_m1m2(samples[0:2]) # log(Mc), q --> m1, m2
+        samples[0:2] = lMcq_m1m2(samples[0:2]) # log(Mc), q --> m1, m2
         samples[4] = np.cbrt(samples[4]) * 1e9 * PC_SI # d^3 -->distance
         # 5: phase is already in 0,2pi
         samples[6] = np.arccos(samples[6]) # cos(inclination)-->inclination in [0,pi]
@@ -85,6 +83,7 @@ class UniformSampler ():
         samples[8] = np.arcsin(samples[8]) # sin(beta)--> beta in [-pi/2, pi/2] (ecliptic latitude)
         # 9: psi is already in 0,pi
         # 10: Deltat is already in seconds   
+        samples[10] = samples[10]*DAY_SI
         return samples
     
 

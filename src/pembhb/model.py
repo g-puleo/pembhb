@@ -245,13 +245,17 @@ class PeregrineModel(torch.nn.Module):
 
 
     def forward(self, d_f, parameters):
+        #print(f"d_f shape: {d_f.shape}")
         d_f_norm = self.normalisation(d_f)
-        # run the fd signal through the unet (output has same shape as input)
+        #print(f"d_f_norm shape: {d_f_norm.shape}")
         d_f_processed = self.unet_f(d_f_norm)
-        # compress the processed signal
-        features_f = self.linear_f(self.flatten(d_f_processed))
-        # classify the  (t(d), parameters) pair
+        #print(f"d_f_processed shape: {d_f_processed.shape}")
+        flattened = self.flatten(d_f_processed)
+        #print(f"flattened shape: {flattened.shape}")
+        features_f = self.linear_f(flattened)
+        #print(f"features_f shape: {features_f.shape}")
         logratios_1d = self.logratios_1d(features_f, parameters)
+        #print(f"logratios_1d shape: {logratios_1d.shape}")
         return logratios_1d
 
 ### THIS CHUNK OF CODE IS DIRECTLY COPIED FROM PEREGRINE

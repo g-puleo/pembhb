@@ -3,6 +3,7 @@ import numpy as np
 import os
 import argparse
 import yaml
+import torch
 from pembhb import ROOT_DIR
 from pembhb.model import InferenceNetwork
 from pembhb.sampler import UniformSampler
@@ -11,46 +12,58 @@ from pembhb.data import MBHBDataset
 def plot_posterior(data: np.array, injected_params: np.array, model: InferenceNetwork):
 
     N_examples = data.shape[0]
+    print(data.shape)
     marginals = model.marginals
     N_marginals = len(model.marginals)
-    assert N_examples < 10, "N_examples must be less than 10 to limit the number of plots."
+    assert N_examples==1,  "N_examples must be less than 10 to limit the number of plots."
     # generate samples from each prior
     sampler = UniformSampler(model.bounds_trained)
-    _, samples = sampler.sample(n_samples=10000)
-    logratios = model(data, samples)
+    Nsamples = 1000
+    _, samples = sampler.sample(n_samples=Nsamples)
+    samples= samples.T
+    samples_torch =  torch.tensor(samples, device='cuda', dtype=torch.float32)
+    data_torch = torch.tensor(data,device='cuda').expand(Nsamples, -1,-1)
+    print(samples_torch.dtype, data_torch.dtype)
+
+    logratios = model(data_torch, samples_torch)
 
 
     for i in range(N_examples):
-        logratios_this = logratios[i]
-        inj_par_this = injected_params[i]
         for j in range(N_marginals):
             current_marginal = marginals[j]
-            current_param = inj_par_this[current_marginal]
+            # print(current_marginal, type(current_marginal))
+            current_param = injected_params[current_marginal]
             Ndim = len(current_marginal)
             assert Ndim < 3, "unable to plot marginal with >=3 dimensions"
-            logr = logratios_this[j]    
-            posterior_weight = np.exp(-logr)
+            logr = logratios[:,j]    
+            posterior_weight = np.exp(-logr.detach().cpu().numpy())
             if Ndim == 1: 
-                plt.hist(samples[:,current_marginal], weights=posterior_weight)
-                plt.axvline(x=current_param[0])
+                print(samples[:,current_marginal].squeeze(1).shape, posterior_weight.shape)
+                plt.hist(samples[:,current_marginal].squeeze(1), weights=posterior_weight, histtype='step', label='approximate posterior', bins=100)
+                plt.axvline(x=current_param, color='red',  label='true value')
                 plt.title(f"marginal {current_marginal}")
+                plt.legend()
                 plt.xlabel(f"value")
-                plt.ylabel(f"approximate posterior")
+                plt.ylabel(f"pdf")
                 plt.savefig(f"marginal_{i}_{j}")
+                plt.close()
             if Ndim == 2: 
-                plt.hist(samples[:,current_marginal], weights=posterior_weight)
-                plt.scatter(x=current_param[0], y=current_param[1])
+                print(samples[:,current_marginal].shape, posterior_weight.shape)
+                plt.hist2d(x=samples[:,current_marginal][:,0], y=samples[:,current_marginal][:,1], weights=posterior_weight, bins=100)
+                plt.scatter(x=current_param[0], y=current_param[1], marker='*', color='red')
                 plt.title(f"marginal {current_marginal}")
                 plt.xlabel(f"value_A")
                 plt.ylabel(f"value_B")
                 plt.savefig(f"marginal_{i}_{j}")
-
+                plt.close()
             
 
 if __name__ == "__main__":
 
     dataset = MBHBDataset("example.h5")
     datum = dataset.__getitem__(0)
-    model = InferenceNetwork.load_from_checkpoint("/u/g/gpuleo/pembhb/logs_0721/peregrine/version_1/checkpoints/epoch=369-step=1110.ckpt")
+    data_fd = datum["data_fd"][np.newaxis, :,:]
+    source_par = datum["source_parameters"]
+    model = InferenceNetwork.load_from_checkpoint("/u/g/gpuleo/pembhb/logs_0721/peregrine_norm/version_0/checkpoints/epoch=248-step=747.ckpt")
     
-    plot_posterior(datum["data_fd"], datum["source_parameters"], model)
+    plot_posterior(data_fd, source_par , model)
