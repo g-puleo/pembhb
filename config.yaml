@@ -20,5 +20,8 @@ prior:
 
 training: 
   batch_size: 400
-  epochs: 1000
-  learning_rate: 0.0001
+  epochs: 845
+  learning_rate: 0.001
+
+tmnre:
+  marginals: [[0], [1], [0,1]]

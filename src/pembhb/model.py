@@ -101,8 +101,10 @@ class InferenceNetwork(LightningModule):
     def __init__(self, lr: float, classifier_model: torch.nn.Module):  
         super().__init__()
         self.model = classifier_model
+        self.marginals = self.model.marginals
         self.loss = nn.BCEWithLogitsLoss(reduction='mean')
         self.lr = lr
+        self.bounds_trained = self.model.bounds_trained
         self.save_hyperparameters()
 
     def forward(self, x, parameters):
@@ -184,7 +186,9 @@ class SimpleModel(torch.nn.Module):
             input_size = output_size
         
         self.logratios = MarginalClassifierHead(input_size, marginals=marginals, hidden_size=marginal_hidden_size)
-
+        self.marginals = marginals 
+        #self.bounds_trained = 
+        
 
     def forward(self, x, parameters):
         """
@@ -208,18 +212,21 @@ class SimpleModel(torch.nn.Module):
 
 
 class PeregrineModel(torch.nn.Module):
-    def __init__(self, conf):
+    def __init__(self, conf: dict):
         super().__init__()
         self.batch_size = conf["training"]["batch_size"]
         self.marginals = conf["tmnre"]["marginals"]
+        self.bounds_trained = conf["prior"]
         # self.unet_t = Unet(
         #     n_in_channels=2 * len(conf["waveform_params"]["TDI"]),
         #     n_out_channels=1,
         #     sizes=(16, 32, 64, 128, 256),
         #     down_sampling=(8, 8, 8, 8),
         # )
+        n_channels = 2 * len(conf["waveform_params"]["TDI"])
+        self.normalisation = nn.BatchNorm1d(num_features=n_channels)
         self.unet_f = Unet(
-            n_in_channels=2 * len(conf["waveform_params"]["TDI"]),
+            n_in_channels=n_channels,
             n_out_channels=1,
             sizes=(16, 32, 64, 128, 256),
             down_sampling=(2, 2, 2, 2),
@@ -238,9 +245,9 @@ class PeregrineModel(torch.nn.Module):
 
 
     def forward(self, d_f, parameters):
-
+        d_f_norm = self.normalisation(d_f)
         # run the fd signal through the unet (output has same shape as input)
-        d_f_processed = self.unet_f(d_f)
+        d_f_processed = self.unet_f(d_f_norm)
         # compress the processed signal
         features_f = self.linear_f(self.flatten(d_f_processed))
         # classify the  (t(d), parameters) pair

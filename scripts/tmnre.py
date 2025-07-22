@@ -28,10 +28,12 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
     ######## DATA LOADING AND TRAINING THE MODEL #########
 
 
-    logger = TensorBoardLogger(os.path.join(ROOT_DIR, f"logs_0716"), name=f"straightline_{idx}")
+    logger = TensorBoardLogger(os.path.join(ROOT_DIR, f"logs_0721"), name=f"peregrine_norm")
     trainer = Trainer(logger=logger, max_epochs=conf["training"]["epochs"], accelerator="gpu", devices=1, enable_progress_bar=True)
     torch_model = PeregrineModel(conf)
     model = InferenceNetwork(lr=conf["training"]["learning_rate"], classifier_model=torch_model)
+    data_module = MBHBDataModule("data/simulated_data.h5",
+                                batch_size=conf["training"]["batch_size"])
     #model = InferenceNetwork(num_features=10, num_channels=6, hlayersizes=(100, 20), marginals=conf["tmnre"]["marginals"], marginal_hidden_size=10, lr=lr)
     trainer.fit(model, data_module)
     #trainer.save_checkpoint(os.path.join(ROOT_DIR, "checkpoints", f"tmnre_model_{idx}.ckpt"))

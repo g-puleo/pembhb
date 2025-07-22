@@ -11,10 +11,8 @@ class MBHBDataset(Dataset):
     def __init__(self, filename: str):
         """Initialize the dataset.
 
-        :param data: Dictionary containing the data.
-        :type data: dict
-        :param targets: List of keys to load from the data dictionary.
-        :type targets: list[str]
+        :param filename: name of the .h5 file where data are stored
+        :type filename: str
         """
         self.filename = filename
         with h5py.File(self.filename, 'r') as f:

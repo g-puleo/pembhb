@@ -107,7 +107,7 @@ class LISAMBHBSimulator():
         out_dict = {"parameters": tmnre_input, "data_fd": data_fd}
         return out_dict
     
-    def sample_and_store(self, filename, N, batch_size=1000): 
+    def sample_and_store(self, filename:str, N:int, batch_size=None): 
         """Sample N samples and store them in an HDF5 file.
 
         :param filename: name of the file to store the samples
@@ -117,7 +117,9 @@ class LISAMBHBSimulator():
         :param batch_size: number of samples to generate in each batch, defaults to 1000
         :type batch_size: int, optional
         """
-
+        if batch_size is None:
+            batch_size = max(1,int(N/10.0))
+        
         with h5py.File(filename, "a") as f:
             source_params = f.create_dataset("source_parameters", shape=(N, 11), dtype=np.float32)
             data_fd = f.create_dataset("data_fd", shape=(N, 6, self.n_pt), dtype=np.float32)
