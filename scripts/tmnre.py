@@ -14,11 +14,11 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
     ######## DATA GENERATION #########
     sim = LISAMBHBSimulator(conf, sampler_init_kwargs=sampler_init_kwargs)
     #sim = DummySimulator(sampler_init_kwargs=sampler_init_kwargs)
-    fname = os.path.join(ROOT_DIR, "data", f"simulated_data.h5")
+    fname = os.path.join(ROOT_DIR, "data", f"simulated_data_20k.h5")
     print("Sampling from the simulator...")
     os.makedirs(os.path.join(ROOT_DIR, "data"), exist_ok=True)
     try: 
-        sim.sample_and_store(fname, N=1000, batch_size=200)
+        sim.sample_and_store(fname, N=20000, batch_size=200)
         print("Data saved to", fname)
     except ValueError:
         print("File might already exist, skipping sampling.")
@@ -28,11 +28,11 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
     ######## DATA LOADING AND TRAINING THE MODEL #########
 
 
-    logger = TensorBoardLogger(os.path.join(ROOT_DIR, f"logs_0721"), name=f"peregrine_norm")
+    logger = TensorBoardLogger(os.path.join(ROOT_DIR, f"logs_0723"), name=f"peregrine_norm")
     trainer = Trainer(logger=logger, max_epochs=conf["training"]["epochs"], accelerator="gpu", devices=1, enable_progress_bar=True)
     torch_model = PeregrineModel(conf)
     model = InferenceNetwork(lr=conf["training"]["learning_rate"], classifier_model=torch_model)
-    data_module = MBHBDataModule("data/simulated_data.h5",
+    data_module = MBHBDataModule(fname,
                                 batch_size=conf["training"]["batch_size"])
     #model = InferenceNetwork(num_features=10, num_channels=6, hlayersizes=(100, 20), marginals=conf["tmnre"]["marginals"], marginal_hidden_size=10, lr=lr)
     trainer.fit(model, data_module)

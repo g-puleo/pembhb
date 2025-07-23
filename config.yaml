@@ -1,7 +1,7 @@
 waveform_params:
 
   TDI: "AET"
-  modes: [[2,2], [2,1], [3,3], [3,2], [4,4], [4,3]]
+  modes: [[2,2]]
   noise: "sangria"
   duration: 4 # weeks
   

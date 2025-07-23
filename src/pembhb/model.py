@@ -75,9 +75,11 @@ class MarginalClassifierHead(nn.Module):
                 else:
                     input_size = hlayersizes[i-1]
                     output_size = hlayersizes[i]
-            
+        
                 classifier.add_module(f"fc_{i}", nn.Linear(input_size, output_size))
                 classifier.add_module(f"relu_{i}", nn.ReLU())
+                if i!=len(hlayersizes)-1:
+                    classifier.add_module(f"dropout_{i}", nn.Dropout(p=0.2))
 
             classifier.add_module("output", nn.Linear(output_size, 1)) 
             self.classifiers.append(classifier)
@@ -105,7 +107,7 @@ class InferenceNetwork(LightningModule):
         self.loss = nn.BCEWithLogitsLoss(reduction='mean')
         self.lr = lr
         self.bounds_trained = self.model.bounds_trained
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=['classifier_model'])
 
     def forward(self, x, parameters):
         """
