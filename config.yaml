@@ -1,6 +1,6 @@
 waveform_params:
 
-  TDI: "AET"
+  TDI: "AE"
   modes: [[2,2]]
   noise: "sangria"
   duration: 4 # weeks
@@ -20,7 +20,7 @@ prior:
 
 training: 
   batch_size: 400
-  epochs: 845
+  epochs: 1000
   learning_rate: 0.001
 
 tmnre:

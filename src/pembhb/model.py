@@ -60,8 +60,8 @@ class MarginalClassifierHead(nn.Module):
         :type n_data_features: int
         :param marginals: list of marginals that you want 
         :type marginals: list[list]
-        :param hidden_size: _description_
-        :type hidden_size: int
+        :param hidden_size: sizes of the hidden layers in the classifier
+        :type hidden_size: iterable[int]
         """
         super().__init__()
         self.marginals = marginals
@@ -78,11 +78,10 @@ class MarginalClassifierHead(nn.Module):
         
                 classifier.add_module(f"fc_{i}", nn.Linear(input_size, output_size))
                 classifier.add_module(f"relu_{i}", nn.ReLU())
-                if i!=len(hlayersizes)-1:
-                    classifier.add_module(f"dropout_{i}", nn.Dropout(p=0.2))
 
             classifier.add_module("output", nn.Linear(output_size, 1)) 
             self.classifiers.append(classifier)
+        
 
 
     def forward(self, features, parameters):
@@ -100,14 +99,13 @@ class InferenceNetwork(LightningModule):
     Basic FC network for TMNRE of MBHB data. 
     I wrote this function to test the swyft framework, improvements on the architecture are future work. 
     """
-    def __init__(self, lr: float, classifier_model: torch.nn.Module):  
+    def __init__(self,  conf: dict):  
         super().__init__()
-        self.model = classifier_model
+        self.model = PeregrineModel(conf)
         self.marginals = self.model.marginals
-        self.loss = nn.BCEWithLogitsLoss(reduction='mean')
-        self.lr = lr
+        self.loss = nn.BCEWithLogitsLoss(reduction='none')
+        self.lr = conf["training"]["learning_rate"]
         self.bounds_trained = self.model.bounds_trained
-        self.save_hyperparameters(ignore=['classifier_model'])
 
     def forward(self, x, parameters):
         """
@@ -120,43 +118,60 @@ class InferenceNetwork(LightningModule):
         output = self.model(x, parameters)  # (batch_size, num_marginals)
         return output
 
-    def calc_logits_loss(self, data, parameters):
+    def calc_logits_losses(self, data, parameters):
+    
         all_data = torch.cat((data, data), dim=0)
         scrambled_params = torch.roll(parameters, shifts=1, dims=0)
         all_params = torch.cat((parameters, scrambled_params), dim=0)
         all_logits = self(all_data, all_params) 
         shape_logits_half = (all_logits.shape[0] // 2, all_logits.shape[1])
         labels = torch.cat((torch.ones(shape_logits_half, device="cuda"), torch.zeros(shape_logits_half, device="cuda")), dim=0)
-        loss = self.loss(all_logits, labels)
+        all_loss= self.loss(all_logits, labels)
+        loss_params = torch.mean(all_loss, dim=0)
+        loss = torch.mean(loss_params)
+
         #breakpoint()
-        return all_logits, loss
+        return all_logits, loss_params, loss
     
-    def calc_accuracy(self, all_logits):
+    def calc_accuracies(self, all_logits):
+        # the first half of all_params contains parameters from the joint, associated with the first half of all_data
+        # the second half of all_params contains parameters from the marginal, independent of the second half of all_data
         shape_logits_half = (all_logits.shape[0] // 2, all_logits.shape[1])
         joint_preds = (all_logits[:shape_logits_half[0]] > 0).float()
         scrambled_preds = (all_logits[shape_logits_half[0]:] > 0).float()
-        joint_accuracy = (joint_preds == 1).float().mean()
-        scrambled_accuracy = (scrambled_preds == 0).float().mean()
-        accuracy = (joint_accuracy + scrambled_accuracy) / 2
-        return accuracy
+        joint_accurate = (joint_preds == 1).float()
+        scrambled_accurate = (scrambled_preds == 0).float()
+        joint_accuracy_params = torch.mean(joint_accurate, dim=0)
+        scrambled_accuracy_params = torch.mean(scrambled_accurate, dim=0)
+        accuracy_params = (joint_accuracy_params + scrambled_accuracy_params) / 2
+        accuracy = torch.mean(accuracy_params)
+
+        return accuracy_params, accuracy
 
     def training_step(self, batch, batch_idx): 
         data = batch['data_fd']
         parameters = batch['source_parameters']
-        # the first half of all_params contains parameters from the joint, associated with the first half of all_data
-        # the second half of all_params contains parameters from the marginal, independent of the second half of all_data
-        all_logits, loss = self.calc_logits_loss(data, parameters)
-        accuracy = self.calc_accuracy(all_logits)
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+
+        all_logits, loss_params, loss = self.calc_logits_losses(data, parameters)
+        accuracy_params, accuracy = self.calc_accuracies(all_logits)
+        
+        self.log('train_loss', loss , on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+
+        for i, marginal in enumerate(self.marginals):
+            self.log(f'train_accuracy_{i}', accuracy_params[i], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            self.log(f'train_loss_{i}', loss_params[i], on_step=True, on_epoch=True, prog_bar=True, logger=True)
         # breakpoint()
         return loss 
     
     def validation_step(self, batch, batch_idx):
-        all_logits, loss = self.calc_logits_loss(batch['data_fd'], batch['source_parameters'])
-        accuracy = self.calc_accuracy(all_logits)
+        all_logits, loss_params, loss= self.calc_logits_losses(batch['data_fd'], batch['source_parameters'])
+        accuracy_params, accuracy = self.calc_accuracies(all_logits)
         self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('val_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        for i, marginal in enumerate(self.marginals):
+            self.log(f'val_accuracy_{i}', accuracy_params[i], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            self.log(f'val_loss_{i}', loss_params[i], on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss
     
     def configure_optimizers(self):
@@ -344,7 +359,7 @@ class Unet(nn.Module):
         self,
         n_in_channels,
         n_out_channels,
-        sizes=(16, 32, 64, 128, 256),
+        sizes=(16, 32, 64, 128),
         down_sampling=(2, 2, 2, 2),
     ):
         super(Unet, self).__init__()
@@ -352,8 +367,8 @@ class Unet(nn.Module):
         self.down1 = Down(sizes[0], sizes[1], down_sampling[0])
         self.down2 = Down(sizes[1], sizes[2], down_sampling[1])
         self.down3 = Down(sizes[2], sizes[3], down_sampling[2])
-        self.down4 = Down(sizes[3], sizes[4], down_sampling[3])
-        self.up1 = Up(sizes[4], sizes[3])
+        #self.down4 = Down(sizes[3], sizes[4], down_sampling[3])
+        #self.up1 = Up(sizes[4], sizes[3])
         self.up2 = Up(sizes[3], sizes[2])
         self.up3 = Up(sizes[2], sizes[1])
         self.up4 = Up(sizes[1], sizes[0])
@@ -364,9 +379,9 @@ class Unet(nn.Module):
         x2 = self.down1(x1)
         x3 = self.down2(x2)
         x4 = self.down3(x3)
-        x5 = self.down4(x4)
-        x = self.up1(x5, x4)
-        x = self.up2(x, x3)
+        # x5 = self.down4(x4)
+        # x = self.up1(x5, x4)
+        x = self.up2(x4, x3)
         x = self.up3(x, x2)
         x = self.up4(x, x1)
         f = self.outc(x)

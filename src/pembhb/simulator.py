@@ -54,19 +54,21 @@ class LISAMBHBSimulator():
             "model": conf["waveform_params"]["noise"],
             "return_type": "ASD"
         }
-        ASD = np.zeros((3, self.freqs.shape[0]))
         self.channels = conf["waveform_params"]["TDI"]
-        if self.channels == "AET":
-            ASD[0] = lisasens.get_sensitivity(self.freqs, sens_fn = lisasens.A1TDISens, **psd_kwargs)
-            ASD[1] = lisasens.get_sensitivity(self.freqs, sens_fn = lisasens.E1TDISens, **psd_kwargs)
-            ASD[2] = lisasens.get_sensitivity(self.freqs, sens_fn = lisasens.T1TDISens, **psd_kwargs)
-            # ASD[self.freqs<1e-5] =0.0 
-        elif self.channels == "XYZ":
-            ASD[0] = lisasens.get_sensitivity(self.freqs, sens_fn = lisasens.X1TDISens, **psd_kwargs)
-            ASD[1] = lisasens.get_sensitivity(self.freqs, sens_fn = lisasens.Y1TDISens, **psd_kwargs)
-            ASD[2] = lisasens.get_sensitivity(self.freqs, sens_fn = lisasens.Z1TDISens, **psd_kwargs)
-        else:
-            raise ValueError("conf['waveform_params']['TDI'] must be either XYZ or AET. ")
+        ASD = np.zeros((len(self.channels), self.freqs.shape[0]))
+        lisasens_dict = {   'A': lisasens.A1TDISens, 
+                            'E': lisasens.E1TDISens,
+                            'T': lisasens.T1TDISens, 
+                            'X': lisasens.X1TDISens,
+                            'Y': lisasens.Y1TDISens,
+                            'Z': lisasens.Z1TDISens
+                        }
+    
+        for i, channel in enumerate(self.channels):
+            if channel not in lisasens_dict:
+                raise ValueError(f"Channel {channel} is not supported. Supported channels are: {list(lisasens_dict.keys())}")
+            ASD[i] = lisasens.get_sensitivity(self.freqs, sens_fn=lisasens_dict[channel], **psd_kwargs)
+
         self.ASD = ASD
         self.PSD = ASD**2
         self.sampler = UniformSampler(**sampler_init_kwargs)
@@ -122,7 +124,7 @@ class LISAMBHBSimulator():
         
         with h5py.File(filename, "a") as f:
             source_params = f.create_dataset("source_parameters", shape=(N, 11), dtype=np.float32)
-            data_fd = f.create_dataset("data_fd", shape=(N, 6, self.n_pt), dtype=np.float32)
+            data_fd = f.create_dataset("white_data_fd", shape=(N, 6, self.n_pt), dtype=np.float32)
             snr = f.create_dataset("snr", shape = (N,), dtype=np.float32)
             for i in tqdm(range(0, N, batch_size)):
                 batch_end = min(i + batch_size, N)
@@ -132,7 +134,8 @@ class LISAMBHBSimulator():
                 z_samples = out["parameters"]
                 data_fd_batch = out["data_fd"]
                 snr_batch = self.get_SNR_FD(data_fd_batch)
-                data_fd_amp_phase = np.concatenate((np.abs(data_fd_batch), np.angle(data_fd_batch)), axis=1)
+                white_data = data_fd_batch/self.ASD
+                data_fd_amp_phase = np.concatenate((np.abs(white_data), np.angle(white_data)), axis=1)
                 source_params[i:batch_end] = z_samples.T # Reshape to (batch_size, 11) instead of (11, batch_size)
                 data_fd[i:batch_end] = data_fd_amp_phase
                 snr[i:batch_end] = snr_batch

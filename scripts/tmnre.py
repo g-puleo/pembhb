@@ -4,6 +4,7 @@ from pembhb.model import InferenceNetwork, PeregrineModel
 from pembhb.data import MBHBDataModule
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch import Trainer
+from lightning.pytorch.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader , random_split
 import numpy as np
 from pembhb import ROOT_DIR
@@ -14,7 +15,7 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
     ######## DATA GENERATION #########
     sim = LISAMBHBSimulator(conf, sampler_init_kwargs=sampler_init_kwargs)
     #sim = DummySimulator(sampler_init_kwargs=sampler_init_kwargs)
-    fname = os.path.join(ROOT_DIR, "data", f"simulated_data_20k.h5")
+    fname = os.path.join(ROOT_DIR, "data", f"simulated_data_white20k.h5")
     print("Sampling from the simulator...")
     os.makedirs(os.path.join(ROOT_DIR, "data"), exist_ok=True)
     try: 
@@ -28,12 +29,16 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
     ######## DATA LOADING AND TRAINING THE MODEL #########
 
 
-    logger = TensorBoardLogger(os.path.join(ROOT_DIR, f"logs_0723"), name=f"peregrine_norm")
-    trainer = Trainer(logger=logger, max_epochs=conf["training"]["epochs"], accelerator="gpu", devices=1, enable_progress_bar=True)
+    checkpoint_callback = ModelCheckpoint(monitor='val_accuracy', mode='max')
+    logger = TensorBoardLogger(os.path.join(ROOT_DIR, f"logs_0725"), name=f"peregrine_norm_white")
+    trainer = Trainer(logger=logger,
+                      max_epochs=conf["training"]["epochs"], 
+                      accelerator="gpu", devices=1,
+                      enable_progress_bar=True, 
+                      callbacks=[checkpoint_callback])
     torch_model = PeregrineModel(conf)
-    model = InferenceNetwork(lr=conf["training"]["learning_rate"], classifier_model=torch_model)
-    data_module = MBHBDataModule(fname,
-                                batch_size=conf["training"]["batch_size"])
+    model = InferenceNetwork(conf)
+    data_module = MBHBDataModule(fname, conf)
     #model = InferenceNetwork(num_features=10, num_channels=6, hlayersizes=(100, 20), marginals=conf["tmnre"]["marginals"], marginal_hidden_size=10, lr=lr)
     trainer.fit(model, data_module)
     #trainer.save_checkpoint(os.path.join(ROOT_DIR, "checkpoints", f"tmnre_model_{idx}.ckpt"))

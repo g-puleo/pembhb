@@ -5,10 +5,31 @@ import argparse
 import yaml
 import torch
 from pembhb import ROOT_DIR
-from pembhb.model import InferenceNetwork
+from pembhb.model import InferenceNetwork,PeregrineModel
 from pembhb.sampler import UniformSampler
 from pembhb.simulator import LISAMBHBSimulator
 from pembhb.data import MBHBDataset
+
+def load_wronglysaved_model():
+    model_checkpoint = torch.load("/u/g/gpuleo/pembhb/logs_0723/peregrine_norm/version_1/checkpoints/epoch=844-step=38025.ckpt")
+    config_path = os.path.join(ROOT_DIR, "config.yaml")
+    # load conf and init untrained model
+    with open(config_path, "r") as file:
+        conf = yaml.safe_load(file)
+    model = PeregrineModel(conf=conf)
+
+    # engineer the checkpoint to load the model state dict even if it was ignored
+    x = model_checkpoint["state_dict"]
+    from collections import OrderedDict
+    y = OrderedDict()
+    for key in x.keys():
+        target_key = key.removeprefix("model.")
+        y[target_key] = x[key]
+    model_checkpoint["state_dict"] = y
+    model.load_state_dict(state_dict=model_checkpoint["state_dict"])
+    lr = model_checkpoint["hyper_parameters"]["lr"]
+    trained_model = InferenceNetwork(lr=lr, classifier_model=model)
+    return trained_model 
 def plot_posterior(data: np.array, injected_params: np.array, model: InferenceNetwork):
 
     N_examples = data.shape[0]
@@ -64,6 +85,5 @@ if __name__ == "__main__":
     datum = dataset.__getitem__(0)
     data_fd = datum["data_fd"][np.newaxis, :,:]
     source_par = datum["source_parameters"]
-    model = InferenceNetwork.load_from_checkpoint("/u/g/gpuleo/pembhb/logs_0721/peregrine_norm/version_0/checkpoints/epoch=248-step=747.ckpt")
-    
+    model = load_wronglysaved_model().to("cuda")
     plot_posterior(data_fd, source_par , model)
