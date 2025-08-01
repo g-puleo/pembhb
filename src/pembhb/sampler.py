@@ -5,6 +5,7 @@
 ### 
 import numpy as np
 from bbhx.utils.constants import PC_SI
+from pembhb.utils import _ORDERED_PRIOR_KEYS
 DAY_SI = 24 * 3600  # seconds in a day
 
 def lMcq_m1m2(x: np.array):
@@ -33,21 +34,9 @@ class UniformSampler ():
         ## value is in Gpc^3
         self.prior_bounds["dist"][0]   = self.prior_bounds["dist"][0]**3
         self.prior_bounds["dist"][1]   = self.prior_bounds["dist"][1]**3
-        self.ordered_prior_keys = [
-            "logMchirp",
-            "q",
-            "chi1",
-            "chi2",
-            "dist",
-            "phi",
-            "inc",
-            "lambda",
-            "beta",
-            "psi",
-            "Deltat"
-        ]
-        self.lower_bounds = np.array([self.prior_bounds[key][0] for key in self.ordered_prior_keys]).reshape(-1,1)
-        self.upper_bounds = np.array([self.prior_bounds[key][1] for key in self.ordered_prior_keys]).reshape(-1,1)
+
+        self.lower_bounds = np.array([self.prior_bounds[key][0] for key in _ORDERED_PRIOR_KEYS]).reshape(-1,1)
+        self.upper_bounds = np.array([self.prior_bounds[key][1] for key in _ORDERED_PRIOR_KEYS]).reshape(-1,1)
         self.n_params = self.lower_bounds.shape[0]
     
     def sample(self, n_samples: int) -> np.array:
