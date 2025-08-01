@@ -27,7 +27,8 @@ class MBHBDataset(Dataset):
         
     def transform(self, data): 
         """
-        data: np.array of shape (6, n_pt) where n_pt is the number of points in the frequency domain
+        data: np.array of shape (2*n_channels, n_pt) where n_pt is the number of points in the frequency domain
+        n_channels is the number of TDI lisa channels used. 
         This function transforms the data to log10 scale for the amplitude and keeps the phase.
         
         :param data: Frequency domain data.
@@ -49,7 +50,7 @@ class MBHBDataset(Dataset):
         
         with h5py.File(self.filename, 'r') as f:
             dict_out = {
-                "data_fd": self.transform(f["white_data_fd"][idx]),
+                "data_fd": f["data_fd"][idx],
                 "source_parameters": f["source_parameters"][idx],
             }
         return dict_out

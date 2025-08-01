@@ -106,7 +106,8 @@ class InferenceNetwork(LightningModule):
         self.loss = nn.BCEWithLogitsLoss(reduction='none')
         self.lr = conf["training"]["learning_rate"]
         self.bounds_trained = self.model.bounds_trained
-
+        self.save_hyperparameters(conf)
+        
     def forward(self, x, parameters):
         """
         Forward pass of the network.
@@ -119,7 +120,6 @@ class InferenceNetwork(LightningModule):
         return output
 
     def calc_logits_losses(self, data, parameters):
-    
         all_data = torch.cat((data, data), dim=0)
         scrambled_params = torch.roll(parameters, shifts=1, dims=0)
         all_params = torch.cat((parameters, scrambled_params), dim=0)
@@ -170,10 +170,18 @@ class InferenceNetwork(LightningModule):
         self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('val_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         for i, marginal in enumerate(self.marginals):
-            self.log(f'val_accuracy_{i}', accuracy_params[i], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-            self.log(f'val_loss_{i}', loss_params[i], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            self.log(f'val_accuracy_{i}', accuracy_params[i], on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            self.log(f'val_loss_{i}', loss_params[i], on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            
         return loss
     
+    def test_step(self, batch, batch_idx):
+        all_logits, loss_params, loss = self.calc_logits_losses(batch['data_fd'], batch['source_parameters'])
+        accuracy_params, accuracy = self.calc_accuracies(all_logits)
+        # print accuracies on test set
+        self.log('test_acc', accuracy, on_step=False, on_epoch=True)
+        for i, marginal in enumerate(self.marginals):
+            self.log(f'test_accuracy_{i}', accuracy_params[i], on_step=False, on_epoch=True)
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
         #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=5)
@@ -256,7 +264,7 @@ class PeregrineModel(torch.nn.Module):
         self.logratios_1d = MarginalClassifierHead(
             n_data_features=16,
             marginals=self.marginals, 
-            hlayersizes=(32, 16, 8, 4, 1)
+            hlayersizes=(32, 16, 8, 4)
         )
 
 
@@ -367,8 +375,8 @@ class Unet(nn.Module):
         self.down1 = Down(sizes[0], sizes[1], down_sampling[0])
         self.down2 = Down(sizes[1], sizes[2], down_sampling[1])
         self.down3 = Down(sizes[2], sizes[3], down_sampling[2])
-        #self.down4 = Down(sizes[3], sizes[4], down_sampling[3])
-        #self.up1 = Up(sizes[4], sizes[3])
+        self.down4 = Down(sizes[3], sizes[4], down_sampling[3])
+        self.up1 = Up(sizes[4], sizes[3])
         self.up2 = Up(sizes[3], sizes[2])
         self.up3 = Up(sizes[2], sizes[1])
         self.up4 = Up(sizes[1], sizes[0])
@@ -379,9 +387,9 @@ class Unet(nn.Module):
         x2 = self.down1(x1)
         x3 = self.down2(x2)
         x4 = self.down3(x3)
-        # x5 = self.down4(x4)
-        # x = self.up1(x5, x4)
-        x = self.up2(x4, x3)
+        x5 = self.down4(x4)
+        x = self.up1(x5, x4)
+        x = self.up2(x, x3)
         x = self.up3(x, x2)
         x = self.up4(x, x1)
         f = self.outc(x)

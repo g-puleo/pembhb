@@ -1,4 +1,5 @@
 from bbhx.waveformbuild import BBHWaveformFD
+from bbhx.response.fastfdresponse import LISATDIResponse
 from lisatools.detector import EqualArmlengthOrbits
 import lisatools.sensitivity as lisasens
 import numpy as np 
@@ -24,7 +25,7 @@ class LISAMBHBSimulator():
         orbits.configure(linear_interp_setup=True)
 
         response_kwargs = {
-            "TDItag": conf["waveform_params"]["TDI"],
+            "TDItag": "AET",
             "rescaled": False,
             "orbits": orbits
             }
@@ -55,7 +56,8 @@ class LISAMBHBSimulator():
             "return_type": "ASD"
         }
         self.channels = conf["waveform_params"]["TDI"]
-        ASD = np.zeros((len(self.channels), self.freqs.shape[0]))
+        self.n_channels = len(self.channels)
+        ASD = np.zeros((self.n_channels, self.freqs.shape[0]))
         lisasens_dict = {   'A': lisasens.A1TDISens, 
                             'E': lisasens.E1TDISens,
                             'T': lisasens.T1TDISens, 
@@ -86,11 +88,12 @@ class LISAMBHBSimulator():
         injection[-1], injection[-4], injection[-3],  injection[-2] = LISA_to_SSB(injection[-1], injection[-4], injection[-3], injection[-2])
         f_len = len(self.freqs)
         n_samples = injection.shape[1]
-        noise_fft = np.random.normal(loc= 0.0,size = (n_samples,3, f_len)) + 1j*np.random.normal(loc= 0.0,size = ( n_samples, 3, f_len))
+        noise_fft = np.random.normal(loc= 0.0,size = (n_samples,self.n_channels, f_len)) + 1j*np.random.normal(loc= 0.0,size = (n_samples, self.n_channels, f_len))
         noise_fd = noise_fft * self.ASD * np.hanning(self.n_pt)
         # Insert a set of zeros between injection[5] and injection[6]. this is the f_ref parameter , which in bbhx can be set to 0 in order to set f_ref @ t_chirp
         injection = np.insert(injection, 6, np.zeros(injection[5].shape), axis=0) 
-        wave_FD = self.waveform_generator(*injection, **self.waveform_kwargs) 
+        wave_FD = self.waveform_generator(*injection, **self.waveform_kwargs)[:, :2, :]
+
         simulated_data_fd = (noise_fd + wave_FD)
         # stack real and imaginary parts over channels
         #breakpoint()
@@ -124,8 +127,9 @@ class LISAMBHBSimulator():
         
         with h5py.File(filename, "a") as f:
             source_params = f.create_dataset("source_parameters", shape=(N, 11), dtype=np.float32)
-            data_fd = f.create_dataset("white_data_fd", shape=(N, 6, self.n_pt), dtype=np.float32)
+            data_fd = f.create_dataset("data_fd", shape=(N, 4, self.n_pt), dtype=np.float32)
             snr = f.create_dataset("snr", shape = (N,), dtype=np.float32)
+            psd_dataset = f.create_dataset("psd", data=self.PSD, dtype=np.float32)
             for i in tqdm(range(0, N, batch_size)):
                 batch_end = min(i + batch_size, N)
                 batch_size_actual = batch_end - i
@@ -134,8 +138,7 @@ class LISAMBHBSimulator():
                 z_samples = out["parameters"]
                 data_fd_batch = out["data_fd"]
                 snr_batch = self.get_SNR_FD(data_fd_batch)
-                white_data = data_fd_batch/self.ASD
-                data_fd_amp_phase = np.concatenate((np.abs(white_data), np.angle(white_data)), axis=1)
+                data_fd_amp_phase = np.concatenate((np.abs(data_fd_batch), np.angle(data_fd_batch)), axis=1)
                 source_params[i:batch_end] = z_samples.T # Reshape to (batch_size, 11) instead of (11, batch_size)
                 data_fd[i:batch_end] = data_fd_amp_phase
                 snr[i:batch_end] = snr_batch
