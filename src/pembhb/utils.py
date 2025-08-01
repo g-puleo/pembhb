@@ -1,5 +1,7 @@
 import yaml
 import torch
+import os 
+from pembhb import ROOT_DIR
 import numpy as np
 from pembhb.model import InferenceNetwork
 from pembhb.data import MBHBDataset
@@ -101,3 +103,14 @@ def update_bounds(model: InferenceNetwork, observation_dataset: MBHBDataset, con
     
     return updated_prior
 
+
+
+if __name__ == "__main__":
+    fname = "/u/g/gpuleo/pembhb/logs_0729/peregrine_norm/version_1/checkpoints/epoch=93-step=16920.ckpt"
+    conf = read_config(os.path.join(ROOT_DIR,"config.yaml"))
+    model = InferenceNetwork.load_from_checkpoint(fname, conf=conf)
+    model.eval()
+
+    dataset = MBHBDataset(os.path.join(ROOT_DIR, "data/observation.h5"))
+
+    updated_prior = update_bounds(model, dataset, conf, parameter_idx=0, n_gridpoints=100)
