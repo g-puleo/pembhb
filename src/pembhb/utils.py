@@ -6,7 +6,7 @@ import numpy as np
 from pembhb.model import InferenceNetwork
 from pembhb.data import MBHBDataset
 from torch.utils.data import DataLoader
-
+import matplotlib.pyplot as plt
 _ORDERED_PRIOR_KEYS = [
         "logMchirp",
         "q",
@@ -81,17 +81,62 @@ def get_logratios_grid(dataset: MBHBDataset, model: InferenceNetwork, low: float
         injection_params = torch.cat(injection_params, dim=0).numpy()
     return results, injection_params, grid.detach().cpu()
 
-def update_bounds(model: InferenceNetwork, observation_dataset: MBHBDataset, conf: dict, parameter_idx: int, n_gridpoints: int = 100):
+def get_pvalues_1d(logratios: np.array, grid: np.array, inj_param: np.array):
+    """Calculate p-values for a 1D logratios array. 
+    Recall that exp(logratios) = posterior/prior, and here we assume a uniform prior. 
+    
+    :param logratios: logratios for the grid , has shape (batch size, ngrid_points)
+    :type logratios: np.array
+    :param inj_param: injected parameter value
+    :type inj_param: float
+    :param ngrid_points: number of points in the grid
+    :type ngrid_points: int
+    :return: p-value for the injected parameter
+    """
+    
+    ratios = np.exp(logratios)
+    sorted_ratios = np.sort(ratios, axis=1) 
+    sorted_indices =  np.argsort(ratios, axis=1)
+    sorted_grid =  grid[sorted_indices]
+    inj_param = inj_param.reshape(-1,1,1)
+    # find closest value in the grid to the injected parameter
+    idx = np.argmin(np.abs(sorted_grid - inj_param), axis=1).numpy().squeeze(1)
+    idx_rank = np.arange(idx.shape[0])
 
+    cumsum =  np.cumsum(sorted_ratios, axis=1)
+    cumsum /= cumsum[:,-1:]  # normalize to get a cumulative distribution
+    print(idx_rank.shape, idx.shape)
+    p_values = cumsum[idx_rank, idx]
+
+    return p_values
+
+
+def update_bounds(model: InferenceNetwork, observation_dataset: MBHBDataset, priordict: dict, parameter_idx: int, n_gridpoints: int = 100):
+    """Update the prior bounds based on the posterior obtained from a model on a single observation. 
+    Used to do truncation in MNRE. 
+
+    :param model: trained inference model
+    :type model: InferenceNetwork
+    :param observation_dataset: dataset containing the (single) obs
+    :type observation_dataset: MBHBDataset
+    :param priordict: dictionary containing the prior bounds for each parameter. 
+    :type priordict: dict
+    :param parameter_idx: index of the parameter to update
+    :type parameter_idx: int
+    :param n_gridpoints: number of points in the grid, defaults to 100
+    :type n_gridpoints: int, optional
+    :return: updated prior bounds
+    :rtype: dict
+    """
     # evaluate the model over a decently fine grid, which requires knowledge of previous prior region 
-    prior_low, prior_high = conf["prior"][_ORDERED_PRIOR_KEYS[parameter_idx]]
+    prior_low, prior_high = priordict[_ORDERED_PRIOR_KEYS[parameter_idx]]
     logratios, injection_params, grid = get_logratios_grid(observation_dataset, model, prior_low, prior_high, n_gridpoints, inj_param_idx=parameter_idx)
     # find the 95% two tail interval of the posterior 
     print(f"injection_params are: {injection_params}")
     cumsum = np.cumsum(np.exp(logratios))
     cumsum /= cumsum[-1]  
-    idx_low = np.argwhere(cumsum < 0.05)[-1]
-    idx_high = np.argwhere(cumsum > 0.95)[0]
+    idx_low = np.argwhere(cumsum < 0.01)[-1]
+    idx_high = np.argwhere(cumsum > 0.99)[0]
 
     new_low = grid[idx_low]
     new_high = grid[idx_high]
@@ -102,6 +147,31 @@ def update_bounds(model: InferenceNetwork, observation_dataset: MBHBDataset, con
     
     return updated_prior
 
+def pp_plot( dataset, model , low: float, high: float, inj_param_idx: int, name: str):  
+    """Generate a pp plot using the examples in dataset, and the posteriors obtained by the model . 
+    :param dataset: dataset used to make the pp plot
+    :type dataset: MBHBDataset
+    :param model:  trained model used to make the pp plot
+    :type model: InferenceNetwork
+    :param low: lower bound of the prior used to generate the dataset
+    :type low: float
+    :param high: upper bound of the prior used to generate the dataset
+    :type high: float
+    :param inj_param_idx: index of the parameter that you want to make the pp plot for, with respect to the output of the model. 
+    :type inj_param_idx: int
+    """
+    logratios, injection_params, grid = get_logratios_grid(dataset, model, low=low, high=high, ngrid_points=100, inj_param_idx=inj_param_idx)
+    p_values = get_pvalues_1d(logratios, grid, injection_params)
+    sorted_pvalues = np.sort(p_values)
+    sorted_rank = np.arange(sorted_pvalues.shape[0])
+    fig, ax  = plt.subplots(figsize=(10, 6))
+    ax.plot(sorted_rank, sorted_pvalues, marker='o', linestyle='-', markersize=3)
+    ax.set_xlabel('Rank')
+    ax.set_ylabel('P-value')
+    ax.set_title(f'Sorted P-values, {name}')
+    ax.grid(visible=True)
+    fig.savefig(os.path.join(ROOT_DIR, "plots", f"{name}_pp_plot.png"))
+    plt.close()
 
 
 if __name__ == "__main__":
