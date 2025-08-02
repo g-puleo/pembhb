@@ -90,7 +90,7 @@ def update_bounds(model: InferenceNetwork, observation_dataset: MBHBDataset, con
     print(f"logratios shape: {logratios.shape}")
     breakpoint()
     cumsum = np.cumsum(np.exp(logratios))
-    cumsum /= cumsum[:,-1:]  
+    cumsum /= cumsum[-1]  
     idx_low = np.argwhere(cumsum < 0.025)[0]
     idx_high = np.argwhere(cumsum > 0.975)[-1]
 
