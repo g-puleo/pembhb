@@ -87,12 +87,11 @@ def update_bounds(model: InferenceNetwork, observation_dataset: MBHBDataset, con
     prior_low, prior_high = conf["prior"][_ORDERED_PRIOR_KEYS[parameter_idx]]
     logratios, injection_params, grid = get_logratios_grid(observation_dataset, model, prior_low, prior_high, n_gridpoints, inj_param_idx=parameter_idx)
     # find the 95% two tail interval of the posterior 
-    print(f"logratios shape: {logratios.shape}")
-    breakpoint()
+    print(f"injection_params are: {injection_params}")
     cumsum = np.cumsum(np.exp(logratios))
     cumsum /= cumsum[-1]  
-    idx_low = np.argwhere(cumsum < 0.025)[0]
-    idx_high = np.argwhere(cumsum > 0.975)[-1]
+    idx_low = np.argwhere(cumsum < 0.05)[-1]
+    idx_high = np.argwhere(cumsum > 0.95)[0]
 
     new_low = grid[idx_low]
     new_high = grid[idx_high]
@@ -113,4 +112,5 @@ if __name__ == "__main__":
 
     dataset = MBHBDataset(os.path.join(ROOT_DIR, "data/observation.h5"))
 
-    updated_prior = update_bounds(model, dataset, conf, parameter_idx=0, n_gridpoints=100)
+    updated_prior = update_bounds(model, dataset, conf, parameter_idx=1, n_gridpoints=100)
+    print(updated_prior)
