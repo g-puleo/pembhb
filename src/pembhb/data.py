@@ -15,7 +15,7 @@ class MBHBDataset(Dataset):
         "whiten": "_transform_whiten"
     }
 
-    def __init__(self, filename: str, transform: str = "none"):
+    def __init__(self, filename: str, transform: str = "none", device: str = "cuda"):
         """Initialize the dataset.
 
         :param filename: name of the .h5 file where data are stored
@@ -25,17 +25,20 @@ class MBHBDataset(Dataset):
         self.channels_amp = [0,1]
         self.channels_phase = [2,3]
         self.filename = filename
-        
+        self.transform = getattr(self, self._TRANSFORMS[transform])   
+        self.device = device
         with h5py.File(self.filename, 'r') as f:
             self.keys = list(f.keys())
             self.len = f[self.keys[0]].shape[0]
             if transform in ["logwhiten", "whiten"]:
-                self.PSD = f["psd"][()]
-
-        self.transform = getattr(self, self._TRANSFORMS[transform])   
+                self.PSD = torch.tensor(f["psd"][:], device=self.device, dtype=torch.float32)
+            self.data = self.transform(torch.tensor(f["data_fd"][:], device=self.device, dtype=torch.float32))
+            self.parameters =  torch.tensor(f["source_parameters"][:], device=self.device, dtype=torch.float32)
+            
 
     def _transform_identity(self, data):
         return data
+    
     def _transform_logwhiten(self, data): 
         """
         data: np.array of shape (2*n_channels, n_pt) where n_pt is the number of points in the frequency domain
@@ -52,7 +55,7 @@ class MBHBDataset(Dataset):
         #this line fetches only the channels in self.channels, in order. 
         data_ampl = np.log10((data[self.channels_amp]+1e-33)/self.PSD[self.channels_amp]) # add a small value to avoid log(0)
         data_phase = data[self.channels_phase]
-        return np.concatenate((data_ampl, data_phase), axis=0)
+        return torch.concatenate((data_ampl, data_phase), dim=0)
 
     def _transform_log(self, data): 
         """
@@ -68,27 +71,25 @@ class MBHBDataset(Dataset):
         #apply log10 to the amplitude of the data 
         #data is of shape (6, n) with channels sorted as AETAET, first half amplitude is , second half is phase
         #this line fetches only the channels in self.channels, in order. 
-        data_ampl = np.log10(data[self.channels_amp]+1e-33) # add a small value to avoid log(0)
+        data_ampl = torch.log10(data[self.channels_amp]+1e-33) # add a small value to avoid log(0)
         data_phase = data[self.channels_phase]
-        return np.concatenate((data_ampl, data_phase), axis=0)
+        return torch.concatenate((data_ampl, data_phase), dim=0)
     
     def _transform_whiten(self, data):
 
         print(self.PSD.shape, data[self.channels_amp].shape)
         data_ampl = data[self.channels_amp]/self.PSD[self.channels_amp]
         data_phase = data[self.channels_phase]
-        return np.concatenate((data_ampl, data_phase), axis=0)
+        return torch.concatenate((data_ampl, data_phase), dim=0)
 
     def __len__(self):
         return self.len
     
     def __getitem__(self, idx):
-        
-        with h5py.File(self.filename, 'r') as f:
-            dict_out = {
-                "data_fd": self.transform(f["data_fd"][idx]),
-                "source_parameters": f["source_parameters"][idx],
-            }
+        dict_out = {
+            'source_parameters': self.parameters[idx],
+            'data_fd': self.data[idx]
+        }
         return dict_out
             
 

@@ -56,7 +56,7 @@ if __name__ == "__main__":
     config_path = os.path.join(ROOT_DIR, "config.yaml")
     conf = read_config(config_path)
 
-    dataset_observation = MBHBDataset(os.path.join(ROOT_DIR, "data/observation.h5"))
+    dataset_observation = MBHBDataset(os.path.join(ROOT_DIR, "data/observation.h5"), conf["training"]["transform"])
     # load observation
     for i in range(1): 
         trained_model, test_dataset = round(conf, sampler_init_kwargs={'prior_bounds': conf["prior"]}, lr=conf["training"]["learning_rate"], idx=0)
