@@ -121,6 +121,7 @@ class LISAMBHBSimulator():
         :type N: int
         :param batch_size: number of samples to generate in each batch, defaults to 1000
         :type batch_size: int, optional
+        :return: None
         """
         if batch_size is None:
             batch_size = max(1,int(N/10.0))

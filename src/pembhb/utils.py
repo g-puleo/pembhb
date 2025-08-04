@@ -7,6 +7,7 @@ from pembhb.model import InferenceNetwork
 from pembhb.data import MBHBDataset
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 _ORDERED_PRIOR_KEYS = [
         "logMchirp",
         "q",
@@ -41,7 +42,7 @@ def get_logratios_grid(dataset: MBHBDataset, model: InferenceNetwork, low: float
     :type ngrid_points: int, optional
     :return: logratios for the grid, with shape   [batchsize, ngrid_points], injection parameters with shape [batchsize, 11], grid with shape [ngrid_points, 1]
     """
-    dataloader = DataLoader(dataset, batch_size=min(50, len(dataset)), shuffle=False)
+    dataloader = DataLoader(dataset, batch_size=min(10, len(dataset)), shuffle=False)
 
     results = []
     injection_params = []
@@ -51,30 +52,30 @@ def get_logratios_grid(dataset: MBHBDataset, model: InferenceNetwork, low: float
     grid = torch.linspace(low, high, ngrid_points).to("cuda").reshape(-1, 1)
 
     with torch.no_grad():
-        for batch in dataloader:
+        for batch in tqdm( dataloader ) :
             data_fd = batch["data_fd"].to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
             source_parameters = batch["source_parameters"]  # Shape: [batchsize, 11]
 
             # q_grid = torch.linspace(low, high, ngrid_points).to("cuda").reshape(-1, 1)
             zero_pad1d = torch.zeros(ngrid_points, 10).to("cuda")
 
-            lmc_grid_padded = torch.cat((grid, zero_pad1d), dim=1)  # Shape: [ngrid_points, 11]
-            # q_grid_padded = torch.cat((zero_pad1d[:, 0:1], q_grid, zero_pad1d[:, 1:]), dim=1)  # Shape: [ngrid_points, 11]
+            #grid_padded = torch.cat((grid, zero_pad1d), dim=1)  # Shape: [ngrid_points, 11]
+            grid_padded = torch.cat((zero_pad1d[:, :inj_param_idx], grid, zero_pad1d[:, inj_param_idx:]), dim=1)  # Shape: [ngrid_points, 11]
 
             batch_size = data_fd.shape[0]
             data_fd_expanded = data_fd.unsqueeze(1).expand(batch_size, ngrid_points, -1, -1)  # Shape: [batchsize, ngrid_points, n_channels, n_datapoints]
-            mc_grid_expanded = lmc_grid_padded.unsqueeze(0).expand(batch_size, -1, -1) # shape is [batchsize, ngrid_points, 11]
+            grid_expanded = grid_padded.unsqueeze(0).expand(batch_size, -1, -1) # shape is [batchsize, ngrid_points, 11]
 
             batched_data = data_fd_expanded.reshape(-1, data_fd_expanded.shape[-2], data_fd_expanded.shape[-1])  # Flatten batch and ngrid_points
-            batched_mc_grid = mc_grid_expanded.reshape(-1, mc_grid_expanded.shape[-1])  # Flatten batch and ngrid_points
+            batched_grid = grid_expanded.reshape(-1, grid_expanded.shape[-1])  # Flatten batch and ngrid_points
 
             #print(f"data_fd_expanded shape: {data_fd_expanded.shape}, mc_grid shape: {mc_grid.shape}")
-            logratios_mchirp = model(batched_data, batched_mc_grid)[:, 0]  # Get logratios for mchirp
+            logratios= model(batched_data, batched_grid)[:, inj_param_idx]  # Get logratios for mchirp
             # view them as [batchsize, ngrid_points]
-            logratios_mchirp = logratios_mchirp.reshape(batch_size, ngrid_points)
+            logratios = logratios.reshape(batch_size, ngrid_points)
             #logratios_q = model(data_fd_expanded, q_grid_padded.unsqueeze(0).expand(batch_size, -1, -1))[:, :, 1]
 
-            results.append(logratios_mchirp.detach().cpu())
+            results.append(logratios.detach().cpu())
             injection_params.append(source_parameters[:, inj_param_idx].detach().cpu())
 
         results = torch.cat(results, dim=0).numpy()
@@ -131,6 +132,7 @@ def update_bounds(model: InferenceNetwork, observation_dataset: MBHBDataset, pri
     # evaluate the model over a decently fine grid, which requires knowledge of previous prior region 
     prior_low, prior_high = priordict[_ORDERED_PRIOR_KEYS[parameter_idx]]
     logratios, injection_params, grid = get_logratios_grid(observation_dataset, model, prior_low, prior_high, n_gridpoints, inj_param_idx=parameter_idx)
+    print(f"prior_low: {prior_low}, prior_high: {prior_high}")
     # find the 95% two tail interval of the posterior 
     print(f"injection_params are: {injection_params}")
     cumsum = np.cumsum(np.exp(logratios))
@@ -141,7 +143,7 @@ def update_bounds(model: InferenceNetwork, observation_dataset: MBHBDataset, pri
     new_low = grid[idx_low]
     new_high = grid[idx_high]
 
-    updated_prior = conf["prior"].copy()
+    updated_prior = priordict.copy()
     updated_prior[_ORDERED_PRIOR_KEYS[parameter_idx]] = [new_low.item(), new_high.item()]
     print(f"Updated prior for {_ORDERED_PRIOR_KEYS[parameter_idx]}: {updated_prior[_ORDERED_PRIOR_KEYS[parameter_idx]]}")
     

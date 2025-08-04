@@ -141,13 +141,13 @@ if __name__ == "__main__":
 
     #     data_fd = datum["data_fd"][np.newaxis, :,:]
     #     source_par = datum["source_parameters"]
-    fname = "/u/g/gpuleo/pembhb/logs_0729/peregrine_norm/version_1/checkpoints/epoch=93-step=16920.ckpt"
+    fname = "/u/g/gpuleo/pembhb/logs/20250804_125709/round_1/version_0/checkpoints/epoch=36-step=3330.ckpt"
     conf = utils.read_config(os.path.join(ROOT_DIR,"config.yaml"))
     model = InferenceNetwork.load_from_checkpoint(fname, conf=conf)
     model.eval()
 
     #     plot_posterior_grid(data_fd, source_par , model, i)
-    logratios, injection_params, grid = get_logratios_grid(dataset, model, low=5, high=6, ngrid_points=100, inj_param_idx=0)
+    logratios, injection_params, grid = utils.get_logratios_grid(dataset, model, low=5, high=6, ngrid_points=100, inj_param_idx=0)
     p_values = get_pvalues_1d(logratios, grid, injection_params)
     sorted_pvalues = np.sort(p_values)
     sorted_rank = np.arange(sorted_pvalues.shape[0])

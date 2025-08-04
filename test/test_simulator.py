@@ -1,56 +1,40 @@
 import pytest
 import numpy as np
-from pembhb.simulator import LISAMBHBSimulator
+import os
 import yaml
+from pembhb.simulator import LISAMBHBSimulator
+from pembhb.utils import read_config
+from pembhb.sampler import UniformSampler
+from pembhb import ROOT_DIR
 DAY_SI = 24*3600
 WEEK_SI = 7*DAY_SI
 from bbhx.utils.constants import PC_SI, YRSID_SI
 @pytest.fixture
-def example_config():
+def simulator():
     """Fixture to provide example configuration."""
-    return {
-        "waveform_params": {
-            "TDI": "XYZ",
-            "modes": [[2, 2], [2, 1], [3, 3], [3, 2], [4, 4], [4, 3]],
-            "noise": "sangria",
-            "duration": 1,  # weeks
-            "dt": 10,  # seconds
-        }
-    }
+    conf = read_config(os.path.join(ROOT_DIR, "config.yaml"))
+    return LISAMBHBSimulator(conf, sampler_init_kwargs={"prior_bounds": conf["prior"]})
 
-
-
-@pytest.fixture
-def example_injection():
-    """Fixture to provide example injection parameters."""
-    return [
-        5e6, #m1
-        3e4, #m2
-        0.0, #chi1
-        0.0, #chi2
-        10.0 * 1e9 * PC_SI,  # distance
-        0, #f_ref 
-        0.5, #inc
-        0.5, #lambda
-        0.5, # beta
-        0.5, # psi
-        0.5 * YRSID_SI 
-    ]
-
-
-def test_simulator_initialization(example_config):
-    """Test initialization of the simulator."""
-    simulator = LISAMBHBSimulator(conf=example_config)
-    assert simulator.obs_time == 24 * 3600 * 7 * example_config["waveform_params"]["duration"]
-    assert simulator.dt == example_config["waveform_params"]["dt"]
-    assert simulator.n_pt > 0
-    assert simulator.ASD is not None
-
-def test_generate_d_f(example_config, example_injection):
-    """Test the frequency domain data generation."""
-    simulator = LISAMBHBSimulator(conf=example_config)
-    frequency_data = simulator.generate_d_f(injection=example_injection)
+def test_sample(simulator): 
+    outdict = simulator._sample(N=10)
+    frequency_data = outdict["data_fd"]
+    parameters = outdict["parameters"]
+    
     assert isinstance(frequency_data, np.ndarray)
-    assert frequency_data.shape[0] > 0
+    assert frequency_data.shape[0] == 10
+    assert frequency_data.shape[1] == 2
+    assert frequency_data.shape[2] == 10000
+    assert isinstance(parameters, np.ndarray)
+    assert parameters.shape[0] == 11
+    assert parameters.shape[1] == 10
     assert np.iscomplexobj(frequency_data)
+
+
+
+def test_sample_and_store(simulator):
+    fname = os.path.join(ROOT_DIR, "test", "test_sample_and_store.h5")
+    simulator.sample_and_store(fname, N=10, batch_size=5)
+    assert os.path.exists(fname)
+    os.remove(fname)
+    assert not os.path.exists(fname)        
 

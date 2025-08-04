@@ -15,15 +15,15 @@ class MBHBDataset(Dataset):
         "whiten": "_transform_whiten"
     }
 
-    def __init__(self, filename: str, transform: str = "none", device: str = "cuda"):
+    def __init__(self, filename: str, transform: str = "none", device: str = "cpu"):
         """Initialize the dataset.
 
         :param filename: name of the .h5 file where data are stored
         :type filename: str
         """
 
-        self.channels_amp = [0,1]
-        self.channels_phase = [2,3]
+        self.channels_amp = torch.tensor([0,1], device=device, dtype=torch.int64)  # AE
+        self.channels_phase = torch.tensor([2,3], device=device, dtype=torch.int64)  # AE
         self.filename = filename
         self.transform = getattr(self, self._TRANSFORMS[transform])   
         self.device = device
@@ -31,9 +31,9 @@ class MBHBDataset(Dataset):
             self.keys = list(f.keys())
             self.len = f[self.keys[0]].shape[0]
             if transform in ["logwhiten", "whiten"]:
-                self.PSD = torch.tensor(f["psd"][:], device=self.device, dtype=torch.float32)
-            self.data = self.transform(torch.tensor(f["data_fd"][:], device=self.device, dtype=torch.float32))
-            self.parameters =  torch.tensor(f["source_parameters"][:], device=self.device, dtype=torch.float32)
+                self.PSD = torch.tensor(f["psd"][()], device="self.device", dtype=torch.float32)
+            self.data = self.transform(torch.tensor(f["data_fd"][()], device=self.device, dtype=torch.float32))
+            self.parameters =  torch.tensor(f["source_parameters"][()], device=self.device, dtype=torch.float32)
             
 
     def _transform_identity(self, data):
@@ -53,9 +53,9 @@ class MBHBDataset(Dataset):
         #apply log10 to the amplitude of the data 
         #data is of shape (6, n) with channels sorted as AETAET, first half amplitude is , second half is phase
         #this line fetches only the channels in self.channels, in order. 
-        data_ampl = np.log10((data[self.channels_amp]+1e-33)/self.PSD[self.channels_amp]) # add a small value to avoid log(0)
-        data_phase = data[self.channels_phase]
-        return torch.concatenate((data_ampl, data_phase), dim=0)
+        data_ampl = np.log10((data[:,self.channels_amp]+1e-33)/self.PSD[self.channels_amp]) # add a small value to avoid log(0)
+        data_phase = data[:,self.channels_phase]
+        return torch.concatenate((data_ampl, data_phase), dim=1)
 
     def _transform_log(self, data): 
         """
@@ -71,16 +71,18 @@ class MBHBDataset(Dataset):
         #apply log10 to the amplitude of the data 
         #data is of shape (6, n) with channels sorted as AETAET, first half amplitude is , second half is phase
         #this line fetches only the channels in self.channels, in order. 
-        data_ampl = torch.log10(data[self.channels_amp]+1e-33) # add a small value to avoid log(0)
-        data_phase = data[self.channels_phase]
-        return torch.concatenate((data_ampl, data_phase), dim=0)
+        # breakpoint()
+        data_ampl = torch.log10(data[:,self.channels_amp]+1e-33) # add a small value to avoid log(0)
+        data_phase = data[:,self.channels_phase]
+        return torch.concatenate((data_ampl, data_phase), dim=1)
     
     def _transform_whiten(self, data):
 
         print(self.PSD.shape, data[self.channels_amp].shape)
-        data_ampl = data[self.channels_amp]/self.PSD[self.channels_amp]
-        data_phase = data[self.channels_phase]
-        return torch.concatenate((data_ampl, data_phase), dim=0)
+        raise NotImplementedError("Have to check psd shape.")
+        data_ampl = data[:,self.channels_amp]/self.PSD[self.channels_amp]
+        data_phase = data[:,self.channels_phase]
+        return torch.concatenate((data_ampl, data_phase), dim=1)
 
     def __len__(self):
         return self.len
@@ -102,16 +104,13 @@ class MBHBDataModule( L.LightningDataModule ):
 
         :param filename: Path to the HDF5 file.
         :type filename: str
-        :param targets: List of keys to load from the HDF5 file. If None, all keys are loaded.
-        :type targets: list[str], optional
-        :param batch_size: Batch size for data loading.
-        :type batch_size: int
+        :param conf: Configuration dictionary, used to set the batch size and the transformation to apply to the frequency domain data.
+        :type conf: dict
         """
         super().__init__()
         self.batch_size = conf["training"]["batch_size"]
         self.generator = torch.Generator().manual_seed(31415)
         self.filename = filename
-        self.channels = conf["waveform_params"]["TDI"]
         self.transform = conf["training"]["transform"]
 
     def prepare_data(self):

@@ -6,8 +6,8 @@ waveform_params:
   duration: 4 # weeks
   
 prior:
-  "logMchirp": [5,6] # log10(Mchirp/Msun)
-  "q": [1.0,5.0]
+  "logMchirp": [5.292929172515869, 5.454545497894287] # log10(Mchirp/Msun)
+  "q": [3.383838415145874, 4.1919193267822]
   "chi1": [0,0]
   "chi2": [0,0]
   "dist": [4.0,40]  # dist in Gpc (note that we shall sample uniformly dist^3)

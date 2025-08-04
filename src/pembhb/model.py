@@ -116,10 +116,12 @@ class InferenceNetwork(LightningModule):
             data: Tensor of shape (batch_size, num_channels, num_features) containing the frequency domain signal in the TDI channels
             parameters: Tensor of shape (batch_size, 11) containing the parameters to be used in the classifier
         """
+        # breakpoint()
         output = self.model(x, parameters)  # (batch_size, num_marginals)
         return output
 
     def calc_logits_losses(self, data, parameters):
+
         all_data = torch.cat((data, data), dim=0)
         scrambled_params = torch.roll(parameters, shifts=1, dims=0)
         all_params = torch.cat((parameters, scrambled_params), dim=0)
@@ -129,8 +131,6 @@ class InferenceNetwork(LightningModule):
         all_loss= self.loss(all_logits, labels)
         loss_params = torch.mean(all_loss, dim=0)
         loss = torch.mean(loss_params)
-
-        #breakpoint()
         return all_logits, loss_params, loss
     
     def calc_accuracies(self, all_logits):

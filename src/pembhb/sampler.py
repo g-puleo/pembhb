@@ -30,11 +30,10 @@ class UniformSampler ():
         :param prior_bounds: _description_
         :type prior_bounds: dict
         """
-        self.prior_bounds = prior_bounds
+        self.prior_bounds = prior_bounds.copy()
         ## value is in Gpc^3
         self.prior_bounds["dist"][0]   = self.prior_bounds["dist"][0]**3
         self.prior_bounds["dist"][1]   = self.prior_bounds["dist"][1]**3
-
         self.lower_bounds = np.array([self.prior_bounds[key][0] for key in _ORDERED_PRIOR_KEYS]).reshape(-1,1)
         self.upper_bounds = np.array([self.prior_bounds[key][1] for key in _ORDERED_PRIOR_KEYS]).reshape(-1,1)
         self.n_params = self.lower_bounds.shape[0]
