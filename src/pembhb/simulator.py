@@ -1,16 +1,20 @@
-from bbhx.waveformbuild import BBHWaveformFD
-from bbhx.response.fastfdresponse import LISATDIResponse
+import numpy as np 
+import os
+import h5py
+import yaml
+from scipy.signal.windows import tukey
+from tqdm import tqdm
+
 from lisatools.detector import EqualArmlengthOrbits
 import lisatools.sensitivity as lisasens
-import numpy as np 
+
+from bbhx.waveformbuild import BBHWaveformFD, BBHWaveformTD
+from bbhx.response.fastfdresponse import LISATDIResponse
 from bbhx.utils.transform import LISA_to_SSB
-import yaml
 from bbhx.utils.constants import YRSID_SI, PC_SI
-import os
+
 from pembhb import ROOT_DIR
 from pembhb.sampler import UniformSampler
-import h5py
-from tqdm import tqdm
 
 gpu_available=False
 WEEK_SI = 7 * 24 * 3600  # seconds in a week
@@ -186,8 +190,89 @@ class LISAMBHBSimulator():
     # plt.show()
 
 
+class LISAMBHBSimulatorTD(): 
+
+    def __init__(self, conf, sampler_init_kwargs):
+        super().__init__()
+        # initialise the waveform generator
+        orbits = EqualArmlengthOrbits(use_gpu=gpu_available)
+        orbits.configure(linear_interp_setup=True)
+        response_kwargs = {
+            "TDItag": "AET",
+            "rescaled": False,
+            "orbits": orbits
+            }
+        
+        self.waveform_generator = BBHWaveformTD(
+            amp_phase_kwargs = dict(run_phenomd=False),
+            response_kwargs = response_kwargs,
+            use_gpu = gpu_available
+        )
+
+        #### SET UP FREQUENCY GRID from OBSERVATION TIME AND SAMPLING RATE ####
+        self.obs_time = int( 24*3600*7*conf["waveform_params"]["duration"])# weeks to seconds
+        self.dt = conf['waveform_params']['dt']
+        # pad the time to power of 2 for the noise
+        self.time_pt = int(self.obs_time / self.dt)
+        self.n_pt = 2**int(np.ceil(np.log2(self.obs_time/self.dt)))
+        self.df = 1./self.n_pt/self.dt
+        self.window = tukey(self.time_pt, alpha=0.05)
+        self.f_len = self.n_pt//2 +1,
+        #grid_freq_0 = np.fft.rfftfreq( self.time_pt, d = self.dt)[1:]
+        grid_freq_1 = np.arange(1,self.n_pt//2 +1 ) * self.df
 
 
+        #### set up the noise model 
+        psd_kwargs = {
+            "model": conf["waveform_params"]["noise"],
+            "return_type": "ASD"
+        }
+        ASD = lisasens.get_sensitivity(grid_freq_1, sens_fn = lisasens.A1TDISens, **psd_kwargs)
+        # high pass filter
+        ASD[grid_freq_1 < 5e-5] = 0.0 
+        self.noise_factor = np.concatenate(([0.0],ASD[:-1], ASD[::-1].conj()))/np.sqrt(4*df)
+        
+        self.noise_rng = np.random.default_rng(seed=0)
+
+    
+        self.waveform_kwargs = {
+            "dt": self.dt,
+            "modes": conf["waveform_params"]["modes"],
+            "out_channel": 0,
+            "length": 1024,
+            "t_obs_start": 0.0, 
+            "t_obs_end": self.obs_time/ YRSID_SI
+            }
+        self.channels = conf["waveform_params"]["TDI"]
+        self.n_channels = len(self.channels)
+
+        self.sampler = UniformSampler(**sampler_init_kwargs)
+
+
+        ################################
+
+    def generate_d_f(self, injection: np.array):
+        """ Generate simulated data in frequency domain given the injection parameters.
+
+        :param injection: injection parameteres in LISA frame
+        :type injection: list[np.array]
+        :return: simulated data in frequency domain
+        :rtype: np.array
+        """
+        injection[-1], injection[-4], injection[-3], injection[-2] = LISA_to_SSB(injection[-1], injection[-4], injection[-3], injection[-2])
+        # generate wave in TD
+        noise_fft = np.random.normal(loc= 0.0,size = self.f_len) + 1j*np.random.normal(loc= 0.0,size = self.f_len)
+        #apply a filter 
+        #if window_filter is not None:
+        #    noise_fft *= window_filter
+        full_noise_fft = self.noise_factor * np.concatenate((noise_fft[:-1],noise_fft[::-1].conj()[:-1]))
+        full_noise_fft[0] = 0.0 + 1j *0.0 #Force f=0 to be 0
+        noise_td = np.fft.ifft(full_noise_fft)[:self.time_pt].real
+        # add noise 
+        wave_TD = self.waveform_generator(*injection,**self.waveform_kwargs) + noise_td
+        wave_FD = np.fft.rfft(wave_TD*self.window)[0,1:].astype(np.complex64) * self.dt * self.noise_factor
+
+        return (wave_TD[0].astype(np.float32), wave_FD)
 
 class DummySampler:
     def __init__(self, low=0.0, high=1.0):
