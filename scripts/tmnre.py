@@ -24,14 +24,14 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
     ######## DATA GENERATION #########
     sim = LISAMBHBSimulator(conf, sampler_init_kwargs=sampler_init_kwargs)
     #sim = DummySimulator(sampler_init_kwargs=sampler_init_kwargs)
-    fname = os.path.join(ROOT_DIR, "data", f"full_simulated_data_round_{idx}.h5")
+    fname = os.path.join(ROOT_DIR, "data", f"restricted_simulated_data_round_{idx}.h5")
     print("Sampling from the simulator...")
     os.makedirs(os.path.join(ROOT_DIR, "data"), exist_ok=True)
     try: 
         sim.sample_and_store(fname, N=21000, batch_size=200)
         print("Data saved to", fname)
     except ValueError:
-        print("File might already exist, skipping sampling.")
+        print("File might already exisht, skipping sampling.")
         
 
 

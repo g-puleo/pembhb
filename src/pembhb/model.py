@@ -183,17 +183,16 @@ class InferenceNetwork(LightningModule):
             self.log(f'test_accuracy_{i}', accuracy_params[i], on_step=False, on_epoch=True)
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
-        #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=5)
-        # return {
-        #     'optimizer': optimizer,
-        #     'lr_scheduler': {
-        #         'scheduler': scheduler,
-        #         'monitor': 'val_loss',
-        #         'interval': 'epoch',
-        #         'frequency': 1
-        #     }
-        # }
-        return optimizer
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=25)
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'monitor': 'val_loss',
+                'interval': 'epoch',
+                'frequency': 1
+            }
+        }
 
 class SimpleModel(torch.nn.Module):
     def __init__(self, num_features: int, num_channels: int,  hlayersizes: tuple,  marginals: list[list], marginal_hidden_size: int, lr: float):  
