@@ -161,7 +161,6 @@ class InferenceNetwork(LightningModule):
         for i, marginal in enumerate(self.marginals):
             self.log(f'train_accuracy_{i}', accuracy_params[i], on_step=True, on_epoch=True, prog_bar=True, logger=True)
             self.log(f'train_loss_{i}', loss_params[i], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        # breakpoint()
         return loss 
     
     def validation_step(self, batch, batch_idx):
@@ -212,7 +211,6 @@ class SimpleModel(torch.nn.Module):
         
         self.logratios = MarginalClassifierHead(input_size, marginals=marginals, hidden_size=marginal_hidden_size)
         self.marginals = marginals 
-        #self.bounds_trained = 
         
 
     def forward(self, x, parameters):
