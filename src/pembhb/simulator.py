@@ -227,11 +227,11 @@ class LISAMBHBSimulatorTD():
             "model": conf["waveform_params"]["noise"],
             "return_type": "ASD"
         }
-        ASD = lisasens.get_sensitivity(grid_freq_1, sens_fn = lisasens.A1TDISens, **psd_kwargs)
+        self.ASD = lisasens.get_sensitivity(grid_freq_1, sens_fn = lisasens.A1TDISens, **psd_kwargs)
         # high pass filter
-        ASD[grid_freq_1 < 5e-5] = 0.0 
-        self.noise_factor = np.concatenate(([0.0],ASD[:-1], ASD[::-1].conj()))/np.sqrt(4*df)
-        
+        self.ASD[grid_freq_1 < 5e-5] = 0.0 
+        self.noise_factor = np.concatenate(([0.0],self.ASD[:-1], self.ASD[::-1].conj()))/np.sqrt(4*self.df)
+
         self.noise_rng = np.random.default_rng(seed=0)
 
     
@@ -273,7 +273,73 @@ class LISAMBHBSimulatorTD():
         wave_FD = np.fft.rfft(wave_TD*self.window)[0,1:].astype(np.complex64) * self.dt * self.noise_factor
 
         return (wave_TD[0].astype(np.float32), wave_FD)
+    
+    def _sample(self, N=1): 
+        """Draw one sample from the joint distribution, first sampling parameters from the prior and then generating the data in frequency domain.
 
+        :param N: _description_, defaults to 1
+        :type N: int, optional
+        :return: out_dict {"parameters": prior samples , frequency domain data)
+        :rtype: dict
+        """
+        z_samples, tmnre_input = self.sampler.sample(N)
+        data_td, data_fd = self.generate_d_f(z_samples)
+        out_dict = {"parameters": tmnre_input, "data_td": data_td, "data_fd": data_fd}
+        return out_dict
+    
+    def sample_and_store(self, filename:str, N:int, batch_size=None): 
+        """Sample N samples and store them in an HDF5 file.
+
+        :param filename: name of the file to store the samples
+        :type filename: str
+        :param N: number of samples to generate
+        :type N: int
+        :param batch_size: number of samples to generate in each batch, defaults to 1000
+        :type batch_size: int, optional
+        :return: None
+        """
+        if batch_size is None:
+            batch_size = max(1,int(N/10.0))
+        
+        with h5py.File(filename, "a") as f:
+            source_params = f.create_dataset("source_parameters", shape=(N, 11), dtype=np.float32)
+            data_fd = f.create_dataset("data_fd", shape=(N, 4, self.n_pt), dtype=np.float32)
+            data_td = f.create_dataset("data_td", shape=(N, self.time_pt), dtype=np.float32)
+            snr = f.create_dataset("snr", shape = (N,), dtype=np.float32)
+            psd_dataset = f.create_dataset("psd", data=self.PSD, dtype=np.float32)
+            print("Sampling and storing simulations to ", filename)
+            for i in tqdm(range(0, N, batch_size)):
+                batch_end = min(i + batch_size, N)
+                batch_size_actual = batch_end - i
+                out = self._sample(batch_size_actual)
+
+                z_samples = out["parameters"]
+                data_fd_batch = out["data_fd"]
+                data_td_batch = out["data_td"]
+                snr_batch = self.get_SNR_FD(data_fd_batch)
+                data_fd_amp_phase = np.concatenate((np.abs(data_fd_batch), np.angle(data_fd_batch)), axis=1)
+                source_params[i:batch_end] = z_samples.T # Reshape to (batch_size, 11) instead of (11, batch_size)
+                data_fd[i:batch_end] = data_fd_amp_phase
+                data_td[i:batch_end] = data_td_batch
+                snr[i:batch_end] = snr_batch
+    
+    def get_SNR_FD(self,
+        signal
+        ):
+        """
+        Obtain the SNR of a signal in frequency domain.
+
+        :param signal: data in frequency domain, output by bbhx with shape (n_samples, 3, n_freqs)
+        :type signal: np.array
+        :return: SNR values with shape (n_samples,)
+        :rtype: np.array
+        """
+    
+        SNR2 =  np.sum(signal*signal.conj()*self.df/self.PSD,axis=(1,2)).real * 4.0 
+        return np.sqrt(SNR2)
+
+
+    
 class DummySampler:
     def __init__(self, low=0.0, high=1.0):
         self.low = low
