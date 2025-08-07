@@ -6,8 +6,8 @@ waveform_params:
   duration: 4 # weeks
   
 prior:
-  "logMchirp": [5.222222328186035, 5.5050506591796875] # log10(Mchirp/Msun)
-  "q":  [3.626262664794922, 4.232323169708252]
+  "logMchirp": [5, 6] # log10(Mchirp/Msun)
+  "q":  [1, 5]
   "chi1": [0,0]
   "chi2": [0,0]
   "dist": [4.0,40]  # dist in Gpc (note that we shall sample uniformly dist^3)
@@ -23,6 +23,8 @@ training:
   epochs: 1000
   learning_rate: 0.0001
   transform: "log" # options: "none", "logwhiten", "log", "whiten"
+  scheduler_factor: 0.2
+  scheduler_patience: 15
 
 tmnre:
   marginals: [[0], [1], [0,1]]

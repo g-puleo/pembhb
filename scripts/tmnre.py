@@ -25,7 +25,7 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
     ######## DATA GENERATION #########
     sim = LISAMBHBSimulator(conf, sampler_init_kwargs=sampler_init_kwargs)
     #sim = DummySimulator(sampler_init_kwargs=sampler_init_kwargs)
-    fname = os.path.join(ROOT_DIR, "data", f"restricted_simulated_data_round_{idx}.h5")
+    fname = os.path.join(ROOT_DIR, "data", f"simulated_data_round_{idx}.h5")
     print("Sampling from the simulator...")
     os.makedirs(os.path.join(ROOT_DIR, "data"), exist_ok=True)
     try: 
@@ -40,7 +40,7 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
 
 
     checkpoint_callback = ModelCheckpoint(monitor='val_loss', mode='min')
-    early_stopping_callback = EarlyStopping(monitor='val_loss', patience=100, mode='min')
+    early_stopping_callback = EarlyStopping(monitor='val_loss', patience=30, mode='min')
     logger = TensorBoardLogger(os.path.join(ROOT_DIR, f"logs/{TIME_OF_EXECUTION}"), name=f"round_{idx}")
     trainer = Trainer(
                     logger=logger,
@@ -91,7 +91,7 @@ if __name__ == "__main__":
     q_lower = [conf["prior"]["q"][0]]
     q_upper = [conf["prior"]["q"][1]]
 
-    for i in range(1): 
+    for i in range(5): 
         print(f"Running round {i}...")
         # if i == 0: 
         #     trained_model = InferenceNetwork.load_from_checkpoint("/u/g/gpuleo/pembhb/logs/logs_0804/peregrine_norm/version_1/checkpoints/epoch=136-step=23290.ckpt")
@@ -109,8 +109,8 @@ if __name__ == "__main__":
         pp_plot(test_dataset, trained_model, low=conf["prior"]["logMchirp"][0], high=conf["prior"]["logMchirp"][1], inj_param_idx=0, name=f"round_{i}_logMchirp")
         pp_plot(test_dataset, trained_model, low=conf["prior"]["q"][0], high=conf["prior"]["q"][1], inj_param_idx=1, name=f"round_{i}_q")
 
-        updated_prior = update_bounds(trained_model, dataset_observation, conf["prior"], parameter_idx=0, n_gridpoints=100)
-        updated_prior = update_bounds(trained_model, dataset_observation, updated_prior, parameter_idx=1, n_gridpoints=100)
+        updated_prior = update_bounds(trained_model, dataset_observation, conf["prior"], parameter_idx=0, n_gridpoints=1000)
+        updated_prior = update_bounds(trained_model, dataset_observation, updated_prior, parameter_idx=1, n_gridpoints=1000)
         print(f"Updated prior after round {i}:\nlog10Mchirp: {updated_prior['logMchirp']},\nmass ratio: {updated_prior['q']}\n")
         conf["prior"] = updated_prior
         
@@ -134,7 +134,7 @@ if __name__ == "__main__":
 
         # Update the plots
         axes[0].plot(range(len(logMchirp_lower)), logMchirp_lower, label="Lower Bound", color="blue")
-        axes[0].plot(range(len(logMchirp_upper)), logMchirp_upper, label="Upper Bound", color="orange")
+        axes[0].plot(range(len(logMchirp_upper)), logMchirp_upper, label="Upper Bound", color="blue")
         axes[1].plot(range(len(q_lower)), q_lower, label="Lower Bound", color="blue")
         axes[1].plot(range(len(q_upper)), q_upper, label="Upper Bound", color="orange")
 
