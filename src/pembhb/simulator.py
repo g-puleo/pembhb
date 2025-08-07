@@ -214,22 +214,21 @@ class LISAMBHBSimulatorTD():
         self.dt = conf['waveform_params']['dt']
         # pad the time to power of 2 for the noise
         self.time_pt = int(self.obs_time / self.dt)
-        self.n_pt = 2**int(np.ceil(np.log2(self.obs_time/self.dt)))
-        self.df = 1./self.n_pt/self.dt
         self.window = tukey(self.time_pt, alpha=0.05)
-        self.f_len = self.n_pt//2 +1,
-        #grid_freq_0 = np.fft.rfftfreq( self.time_pt, d = self.dt)[1:]
-        grid_freq_1 = np.arange(1,self.n_pt//2 +1 ) * self.df
-
-
+        self.grid_freq = np.fft.rfftfreq( self.time_pt, d = self.dt)[1:]
+        self.f_len = len(self.grid_freq)
+        df_ = np.diff(self.grid_freq)
+        assert np.allclose(np.diff(df_), 0.0), "Frequency grid is not uniform."
+        self.df = df_[0]
         #### set up the noise model 
         psd_kwargs = {
             "model": conf["waveform_params"]["noise"],
             "return_type": "ASD"
         }
-        self.ASD = lisasens.get_sensitivity(grid_freq_1, sens_fn = lisasens.A1TDISens, **psd_kwargs)
+        self.ASD = lisasens.get_sensitivity(self.grid_freq, sens_fn = lisasens.A1TDISens, **psd_kwargs)
         # high pass filter
-        self.ASD[grid_freq_1 < 5e-5] = 0.0 
+        self.ASD[self.grid_freq < 5e-5] = 0.0 
+        self.PSD = self.ASD**2
         self.noise_factor = np.concatenate(([0.0],self.ASD[:-1], self.ASD[::-1].conj()))/np.sqrt(4*self.df)
 
         self.noise_rng = np.random.default_rng(seed=0)
@@ -247,7 +246,7 @@ class LISAMBHBSimulatorTD():
         self.n_channels = len(self.channels)
 
         self.sampler = UniformSampler(**sampler_init_kwargs)
-
+        breakpoint()
 
         ################################
 
@@ -261,15 +260,26 @@ class LISAMBHBSimulatorTD():
         """
         injection[-1], injection[-4], injection[-3], injection[-2] = LISA_to_SSB(injection[-1], injection[-4], injection[-3], injection[-2])
         # generate wave in TD
+        injection = np.insert(injection, 6, np.zeros(injection[5].shape), axis=0) 
+
         noise_fft = np.random.normal(loc= 0.0,size = self.f_len) + 1j*np.random.normal(loc= 0.0,size = self.f_len)
+        print("injection shape:", injection.shape)
+        print("noise_fft shape:", noise_fft.shape)
+        print("self.noise_factor shape:", self.noise_factor.shape)
         #apply a filter 
         #if window_filter is not None:
         #    noise_fft *= window_filter
         full_noise_fft = self.noise_factor * np.concatenate((noise_fft[:-1],noise_fft[::-1].conj()[:-1]))
         full_noise_fft[0] = 0.0 + 1j *0.0 #Force f=0 to be 0
-        noise_td = np.fft.ifft(full_noise_fft)[:self.time_pt].real
+        noise_td_full = np.fft.ifft(full_noise_fft)
+        print("noise_td_full shape:", noise_td_full.shape)
+        noise_td = noise_td_full[:self.time_pt].real
+        print("noise_td shape:", noise_td.shape)
+
         # add noise 
-        wave_TD = self.waveform_generator(*injection,**self.waveform_kwargs) + noise_td
+        signal_td = self.waveform_generator(*injection, **self.waveform_kwargs) 
+        print("signal_td shape:", signal_td.shape)
+        wave_TD = signal_td + noise_td
         wave_FD = np.fft.rfft(wave_TD*self.window)[0,1:].astype(np.complex64) * self.dt * self.noise_factor
 
         return (wave_TD[0].astype(np.float32), wave_FD)
@@ -411,3 +421,6 @@ class DummySimulator:
                 data_fd_batch = out["data_fd"]
                 source_params[i:batch_end] = z_samples
                 data_fd[i:batch_end] = data_fd_batch
+
+
+

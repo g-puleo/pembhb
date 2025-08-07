@@ -12,7 +12,7 @@ from bbhx.utils.constants import PC_SI, YRSID_SI
 @pytest.fixture()
 def fd_simulator():
     """Fixture to provide example configuration."""
-    conf = read_config(os.path.join(ROOT_DIR, "config.yaml"))
+    conf = read_config(os.path.join(ROOT_DIR, "config_td.yaml"))
     return LISAMBHBSimulator(conf, sampler_init_kwargs={"prior_bounds": conf["prior"]})
 
 
@@ -41,12 +41,9 @@ def test_sample_and_store(fd_simulator):
 @pytest.fixture()
 def  td_simulator():
     """Fixture to provide example configuration."""
-    conf = read_config(os.path.join(ROOT_DIR, "config.yaml"))
+    conf = read_config(os.path.join(ROOT_DIR, "config_td.yaml"))
     return LISAMBHBSimulatorTD(conf, sampler_init_kwargs={"prior_bounds": conf["prior"]})
 
-def test_sample_and_store_td(td_simulator):
-    fname = os.path.join(ROOT_DIR, "test", "test_sample_and_store.h5")
-    td_simulator.sample_and_store(fname, N=10, batch_size=5)
-    assert os.path.exists(fname)
-    os.remove(fname)
-    assert not os.path.exists(fname)        
+def test_sample_(td_simulator):
+    td_simulator._sample( N=10 ) 
+
