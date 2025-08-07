@@ -54,11 +54,11 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
     data_module = MBHBDataModule(fname, conf)
 
     # find the learning rate. 
-    tuner = Tuner(trainer)
-    lr_finder = tuner.lr_find(model, datamodule=data_module)
-    fig = lr_finder.plot(suggest=True)
-    fig.savefig(os.path.join(ROOT_DIR, f"plots/lr_finder_round_{idx}.png"))
-    fig.close()
+    # tuner = Tuner(trainer)
+    # lr_finder = tuner.lr_find(model, datamodule=data_module)
+    # fig = lr_finder.plot(suggest=True)
+    # fig.savefig(os.path.join(ROOT_DIR, f"plots/lr_finder_round_{idx}.png"))
+    # fig.close()
     
     #model = InferenceNetwork(num_features=10, num_channels=6, hlayersizes=(100, 20), marginals=conf["tmnre"]["marginals"], marginal_hidden_size=10, lr=lr)
     trainer.fit(model, data_module)
