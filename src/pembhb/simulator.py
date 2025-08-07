@@ -225,17 +225,22 @@ class LISAMBHBSimulatorTD():
             "model": conf["waveform_params"]["noise"],
             "return_type": "ASD"
         }
+        print("shape of grid_freq:", self.grid_freq.shape)
         self.ASD = lisasens.get_sensitivity(self.grid_freq, sens_fn = lisasens.A1TDISens, **psd_kwargs)
         # high pass filter
+        print("shape of ASD:", self.ASD.shape)
         self.ASD[self.grid_freq < 5e-5] = 0.0 
         self.PSD = self.ASD**2
-        self.noise_factor = np.concatenate(([0.0],self.ASD[:-1], self.ASD[::-1].conj()))/np.sqrt(4*self.df)
+        # self.noise_factor will undergo ifft: ifft expects the output format of np.fft. 
+        # the output of fft is such that out[0] is the DC component, out[:n//2] is the positive frequencies and out[n//2:] is the negative frequencies
+        # look at https://numpy.org/doc/stable/reference/routines.fft.html#module-numpy.fft . 
+        self.noise_factor = np.concatenate(([0.0],self.ASD[1:], self.ASD[::-1].conj()))/np.sqrt(4*self.df)
 
         self.noise_rng = np.random.default_rng(seed=0)
 
     
         self.waveform_kwargs = {
-            "dt": self.dt,
+            "freqs": self.grid_freq,
             "modes": conf["waveform_params"]["modes"],
             "out_channel": 0,
             "length": 1024,
@@ -269,7 +274,7 @@ class LISAMBHBSimulatorTD():
         #apply a filter 
         #if window_filter is not None:
         #    noise_fft *= window_filter
-        full_noise_fft = self.noise_factor * np.concatenate((noise_fft[:-1],noise_fft[::-1].conj()[:-1]))
+        full_noise_fft = self.noise_factor * np.concatenate((noise_fft,noise_fft[::-1].conj()))
         full_noise_fft[0] = 0.0 + 1j *0.0 #Force f=0 to be 0
         noise_td_full = np.fft.ifft(full_noise_fft)
         print("noise_td_full shape:", noise_td_full.shape)
