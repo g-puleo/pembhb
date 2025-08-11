@@ -50,17 +50,13 @@ def get_logratios_grid(dataset: MBHBDataset, model: InferenceNetwork, low: float
     model.eval()
     model = model.to("cuda")
     grid = torch.linspace(low, high, ngrid_points).to("cuda").reshape(-1, 1)
-
+    zero_pad1d = torch.zeros(ngrid_points, 10).to("cuda")
+    grid_padded = torch.cat((zero_pad1d[:, :inj_param_idx], grid, zero_pad1d[:, inj_param_idx:]), dim=1)  # Shape: [ngrid_points, 11]
     with torch.no_grad():
         for batch in tqdm( dataloader ) :
             data_fd = batch["data_fd"].to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
             source_parameters = batch["source_parameters"]  # Shape: [batchsize, 11]
 
-            # q_grid = torch.linspace(low, high, ngrid_points).to("cuda").reshape(-1, 1)
-            zero_pad1d = torch.zeros(ngrid_points, 10).to("cuda")
-
-            #grid_padded = torch.cat((grid, zero_pad1d), dim=1)  # Shape: [ngrid_points, 11]
-            grid_padded = torch.cat((zero_pad1d[:, :inj_param_idx], grid, zero_pad1d[:, inj_param_idx:]), dim=1)  # Shape: [ngrid_points, 11]
 
             batch_size = data_fd.shape[0]
             data_fd_expanded = data_fd.unsqueeze(1).expand(batch_size, ngrid_points, -1, -1)  # Shape: [batchsize, ngrid_points, n_channels, n_datapoints]
@@ -80,6 +76,45 @@ def get_logratios_grid(dataset: MBHBDataset, model: InferenceNetwork, low: float
 
         results = torch.cat(results, dim=0).numpy()
         injection_params = torch.cat(injection_params, dim=0).numpy()
+    return results, injection_params, grid.detach().cpu()
+
+def get_logratios_grid_2d(dataset: MBHBDataset, model: InferenceNetwork, lows: float, highs: float, ngrid_points: int, out_idx : int, inj_param_idx : tuple):
+    dataloader = DataLoader(dataset, batch_size=min(10, len(dataset)), shuffle=False)
+    results = []
+    injection_params = []
+
+    model.eval()
+    model = model.to("cuda")
+    grid_0 = torch.linspace(lows[0], highs[0], ngrid_points).to("cuda").reshape(-1, 1)
+    grid_1 = torch.linspace(lows[1], highs[1], ngrid_points).to("cuda").reshape(-1, 1)
+
+    grid_x, grid_y = np.meshgrid(grid_0, grid_1) # grid_x and grid_y have shape (ngrid_points, ngrid_points)
+    flattened_x = grid_x.flatten() # values of param_0 to test
+    flattened_y = grid_y.flatten() # values of param_1 to test
+    grid = torch.stack((flattened_x, flattened_y), dim=1).to("cuda")  # Shape: [ngrid_points^2, 2]
+    padder = torch.zeros(ngrid_points**2, 9).to("cuda") # pass zero as other parameters
+    grid_padded_input = torch.cat((grid, padder), dim=1)  # Shape: [ngrid_points^2, 11]
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader):
+            data_fd = batch["data_fd"].to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
+            source_parameters = batch["source_parameters"]
+            batch_size = data_fd.shape[0]
+            data_fd_expanded = data_fd.unsqueeze(1).expand(-1, ngrid_points**2, -1, -1)  # Shape: [batchsize, ngrid_points^2, n_channels, n_datapoints]
+            grid_expanded = grid_padded_input.unsqueeze(0).expand(batch_size, -1, -1) # shape is [batchsize, ngrid_points^2, 11]
+
+            batched_data = data_fd_expanded.reshape(-1, data_fd_expanded.shape[-2], data_fd_expanded.shape[-1])
+            batched_grid = grid_expanded.reshape(-1, grid_expanded.shape[-1])  # Flatten batch and ngrid_points
+
+            logratios = model(batched_data, batched_grid)[:, out_idx] # shape is [batchsize*ngrid_points^2, ]
+            logratios = logratios.reshape(batch_size, ngrid_points**2)  # Reshape to [batchsize, ngrid_points^2]
+
+            results.append(logratios.detach().cpu())
+            injection_params.append(source_parameters[:, inj_param_idx].detach().cpu())
+
+        results = torch.cat(results, dim=0).numpy()
+        injection_params = torch.cat(injection_params, dim=0).numpy()
+
     return results, injection_params, grid.detach().cpu()
 
 def get_pvalues_1d(logratios: np.array, grid: np.array, inj_param: np.array):
@@ -110,6 +145,30 @@ def get_pvalues_1d(logratios: np.array, grid: np.array, inj_param: np.array):
     p_values = cumsum[idx_rank, idx]
 
     return p_values
+
+def get_pvalues_2d(logratios: np.array, grid: np.array , inj_param: np.array):
+    """Calculate p-values for a 2D logratios array.
+    Assume the grid was flattened before. 
+    Recall that exp(logratios) = posterior/prior, and here we assume a uniform prior.
+
+    :param logratios: logratios for the grid , has shape (batch size, ngrid_points)
+    :type logratios: np.array
+    :param grid: grid of parameters, has shape (ngrid_points, 2)
+    :type grid: np.array
+    :param inj_param: injected parameter value
+    :type inj_param: np.array with shape (batch size, 2)
+    """
+
+    ratios = np.exp(logratios)
+    sorted_ratios = np.sort(ratios, axis=1)
+    sorted_indices =  np.argsort(ratios, axis=1)
+    sorted_grid =  grid[sorted_indices] # shape is 
+    inj_param = inj_param.reshape(-1,1,2)
+
+
+    
+
+
 
 
 def update_bounds(model: InferenceNetwork, observation_dataset: MBHBDataset, priordict: dict, parameter_idx: int, n_gridpoints: int = 100):
@@ -174,6 +233,10 @@ def pp_plot( dataset, model , low: float, high: float, inj_param_idx: int, name:
     ax.grid(visible=True)
     fig.savefig(os.path.join(ROOT_DIR, "plots", f"{name}_pp_plot.png"))
     plt.close()
+
+def pp_plot_2d(dataset, model, lows: tuple, highs: tuple, inj_param_idx: tuple, out_idx: int, name: str):
+
+    dataset = MBHBDataset(dataset, channels="AE")
 
 
 if __name__ == "__main__":

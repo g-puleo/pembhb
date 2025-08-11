@@ -45,6 +45,7 @@ class UniformSampler ():
         :type n_samples: int
         :return: samples in bbhx input format, samples for tmnre
         :rtype: list[np.array]
+        
         """
 
         unif_samples = np.random.uniform(0, 1, size=(self.n_params, n_samples))

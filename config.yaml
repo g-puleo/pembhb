@@ -4,6 +4,9 @@ waveform_params:
   modes: [[2,2]]
   noise: "sangria"
   duration: 4 # weeks
+  min_freq: -4 # log10(f/Hz)
+  max_freq: -2 # log10(f/Hz)
+  n_freqs: 10000 # number of frequency bins in the waveform
   
 prior:
   "logMchirp": [5, 6] # log10(Mchirp/Msun)
@@ -21,10 +24,10 @@ prior:
 training: 
   batch_size: 100
   epochs: 1000
-  learning_rate: 0.0001
+  learning_rate: 0.001
   transform: "log" # options: "none", "logwhiten", "log", "whiten"
   scheduler_factor: 0.2
-  scheduler_patience: 15
-
+  scheduler_patience: 75
+  early_stop_patience: 100
 tmnre:
   marginals: [[0], [1], [0,1]]

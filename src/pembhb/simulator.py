@@ -38,7 +38,7 @@ class LISAMBHBSimulator():
 
 
         self.obs_time = int( 24*3600*7*conf["waveform_params"]["duration"])# weeks to seconds
-        self.freqs = np.logspace(-4, -2, 10000)
+        self.freqs = np.logspace(conf["waveform_params"]["min_freq"], conf["waveform_params"]["max_freq"], conf["waveform_params"]["n_freqs"])
         self.df = np.diff(self.freqs, prepend=self.freqs[0])
         self.n_pt = len(self.freqs)
         self.waveform_kwargs = {

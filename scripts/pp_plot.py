@@ -10,6 +10,7 @@ from pembhb.model import InferenceNetwork,PeregrineModel
 from pembhb.sampler import UniformSampler
 from pembhb.simulator import LISAMBHBSimulator
 from pembhb.data import MBHBDataset
+from pembhb.utils import get_pvalues_1d
 from torch.utils.data import DataLoader
 
 # def load_wronglysaved_model():
@@ -80,36 +81,6 @@ def plot_posterior(data: np.array, injected_params: np.array, model: InferenceNe
                 plt.savefig(f"marginal_{i}_{j}")
                 plt.close()
 
-
-
-def get_pvalues_1d(logratios: np.array, grid: np.array, inj_param: np.array):
-    """Calculate p-values for a 1D logratios array. 
-    Recall that exp(logratios) = posterior/prior, and here we assume a uniform prior. 
-    
-    :param logratios: logratios for the grid , has shape (batch size, ngrid_points)
-    :type logratios: np.array
-    :param inj_param: injected parameter value
-    :type inj_param: float
-    :param ngrid_points: number of points in the grid
-    :type ngrid_points: int
-    :return: p-value for the injected parameter
-    """
-    
-    ratios = np.exp(logratios)
-    sorted_ratios = np.sort(ratios, axis=1) 
-    sorted_indices =  np.argsort(ratios, axis=1)
-    sorted_grid =  grid[sorted_indices]
-    inj_param = inj_param.reshape(-1,1,1)
-    # find closest value in the grid to the injected parameter
-    idx = np.argmin(np.abs(sorted_grid - inj_param), axis=1).numpy().squeeze(1)
-    idx_rank = np.arange(idx.shape[0])
-
-    cumsum =  np.cumsum(sorted_ratios, axis=1)
-    cumsum /= cumsum[:,-1:]  # normalize to get a cumulative distribution
-    print(idx_rank.shape, idx.shape)
-    p_values = cumsum[idx_rank, idx]
-
-    return p_values
 
 def plot_posterior_grid(data: np.array, injected_params: np.array, model: InferenceNetwork, idx: int ,  ngrid_points=100):
 

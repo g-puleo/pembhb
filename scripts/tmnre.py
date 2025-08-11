@@ -40,9 +40,10 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
 
 
     checkpoint_callback = ModelCheckpoint(monitor='val_loss', mode='min')
-    early_stopping_callback = EarlyStopping(monitor='val_loss', patience=30, mode='min')
-    logger = TensorBoardLogger(os.path.join(ROOT_DIR, f"logs/{TIME_OF_EXECUTION}"), name=f"round_{idx}")
-    trainer = Trainer(
+    early_stopping_callback = EarlyStopping(monitor='val_loss', patience=conf["training"]["early_stop_patience"], mode='min')
+    logger = TensorBoardLogger(os.path.join(ROOT_DIR, f"logs"), name=f"{TIME_OF_EXECUTION}_round_{idx}")
+
+    trainer= Trainer(
                     logger=logger,
                     max_epochs=conf["training"]["epochs"], 
                     accelerator="gpu", devices=1,
@@ -55,10 +56,11 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
 
     # find the learning rate. 
     # tuner = Tuner(trainer)
-    # lr_finder = tuner.lr_find(model, datamodule=data_module)
+    # lr_finder = tuner.lr_find(model, datamodule=data_module, min_lr=1e-4, max_lr=1e-1)
     # fig = lr_finder.plot(suggest=True)
+    # plt.yscale('log')
     # fig.savefig(os.path.join(ROOT_DIR, f"plots/lr_finder_round_{idx}.png"))
-    # fig.close()
+    # plt.close(fig)
     
     #model = InferenceNetwork(num_features=10, num_channels=6, hlayersizes=(100, 20), marginals=conf["tmnre"]["marginals"], marginal_hidden_size=10, lr=lr)
     trainer.fit(model, data_module)
@@ -70,7 +72,7 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
 if __name__ == "__main__":  
 
     # Load configuration from config.yaml
-    config_path = os.path.join(ROOT_DIR, "config.yaml")
+    config_path = os.path.join(ROOT_DIR, "config_1.yaml")
     conf = read_config(config_path)
 
     dataset_observation = MBHBDataset(os.path.join(ROOT_DIR, "data/observation.h5"), conf["training"]["transform"])
@@ -91,7 +93,7 @@ if __name__ == "__main__":
     q_lower = [conf["prior"]["q"][0]]
     q_upper = [conf["prior"]["q"][1]]
 
-    for i in range(5): 
+    for i in range(1,2): 
         print(f"Running round {i}...")
         # if i == 0: 
         #     trained_model = InferenceNetwork.load_from_checkpoint("/u/g/gpuleo/pembhb/logs/logs_0804/peregrine_norm/version_1/checkpoints/epoch=136-step=23290.ckpt")

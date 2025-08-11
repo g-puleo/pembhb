@@ -106,6 +106,8 @@ class InferenceNetwork(LightningModule):
         self.loss = nn.BCEWithLogitsLoss(reduction='none')
         self.lr = conf["training"]["learning_rate"]
         self.bounds_trained = self.model.bounds_trained
+        self.scheduler_patience = conf["training"]["scheduler_patience"]
+        self.scheduler_factor = conf["training"]["scheduler_factor"]
         self.save_hyperparameters(conf)
         
     def forward(self, x, parameters):
@@ -246,6 +248,7 @@ class PeregrineModel(torch.nn.Module):
         #     down_sampling=(8, 8, 8, 8),
         # )
         n_channels = 2 * len(conf["waveform_params"]["TDI"])
+        n_freqs = conf["waveform_params"]["n_freqs"]
         self.normalisation = nn.BatchNorm1d(num_features=n_channels)
         self.unet_f = Unet(
             n_in_channels=n_channels,
@@ -256,7 +259,7 @@ class PeregrineModel(torch.nn.Module):
 
         self.flatten = nn.Flatten(1)
         #self.linear_t = LinearCompression()
-        self.linear_f = LinearCompression()
+        self.linear_f = LinearCompression(n_freqs)
 
         self.logratios_1d = MarginalClassifierHead(
             n_data_features=16,
@@ -394,16 +397,16 @@ class Unet(nn.Module):
 
 
 class LinearCompression(nn.Module):
-    def __init__(self):
+    def __init__(self, N_input):
         super(LinearCompression, self).__init__()
         self.sequential = nn.Sequential(
-            nn.LazyLinear(1024),
+            nn.Linear(N_input, 1024),
             nn.ReLU(),
-            nn.LazyLinear(256),
+            nn.Linear(1024, 256),
             nn.ReLU(),
-            nn.LazyLinear(64),
+            nn.Linear(256, 64),
             nn.ReLU(),
-            nn.LazyLinear(16),
+            nn.Linear(64, 16),
         )
 
     def forward(self, x):
