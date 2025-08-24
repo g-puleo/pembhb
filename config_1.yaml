@@ -9,8 +9,8 @@ waveform_params:
   n_freqs: 10000 # number of frequency bins in the waveform
   
 prior:
-  "logMchirp": [5, 6] # log10(Mchirp/Msun)
-  "q":  [1, 5]
+  "logMchirp": [5.3253254890441895, 5.466466426849365] # log10(Mchirp/Msun)
+  "q":  [3.522522449493408, 4.255255222320557]
   "chi1": [0,0]
   "chi2": [0,0]
   "dist": [4.0,40]  # dist in Gpc (note that we shall sample uniformly dist^3)
@@ -24,10 +24,10 @@ prior:
 training: 
   batch_size: 100
   epochs: 1000
-  learning_rate: 0.01
+  learning_rate: 0.000001
   transform: "log" # options: "none", "logwhiten", "log", "whiten"
-  scheduler_factor: 0.75
+  scheduler_factor: 1.0
   scheduler_patience: 20
-  early_stop_patience: 40
+  early_stop_patience: 10
 tmnre:
   marginals: [[0], [1], [0,1]]

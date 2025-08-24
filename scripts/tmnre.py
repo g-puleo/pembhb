@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader , random_split
 import numpy as np
 from pembhb import ROOT_DIR
 from pembhb.utils import read_config, update_bounds, pp_plot
-import yaml 
+import argparse 
 from datetime import datetime
 import matplotlib.pyplot as plt
 
@@ -70,9 +70,10 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
 
 
 if __name__ == "__main__":  
-
-    # Load configuration from config.yaml
-    config_path = os.path.join(ROOT_DIR, "config_1.yaml")
+    parser = argparse.ArgumentParser(description="Train TMNRE model with configurable settings.")
+    parser.add_argument("--config", type=str, required=True, help="Path to the config YAML file.")
+    args = parser.parse_args()
+    config_path = args.config
     conf = read_config(config_path)
 
     dataset_observation = MBHBDataset(os.path.join(ROOT_DIR, "data/observation.h5"), conf["training"]["transform"])
