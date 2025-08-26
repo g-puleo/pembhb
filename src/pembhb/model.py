@@ -185,14 +185,12 @@ class InferenceNetwork(LightningModule):
             self.log(f'test_accuracy_{i}', accuracy_params[i], on_step=False, on_epoch=True)
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=5)
+        #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=5)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 10**(epoch//15) if epoch < 30 else 100)
         return {
             'optimizer': optimizer,
             'lr_scheduler': {
-                'scheduler': scheduler,
-                'monitor': 'val_loss',
-                'interval': 'epoch',
-                'frequency': 1
+                'scheduler': scheduler
             }
         }
 
