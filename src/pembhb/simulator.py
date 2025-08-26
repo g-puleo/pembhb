@@ -1,16 +1,20 @@
-from bbhx.waveformbuild import BBHWaveformFD
-from bbhx.response.fastfdresponse import LISATDIResponse
+import numpy as np 
+import os
+import h5py
+import yaml
+from scipy.signal.windows import tukey
+from tqdm import tqdm
+
 from lisatools.detector import EqualArmlengthOrbits
 import lisatools.sensitivity as lisasens
-import numpy as np 
+
+from bbhx.waveformbuild import BBHWaveformFD, BBHWaveformTD
+from bbhx.response.fastfdresponse import LISATDIResponse
 from bbhx.utils.transform import LISA_to_SSB
-import yaml
 from bbhx.utils.constants import YRSID_SI, PC_SI
-import os
+
 from pembhb import ROOT_DIR
 from pembhb.sampler import UniformSampler
-import h5py
-from tqdm import tqdm
 
 gpu_available=False
 WEEK_SI = 7 * 24 * 3600  # seconds in a week
@@ -186,9 +190,170 @@ class LISAMBHBSimulator():
     # plt.show()
 
 
+class LISAMBHBSimulatorTD(): 
+
+    def __init__(self, conf, sampler_init_kwargs):
+        super().__init__()
+        # initialise the waveform generator
+        orbits = EqualArmlengthOrbits(use_gpu=gpu_available)
+        orbits.configure(linear_interp_setup=True)
+        response_kwargs = {
+            "TDItag": "AET",
+            "rescaled": False,
+            "orbits": orbits
+            }
+        
+        self.waveform_generator = BBHWaveformTD(
+            amp_phase_kwargs = dict(run_phenomd=False),
+            response_kwargs = response_kwargs,
+            use_gpu = gpu_available
+        )
+
+        #### SET UP FREQUENCY GRID from OBSERVATION TIME AND SAMPLING RATE ####
+        self.obs_time = int( 24*3600*7*conf["waveform_params"]["duration"])# weeks to seconds
+        self.dt = conf['waveform_params']['dt']
+        # pad the time to power of 2 for the noise
+        self.n_time_pt_noise = int(2**np.ceil(np.log2(self.obs_time / self.dt)))
+        self.df_noise = 1./self.n_time_pt_noise/self.dt
+        self.grid_freq_noise = np.arange(1,self.n_time_pt_noise//2 +1 ) * self.df_noise
+        self.f_len_noise = len(self.grid_freq_noise)
+        self.window_noise = tukey(self.n_time_pt_noise, alpha=0.05)
+        #### set up the noise model
+        psd_kwargs = {
+            "model": conf["waveform_params"]["noise"],
+            "return_type": "ASD"
+        }
+        print("shape of grid_freq:", self.grid_freq_noise.shape)
+        self.ASD = lisasens.get_sensitivity(self.grid_freq_noise, sens_fn = lisasens.A1TDISens, **psd_kwargs)
+        # high pass filter
+        print("shape of ASD:", self.ASD.shape)
+        self.ASD[self.grid_freq_noise < 5e-5] = 0.0
+        self.PSD = self.ASD**2
+        # self.noise_factor will undergo ifft: ifft expects the output format of np.fft. 
+        # the output of fft is such that out[0] is the DC component, out[:n//2] is the positive frequencies and out[n//2:] is the negative frequencies
+        # look at https://numpy.org/doc/stable/reference/routines.fft.html#module-numpy.fft . 
+        self.noise_factor = np.concatenate(([0.0],self.ASD[1:], self.ASD[::-1].conj()))/np.sqrt(4*self.df_noise)
+
+        self.noise_rng = np.random.default_rng(seed=0)
+
+    
+        self.waveform_kwargs = {
+            #"freqs": self.grid_freq,
+            "modes": conf["waveform_params"]["modes"],
+            "out_channel": 0,
+            "length": 1024,
+            "t_obs_start": 0.0, 
+            "t_obs_end": self.obs_time/ YRSID_SI
+            }
+        self.channels = conf["waveform_params"]["TDI"]
+        self.n_channels = len(self.channels)
+
+        self.sampler = UniformSampler(**sampler_init_kwargs)
+        breakpoint()
+        ################################
+
+    def generate_d_f(self, injection: np.array):
+        """ Generate simulated data in frequency domain given the injection parameters.
+
+        :param injection: injection parameteres in LISA frame
+        :type injection: list[np.array]
+        :return: simulated data in frequency domain
+        :rtype: np.array
+        """
+        injection[-1], injection[-4], injection[-3], injection[-2] = LISA_to_SSB(injection[-1], injection[-4], injection[-3], injection[-2])
+        # generate wave in TD
+        injection = np.insert(injection, 6, np.zeros(injection[5].shape), axis=0) 
+        n_observations = injection.shape[1]
+        noise_fft = np.random.normal(loc= 0.0,size = (n_observations , self.f_len_noise)) + 1j*np.random.normal(loc= 0.0,size = (n_observations , self.f_len_noise))
+        print("injection shape:", injection.shape)
+        print("noise_fft shape:", noise_fft.shape)
+        print("self.noise_factor shape:", self.noise_factor.shape)
+        #apply a filter 
+        #if window_filter is not None:
+        #    noise_fft *= window_filter
+        full_noise_fft = self.noise_factor * np.concatenate((noise_fft,noise_fft[::-1].conj()), axis=1)
+        full_noise_fft[0] = 0.0 + 1j *0.0 #Force f=0 to be 0
+        noise_td_full = np.fft.ifft(full_noise_fft)
+        print(f"FULL_NOISE SHAPE {full_noise_fft.shape}")
+        print("noise_td_full shape:", noise_td_full.shape)
+        noise_td = noise_td_full[:self.n_time_pt_noise].real
+        print("noise_td shape:", noise_td.shape)
+
+        # add noise 
+        signal_td = self.waveform_generator(*injection, **self.waveform_kwargs) 
+        print("signal_td shape:", signal_td.shape)
+        breakpoint()
+        wave_TD = signal_td + noise_td
+        print(f"wave_TD shape:{wave_TD.shape},self.window shape:{self.window.shape}, self.dt: {self.dt}, self.noise_factor shape: {self.noise_factor.shape}")
+        wave_FD = np.fft.rfft(wave_TD*self.window)[0,1:].astype(np.complex64) * self.dt * self.noise_factor
+        return (wave_TD[0].astype(np.float32), wave_FD)
+    
+    def _sample(self, N=1): 
+        """Draw one sample from the joint distribution, first sampling parameters from the prior and then generating the data in frequency domain.
+
+        :param N: _description_, defaults to 1
+        :type N: int, optional
+        :return: out_dict {"parameters": prior samples , frequency domain data)
+        :rtype: dict
+        """
+        z_samples, tmnre_input = self.sampler.sample(N)
+        data_td, data_fd = self.generate_d_f(z_samples)
+        out_dict = {"parameters": tmnre_input, "data_td": data_td, "data_fd": data_fd}
+        return out_dict
+    
+    def sample_and_store(self, filename:str, N:int, batch_size=None): 
+        """Sample N samples and store them in an HDF5 file.
+
+        :param filename: name of the file to store the samples
+        :type filename: str
+        :param N: number of samples to generate
+        :type N: int
+        :param batch_size: number of samples to generate in each batch, defaults to 1000
+        :type batch_size: int, optional
+        :return: None
+        """
+        if batch_size is None:
+            batch_size = max(1,int(N/10.0))
+        
+        with h5py.File(filename, "a") as f:
+            source_params = f.create_dataset("source_parameters", shape=(N, 11), dtype=np.float32)
+            data_fd = f.create_dataset("data_fd", shape=(N, 4, self.n_pt), dtype=np.float32)
+            data_td = f.create_dataset("data_td", shape=(N, self.time_pt), dtype=np.float32)
+            snr = f.create_dataset("snr", shape = (N,), dtype=np.float32)
+            psd_dataset = f.create_dataset("psd", data=self.PSD, dtype=np.float32)
+            print("Sampling and storing simulations to ", filename)
+            for i in tqdm(range(0, N, batch_size)):
+                batch_end = min(i + batch_size, N)
+                batch_size_actual = batch_end - i
+                out = self._sample(batch_size_actual)
+
+                z_samples = out["parameters"]
+                data_fd_batch = out["data_fd"]
+                data_td_batch = out["data_td"]
+                snr_batch = self.get_SNR_FD(data_fd_batch)
+                data_fd_amp_phase = np.concatenate((np.abs(data_fd_batch), np.angle(data_fd_batch)), axis=1)
+                source_params[i:batch_end] = z_samples.T # Reshape to (batch_size, 11) instead of (11, batch_size)
+                data_fd[i:batch_end] = data_fd_amp_phase
+                data_td[i:batch_end] = data_td_batch
+                snr[i:batch_end] = snr_batch
+    
+    def get_SNR_FD(self,
+        signal
+        ):
+        """
+        Obtain the SNR of a signal in frequency domain.
+
+        :param signal: data in frequency domain, output by bbhx with shape (n_samples, 3, n_freqs)
+        :type signal: np.array
+        :return: SNR values with shape (n_samples,)
+        :rtype: np.array
+        """
+    
+        SNR2 =  np.sum(signal*signal.conj()*self.df/self.PSD,axis=(1,2)).real * 4.0 
+        return np.sqrt(SNR2)
 
 
-
+    
 class DummySampler:
     def __init__(self, low=0.0, high=1.0):
         self.low = low
@@ -260,3 +425,6 @@ class DummySimulator:
                 data_fd_batch = out["data_fd"]
                 source_params[i:batch_end] = z_samples
                 data_fd[i:batch_end] = data_fd_batch
+
+
+
