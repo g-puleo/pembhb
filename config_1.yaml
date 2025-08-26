@@ -24,7 +24,7 @@ prior:
 training: 
   batch_size: 100
   epochs: 1000
-  learning_rate: 0.000001
+  learning_rate: 0.00001
   transform: "log" # options: "none", "logwhiten", "log", "whiten"
   scheduler_factor: 1.0
   scheduler_patience: 20
