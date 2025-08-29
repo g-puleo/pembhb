@@ -65,11 +65,9 @@ def get_logratios_grid(dataset: MBHBDataset, model: InferenceNetwork, low: float
             batched_data = data_fd_expanded.reshape(-1, data_fd_expanded.shape[-2], data_fd_expanded.shape[-1])  # Flatten batch and ngrid_points
             batched_grid = grid_expanded.reshape(-1, grid_expanded.shape[-1])  # Flatten batch and ngrid_points
 
-            #print(f"data_fd_expanded shape: {data_fd_expanded.shape}, mc_grid shape: {mc_grid.shape}")
             logratios= model(batched_data, batched_grid)[:, inj_param_idx]  # Get logratios for mchirp
             # view them as [batchsize, ngrid_points]
             logratios = logratios.reshape(batch_size, ngrid_points)
-            #logratios_q = model(data_fd_expanded, q_grid_padded.unsqueeze(0).expand(batch_size, -1, -1))[:, :, 1]
 
             results.append(logratios.detach().cpu())
             injection_params.append(source_parameters[:, inj_param_idx].detach().cpu())
@@ -249,3 +247,16 @@ if __name__ == "__main__":
 
     updated_prior = update_bounds(model, dataset, conf, parameter_idx=1, n_gridpoints=100)
     print(updated_prior)
+
+
+def chirp_mass_from_m1m2(m1, m2):
+    """Calculate the chirp mass from the component masses.
+    :param m1: mass of the primary black hole
+    :type m1: float or np.array
+    :param m2: mass of the secondary black hole
+    :type m2: float or np.array
+    :return: chirp mass
+    :rtype: float or np.array
+    """
+    return (m1*m2)**(3/5) / (m1+m2)**(1/5)                            
+                                      

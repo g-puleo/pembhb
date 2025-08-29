@@ -100,7 +100,6 @@ class LISAMBHBSimulator():
 
         simulated_data_fd = (noise_fd + wave_FD)
         # stack real and imaginary parts over channels
-        #breakpoint()
         return simulated_data_fd
 
     def _sample(self, N=1): 
@@ -111,7 +110,7 @@ class LISAMBHBSimulator():
         :return: out_dict {"parameters": prior samples , frequency domain data)
         :rtype: dict
         """
-        z_samples, tmnre_input = self.sampler.sample(N)
+        z_samples, tmnre_input = self.sampler.sample(N, self.obs_time)
         data_fd = self.generate_d_f(z_samples)
         out_dict = {"parameters": tmnre_input, "data_fd": data_fd}
         return out_dict
@@ -210,10 +209,12 @@ class LISAMBHBSimulatorTD():
         )
 
         #### SET UP FREQUENCY GRID from OBSERVATION TIME AND SAMPLING RATE ####
-        self.obs_time = int( 24*3600*7*conf["waveform_params"]["duration"])# weeks to seconds
+        self.obs_time_SI = int( 24*3600*7*conf["waveform_params"]["duration"])# weeks to seconds
+        self.t_obs_start_SI = 0.0 # seconds
+        self.t_obs_end_SI = self.t_obs_start_SI + self.obs_time_SI # seconds
         self.dt = conf['waveform_params']['dt']
         # pad the time to power of 2 for the noise
-        self.n_time_pt_noise = int(2**np.ceil(np.log2(self.obs_time / self.dt)))
+        self.n_time_pt_noise = int(self.obs_time_SI / self.dt)
         self.df_noise = 1./self.n_time_pt_noise/self.dt
         self.grid_freq_noise = np.arange(1,self.n_time_pt_noise//2 +1 ) * self.df_noise
         self.f_len_noise = len(self.grid_freq_noise)
@@ -223,17 +224,14 @@ class LISAMBHBSimulatorTD():
             "model": conf["waveform_params"]["noise"],
             "return_type": "ASD"
         }
-        print("shape of grid_freq:", self.grid_freq_noise.shape)
         self.ASD = lisasens.get_sensitivity(self.grid_freq_noise, sens_fn = lisasens.A1TDISens, **psd_kwargs)
         # high pass filter
-        print("shape of ASD:", self.ASD.shape)
         self.ASD[self.grid_freq_noise < 5e-5] = 0.0
         self.PSD = self.ASD**2
         # self.noise_factor will undergo ifft: ifft expects the output format of np.fft. 
         # the output of fft is such that out[0] is the DC component, out[:n//2] is the positive frequencies and out[n//2:] is the negative frequencies
         # look at https://numpy.org/doc/stable/reference/routines.fft.html#module-numpy.fft . 
         self.noise_factor = np.concatenate(([0.0],self.ASD[1:], self.ASD[::-1].conj()))/np.sqrt(4*self.df_noise)
-
         self.noise_rng = np.random.default_rng(seed=0)
 
     
@@ -242,14 +240,14 @@ class LISAMBHBSimulatorTD():
             "modes": conf["waveform_params"]["modes"],
             "out_channel": 0,
             "length": 1024,
-            "t_obs_start": 0.0, 
-            "t_obs_end": self.obs_time/ YRSID_SI
+            "t_obs_start": self.t_obs_start_SI/ YRSID_SI, 
+            "t_obs_end": self.t_obs_end_SI/ YRSID_SI,
+            "dt": self.dt
             }
         self.channels = conf["waveform_params"]["TDI"]
         self.n_channels = len(self.channels)
 
         self.sampler = UniformSampler(**sampler_init_kwargs)
-        breakpoint()
         ################################
 
     def generate_d_f(self, injection: np.array):
@@ -262,30 +260,32 @@ class LISAMBHBSimulatorTD():
         """
         injection[-1], injection[-4], injection[-3], injection[-2] = LISA_to_SSB(injection[-1], injection[-4], injection[-3], injection[-2])
         # generate wave in TD
+        # insert a set of zeros between injection[5] and injection[6]. this is the f_ref parameter , which in bbhx can be set to 0 in order to set f_ref @ t_chirp
         injection = np.insert(injection, 6, np.zeros(injection[5].shape), axis=0) 
         n_observations = injection.shape[1]
         noise_fft = np.random.normal(loc= 0.0,size = (n_observations , self.f_len_noise)) + 1j*np.random.normal(loc= 0.0,size = (n_observations , self.f_len_noise))
-        print("injection shape:", injection.shape)
-        print("noise_fft shape:", noise_fft.shape)
-        print("self.noise_factor shape:", self.noise_factor.shape)
+
         #apply a filter 
         #if window_filter is not None:
         #    noise_fft *= window_filter
         full_noise_fft = self.noise_factor * np.concatenate((noise_fft,noise_fft[::-1].conj()), axis=1)
         full_noise_fft[0] = 0.0 + 1j *0.0 #Force f=0 to be 0
         noise_td_full = np.fft.ifft(full_noise_fft)
-        print(f"FULL_NOISE SHAPE {full_noise_fft.shape}")
-        print("noise_td_full shape:", noise_td_full.shape)
         noise_td = noise_td_full[:self.n_time_pt_noise].real
-        print("noise_td shape:", noise_td.shape)
 
         # add noise 
         signal_td = self.waveform_generator(*injection, **self.waveform_kwargs) 
-        print("signal_td shape:", signal_td.shape)
-        breakpoint()
         wave_TD = signal_td + noise_td
-        print(f"wave_TD shape:{wave_TD.shape},self.window shape:{self.window.shape}, self.dt: {self.dt}, self.noise_factor shape: {self.noise_factor.shape}")
-        wave_FD = np.fft.rfft(wave_TD*self.window)[0,1:].astype(np.complex64) * self.dt * self.noise_factor
+        # Apply window to time-domain signal
+        wave_TD_windowed = wave_TD * self.window_noise
+        # Compute the real FFT along the time axis (assume wave_TD shape is (n_observations, n_time_pt_noise))
+        wave_FD_raw = np.fft.rfft(wave_TD_windowed, axis=1)
+        # Remove the DC component (first frequency bin)
+        wave_FD_no_dc = wave_FD_raw[:, 1:]
+        # Convert to complex64
+        wave_FD_complex = wave_FD_no_dc.astype(np.complex64)
+        # Multiply by dt and ASD
+        wave_FD = wave_FD_complex * self.dt * self.ASD
         return (wave_TD[0].astype(np.float32), wave_FD)
     
     def _sample(self, N=1): 
@@ -296,7 +296,7 @@ class LISAMBHBSimulatorTD():
         :return: out_dict {"parameters": prior samples , frequency domain data)
         :rtype: dict
         """
-        z_samples, tmnre_input = self.sampler.sample(N)
+        z_samples, tmnre_input = self.sampler.sample(N, self.t_obs_end_SI)
         data_td, data_fd = self.generate_d_f(z_samples)
         out_dict = {"parameters": tmnre_input, "data_td": data_td, "data_fd": data_fd}
         return out_dict

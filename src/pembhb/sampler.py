@@ -16,16 +16,16 @@ def lMcq_m1m2(x: np.array):
     :return: m1 and m2
     :rtype: np.array
     """
-    Mc = 10 ** x[0]
-    m1 = Mc * x[1]**1.4 * (1. + x[1])**0.2
-    m2 = Mc * x[1]**0.4 * (1. + x[1])**(-0.6)
-    return np.stack([m1, m2], axis=0)
-
+    lMc = x[0]
+    q = x[1]
+    Mc = 10 ** lMc
+    M = Mc * (q/(1+q)**2)**(-0.6)
+    return np.stack([M * q / (1. + q), M / (1. + q)], axis=0)
 
 class UniformSampler ():
 
     def __init__(self, prior_bounds: dict = None ):
-        """_summary_
+        """Initialise sampler with given prior bounds. 
 
         :param prior_bounds: _description_
         :type prior_bounds: dict
@@ -38,11 +38,13 @@ class UniformSampler ():
         self.upper_bounds = np.array([self.prior_bounds[key][1] for key in _ORDERED_PRIOR_KEYS]).reshape(-1,1)
         self.n_params = self.lower_bounds.shape[0]
     
-    def sample(self, n_samples: int) -> np.array:
+    def sample(self, n_samples: int, t_obs_end: float) -> np.array:
         """ Generate samples from the uniform prior.
 
         :param n_samples: number of samples to generate
         :type n_samples: int
+        :param t_obs_end: end of observation time in seconds (used to offset the t_ref)
+        :type t_obs_end: float
         :return: samples in bbhx input format, samples for tmnre
         :rtype: list[np.array]
         
@@ -51,15 +53,17 @@ class UniformSampler ():
         unif_samples = np.random.uniform(0, 1, size=(self.n_params, n_samples))
         tmnre_input = unif_samples * (self.upper_bounds - self.lower_bounds) + self.lower_bounds
         #NB IT IS VERY IMPORTANT TO USE .copy() OTHERWISE THE OPERATIONS WILL BE PERFORMED IN-PLACE
-        bbhx_input = self.samples_to_bbhx_input(tmnre_input.copy())
+        bbhx_input = self.samples_to_bbhx_input(tmnre_input.copy(), t_obs_end)
         return bbhx_input , tmnre_input
 
-    def samples_to_bbhx_input(self, samples: np.array) -> np.array:
+    def samples_to_bbhx_input(self, samples: np.array, t_obs_end: float) -> np.array:
         """convert the sampler to the bbhx input format : 
         
 
         :param samples: MBHB parameters in the following order: log10(chirp mass), q, chi1, chi2, dist, phi, cos(inc), lambda, sin(beta), psi, Deltat
         :type samples: np.array
+        :param t_obs_end: observation time in seconds (used to offset the t_ref)
+        :type t_obs_end: float
         :return: MBHB parameters in the following order: m1, m2, chi1, chi2, distance, phase, inclination, lambda, beta, psi, Deltat
         :rtype: np.array
         """
@@ -72,7 +76,7 @@ class UniformSampler ():
         samples[8] = np.arcsin(samples[8]) # sin(beta)--> beta in [-pi/2, pi/2] (ecliptic latitude)
         # 9: psi is already in 0,pi
         # 10: Deltat is already in seconds   
-        samples[10] = samples[10]*DAY_SI
+        samples[10] = samples[10]*DAY_SI + t_obs_end # offset t_ref by the observation time
         return samples
     
 
