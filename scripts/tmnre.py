@@ -1,6 +1,6 @@
 import os
 import torch
-from pembhb.simulator import LISAMBHBSimulator, DummySimulator
+from pembhb.simulator import LISAMBHBSimulatorTD, DummySimulator
 from pembhb.model import InferenceNetwork, PeregrineModel
 from pembhb.data import MBHBDataModule, MBHBDataset
 from lightning.pytorch.loggers import TensorBoardLogger
@@ -23,17 +23,17 @@ TIME_OF_EXECUTION = get_timestamp()
 def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
 
     ######## DATA GENERATION #########
-    sim = LISAMBHBSimulator(conf, sampler_init_kwargs=sampler_init_kwargs)
+    sim = LISAMBHBSimulatorTD(conf, sampler_init_kwargs=sampler_init_kwargs)
     #sim = DummySimulator(sampler_init_kwargs=sampler_init_kwargs)
     fname = os.path.join(ROOT_DIR, "data", f"simulated_data_round_{idx}.h5")
     print("Sampling from the simulator...")
     os.makedirs(os.path.join(ROOT_DIR, "data"), exist_ok=True)
     try: 
-        sim.sample_and_store(fname, N=21000, batch_size=200)
+        sim.sample_and_store(fname, N=50000, batch_size=200)
         print("Data saved to", fname)
     except ValueError:
-        print("File might already exisht, skipping sampling.")
-        
+        print("File might already exist, skipping sampling.")
+
 
 
     ######## DATA LOADING AND TRAINING THE MODEL #########
@@ -94,7 +94,7 @@ if __name__ == "__main__":
     q_lower = [conf["prior"]["q"][0]]
     q_upper = [conf["prior"]["q"][1]]
 
-    for i in range(1,2): 
+    for i in range(1): 
         print(f"Running round {i}...")
         # if i == 0: 
         #     trained_model = InferenceNetwork.load_from_checkpoint("/u/g/gpuleo/pembhb/logs/logs_0804/peregrine_norm/version_1/checkpoints/epoch=136-step=23290.ckpt")

@@ -50,11 +50,12 @@ from typing import Iterable
 #         out = self.classifier(combined)  # (B, 1)
 
 #         return out
-
+WEEK_SI = 7 * 24 * 3600  # seconds in a week
 class MarginalClassifierHead(nn.Module):
 
     def __init__(self, n_data_features: int , marginals: list[list], hlayersizes: Iterable[int]):
-        """_summary_
+        """Classifier head for multiple marginals. 
+        Performs a binary classification for each marginal in the list of marginals. Used for TMNRE. 
 
         :param n_data_features: the number of features in the data summary
         :type n_data_features: int
@@ -97,7 +98,6 @@ class MarginalClassifierHead(nn.Module):
 class InferenceNetwork(LightningModule):
     """ 
     Basic FC network for TMNRE of MBHB data. 
-    I wrote this function to test the swyft framework, improvements on the architecture are future work. 
     """
     def __init__(self,  conf: dict):  
         super().__init__()
@@ -110,7 +110,7 @@ class InferenceNetwork(LightningModule):
         self.scheduler_factor = conf["training"]["scheduler_factor"]
         self.save_hyperparameters(conf)
         
-    def forward(self, x, parameters):
+    def forward(self, d_f, d_t, parameters):
         """
         Forward pass of the network.
         
@@ -118,16 +118,17 @@ class InferenceNetwork(LightningModule):
             data: Tensor of shape (batch_size, num_channels, num_features) containing the frequency domain signal in the TDI channels
             parameters: Tensor of shape (batch_size, 11) containing the parameters to be used in the classifier
         """
-        # breakpoint()
-        output = self.model(x, parameters)  # (batch_size, num_marginals)
+        output = self.model(d_f, d_t, parameters)  # (batch_size, num_marginals)
         return output
 
-    def calc_logits_losses(self, data, parameters):
+    def calc_logits_losses(self, data_f, data_t, parameters):
 
-        all_data = torch.cat((data, data), dim=0)
+        all_data_f = torch.cat((data_f, data_f), dim=0)
+        all_data_t = torch.cat((data_t, data_t), dim=0)
+
         scrambled_params = torch.roll(parameters, shifts=1, dims=0)
         all_params = torch.cat((parameters, scrambled_params), dim=0)
-        all_logits = self(all_data, all_params) 
+        all_logits = self(all_data_f, all_data_t, all_params) 
         shape_logits_half = (all_logits.shape[0] // 2, all_logits.shape[1])
         labels = torch.cat((torch.ones(shape_logits_half, device="cuda"), torch.zeros(shape_logits_half, device="cuda")), dim=0)
         all_loss= self.loss(all_logits, labels)
@@ -151,10 +152,11 @@ class InferenceNetwork(LightningModule):
         return accuracy_params, accuracy
 
     def training_step(self, batch, batch_idx): 
-        data = batch['data_fd']
+        data_f = batch['data_fd']
+        data_t = batch['data_td']
         parameters = batch['source_parameters']
 
-        all_logits, loss_params, loss = self.calc_logits_losses(data, parameters)
+        all_logits, loss_params, loss = self.calc_logits_losses(data_f, data_t, parameters)
         accuracy_params, accuracy = self.calc_accuracies(all_logits)
         
         self.log('train_loss', loss , on_step=True, on_epoch=True, prog_bar=True, logger=True)
@@ -166,7 +168,7 @@ class InferenceNetwork(LightningModule):
         return loss 
     
     def validation_step(self, batch, batch_idx):
-        all_logits, loss_params, loss= self.calc_logits_losses(batch['data_fd'], batch['source_parameters'])
+        all_logits, loss_params, loss= self.calc_logits_losses(batch['data_fd'], batch["data_td"], batch['source_parameters'])
         accuracy_params, accuracy = self.calc_accuracies(all_logits)
         self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('val_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
@@ -185,18 +187,19 @@ class InferenceNetwork(LightningModule):
             self.log(f'test_accuracy_{i}', accuracy_params[i], on_step=False, on_epoch=True)
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
-        #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=5)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=self.scheduler_factor, patience=self.scheduler_patience, min_lr=1e-6)
         #scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 10**(epoch//15) if epoch < 30 else 100)
-        scheduler = torch.optim.lr_scheduler.CyclicLR(
-            optimizer,
-            base_lr=0.0001,
-            max_lr=0.001,
-            step_size_up=15,
-        )
+        #scheduler = torch.optim.lr_scheduler.CyclicLR(
+        #     optimizer,
+        #     base_lr=0.0001,
+        #     max_lr=0.001,
+        #     step_size_up=15,
+        # )
         return {
             'optimizer': optimizer,
             'lr_scheduler': {
-                'scheduler': scheduler
+                'scheduler': scheduler,
+                'monitor': 'val_loss'
             }
         }
 
@@ -245,45 +248,54 @@ class PeregrineModel(torch.nn.Module):
         self.batch_size = conf["training"]["batch_size"]
         self.marginals = conf["tmnre"]["marginals"]
         self.bounds_trained = conf["prior"]
-        # self.unet_t = Unet(
-        #     n_in_channels=2 * len(conf["waveform_params"]["TDI"]),
-        #     n_out_channels=1,
-        #     sizes=(16, 32, 64, 128, 256),
-        #     down_sampling=(8, 8, 8, 8),
-        # )
-        n_channels = 2 * len(conf["waveform_params"]["TDI"])
-        n_freqs = conf["waveform_params"]["n_freqs"]
-        self.normalisation = nn.BatchNorm1d(num_features=n_channels)
+
+        n_channels =  len(conf["waveform_params"]["channels"])
+        n_timesteps = int(conf["waveform_params"]["duration"]*WEEK_SI/conf["waveform_params"]["dt"])
+        n_freqs = n_timesteps // 2 
+        self.normalisation_f = nn.BatchNorm1d(num_features=n_channels*2)
+        self.normalisation_t = nn.BatchNorm1d(num_features=n_channels)
         self.unet_f = Unet(
-            n_in_channels=n_channels,
+            n_in_channels=n_channels*2,
             n_out_channels=1,
             sizes=(16, 32, 64, 128, 256),
             down_sampling=(2, 2, 2, 2),
         )
+        self.unet_t = Unet(
+            n_in_channels=n_channels,
+            n_out_channels=1,
+            sizes=(16, 32, 64, 128, 256),
+            down_sampling=(8,8,8,8),
+        )
 
         self.flatten = nn.Flatten(1)
-        #self.linear_t = LinearCompression()
+        self.linear_t = LinearCompression(n_timesteps)
         self.linear_f = LinearCompression(n_freqs)
 
         self.logratios_1d = MarginalClassifierHead(
-            n_data_features=16,
+            n_data_features=32,
             marginals=self.marginals, 
             hlayersizes=(32, 16, 8, 4)
         )
 
 
 
-    def forward(self, d_f, parameters):
+    def forward(self, d_f, d_t, parameters):
         #print(f"d_f shape: {d_f.shape}")
-        d_f_norm = self.normalisation(d_f)
+        d_f_norm = self.normalisation_f(d_f)
+        d_t_norm = self.normalisation_t(d_t)
         #print(f"d_f_norm shape: {d_f_norm.shape}")
         d_f_processed = self.unet_f(d_f_norm)
+        d_t_processed = self.unet_t(d_t_norm)
         #print(f"d_f_processed shape: {d_f_processed.shape}")
-        flattened = self.flatten(d_f_processed)
+        flattened_f = self.flatten(d_f_processed)
+        flattened_t = self.flatten(d_t_processed)
+
         #print(f"flattened shape: {flattened.shape}")
-        features_f = self.linear_f(flattened)
+        features_f = self.linear_f(flattened_f)
+        features_t = self.linear_t(flattened_t)
+        features = torch.cat((features_f, features_t), dim=-1)
         #print(f"features_f shape: {features_f.shape}")
-        logratios_1d = self.logratios_1d(features_f, parameters)
+        logratios_1d = self.logratios_1d(features, parameters)
         #print(f"logratios_1d shape: {logratios_1d.shape}")
         return logratios_1d
 

@@ -32,7 +32,9 @@ class MBHBDataset(Dataset):
             self.len = f[self.keys[0]].shape[0]
             if transform in ["logwhiten", "whiten"]:
                 self.PSD = torch.tensor(f["psd"][()], device="self.device", dtype=torch.float32)
-            self.data = self.transform(torch.tensor(f["data_fd"][()], device=self.device, dtype=torch.float32))
+            self.data_fd = self.transform(torch.tensor(f["data_fd"][()], device=self.device, dtype=torch.float32))
+            self.data_td = torch.tensor(f["data_td"][()], device=self.device, dtype=torch.float32)
+
             self.parameters =  torch.tensor(f["source_parameters"][()], device=self.device, dtype=torch.float32)
             
 
@@ -90,7 +92,8 @@ class MBHBDataset(Dataset):
     def __getitem__(self, idx):
         dict_out = {
             'source_parameters': self.parameters[idx],
-            'data_fd': self.data[idx]
+            'data_fd': self.data_fd[idx],
+            'data_td': self.data_td[idx]
         }
         return dict_out
             

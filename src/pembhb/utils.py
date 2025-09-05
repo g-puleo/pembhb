@@ -21,6 +21,11 @@ _ORDERED_PRIOR_KEYS = [
         "psi",
         "Deltat"
     ]
+
+def print_params(params: np.array):
+    for idx, param in enumerate(params):
+        print(f"{_ORDERED_PRIOR_KEYS[idx]}: {params[param]}")
+
 def read_config(fname: str): 
     with open(fname, "r") as file:
         conf = yaml.safe_load(file)
@@ -55,17 +60,21 @@ def get_logratios_grid(dataset: MBHBDataset, model: InferenceNetwork, low: float
     with torch.no_grad():
         for batch in tqdm( dataloader ) :
             data_fd = batch["data_fd"].to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
+            data_td = batch["data_td"].to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
             source_parameters = batch["source_parameters"]  # Shape: [batchsize, 11]
 
 
             batch_size = data_fd.shape[0]
+
+            data_td_expanded = data_td.unsqueeze(1).expand(batch_size, ngrid_points, -1, -1)  # Shape: [batchsize, ngrid_points, n_channels, n_datapoints]
             data_fd_expanded = data_fd.unsqueeze(1).expand(batch_size, ngrid_points, -1, -1)  # Shape: [batchsize, ngrid_points, n_channels, n_datapoints]
             grid_expanded = grid_padded.unsqueeze(0).expand(batch_size, -1, -1) # shape is [batchsize, ngrid_points, 11]
 
-            batched_data = data_fd_expanded.reshape(-1, data_fd_expanded.shape[-2], data_fd_expanded.shape[-1])  # Flatten batch and ngrid_points
+            batched_data_td = data_td_expanded.reshape(-1, data_td_expanded.shape[-2], data_td_expanded.shape[-1])  # Flatten batch and ngrid_points
+            batched_data_fd = data_fd_expanded.reshape(-1, data_fd_expanded.shape[-2], data_fd_expanded.shape[-1])  # Flatten batch and ngrid_points
             batched_grid = grid_expanded.reshape(-1, grid_expanded.shape[-1])  # Flatten batch and ngrid_points
 
-            logratios= model(batched_data, batched_grid)[:, inj_param_idx]  # Get logratios for mchirp
+            logratios= model(batched_data_fd, batched_data_td, batched_grid)[:, inj_param_idx]  # Get logratios for mchirp
             # view them as [batchsize, ngrid_points]
             logratios = logratios.reshape(batch_size, ngrid_points)
 

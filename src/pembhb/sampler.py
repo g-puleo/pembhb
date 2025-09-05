@@ -27,7 +27,7 @@ class UniformSampler ():
     def __init__(self, prior_bounds: dict = None ):
         """Initialise sampler with given prior bounds. 
 
-        :param prior_bounds: _description_
+        :param prior_bounds: dict of prior bounds
         :type prior_bounds: dict
         """
         self.prior_bounds = prior_bounds.copy()
@@ -79,15 +79,3 @@ class UniformSampler ():
         samples[10] = samples[10]*DAY_SI + t_obs_end # offset t_ref by the observation time
         return samples
     
-
-
-
-
-# def hpd_thresholder(grid: np.array, fun: callable, hpd: float = 0.9) -> int:
-#     f = fun(grid)
-#     sorted_pixels = np.sort(f)
-#     cumsum = np.cumsum(sorted_pixels)
-#     total_sum = cumsum[-1]
-#     threshold = hpd * total_sum
-#     idx = np.searchsorted(cumsum, threshold)
-#     return sorted_pixels[idx]

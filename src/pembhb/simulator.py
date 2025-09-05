@@ -59,7 +59,7 @@ class LISAMBHBSimulator():
             "model": conf["waveform_params"]["noise"],
             "return_type": "ASD"
         }
-        self.channels = conf["waveform_params"]["TDI"]
+        self.channels = conf["waveform_params"]["channels"]
         self.n_channels = len(self.channels)
         ASD = np.zeros((self.n_channels, self.freqs.shape[0]))
         lisasens_dict = {   'A': lisasens.A1TDISens, 
@@ -148,7 +148,7 @@ class LISAMBHBSimulator():
                 snr[i:batch_end] = snr_batch
 
     def get_SNR_FD(self,
-        signal
+        signal_FD
         ):
         """
         Obtain the SNR of a signal in frequency domain.
@@ -159,10 +159,10 @@ class LISAMBHBSimulator():
         :rtype: np.array
         """
     
-        SNR2 =  np.sum(signal*signal.conj()*self.df/self.PSD,axis=(1,2)).real * 4.0 
+        SNR2 =  np.sum(signal_FD*signal_FD.conj()*self.df/self.PSD,axis=(1,2)).real * 4.0 
         return np.sqrt(SNR2)
 
-
+    
 
     
 # if __name__ == "__main__":
@@ -197,7 +197,7 @@ class LISAMBHBSimulatorTD():
         orbits = EqualArmlengthOrbits(use_gpu=gpu_available)
         orbits.configure(linear_interp_setup=True)
         response_kwargs = {
-            "TDItag": "AET",
+            "TDItag": "AET", 
             "rescaled": False,
             "orbits": orbits
             }
@@ -213,42 +213,69 @@ class LISAMBHBSimulatorTD():
         self.t_obs_start_SI = 0.0 # seconds
         self.t_obs_end_SI = self.t_obs_start_SI + self.obs_time_SI # seconds
         self.dt = conf['waveform_params']['dt']
+        self.channels = conf["waveform_params"]["channels"]
+        self.n_channels = len(self.channels)
         # pad the time to power of 2 for the noise
         self.n_time_pt_noise = int(self.obs_time_SI / self.dt)
         self.df_noise = 1./self.n_time_pt_noise/self.dt
         self.grid_freq_noise = np.arange(1,self.n_time_pt_noise//2 +1 ) * self.df_noise
         self.f_len_noise = len(self.grid_freq_noise)
-        self.window_noise = tukey(self.n_time_pt_noise, alpha=0.05)
+        self.window_td = tukey(self.n_time_pt_noise, alpha=0.0005)
+        self.window_fd_noise = np.hanning(self.n_time_pt_noise//2 +1)
         #### set up the noise model
         psd_kwargs = {
             "model": conf["waveform_params"]["noise"],
             "return_type": "ASD"
         }
-        self.ASD = lisasens.get_sensitivity(self.grid_freq_noise, sens_fn = lisasens.A1TDISens, **psd_kwargs)
-        # high pass filter
-        self.ASD[self.grid_freq_noise < 5e-5] = 0.0
+        ASD = np.zeros((self.n_channels, self.grid_freq_noise.shape[0]))
+        lisasens_dict = {   'A': lisasens.A1TDISens, 
+                            'E': lisasens.E1TDISens,
+                            'T': lisasens.T1TDISens, 
+                            'X': lisasens.X1TDISens,
+                            'Y': lisasens.Y1TDISens,
+                            'Z': lisasens.Z1TDISens
+                        }
+    
+        for i, channel in enumerate(self.channels):
+            if channel not in lisasens_dict:
+                raise ValueError(f"Channel {channel} is not supported. Supported channels are: {list(lisasens_dict.keys())}")
+            ASD[i] = lisasens.get_sensitivity(self.grid_freq_noise, sens_fn=lisasens_dict[channel], **psd_kwargs)
+
+        ASD[:,self.grid_freq_noise < 5e-5] =0.0 
+        self.ASD = ASD
+
         self.PSD = self.ASD**2
         # self.noise_factor will undergo ifft: ifft expects the output format of np.fft. 
         # the output of fft is such that out[0] is the DC component, out[:n//2] is the positive frequencies and out[n//2:] is the negative frequencies
         # look at https://numpy.org/doc/stable/reference/routines.fft.html#module-numpy.fft . 
-        self.noise_factor = np.concatenate(([0.0],self.ASD[1:], self.ASD[::-1].conj()))/np.sqrt(4*self.df_noise)
+        self.noise_factor = np.concatenate(([[0.0]]*self.n_channels,self.ASD[:,1:], self.ASD[:,::-1].conj()), axis=1)/np.sqrt(4*self.df_noise)
         self.noise_rng = np.random.default_rng(seed=0)
 
-    
+        self.channels = conf["waveform_params"]["channels"]
+        channel_idx = [ i for i, c in enumerate(["A", "E", "T"]) if c in self.channels ]
         self.waveform_kwargs = {
             #"freqs": self.grid_freq,
             "modes": conf["waveform_params"]["modes"],
-            "out_channel": 0,
+            "out_channel": channel_idx,
             "length": 1024,
             "t_obs_start": self.t_obs_start_SI/ YRSID_SI, 
             "t_obs_end": self.t_obs_end_SI/ YRSID_SI,
             "dt": self.dt
             }
-        self.channels = conf["waveform_params"]["TDI"]
         self.n_channels = len(self.channels)
 
         self.sampler = UniformSampler(**sampler_init_kwargs)
-        ################################
+    def generate_noise_td( self, n_observations):
+        noise_fd = self.noise_rng.normal(loc= 0.0,size = (n_observations , self.n_channels, self.f_len_noise)) + 1j*self.noise_rng.normal(loc= 0.0,size = (n_observations , self.n_channels, self.f_len_noise))
+        #noise_fd *= self.window_fd_noise
+        two_sided_noise = self.noise_factor * np.concatenate((noise_fd,noise_fd[::-1].conj()), axis=-1)
+        two_sided_noise[..., 0] = 0.0 + 1j *0.0 #Force the DC component to be 0
+        noise_td_cmplx = np.fft.ifft(two_sided_noise)/self.dt
+        noise_td = noise_td_cmplx[:self.n_time_pt_noise].real
+        return noise_td, two_sided_noise[...,1:self.f_len_noise+1]
+    def generate_signal_td( self, injection: np.array):
+        signal_td = self.waveform_generator(*injection, **self.waveform_kwargs) 
+        return signal_td
 
     def generate_d_f(self, injection: np.array):
         """ Generate simulated data in frequency domain given the injection parameters.
@@ -263,30 +290,21 @@ class LISAMBHBSimulatorTD():
         # insert a set of zeros between injection[5] and injection[6]. this is the f_ref parameter , which in bbhx can be set to 0 in order to set f_ref @ t_chirp
         injection = np.insert(injection, 6, np.zeros(injection[5].shape), axis=0) 
         n_observations = injection.shape[1]
-        noise_fft = np.random.normal(loc= 0.0,size = (n_observations , self.f_len_noise)) + 1j*np.random.normal(loc= 0.0,size = (n_observations , self.f_len_noise))
-
-        #apply a filter 
-        #if window_filter is not None:
-        #    noise_fft *= window_filter
-        full_noise_fft = self.noise_factor * np.concatenate((noise_fft,noise_fft[::-1].conj()), axis=1)
-        full_noise_fft[0] = 0.0 + 1j *0.0 #Force f=0 to be 0
-        noise_td_full = np.fft.ifft(full_noise_fft)
-        noise_td = noise_td_full[:self.n_time_pt_noise].real
-
-        # add noise 
-        signal_td = self.waveform_generator(*injection, **self.waveform_kwargs) 
+ # add noise 
+        noise_td , noise_fd = self.generate_noise_td(n_observations)
+        signal_td = self.generate_signal_td(injection)
         wave_TD = signal_td + noise_td
         # Apply window to time-domain signal
-        wave_TD_windowed = wave_TD * self.window_noise
+        wave_TD_windowed = wave_TD * self.window_td
         # Compute the real FFT along the time axis (assume wave_TD shape is (n_observations, n_time_pt_noise))
-        wave_FD_raw = np.fft.rfft(wave_TD_windowed, axis=1)
+        wave_FD_raw = np.fft.rfft(wave_TD_windowed)
         # Remove the DC component (first frequency bin)
-        wave_FD_no_dc = wave_FD_raw[:, 1:]
+        wave_FD_no_dc = wave_FD_raw[...,1:]
         # Convert to complex64
         wave_FD_complex = wave_FD_no_dc.astype(np.complex64)
         # Multiply by dt and ASD
-        wave_FD = wave_FD_complex * self.dt * self.ASD
-        return (wave_TD[0].astype(np.float32), wave_FD)
+        wave_FD = wave_FD_complex * self.dt #/ self.ASD
+        return (wave_TD.astype(np.float32), wave_FD, noise_fd)
     
     def _sample(self, N=1): 
         """Draw one sample from the joint distribution, first sampling parameters from the prior and then generating the data in frequency domain.
@@ -297,8 +315,8 @@ class LISAMBHBSimulatorTD():
         :rtype: dict
         """
         z_samples, tmnre_input = self.sampler.sample(N, self.t_obs_end_SI)
-        data_td, data_fd = self.generate_d_f(z_samples)
-        out_dict = {"parameters": tmnre_input, "data_td": data_td, "data_fd": data_fd}
+        data_td, data_fd, noise_fd = self.generate_d_f(z_samples)
+        out_dict = {"parameters": tmnre_input, "data_td": data_td, "data_fd": data_fd, "noise_fd": noise_fd}
         return out_dict
     
     def sample_and_store(self, filename:str, N:int, batch_size=None): 
@@ -317,8 +335,11 @@ class LISAMBHBSimulatorTD():
         
         with h5py.File(filename, "a") as f:
             source_params = f.create_dataset("source_parameters", shape=(N, 11), dtype=np.float32)
-            data_fd = f.create_dataset("data_fd", shape=(N, 4, self.n_pt), dtype=np.float32)
-            data_td = f.create_dataset("data_td", shape=(N, self.time_pt), dtype=np.float32)
+            sample_frequencies = f.create_dataset("frequencies", data=self.grid_freq_noise, dtype=np.float32)
+            sample_times_SI = f.create_dataset("times_SI", data=np.arange(0, self.n_time_pt_noise)*self.dt, dtype=np.float32)
+            data_fd = f.create_dataset("data_fd", shape=(N, 2*self.n_channels, self.n_time_pt_noise//2), dtype=np.float32)
+            data_td = f.create_dataset("data_td", shape=(N, self.n_channels, self.n_time_pt_noise), dtype=np.float32)
+            noise_fd = f.create_dataset("noise_fd", shape=(N, self.n_channels, self.n_time_pt_noise//2), dtype=np.complex64)
             snr = f.create_dataset("snr", shape = (N,), dtype=np.float32)
             psd_dataset = f.create_dataset("psd", data=self.PSD, dtype=np.float32)
             print("Sampling and storing simulations to ", filename)
@@ -326,15 +347,16 @@ class LISAMBHBSimulatorTD():
                 batch_end = min(i + batch_size, N)
                 batch_size_actual = batch_end - i
                 out = self._sample(batch_size_actual)
-
                 z_samples = out["parameters"]
                 data_fd_batch = out["data_fd"]
                 data_td_batch = out["data_td"]
+                noise_fd_batch = out["noise_fd"]
                 snr_batch = self.get_SNR_FD(data_fd_batch)
                 data_fd_amp_phase = np.concatenate((np.abs(data_fd_batch), np.angle(data_fd_batch)), axis=1)
                 source_params[i:batch_end] = z_samples.T # Reshape to (batch_size, 11) instead of (11, batch_size)
                 data_fd[i:batch_end] = data_fd_amp_phase
                 data_td[i:batch_end] = data_td_batch
+                noise_fd[i:batch_end] = noise_fd_batch
                 snr[i:batch_end] = snr_batch
     
     def get_SNR_FD(self,
@@ -343,13 +365,19 @@ class LISAMBHBSimulatorTD():
         """
         Obtain the SNR of a signal in frequency domain.
 
-        :param signal: data in frequency domain, output by bbhx with shape (n_samples, 3, n_freqs)
+        :param signal: data in frequency domain, output by bbhx with shape (n_samples, n_channels, n_freqs)
         :type signal: np.array
         :return: SNR values with shape (n_samples,)
         :rtype: np.array
         """
     
-        SNR2 =  np.sum(signal*signal.conj()*self.df/self.PSD,axis=(1,2)).real * 4.0 
+        prod = signal * signal.conj()
+        high_pass_idx =  self.grid_freq_noise >= 5e-5
+        weighted = prod[..., high_pass_idx] * self.df_noise / self.PSD[...,high_pass_idx]
+        summed = np.sum(weighted, axis=(1, 2))
+        real_part = summed.real
+        SNR2 = real_part * 4.0
+        
         return np.sqrt(SNR2)
 
 
