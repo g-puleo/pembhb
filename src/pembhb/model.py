@@ -88,7 +88,6 @@ class MarginalClassifierHead(nn.Module):
     def forward(self, features, parameters):
         outputs = []
         for i, marginal in enumerate(self.marginals):
-            # breakpoint()
             indices = marginal
             input_data = torch.cat([features, parameters[:, indices]], dim=-1)
             outputs.append(self.classifiers[i](input_data))
@@ -162,20 +161,22 @@ class InferenceNetwork(LightningModule):
         self.log('train_loss', loss , on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
-        for i, marginal in enumerate(self.marginals):
-            self.log(f'train_accuracy_{i}', accuracy_params[i], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-            self.log(f'train_loss_{i}', loss_params[i], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        return loss 
-    
+        for d_idx, domain in enumerate(self.marginals.keys()):
+            for i, marginal in enumerate(self.marginals[domain]):
+                self.log(f'train_accuracy_{domain}_{i}', accuracy_params[i], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+                self.log(f'train_loss_{domain}_{i}', loss_params[i], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        return loss
+
     def validation_step(self, batch, batch_idx):
         all_logits, loss_params, loss= self.calc_logits_losses(batch['data_fd'], batch["data_td"], batch['source_parameters'])
         accuracy_params, accuracy = self.calc_accuracies(all_logits)
         self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('val_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        for i, marginal in enumerate(self.marginals):
-            self.log(f'val_accuracy_{i}', accuracy_params[i], on_step=False, on_epoch=True, prog_bar=True, logger=True)
-            self.log(f'val_loss_{i}', loss_params[i], on_step=False, on_epoch=True, prog_bar=True, logger=True)
-            
+        for d_idx, domain in enumerate(self.marginals):
+            for i, marginal in enumerate(self.marginals[domain]):
+                self.log(f'val_accuracy_{domain}_{i}', accuracy_params[i], on_step=False, on_epoch=True, prog_bar=True, logger=True)
+                self.log(f'val_loss_{domain}_{i}', loss_params[i], on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
         return loss
     
     def test_step(self, batch, batch_idx):
@@ -183,8 +184,10 @@ class InferenceNetwork(LightningModule):
         accuracy_params, accuracy = self.calc_accuracies(all_logits)
         # print accuracies on test set
         self.log('test_acc', accuracy, on_step=False, on_epoch=True)
-        for i, marginal in enumerate(self.marginals):
-            self.log(f'test_accuracy_{i}', accuracy_params[i], on_step=False, on_epoch=True)
+        for d_idx, domain in enumerate(self.marginals):
+            for i, marginal in enumerate(self.marginals[domain]):
+                self.log(f'test_accuracy_{domain}_{i}', accuracy_params[i], on_step=False, on_epoch=True)
+
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=self.scheduler_factor, patience=self.scheduler_patience, min_lr=1e-6)
@@ -204,7 +207,7 @@ class InferenceNetwork(LightningModule):
         }
 
 class SimpleModel(torch.nn.Module):
-    def __init__(self, num_features: int, num_channels: int,  hlayersizes: tuple,  marginals: list[list], marginal_hidden_size: int, lr: float):  
+    def __init__(self, num_features: int, num_channels: int,  hlayersizes: tuple,  marginals: dict[list[list]], marginal_hidden_size: int, lr: float):  
         super().__init__()
 
         # self.normalise = nn.BatchNorm1d(num_features=num_channels, eps=1e-22)
@@ -218,7 +221,7 @@ class SimpleModel(torch.nn.Module):
             input_size = output_size
         
         self.logratios = MarginalClassifierHead(input_size, marginals=marginals, hidden_size=marginal_hidden_size)
-        self.marginals = marginals 
+        self.marginals = marginals
         
 
     def forward(self, x, parameters):
@@ -247,6 +250,13 @@ class PeregrineModel(torch.nn.Module):
         super().__init__()
         self.batch_size = conf["training"]["batch_size"]
         self.marginals = conf["tmnre"]["marginals"]
+        
+        # Validate keys of marginals
+        allowed_keys = {"f", "t", "ft"}
+        invalid_keys = set(self.marginals.keys()) - allowed_keys
+        if invalid_keys:
+            raise ValueError(f"Invalid keys in marginals: {invalid_keys}. Allowed keys are {allowed_keys}.")
+        
         self.bounds_trained = conf["prior"]
 
         n_channels =  len(conf["waveform_params"]["channels"])
@@ -270,12 +280,15 @@ class PeregrineModel(torch.nn.Module):
         self.flatten = nn.Flatten(1)
         self.linear_t = LinearCompression(n_timesteps)
         self.linear_f = LinearCompression(n_freqs)
+        self.logratios_model_dict = nn.ModuleDict()
+        for key in self.marginals.keys():
+            self.logratios_model_dict[key] = MarginalClassifierHead(
+                n_data_features=16*len(key),# key can be any of "f", "t", "ft", resulting in double input size if ft. 
+                marginals=self.marginals[key], 
+                hlayersizes=(32, 16, 8, 4)
+            ).to(conf["device"])
 
-        self.logratios_1d = MarginalClassifierHead(
-            n_data_features=32,
-            marginals=self.marginals, 
-            hlayersizes=(32, 16, 8, 4)
-        )
+
 
 
 
@@ -293,10 +306,24 @@ class PeregrineModel(torch.nn.Module):
         #print(f"flattened shape: {flattened.shape}")
         features_f = self.linear_f(flattened_f)
         features_t = self.linear_t(flattened_t)
-        features = torch.cat((features_f, features_t), dim=-1)
-        #print(f"features_f shape: {features_f.shape}")
-        logratios_1d = self.logratios_1d(features, parameters)
-        #print(f"logratios_1d shape: {logratios_1d.shape}")
+        features_ft = torch.cat((features_f, features_t), dim=-1)
+        
+        features_dict = {
+            "ft": features_ft,
+            "f": features_f,
+            "t": features_t
+        }
+        # print(f"features_t device: {features_t.device}")
+        # print(f"parameters device: {parameters.device}")
+        # print(f"features_f device: {features_f.device}")
+        # print(f"features_ft device: {features_ft.device}")
+        # #print(f"features_f shape: {features_f.shape}")
+
+        logratios_1d_list = []
+        for key in self.logratios_model_dict.keys():
+            #breakpoint()
+            logratios_1d_list.append(self.logratios_model_dict[key](features_dict[key], parameters))
+        logratios_1d = torch.cat(logratios_1d_list, dim=-1)
         return logratios_1d
 
 ### THIS CHUNK OF CODE IS DIRECTLY COPIED FROM PEREGRINE

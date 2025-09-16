@@ -19,7 +19,7 @@ prior:
   "lambda": [0.0, 6.28318530718]
   "beta": [-1.0, 1.0] # sin beta
   "psi": [0.0, 3.14159265358979]
-  "Deltat": [ 3, 3 ] # t_merger from end of observation in days
+  "Deltat": [ 0, 0 ] # t_merger from end of observation in days
 
 training: 
   batch_size: 100
@@ -30,4 +30,4 @@ training:
   scheduler_patience: 50
   early_stop_patience: 75
 tmnre:
-  marginals: [[0]]
+  marginals: [[0], [1], [0,1]]

@@ -215,7 +215,7 @@ def update_bounds(model: InferenceNetwork, observation_dataset: MBHBDataset, pri
     
     return updated_prior
 
-def pp_plot( dataset, model , low: float, high: float, inj_param_idx: int, name: str):  
+def pp_plot( dataset, model , low: float, high: float, inj_param_idx: int, name: str = None):  
     """Generate a pp plot using the examples in dataset, and the posteriors obtained by the model . 
     :param dataset: dataset used to make the pp plot
     :type dataset: MBHBDataset
@@ -227,6 +227,8 @@ def pp_plot( dataset, model , low: float, high: float, inj_param_idx: int, name:
     :type high: float
     :param inj_param_idx: index of the parameter that you want to make the pp plot for, with respect to the output of the model. 
     :type inj_param_idx: int
+    :param name: name of the plot, defaults to None
+    :type name: str, optional
     """
     logratios, injection_params, grid = get_logratios_grid(dataset, model, low=low, high=high, ngrid_points=100, inj_param_idx=inj_param_idx)
     p_values = get_pvalues_1d(logratios, grid, injection_params)
@@ -238,7 +240,8 @@ def pp_plot( dataset, model , low: float, high: float, inj_param_idx: int, name:
     ax.set_ylabel('P-value')
     ax.set_title(f'Sorted P-values, {name}')
     ax.grid(visible=True)
-    fig.savefig(os.path.join(ROOT_DIR, "plots", f"{name}_pp_plot.png"))
+    if name is not None:
+        fig.savefig(os.path.join(ROOT_DIR, "plots", f"{name}_pp_plot.png"))
     plt.close()
 
 def pp_plot_2d(dataset, model, lows: tuple, highs: tuple, inj_param_idx: tuple, out_idx: int, name: str):

@@ -290,7 +290,7 @@ class LISAMBHBSimulatorTD():
         # insert a set of zeros between injection[5] and injection[6]. this is the f_ref parameter , which in bbhx can be set to 0 in order to set f_ref @ t_chirp
         injection = np.insert(injection, 6, np.zeros(injection[5].shape), axis=0) 
         n_observations = injection.shape[1]
- # add noise 
+        # add noise 
         noise_td , noise_fd = self.generate_noise_td(n_observations)
         signal_td = self.generate_signal_td(injection)
         wave_TD = signal_td + noise_td
