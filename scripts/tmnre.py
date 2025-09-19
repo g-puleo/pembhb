@@ -3,6 +3,7 @@ import torch
 from pembhb.simulator import LISAMBHBSimulatorTD, DummySimulator
 from pembhb.model import InferenceNetwork, PeregrineModel
 from pembhb.data import MBHBDataModule, MBHBDataset
+
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
@@ -11,7 +12,7 @@ from lightning.pytorch.tuner import Tuner
 from torch.utils.data import DataLoader , random_split
 import numpy as np
 from pembhb import ROOT_DIR
-from pembhb.utils import read_config, update_bounds, pp_plot
+from pembhb.utils import read_config, update_bounds, pp_plot, pp_plot_2d, _ORDERED_PRIOR_KEYS
 import argparse 
 from datetime import datetime
 import matplotlib.pyplot as plt
@@ -40,7 +41,7 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
 
 
     checkpoint_callback = ModelCheckpoint(monitor='val_loss', mode='min')
-    early_stopping_callback = EarlyStopping(monitor='val_accuracy', patience=conf["training"]["early_stop_patience"], mode='min', stopping_threshold=0.8)
+    early_stopping_callback = EarlyStopping(monitor='val_accuracy', patience=conf["training"]["early_stop_patience"], mode='max', stopping_threshold=0.9)
     logger = TensorBoardLogger(os.path.join(ROOT_DIR, f"logs"), name=f"{TIME_OF_EXECUTION}_round_{idx}")
 
     trainer= Trainer(
@@ -109,10 +110,26 @@ if __name__ == "__main__":
         # else:
         trained_model, test_dataset = round(conf, sampler_init_kwargs={'prior_bounds': conf["prior"]}, lr=conf["training"]["learning_rate"], idx=i)
         
-        pp_plot(test_dataset, trained_model, low=conf["prior"]["logMchirp"][0], high=conf["prior"]["logMchirp"][1], inj_param_idx=0, name=f"round_{i}_logMchirp")
-        pp_plot(test_dataset, trained_model, low=conf["prior"]["q"][0], high=conf["prior"]["q"][1], inj_param_idx=1, name=f"round_{i}_q")
+        out_idx = 0
+        updated_prior = conf["prior"].copy()
+        for key in conf["tmnre"]["marginals"]:
+            marginal_list = conf["tmnre"]["marginals"][key]
+            for marginal in marginal_list: 
+                if len(marginal) == 1: 
+                    inj_par_idx = marginal[0]
+                    inj_par_name = _ORDERED_PRIOR_KEYS[inj_par_idx]
+                    pp_plot(test_dataset, trained_model, low=conf["prior"][inj_par_name][0], high=conf["prior"][inj_par_name][0], in_param_idx=0, name=f"round_{i}_{key}")
+                    updated_prior = update_bounds(trained_model, dataset_observation, updated_prior, in_param_idx=inj_par_idx, n_gridpoints=10000, out_param_idx=out_idx)
+                elif len(marginal) == 2:
+                    inj_par_idx1 = marginal[0]
+                    inj_par_idx2 = marginal[1]
+                    inj_par_name1 = _ORDERED_PRIOR_KEYS[inj_par_idx1]
+                    inj_par_name2 = _ORDERED_PRIOR_KEYS[inj_par_idx2]
+                    lows = [conf["prior"][inj_par_name1][0], conf["prior"][inj_par_name2][0]]
+                    highs = [conf["prior"][inj_par_name1][1], conf["prior"][inj_par_name2][1]]
+                    pp_plot_2d(test_dataset, trained_model, lows=lows, highs=highs, in_param_idx=marginal, name=f"round_{inj_par_name1}_{inj_par_name2}")
+                out_idx += 1
 
-        updated_prior = update_bounds(trained_model, dataset_observation, conf["prior"], in_param_idx=1, n_gridpoints=1000, out_param_idx=0)
         #updated_prior = update_bounds(trained_model, dataset_observation, updated_prior, parameter_idx=1, n_gridpoints=1000)
         print(f"Updated prior after round {i}:\nlog10Mchirp: {updated_prior['logMchirp']},\nmass ratio: {updated_prior['q']}\n")
         conf["prior"] = updated_prior

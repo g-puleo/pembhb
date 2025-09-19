@@ -12,6 +12,7 @@ from pembhb.simulator import LISAMBHBSimulator
 from pembhb.data import MBHBDataset
 from pembhb.utils import get_pvalues_1d
 from torch.utils.data import DataLoader
+from glob import glob
 
 # def load_wronglysaved_model():
 #     model_checkpoint = torch.load("/u/g/gpuleo/pembhb/logs_0725/peregrine_norm/version_8/checkpoints/epoch=960-step=43245.ckpt")
@@ -105,28 +106,33 @@ def plot_posterior_grid(data: np.array, injected_params: np.array, model: Infere
     # torch.cuda.empty_cache()
 if __name__ == "__main__":
 
-    dataset = MBHBDataset(os.path.join(ROOT_DIR, "data", "simulate_testset100.h5"), transform_fd='log', transform_td='normalise_max', device='cuda')
+    dataset = MBHBDataset(os.path.join(ROOT_DIR, "data", "test_examples_seed314.h5"), transform_fd='log', transform_td='normalise_max', device='cuda')
 
     # for i in range(20):
     #     datum = dataset.__getitem__(i)
 
     #     data_fd = datum["data_fd"][np.newaxis, :,:]
     #     source_par = datum["source_parameters"]
-    fname = "/u/g/gpuleo/pembhb/logs/20250917_164212_round_0/version_0/checkpoints/epoch=222-step=94775.ckpt"
-    conf = utils.read_config(os.path.join(ROOT_DIR,"config_td.yaml"))
-    model = InferenceNetwork.load_from_checkpoint(fname, conf=conf)
+    fname = "logs/20250919_133507_round_0/version_0/checkpoints/epoch=6-step=2975.ckpt" # tc model, 0.8 threshold
+    fname = glob("/u/g/gpuleo/pembhb/logs/20250917_093320_round_0/version_0/checkpoints/*.ckpt")[0]#mass ratio only
+    #fname = glob("/u/g/gpuleo/pembhb/logs/20250919_141212_round_0/version_0/checkpoints/*.ckpt")[0]#tc only, 0.9 threshold
+
+    #conf = utils.read_config(os.path.join(ROOT_DIR,"config_td.yaml"))
+    model = InferenceNetwork.load_from_checkpoint(fname)
     model.eval()
 
     #     plot_posterior_grid(data_fd, source_par , model, i)
-    logratios, injection_params, grid = utils.get_logratios_grid(dataset, model, low=5, high=6, ngrid_points=100, in_param_idx=10, out_param_idx=0)
+    #logratios, injection_params, grid = utils.get_logratios_grid(dataset, model, low=-3, high=-1, ngrid_points=1000, in_param_idx=10, out_param_idx=0)
+    logratios, injection_params, grid = utils.get_logratios_grid(dataset, model, low=1, high=5, ngrid_points=1000, in_param_idx=1, out_param_idx=0)
     p_values = get_pvalues_1d(logratios, grid, injection_params)
     sorted_pvalues = np.sort(p_values)
     sorted_rank = np.arange(sorted_pvalues.shape[0])
+    sorted_rank_normalised = sorted_rank / sorted_rank.max()
     fig, ax  = plt.subplots(figsize=(10, 6))
-    ax.plot(sorted_rank, sorted_pvalues, marker='o', linestyle='-', markersize=3)
-    ax.set_xlabel('Rank')
-    ax.set_ylabel('P-value')
-    ax.set_title('Sorted P-values')
+    ax.plot(sorted_pvalues, sorted_rank_normalised , marker='o', linestyle='-', markersize=3)
+    ax.set_xlabel('credibility level (HPD)')
+    ax.set_ylabel('empirical coverage')
+    ax.set_title('p-p plot for mass ratio')
     ax.grid(visible=True)
-    fig.savefig(os.path.join(ROOT_DIR, "plots", "pvalues_plot_tc.png"))
+    fig.savefig(os.path.join(ROOT_DIR, "plots", "pvalues_plot_q.png"))
     plt.close()

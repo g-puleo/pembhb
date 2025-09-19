@@ -81,7 +81,7 @@ def get_logratios_grid(dataset: MBHBDataset, model: InferenceNetwork, low: float
             batched2dataset = TensorDataset(batched_data_fd, batched_data_td, batched_grid)
             batched2dataloader = DataLoader(batched2dataset, batch_size=50, shuffle=False)
             logratios_list = []
-            for batch2 in tqdm(batched2dataloader):
+            for batch2 in batched2dataloader:
                 batched2_data_fd, batched2_data_td, batched2_grid = batch2
                 batched2_data_fd = batched2_data_fd.to("cuda")
                 batched2_data_td = batched2_data_td.to("cuda")
@@ -128,9 +128,9 @@ def get_logratios_grid_2d(dataset: MBHBDataset, model: InferenceNetwork, lows: f
             batched_grid = grid_expanded.reshape(-1, grid_expanded.shape[-1])  # Flatten batch and ngrid_points
             batched_data_td = data_td_expanded.reshape(-1, data_td_expanded.shape[-2], data_td_expanded.shape[-1])
             batched2dataset = TensorDataset(batched_data_fd, batched_data_td, batched_grid)
-            batched2dataloader = DataLoader(batched2dataset, batch_size=50, shuffle=False)
+            batched2dataloader = DataLoader(batched2dataset, batch_size=75, shuffle=False)
             logratios_list = []
-            for batch2 in tqdm(batched2dataloader):
+            for batch2 in batched2dataloader:
                 batched2_data_fd, batched2_data_td, batched2_grid = batch2
                 batched2_data_fd = batched2_data_fd.to("cuda")
                 batched2_data_td = batched2_data_td.to("cuda")
@@ -199,36 +199,27 @@ def get_pvalues_2d(logratios: np.array, grid_0: np.array , grid_1: np.array, inj
 
     # flatten spatial dimensions for sorting
     probs_flat = probs.reshape(probs.shape[0], -1)  # shape (batch_size, n_grid_0*n_grid_1)
-
     # sort probabilities in descending order
     sort_idx = np.argsort(-probs_flat, axis=1)  # shape (batch_size, n_grid_0*n_grid_1)
-
     # apply sorting
     probs_sorted = np.take_along_axis(probs_flat, sort_idx, axis=1)  # shape (batch_size, n_grid_0*n_grid_1)
-
     # normalise so total probability sums to 1
     probs_sorted /= probs_sorted.sum(axis=1, keepdims=True)  # shape (batch_size, n_grid_0*n_grid_1)
-
     # cumulative distribution
     cumsum_probs = np.cumsum(probs_sorted, axis=1)  # shape (batch_size, n_grid_0*n_grid_1)
-
     # flatten the grid into list of coordinates
     grid_points = np.stack([grid_0.flatten(), grid_1.flatten()], axis=-1)  # shape (n_grid_0*n_grid_1, 2)
-
     # for each injection, find nearest grid point index
     diffs = inj_param[:, None, :] - grid_points[None, :, :]  # shape (batch_size, n_grid_0*n_grid_1, 2)
     dists = np.linalg.norm(diffs, axis=-1)  # shape (batch_size, n_grid_0*n_grid_1)
     inj_idx = np.argmin(dists, axis=1)  # shape (batch_size,)
-
     # map from original flat index to sorted index
     # first, invert sorting to get rank positions
     inv_sort_idx = np.argsort(sort_idx, axis=1)  # shape (batch_size, n_grid_0*n_grid_1)
-
     # find the rank of the injected point inside the sorted array
     inj_rank = np.take_along_axis(inv_sort_idx, inj_idx[:, None], axis=1).squeeze(-1)  # shape (batch_size,)
-
     # extract p-values from cumulative sums
-    pvalues = np.take_along_axis(cumsum_probs, inj_rank[:, None], axis=1).squeeze(-1)  # shape (batch_size,)
+    pvalues  = np.take_along_axis(cumsum_probs, inj_rank[:, None], axis=1).squeeze(-1)  # shape (batch_size,)
 
     return pvalues  # shape (batch_size,)
 
@@ -240,7 +231,7 @@ def get_pvalues_2d(logratios: np.array, grid_0: np.array , grid_1: np.array, inj
 
 
 
-def update_bounds(model: InferenceNetwork, observation_dataset: MBHBDataset, priordict: dict, in_param_idx: int, n_gridpoints: int = 10000, out_param_idx: int = None, eps: float = 1e-5):
+def update_bounds(model: InferenceNetwork, observation_dataset: MBHBDataset, priordict: dict, in_param_idx: int, n_gridpoints: int = 100000, out_param_idx: int = None, eps: float = 1e-5):
     """Update the prior bounds based on the posterior obtained from a model on a single observation. 
     Used to do truncation in MNRE. 
 
@@ -257,7 +248,7 @@ def update_bounds(model: InferenceNetwork, observation_dataset: MBHBDataset, pri
     :return: updated prior bounds
     :rtype: dict
     """
-
+    print(f"Updating prior bounds for {_ORDERED_PRIOR_KEYS[in_param_idx]}...")
     # evaluate the model over a decently fine grid, which requires knowledge of previous prior region 
     prior_low, prior_high = priordict[_ORDERED_PRIOR_KEYS[in_param_idx]]
     logratios, injection_params, grid = get_logratios_grid(observation_dataset, model, prior_low, prior_high, n_gridpoints, in_param_idx=in_param_idx, out_param_idx=out_param_idx)
@@ -293,6 +284,7 @@ def pp_plot( dataset, model , low: float, high: float, in_param_idx: int, name: 
     :param name: name of the plot, defaults to None
     :type name: str, optional
     """
+    print(f"Making pp plot for {name}...")
     logratios, injection_params, grid = get_logratios_grid(dataset, model, low=low, high=high, ngrid_points=100, in_param_idx=in_param_idx, out_param_idx=out_param_idx)
     p_values = get_pvalues_1d(logratios, grid, injection_params)
     sorted_pvalues = np.sort(p_values)
@@ -308,10 +300,21 @@ def pp_plot( dataset, model , low: float, high: float, in_param_idx: int, name: 
     plt.close()
 
 def pp_plot_2d(dataset, model, lows: tuple, highs: tuple, inj_param_idx: tuple, out_idx: int, name: str):
-
-    dataset = MBHBDataset(dataset, channels="AE")
-
-
+    print(f"Making pp plot for {name}...")
+    logratios, injection_params, grid_x, grid_y = get_logratios_grid_2d(dataset, model, lows=lows, highs=highs, ngrid_points=50, inj_param_idx=inj_param_idx, out_idx=out_idx)
+    p_values = get_pvalues_2d(logratios, grid_x, grid_y, injection_params)
+    sorted_pvalues = np.sort(p_values)
+    sorted_normalised_rank = np.arange(sorted_pvalues.shape[0])/sorted_pvalues.shape[0]
+    fig, ax  = plt.subplots(figsize=(10, 6))
+    ax.plot( sorted_pvalues, sorted_normalised_rank, marker='o', linestyle='-', markersize=3)
+    ax.plot([0,1],[0,1], linestyle='--', color='red')
+    ax.set_xlabel('HPD level')
+    ax.set_ylabel('empirical coverage')
+    ax.set_title(f'P-P plot, {name}')
+    ax.grid(visible=True)
+    if name is not None:
+        fig.savefig(os.path.join(ROOT_DIR, "plots", f"{name}_pp_plot_2d.png"))
+    plt.close()
 if __name__ == "__main__":
     fname = "/u/g/gpuleo/pembhb/logs_0729/peregrine_norm/version_1/checkpoints/epoch=93-step=16920.ckpt"
     conf = read_config(os.path.join(ROOT_DIR,"config.yaml"))

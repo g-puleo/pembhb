@@ -191,7 +191,7 @@ class LISAMBHBSimulator():
 
 class LISAMBHBSimulatorTD(): 
 
-    def __init__(self, conf, sampler_init_kwargs):
+    def __init__(self, conf, sampler_init_kwargs, seed=0):
         super().__init__()
         # initialise the waveform generator
         orbits = EqualArmlengthOrbits(use_gpu=gpu_available)
@@ -249,7 +249,7 @@ class LISAMBHBSimulatorTD():
         # the output of fft is such that out[0] is the DC component, out[:n//2] is the positive frequencies and out[n//2:] is the negative frequencies
         # look at https://numpy.org/doc/stable/reference/routines.fft.html#module-numpy.fft . 
         self.noise_factor = np.concatenate(([[0.0]]*self.n_channels,self.ASD[:,1:], self.ASD[:,::-1].conj()), axis=1)/np.sqrt(4*self.df_noise)
-        self.noise_rng = np.random.default_rng(seed=0)
+        self.noise_rng = np.random.default_rng(seed=seed)
 
         self.channels = conf["waveform_params"]["channels"]
         channel_idx = [ i for i, c in enumerate(["A", "E", "T"]) if c in self.channels ]
