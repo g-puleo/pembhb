@@ -40,7 +40,7 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
 
 
     checkpoint_callback = ModelCheckpoint(monitor='val_loss', mode='min')
-    early_stopping_callback = EarlyStopping(monitor='val_loss', patience=conf["training"]["early_stop_patience"], mode='min')
+    early_stopping_callback = EarlyStopping(monitor='val_accuracy', patience=conf["training"]["early_stop_patience"], mode='min', stopping_threshold=0.8)
     logger = TensorBoardLogger(os.path.join(ROOT_DIR, f"logs"), name=f"{TIME_OF_EXECUTION}_round_{idx}")
 
     trainer= Trainer(
@@ -76,7 +76,7 @@ if __name__ == "__main__":
     config_path = args.config
     conf = read_config(config_path)
 
-    dataset_observation = MBHBDataset(os.path.join(ROOT_DIR, "data/observation.h5"), conf["training"]["transform"])
+    dataset_observation = MBHBDataset(os.path.join(ROOT_DIR, "data/observation.h5"),transform_fd=conf["training"]["transform_fd"], transform_td=conf["training"]["transform_td"])
     # load observation
 
     # Create a figure with two subplots
@@ -112,8 +112,8 @@ if __name__ == "__main__":
         pp_plot(test_dataset, trained_model, low=conf["prior"]["logMchirp"][0], high=conf["prior"]["logMchirp"][1], inj_param_idx=0, name=f"round_{i}_logMchirp")
         pp_plot(test_dataset, trained_model, low=conf["prior"]["q"][0], high=conf["prior"]["q"][1], inj_param_idx=1, name=f"round_{i}_q")
 
-        updated_prior = update_bounds(trained_model, dataset_observation, conf["prior"], parameter_idx=0, n_gridpoints=1000)
-        updated_prior = update_bounds(trained_model, dataset_observation, updated_prior, parameter_idx=1, n_gridpoints=1000)
+        updated_prior = update_bounds(trained_model, dataset_observation, conf["prior"], in_param_idx=1, n_gridpoints=1000, out_param_idx=0)
+        #updated_prior = update_bounds(trained_model, dataset_observation, updated_prior, parameter_idx=1, n_gridpoints=1000)
         print(f"Updated prior after round {i}:\nlog10Mchirp: {updated_prior['logMchirp']},\nmass ratio: {updated_prior['q']}\n")
         conf["prior"] = updated_prior
         

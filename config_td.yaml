@@ -22,14 +22,15 @@ prior:
 training: 
   batch_size: 100
   epochs: 1000
-  learning_rate: 0.00001
-  transform: "log" # options: "none", "logwhiten", "log", "whiten"
+  learning_rate: 0.0001
+  transform_td: "normalise_max" # options: "none", "logwhiten", "log", "whiten"
+  transform_fd: "log" # options: "none", "logwhiten", "log", "whiten", "normalise_max"
   early_stop_patience: 30
   scheduler_factor: 0.3
   scheduler_patience: 10
   
 tmnre:
   marginals: 
-    f: [[0], [1], [0,1]]
+    t: [[10]]
 
 device: "cuda"

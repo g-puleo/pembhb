@@ -105,20 +105,20 @@ def plot_posterior_grid(data: np.array, injected_params: np.array, model: Infere
     # torch.cuda.empty_cache()
 if __name__ == "__main__":
 
-    dataset = MBHBDataset(os.path.join(ROOT_DIR, "testset.h5"), channels="AE")
+    dataset = MBHBDataset(os.path.join(ROOT_DIR, "data", "simulate_testset100.h5"), transform_fd='log', transform_td='normalise_max', device='cuda')
 
     # for i in range(20):
     #     datum = dataset.__getitem__(i)
 
     #     data_fd = datum["data_fd"][np.newaxis, :,:]
     #     source_par = datum["source_parameters"]
-    fname = "/u/g/gpuleo/pembhb/logs/20250804_125709/round_1/version_0/checkpoints/epoch=36-step=3330.ckpt"
-    conf = utils.read_config(os.path.join(ROOT_DIR,"config.yaml"))
+    fname = "/u/g/gpuleo/pembhb/logs/20250917_164212_round_0/version_0/checkpoints/epoch=222-step=94775.ckpt"
+    conf = utils.read_config(os.path.join(ROOT_DIR,"config_td.yaml"))
     model = InferenceNetwork.load_from_checkpoint(fname, conf=conf)
     model.eval()
 
     #     plot_posterior_grid(data_fd, source_par , model, i)
-    logratios, injection_params, grid = utils.get_logratios_grid(dataset, model, low=5, high=6, ngrid_points=100, inj_param_idx=0)
+    logratios, injection_params, grid = utils.get_logratios_grid(dataset, model, low=5, high=6, ngrid_points=100, in_param_idx=10, out_param_idx=0)
     p_values = get_pvalues_1d(logratios, grid, injection_params)
     sorted_pvalues = np.sort(p_values)
     sorted_rank = np.arange(sorted_pvalues.shape[0])
@@ -128,5 +128,5 @@ if __name__ == "__main__":
     ax.set_ylabel('P-value')
     ax.set_title('Sorted P-values')
     ax.grid(visible=True)
-    fig.savefig(os.path.join(ROOT_DIR, "plots", "pvalues_plot.png"))
+    fig.savefig(os.path.join(ROOT_DIR, "plots", "pvalues_plot_tc.png"))
     plt.close()

@@ -285,7 +285,7 @@ class PeregrineModel(torch.nn.Module):
             self.logratios_model_dict[key] = MarginalClassifierHead(
                 n_data_features=16*len(key),# key can be any of "f", "t", "ft", resulting in double input size if ft. 
                 marginals=self.marginals[key], 
-                hlayersizes=(32, 16, 8, 4)
+                hlayersizes=(32, 16, 8, 4)### (100,100,100,100,50,25,10)
             ).to(conf["device"])
 
 
