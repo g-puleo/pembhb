@@ -7,14 +7,14 @@ parser = argparse.ArgumentParser(description="Plot samples from HDF5 file")
 parser.add_argument("filename", type=str, help="Path to the .h5 file")
 args = parser.parse_args()
 filename = args.filename
+plt.figure(figsize=(4,3))
 with h5py.File(filename, 'r') as f:
     snr = f['snr'][:]
     print(f.keys())
     #params = f['source_parameters'][:]
-plt.hist(snr, bins=50, color='blue', alpha=0.7)
+plt.hist(snr, bins=np.logspace(np.log10(snr.min()), np.log10(snr.max()), 50), color='blue', alpha=0.7)
 plt.xlabel('SNR')
-plt.ylabel('Count')
+plt.ylabel('Number of events')
 plt.xscale('log')
-plt.title('Histogram of SNR')
 plt.grid(True)
-plt.savefig('snr_histogram.png')
+plt.savefig('snr_histogram.png' , dpi=300, bbox_inches='tight')

@@ -17,7 +17,7 @@ prior:
   "lambda": [0.0, 6.28318530718]
   "beta": [-1.0, 1.0] # sin beta
   "psi": [0.0, 3.14159265358979]
-  "Deltat": [ -3, -1 ] # t_merger from end of observation in days
+  "Deltat": [ 1, 3 ] # t_merger from end of observation in days
 
 training: 
   batch_size: 100
@@ -25,12 +25,15 @@ training:
   learning_rate: 0.0001
   transform_td: "normalise_max" # options: "none", "logwhiten", "log", "whiten"
   transform_fd: "log" # options: "none", "logwhiten", "log", "whiten", "normalise_max"
-  early_stop_patience: 30
+  early_stop_patience: 20
   scheduler_factor: 0.3
   scheduler_patience: 10
   
 tmnre:
   marginals: 
+    f: [[0]]
+    ft: [[1], [0,1]]
     t: [[10]]
+
 
 device: "cuda"

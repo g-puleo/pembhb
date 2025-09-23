@@ -67,15 +67,14 @@ class UniformSampler ():
         :return: MBHB parameters in the following order: m1, m2, chi1, chi2, distance, phase, inclination, lambda, beta, psi, Deltat
         :rtype: np.array
         """
-    
-        samples[0:2] = lMcq_m1m2(samples[0:2]) # log(Mc), q --> m1, m2
-        samples[4] = np.cbrt(samples[4]) * 1e9 * PC_SI # d^3 -->distance
+        samples_ = samples.copy()
+        samples_[0:2] = lMcq_m1m2(samples_[0:2]) # log(Mc), q --> m1, m2
+        samples_[4] = np.cbrt(samples_[4]) * 1e9 * PC_SI # d^3 -->distance
         # 5: phase is already in 0,2pi
-        samples[6] = np.arccos(samples[6]) # cos(inclination)-->inclination in [0,pi]
+        samples_[6] = np.arccos(samples_[6]) # cos(inclination)-->inclination in [0,pi]
         # 7: lambda is already in 0,2pi
-        samples[8] = np.arcsin(samples[8]) # sin(beta)--> beta in [-pi/2, pi/2] (ecliptic latitude)
+        samples_[8] = np.arcsin(samples_[8]) # sin(beta)--> beta in [-pi/2, pi/2] (ecliptic latitude)
         # 9: psi is already in 0,pi
-        # 10: Deltat is already in seconds   
-        samples[10] = samples[10]*DAY_SI + t_obs_end # offset t_ref by the observation time
-        return samples
-    
+        # 10: Deltat is already in seconds
+        samples_[10] = samples_[10]*DAY_SI + t_obs_end # offset t_ref by the observation time
+        return samples_

@@ -88,7 +88,7 @@ class LISAMBHBSimulator():
         :rtype: np.array
         """
         # adjust sky position in the Lframe:
-        injection[-1] = injection[-1] + self.waveform_kwargs["t_obs_end"]*YRSID_SI
+        injection[-1] = injection[-1] #+ self.waveform_kwargs["t_obs_end"]*YRSID_SI
         injection[-1], injection[-4], injection[-3],  injection[-2] = LISA_to_SSB(injection[-1], injection[-4], injection[-3], injection[-2])
         f_len = len(self.freqs)
         n_samples = injection.shape[1]
@@ -96,11 +96,12 @@ class LISAMBHBSimulator():
         noise_fd = noise_fft * self.ASD * np.hanning(self.n_pt)
         # Insert a set of zeros between injection[5] and injection[6]. this is the f_ref parameter , which in bbhx can be set to 0 in order to set f_ref @ t_chirp
         injection = np.insert(injection, 6, np.zeros(injection[5].shape), axis=0) 
+        print(f"running waveform generator with injection \n{injection}\n and waveform kwargs \n{self.waveform_kwargs}")
         wave_FD = self.waveform_generator(*injection, **self.waveform_kwargs)[:, :2, :]
 
         simulated_data_fd = (noise_fd + wave_FD)
         # stack real and imaginary parts over channels
-        return simulated_data_fd
+        return simulated_data_fd, wave_FD
 
     def _sample(self, N=1): 
         """Draw one sample from the joint distribution, first sampling parameters from the prior and then generating the data in frequency domain.
@@ -278,7 +279,7 @@ class LISAMBHBSimulatorTD():
         return signal_td
 
     def generate_d_f(self, injection: np.array):
-        """ Generate simulated data in frequency domain given the injection parameters.
+        """ Generate simulated data in frequency and time domain given the injection parameters.
 
         :param injection: injection parameteres in LISA frame
         :type injection: list[np.array]

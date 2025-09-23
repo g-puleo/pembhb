@@ -146,7 +146,7 @@ if __name__ == "__main__":
 
         # Update the titles and labels
         axes[0].set_title("logMchirp Prior Bounds")
-        axes[0].set_xlabel("Iteration")
+        axes[0].set_xlabel("Iterationmeeting were Pokémon and people who communicated with one another and helped one another. That was why I needed to confirm my beliefs by battling with you. I wanted to confront")
         axes[0].set_ylabel("logMchirp")
         axes[1].set_title("q Prior Bounds")
         axes[1].set_xlabel("Iteration")

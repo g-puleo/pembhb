@@ -11,7 +11,7 @@ from pembhb.sampler import UniformSampler
 from pembhb.simulator import LISAMBHBSimulator
 from pembhb.data import MBHBDataset
 from pembhb.utils import get_pvalues_1d
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from glob import glob
 
 # def load_wronglysaved_model():
@@ -34,7 +34,7 @@ from glob import glob
 #     lr = model_checkpoint["hyper_parameters"]["lr"]
 #     trained_model = InferenceNetwork(lr=lr, classifier_model=model)
 #     return trained_model 
-def plot_posterior(data: np.array, injected_params: np.array, model: InferenceNetwork):
+def plot_posterior(dataset: np.array, injected_params: np.array, model: InferenceNetwork):
 
     N_examples = data.shape[0]
     print(data.shape)
@@ -113,26 +113,44 @@ if __name__ == "__main__":
 
     #     data_fd = datum["data_fd"][np.newaxis, :,:]
     #     source_par = datum["source_parameters"]
-    fname = "logs/20250919_133507_round_0/version_0/checkpoints/epoch=6-step=2975.ckpt" # tc model, 0.8 threshold
-    fname = glob("/u/g/gpuleo/pembhb/logs/20250917_093320_round_0/version_0/checkpoints/*.ckpt")[0]#mass ratio only
-    #fname = glob("/u/g/gpuleo/pembhb/logs/20250919_141212_round_0/version_0/checkpoints/*.ckpt")[0]#tc only, 0.9 threshold
+    # fname = "logs/20250919_133507_round_0/version_0/checkpoints/epoch=6-step=2975.ckpt" # tc model, 0.8 threshold
+    # fname = glob("/u/g/gpuleo/pembhb/logs/20250917_093320_round_0/version_0/checkpoints/*.ckpt")[0]#mass ratio only
+    # fname = glob("/u/g/gpuleo/pembhb/logs/20250919_141212_round_0/version_0/checkpoints/*.ckpt")[0]#tc only, 0.9 threshold
+    parser = argparse.ArgumentParser(description="Plot posteriors from MBHB dataset.")
+    parser.add_argument("filename", type=str, help="Path to dataset file")
+    parser.add_argument("-n", "--num_events", type=int, default=10, help="Number of events to process")
+    args = parser.parse_args()
 
-    #conf = utils.read_config(os.path.join(ROOT_DIR,"config_td.yaml"))
-    model = InferenceNetwork.load_from_checkpoint(fname)
-    model.eval()
+    # Load dataset
+    dataset = MBHBDataset(args.filename, transform_fd='log', transform_td='normalise_max', device='cuda')
+    filenames_dict = {'q': glob("/u/g/gpuleo/pembhb/logs/20250917_093320_round_0/version_0/checkpoints/*.ckpt")[0], 
+                      'Mc': glob("/u/g/gpuleo/pembhb/logs/20250920_162436_round_0/version_0/checkpoints/*.ckpt")[0],
+                      'tc': glob("/u/g/gpuleo/pembhb/logs/20250919_141212_round_0/version_0/checkpoints/*.ckpt")[0],
+                      'qMc': glob("/u/g/gpuleo/pembhb/logs/20250919_155210_round_0/version_0/checkpoints/*.ckpt")[0]}#mc, q 2d, 0.9 threshold
+    xlabel_dict = {'q': 'mass ratio', 'Mc': r'$\log_{10}(\mathcal{M}_{\rm c}/M_\odot)$', 'tc': r'$t_c$ (days from end of observation)'}
+    param_idx_dict = {'q': 1, 'Mc': 0, 'tc': 10, 'qMc': [0,1]}
 
-    #     plot_posterior_grid(data_fd, source_par , model, i)
-    #logratios, injection_params, grid = utils.get_logratios_grid(dataset, model, low=-3, high=-1, ngrid_points=1000, in_param_idx=10, out_param_idx=0)
-    logratios, injection_params, grid = utils.get_logratios_grid(dataset, model, low=1, high=5, ngrid_points=1000, in_param_idx=1, out_param_idx=0)
-    p_values = get_pvalues_1d(logratios, grid, injection_params)
-    sorted_pvalues = np.sort(p_values)
-    sorted_rank = np.arange(sorted_pvalues.shape[0])
-    sorted_rank_normalised = sorted_rank / sorted_rank.max()
-    fig, ax  = plt.subplots(figsize=(10, 6))
-    ax.plot(sorted_pvalues, sorted_rank_normalised , marker='o', linestyle='-', markersize=3)
-    ax.set_xlabel('credibility level (HPD)')
-    ax.set_ylabel('empirical coverage')
-    ax.set_title('p-p plot for mass ratio')
-    ax.grid(visible=True)
-    fig.savefig(os.path.join(ROOT_DIR, "plots", "pvalues_plot_q.png"))
-    plt.close()
+
+    fig, ax = plt.subplots(figsize=(4.79, 3))
+    for param in ['q', 'Mc', 'tc', 'qMc']:
+        fname = filenames_dict[param]
+        trained_model = InferenceNetwork.load_from_checkpoint(fname)
+        inj_param_idx = param_idx_dict[param]   
+        print(f"Evaluating logratios: {param}, using model from {fname}")
+        if param == 'qMc':
+            logratios, params, grid_x, grid_y = utils.get_logratios_grid_2d(dataset, trained_model, ngrid_points=100, in_param_idx=inj_param_idx, out_param_idx=0)
+            pvalues = utils.get_pvalues_2d(logratios, grid_x, grid_y, params)
+
+        else:
+            xlabel = xlabel_dict[param]
+            logratios, params, grid = utils.get_logratios_grid(dataset, trained_model, ngrid_points=1000, in_param_idx=inj_param_idx, out_param_idx=0)
+            pvalues = utils.get_pvalues_1d(logratios, grid, params)
+
+        sorted_pvalues = np.sort(pvalues)
+        sorted_rank_norm = np.arange(sorted_pvalues.shape[0])/sorted_pvalues.shape[0]
+        ax.plot(sorted_rank_norm, sorted_pvalues, label=param)
+    ax.plot([0,1], [0,1], linestyle='--', color='black', label='ideal')
+    ax.set_xlabel("HPD level")
+    ax.set_ylabel("empirical coverage")
+    ax.legend()
+    fig.savefig(os.path.join(ROOT_DIR, "plots", f"pp_plot_1d_2d_allparams.png"), bbox_inches='tight', dpi=300)
