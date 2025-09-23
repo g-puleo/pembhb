@@ -1,0 +1,28 @@
+[project]
+name = "pembhb"
+version = "0.1.0"
+description = "TMNRE for MBHB parameter estimation in LISA"
+authors = [
+    {name = "Gianmarco Puleo",email = "gpuleo@sissa.it"}
+]
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "lisaanalysistools (>=1.0.15,<2.0.0)",
+    "lightning (==2.5.2)",
+    "bbhx",
+    "tensorboard",
+    "h5py",
+    "pyyaml",
+    "scipy",
+    "matplotlib (>=3.10.3,<4.0.0)",
+    "pytest (>=8.4.1,<9.0.0)", 
+]
+[tool.poetry]
+packages = [
+    { include = "pembhb", from = "src" },
+]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
