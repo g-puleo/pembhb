@@ -15,30 +15,39 @@ with h5py.File(filename, 'r') as f:
     times       = f['times_SI'][:]
     frequencies = f['frequencies'][:]
     psd = f['psd'][:]
-# Plot 3 examples from data_fd
-noise_fd_onesided = np.sqrt(2)*noise_fd_twosided
-print(noise_fd_twosided.shape, noise_fd_onesided.shape)
-fig_fd, ax_fd = plt.subplots(1, 3, figsize=(12, 4))
-for i in range(3):
-    ax_fd[i].plot(frequencies, data_fd[i,0], label='A')
-    ax_fd[i].plot(frequencies, psd[0]**0.5, label='noise ASD', linestyle='--', color='gray')
-    ax_fd[i].plot(frequencies, np.abs(noise_fd_onesided[i,0]), label='A noise', linestyle='--', color='green')
-    #ax_fd[i].plot(data_fd[i,1], label='E')
-    ax_fd[i].set_title(f'data_fd Example {i+1}')
-    ax_fd[i].legend()
-    ax_fd[i].set_yscale('log')
-    ax_fd[i].set_xscale('log')
-fig_fd.tight_layout()
-fig_fd.savefig('data_fd_examples.png')
+# # Plot 3 examples from data_fd
+# noise_fd_onesided = np.sqrt(2)*noise_fd_twosided
+# print(noise_fd_twosided.shape, noise_fd_onesided.shape)
+# fig_fd, ax_fd = plt.subplots(1, 3, figsize=(12, 4))
+# for i in range(3):
+##### plot only channel 0 (A)
+#     ax_fd[i].plot(frequencies, data_fd[i,0], label='A')
+#     ax_fd[i].plot(frequencies, psd[0]**0.5, label='noise ASD', linestyle='--', color='gray')
+#     ax_fd[i].plot(frequencies, np.abs(noise_fd_onesided[i,0]), label='A noise', linestyle='--', color='green')
+#     #ax_fd[i].plot(data_fd[i,1], label='E')
+#     ax_fd[i].set_title(f'data_fd Example {i+1}')
+#     ax_fd[i].legend()
+#     ax_fd[i].set_yscale('log')
+#     ax_fd[i].set_xscale('log')
+# fig_fd.tight_layout()
+# fig_fd.savefig('data_fd_examples.png')
 
-# Plot 3 examples from data_td
-fig_td, ax_td = plt.subplots(1, 3, figsize=(12, 4))
-for i in range(3):
-    ax_td[i].plot(times/DAY_SI, data_td[i,0], label='A')
-    #ax_td[i].plot(data_td[i,1], label='E')
-    ax_td[i].set_title(f'data_td Example {i+1}')
-    ax_td[i].legend()
-    ax_td[i].set_xlabel('Time (days)')
+# # Plot 3 examples from data_td
+# fig_td, ax_td = plt.subplots(1, 3, figsize=(12, 4))
+# for i in range(3):
+#     ax_td[i].plot(times/DAY_SI, data_td[i,0], label='A')
+#     #ax_td[i].plot(data_td[i,1], label='E')
+#     ax_td[i].set_title(f'data_td Example {i+1}')
+#     ax_td[i].legend()
+#     ax_td[i].set_xlabel('Time (days)')
+fig_td, ax_td = plt.subplots(figsize=(6, 3))
+ax_td.plot(times/DAY_SI, data_td[0,0], label='A')
+ax_td.plot(times/DAY_SI, data_td[0,1], label='E')
+#ax_td.set_title('data_td Example 1')
+ax_td.set_xlabel('Time (days)')
+ax_td.set_ylabel('Amplitude')
+ax_td.legend()
+ax_td.grid(True)
 
 fig_td.tight_layout()
-fig_td.savefig('data_td_examples.png')
+fig_td.savefig('data_td_example_presentation.png')

@@ -4,6 +4,7 @@ from lightning import LightningModule
 from torch import nn
 from torch.nn import functional as F
 from typing import Iterable
+from pembhb.utils import _ORDERED_PRIOR_KEYS
 # class GWTransformer(LightningModule):
 #     def __init__(self, n_chunks=100, embed_dim=512, num_heads=8, num_layers=4):
 #         super().__init__()
@@ -108,7 +109,16 @@ class InferenceNetwork(LightningModule):
         self.scheduler_patience = conf["training"]["scheduler_patience"]
         self.scheduler_factor = conf["training"]["scheduler_factor"]
         self.save_hyperparameters(conf)
-        
+        self.output_names = []
+        for d_idx, domain in enumerate(self.marginals):
+            for i, marginal in enumerate(self.marginals[domain]):
+                # create a nice string for the marginal 
+                name_output = ""
+                for idx in marginal: 
+                    name_output += str(_ORDERED_PRIOR_KEYS[idx]) + "_"
+                name_output = name_output[:-1]  # remove trailing underscore
+                self.output_names.append(name_output)
+
     def forward(self, d_f, d_t, parameters):
         """
         Forward pass of the network.
@@ -161,10 +171,13 @@ class InferenceNetwork(LightningModule):
         self.log('train_loss', loss , on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
+        overall_idx = 0
         for d_idx, domain in enumerate(self.marginals.keys()):
             for i, marginal in enumerate(self.marginals[domain]):
-                self.log(f'train_accuracy_{domain}_{i}', accuracy_params[i], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-                self.log(f'train_loss_{domain}_{i}', loss_params[i], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+                name = self.output_names[overall_idx]
+                self.log(f'train_accuracy_{name}', accuracy_params[i], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+                self.log(f'train_loss_{name}', loss_params[i], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+                overall_idx += 1
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -172,11 +185,13 @@ class InferenceNetwork(LightningModule):
         accuracy_params, accuracy = self.calc_accuracies(all_logits)
         self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('val_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        overall_idx = 0
         for d_idx, domain in enumerate(self.marginals):
             for i, marginal in enumerate(self.marginals[domain]):
-                self.log(f'val_accuracy_{domain}_{i}', accuracy_params[i], on_step=False, on_epoch=True, prog_bar=True, logger=True)
-                self.log(f'val_loss_{domain}_{i}', loss_params[i], on_step=False, on_epoch=True, prog_bar=True, logger=True)
-
+                name = self.output_names[overall_idx]
+                self.log(f'val_accuracy_{name}', accuracy_params[overall_idx], on_step=False, on_epoch=True, prog_bar=True, logger=True)
+                self.log(f'val_loss_{name}', loss_params[overall_idx], on_step=False, on_epoch=True, prog_bar=True, logger=True)
+                overall_idx += 1
         return loss
     
     def test_step(self, batch, batch_idx):
@@ -263,7 +278,7 @@ class PeregrineModel(torch.nn.Module):
         n_timesteps = int(conf["waveform_params"]["duration"]*WEEK_SI/conf["waveform_params"]["dt"])
         n_freqs = n_timesteps // 2 
         self.normalisation_f = nn.BatchNorm1d(num_features=n_channels*2)
-        self.normalisation_t = nn.BatchNorm1d(num_features=n_channels)
+        #self.normalisation_t = nn.BatchNorm1d(num_features=n_channels)
         self.unet_f = Unet(
             n_in_channels=n_channels*2,
             n_out_channels=1,
@@ -285,7 +300,7 @@ class PeregrineModel(torch.nn.Module):
             self.logratios_model_dict[key] = MarginalClassifierHead(
                 n_data_features=16*len(key),# key can be any of "f", "t", "ft", resulting in double input size if ft. 
                 marginals=self.marginals[key], 
-                hlayersizes=(32, 16, 8, 4)### (100,100,100,100,50,25,10)
+                hlayersizes=(100,100,100,100,50,25,10)
             ).to(conf["device"])
 
 
@@ -295,10 +310,10 @@ class PeregrineModel(torch.nn.Module):
     def forward(self, d_f, d_t, parameters):
         #print(f"d_f shape: {d_f.shape}")
         d_f_norm = self.normalisation_f(d_f)
-        d_t_norm = self.normalisation_t(d_t)
+        #d_t_norm = self.normalisation_t(d_t)
         #print(f"d_f_norm shape: {d_f_norm.shape}")
         d_f_processed = self.unet_f(d_f_norm)
-        d_t_processed = self.unet_t(d_t_norm)
+        d_t_processed = self.unet_t(d_t)
         #print(f"d_f_processed shape: {d_f_processed.shape}")
         flattened_f = self.flatten(d_f_processed)
         flattened_t = self.flatten(d_t_processed)

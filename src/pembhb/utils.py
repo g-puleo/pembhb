@@ -3,7 +3,6 @@ import torch
 import os 
 from pembhb import ROOT_DIR
 import numpy as np
-from pembhb.model import InferenceNetwork
 from pembhb.data import MBHBDataset
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
@@ -31,7 +30,7 @@ def read_config(fname: str):
         conf = yaml.safe_load(file)
     return conf
 
-def get_logratios_grid(dataset: MBHBDataset, model: InferenceNetwork, ngrid_points: int, in_param_idx : int, out_param_idx: int):
+def get_logratios_grid(dataset: MBHBDataset, model: 'InferenceNetwork', ngrid_points: int, in_param_idx : int, out_param_idx: int):
     """Generate a grid of logratios for a given observation and model.
     This is useful for plotting the posterior and to make pp plots
     
@@ -277,7 +276,7 @@ def update_bounds(model: InferenceNetwork, observation_dataset: MBHBDataset, pri
     
     return updated_prior
 
-def pp_plot( dataset, model , low: float, high: float, in_param_idx: int, name: str = None, out_param_idx: int = None):  
+def pp_plot( dataset, model , in_param_idx: int, name: str = None, out_param_idx: int = None):  
     """Generate a pp plot using the examples in dataset, and the posteriors obtained by the model . 
     :param dataset: dataset used to make the pp plot
     :type dataset: MBHBDataset
@@ -307,7 +306,7 @@ def pp_plot( dataset, model , low: float, high: float, in_param_idx: int, name: 
         fig.savefig(os.path.join(ROOT_DIR, "plots", f"{name}_pp_plot.png"))
     plt.close()
 
-def pp_plot_2d(dataset, model, lows: tuple, highs: tuple, in_param_idx: tuple, out_idx: int, name: str):
+def pp_plot_2d(dataset, model,  in_param_idx: tuple, out_idx: int, name: str):
     print(f"Making pp plot for {name}...")
     logratios, injection_params, grid_x, grid_y = get_logratios_grid_2d(dataset, model, ngrid_points=50, in_param_idx=in_param_idx, out_idx=out_idx)
     p_values = get_pvalues_2d(logratios, grid_x, grid_y, injection_params)

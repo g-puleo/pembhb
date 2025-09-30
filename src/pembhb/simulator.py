@@ -82,7 +82,7 @@ class LISAMBHBSimulator():
     def generate_d_f(self, injection: np.array):
         """ Generate simulated data in frequency domain given the injection parameters.
 
-        :param injection: injection parameteres in LISA frame
+        :param injection: injection parameteres in LISA frame and bbhx format: 
         :type injection: list[np.array]
         :return: simulated data in frequency domain
         :rtype: np.array
@@ -281,8 +281,8 @@ class LISAMBHBSimulatorTD():
     def generate_d_f(self, injection: np.array):
         """ Generate simulated data in frequency and time domain given the injection parameters.
 
-        :param injection: injection parameteres in LISA frame
-        :type injection: list[np.array]
+        :param injection: injection parameteres in LISA frame, and in the bbhx format
+        :type injection: list[np.array] of len=11, or np.array of shape (11, n_observations)
         :return: simulated data in frequency domain
         :rtype: np.array
         """

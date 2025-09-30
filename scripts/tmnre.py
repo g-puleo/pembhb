@@ -118,7 +118,7 @@ if __name__ == "__main__":
                 if len(marginal) == 1: 
                     inj_par_idx = marginal[0]
                     inj_par_name = _ORDERED_PRIOR_KEYS[inj_par_idx]
-                    pp_plot(test_dataset, trained_model, low=conf["prior"][inj_par_name][0], high=conf["prior"][inj_par_name][0], in_param_idx=0, name=f"round_{i}_{key}")
+                    pp_plot(test_dataset, trained_model, in_param_idx=inj_par_idx, name=f"round_{i}_{key}")
                     updated_prior = update_bounds(trained_model, dataset_observation, updated_prior, in_param_idx=inj_par_idx, n_gridpoints=10000, out_param_idx=out_idx)
                 elif len(marginal) == 2:
                     inj_par_idx1 = marginal[0]

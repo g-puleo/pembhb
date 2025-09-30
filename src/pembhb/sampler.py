@@ -57,9 +57,8 @@ class UniformSampler ():
         return bbhx_input , tmnre_input
 
     def samples_to_bbhx_input(self, samples: np.array, t_obs_end: float) -> np.array:
-        """convert the sampler to the bbhx input format : 
-        
-
+        """ Convert the sampler output to the bbhx input format : 
+    
         :param samples: MBHB parameters in the following order: log10(chirp mass), q, chi1, chi2, dist, phi, cos(inc), lambda, sin(beta), psi, Deltat
         :type samples: np.array
         :param t_obs_end: observation time in seconds (used to offset the t_ref)
