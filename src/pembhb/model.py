@@ -277,7 +277,7 @@ class PeregrineModel(torch.nn.Module):
         n_channels =  len(conf["waveform_params"]["channels"])
         n_timesteps = int(conf["waveform_params"]["duration"]*WEEK_SI/conf["waveform_params"]["dt"])
         n_freqs = n_timesteps // 2 
-        self.normalisation_f = nn.BatchNorm1d(num_features=n_channels*2)
+        #self.normalisation_f = nn.BatchNorm1d(num_features=n_channels*2)
         #self.normalisation_t = nn.BatchNorm1d(num_features=n_channels)
         self.unet_f = Unet(
             n_in_channels=n_channels*2,
@@ -300,7 +300,7 @@ class PeregrineModel(torch.nn.Module):
             self.logratios_model_dict[key] = MarginalClassifierHead(
                 n_data_features=16*len(key),# key can be any of "f", "t", "ft", resulting in double input size if ft. 
                 marginals=self.marginals[key], 
-                hlayersizes=(100,100,100,100,50,25,10)
+                hlayersizes=(64, 32, 16, 8)
             ).to(conf["device"])
 
 
@@ -309,10 +309,10 @@ class PeregrineModel(torch.nn.Module):
 
     def forward(self, d_f, d_t, parameters):
         #print(f"d_f shape: {d_f.shape}")
-        d_f_norm = self.normalisation_f(d_f)
+        #d_f_norm = self.normalisation_f(d_f)
         #d_t_norm = self.normalisation_t(d_t)
         #print(f"d_f_norm shape: {d_f_norm.shape}")
-        d_f_processed = self.unet_f(d_f_norm)
+        d_f_processed = self.unet_f(d_f)
         d_t_processed = self.unet_t(d_t)
         #print(f"d_f_processed shape: {d_f_processed.shape}")
         flattened_f = self.flatten(d_f_processed)

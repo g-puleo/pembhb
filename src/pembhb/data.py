@@ -40,8 +40,8 @@ class MBHBDataset(Dataset):
                 print(f"max_td is {self.max_td}. normalising data_td by this value.")
                 self.data_td/= self.max_td
             self.parameters =  torch.tensor(f["source_parameters"][()], device=self.device, dtype=torch.float32)
-            
-
+            self.frequencies = torch.tensor(f["frequencies"][()], device=self.device, dtype=torch.float32)
+            self.times = torch.tensor(f["times_SI"][()], device=self.device, dtype=torch.float32)
     def _transform_identity(self, data):
         return data
     
