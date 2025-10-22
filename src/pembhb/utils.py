@@ -7,6 +7,8 @@ from pembhb.data import MBHBDataset
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+from bbhx import waveformbuild as wfb
+DAY_SI = 86400
 _ORDERED_PRIOR_KEYS = [
         "logMchirp",
         "q",
@@ -333,4 +335,376 @@ def chirp_mass_from_m1m2(m1, m2):
     :rtype: float or np.array
     """
     return (m1*m2)**(3/5) / (m1+m2)**(1/5)                            
-                                      
+
+class BBHWaveformTD(wfb.BBHxParallelModule):
+    """Generate waveforms put through response functions
+
+    This class generates waveforms put through the LISA response function. In the
+    future, ground-based analysis may be added. Therefore, it currently
+    returns the TDI variables according the response keyword arguments given.
+
+    If you use this class, please cite `arXiv:2005.01827 <https://arxiv.org/abs/2005.01827>`_
+    and `arXiv:2111.01064 <https://arxiv.org/abs/2111.01064>`_, as well as the papers
+    listed for the waveform and response given just below.
+
+    Right now, it is hard coded to produce the waveform with
+    :class:`PhenomHMAmpPhase <bbhx.waveforms.phenomhm.PhenomHMAmpPhase>`. This can also be used
+    to produce PhenomD. See the docs for that waveform. The papers describing PhenomHM/PhenomD
+    waveforms are here: `arXiv:1708.00404 <https://arxiv.org/abs/1708.00404>`_,
+    `arXiv:1508.07250 <https://arxiv.org/abs/1508.07250>`_, and
+    `arXiv:1508.07253 <https://arxiv.org/abs/1508.07253>`_.
+
+    The response function is the fast frequency domain response function
+    from `arXiv:1806.10734 <https://arxiv.org/abs/1806.10734>`_ and
+    `arXiv:2003.00357 <https://arxiv.org/abs/2003.00357>`_. It is implemented in
+    :class:`LISATDIResponse <bbhx.response.fastfdresponse.LISATDIResponse`.
+
+    This class is GPU accelerated.
+
+    This is a small modification to the BBHx waveform generation which outputs in FD
+    here we output in TD through IFFT
+
+    Args:
+        amp_phase_kwargs (dict, optional): Keyword arguments for the
+            initialization of the ampltidue-phase waveform class: :class:`PhenomHMAmpPhase <bbhx.waveforms.phenomhm.PhenomHMAmpPhase>`.
+        response_kwargs (dict, optional): Keyword arguments for the initialization
+            of the response class: :class:`LISATDIResponse <bbhx.response.fastfdresponse.LISATDIResponse`.
+        interp_kwargs (dict, optional): Keyword arguments for the initialization
+            of the interpolation class: :class:`TemplateInterpFD`.
+        use_gpu (bool, optional): If ``True``, use a GPU. (Default: ``False``)
+
+    Attributes:
+        amp_phase_gen (obj): Waveform generation class.
+        data_length (int): Length of the final output data.
+        interp_response (obj): Interpolation class.
+        length (int): Length of initial evaluations of waveform and response.
+        num_bin_all (int): Total number of binaries analyzed.
+        num_interp_params (int): Number of parameters to interpolate (9).
+        num_modes (int): Number of harmonic modes.
+        out_buffer_final (xp.ndarray): Array with buffer information with shape:
+            ``(self.num_interp_params, self.num_bin_all, self.num_modes, self.length)``.
+            The order of the parameters is amplitude, phase, t-f, transferL1re, transferL1im,
+            transferL2re, transferL2im, transferL3re, transferL3im.
+
+    """
+    def __init__(
+        self,
+        amp_phase_kwargs={},
+        response_kwargs={},
+        interp_kwargs={},
+        force_backend=None,
+    ):
+        super().__init__(force_backend=force_backend)
+        self.force_backend = force_backend
+        # initialize waveform and response funtions
+        self.amp_phase_gen = wfb.PhenomHMAmpPhase(**amp_phase_kwargs, force_backend=force_backend)
+        self.response_gen = wfb.LISATDIResponse(**response_kwargs, force_backend=force_backend)
+
+        self.num_interp_params = 9
+
+        # setup the final interpolant
+        self.interp_response = wfb.TemplateInterpFD(**interp_kwargs, force_backend=force_backend)
+
+    @property
+    def xp(self) -> object:
+        """Numpy or Cupy"""
+        return self.backend.xp
+
+    @classmethod
+    def supported_backends(cls) -> list:
+        return ["bbhx_" + _tmp for _tmp in cls.GPU_RECOMMENDED()]
+
+    @property
+    def waveform_gen(self) -> callable:
+        """C/CUDA wrapped function for computing waveforms"""
+        return self.backend.direct_sum_wrap
+
+    def __call__(
+        self,
+        m1,
+        m2,
+        chi1z,
+        chi2z,
+        distance,
+        phi_ref,
+        f_ref,
+        inc,
+        lam,
+        beta,
+        psi,
+        t_ref,
+        t_obs_start=0.0, # in years
+        t_obs_end=1.0,   # in years
+        dt = 5.0,        # in second
+        out_channel = None,
+        length=None,
+        modes=None,
+        shift_t_limits=True,
+        compress=True, # TODO
+        squeeze=False, # TODO
+    ):
+        r"""Generate the binary black hole frequency-domain TDI waveforms
+
+
+        Args:
+            m1 (double scalar or np.ndarray): Mass 1 in Solar Masses :math:`(m1 > m2)`.
+            m2 (double or np.ndarray): Mass 2 in Solar Masses :math:`(m1 > m2)`.
+            chi1z (double or np.ndarray): Dimensionless spin 1 (for Mass 1) in Solar Masses.
+            chi2z (double or np.ndarray): Dimensionless spin 2 (for Mass 1) in Solar Masses.
+            distance (double or np.ndarray): Luminosity distance in m.
+            phi_ref (double or np.ndarray): Phase at ``f_ref``.
+            f_ref (double or np.ndarray): Reference frequency at which ``phi_ref`` and ``t_ref`` are set.
+                If ``f_ref == 0``, it will be set internally by the PhenomHM code
+                to :math:`f_\\text{max} = \\text{max}(f^2A_{22}(f))`.
+            inc (double or np.ndarray): Inclination of the binary in radians :math:`(\iota\in[0.0, \pi])`.
+            lam (double or np.ndarray): Ecliptic longitude :math:`(\lambda\in[0.0, 2\pi])`.
+            beta (double or np.ndarray): Ecliptic latitude :math:`(\\beta\in[-\pi/2, \pi/2])`.
+            psi (double or np.ndarray): Polarization angle in radians :math:`(\psi\in[0.0, \pi])`.
+            t_ref (double or np.ndarray): Reference time in seconds. It is set at ``f_ref``.
+            t_obs_start (double, optional): Start time of observation in years
+                in the LISA constellation reference frame. This is with reference to :math:`t=0`.
+                (Default: 0.0)
+            t_obs_end (double, optional): End time of observation in years in the
+                LISA constellation reference frame. This is with reference to :math:`t=0`.
+                (Default: 1.0)
+            dt (double, optional): Sampling rate at which to evaluate the final waveform.
+                set in seconds (Default: 10.0)
+            out_channel (list, optional): Specify how many channels to output. If None 
+            length (int, optional): Number of frequencies to use in sparse array for
+                interpolation.
+            modes (list, optional): Harmonic modes to use. If not given, they will
+                default to those available in the waveform model. For PhenomHM:
+                [(2,2), (3,3), (4,4), (2,1), (3,2), (4,3)]. For PhenomD: [(2,2)].
+                (Default: ``None``)
+            shift_t_limits (bool, optional): If ``False``, ``t_obs_start`` and ``t_obs_end``
+                are relative to ``t_ref`` counting backwards in time. If ``True``,
+                those quantities are relative to :math:`t=0`. (Default: ``False``)
+            compress (bool, optional): If ``True``, combine harmonics into single channel
+                waveforms. (Default: ``True``)
+
+
+
+        Returns:
+            xp.ndarray: Shape ``(3, self.length, self.num_bin_all)``.
+                Final waveform for each binary. If  ``compress==True``.
+                # TODO: switch dimensions?
+            xp.ndarray:  Shape ``(3, self.num_modes, self.length, self.num_bin_all)``.
+                Final waveform for each binary. If ``compress==False``.
+        Raises:
+            ValueError: ``length`` and ``freqs`` not given. Modes are given but not in a list.
+
+        """
+        # make sure everything is at least a 1D array
+        m1 = np.atleast_1d(m1)
+        m2 = np.atleast_1d(m2)
+        chi1z = np.atleast_1d(chi1z)
+        chi2z = np.atleast_1d(chi2z)
+        distance = np.atleast_1d(distance)
+        phi_ref = np.atleast_1d(phi_ref)
+        inc = np.atleast_1d(inc)
+        lam = np.atleast_1d(lam)
+        beta = np.atleast_1d(beta)
+        psi = np.atleast_1d(psi)
+        t_ref = np.atleast_1d(t_ref)
+
+        self.num_bin_all = len(m1)
+
+        # TODO: add sanity checks for t_start, t_end
+        # how to set up time limits
+        if shift_t_limits is False:
+            wfb.warnings.warn(
+                "Deprecated: shift_t_limits. Previously shift_t_limits defaulted to False. This option is now removed and permanently set to shift_t_limits=True."
+            )
+            # t_ref_L = tLfromSSBframe(t_ref, lam, beta)
+
+            # # start and end times are defined in the LISA reference frame
+            # t_obs_start_L = t_ref_L - t_obs_start * YRSID_SI
+            # t_obs_end_L = t_ref_L - t_obs_end * YRSID_SI
+
+            # # convert to SSB frame
+            # t_obs_start_SSB = tSSBfromLframe(t_obs_start_L, lam, beta, 0.0)
+            # t_obs_end_SSB = tSSBfromLframe(t_obs_end_L, lam, beta, 0.0)
+
+            # # fix zeros and less than zero
+            # t_start = (
+            #     t_obs_start_SSB if t_obs_start > 0.0 else np.zeros(self.num_bin_all)
+            # )
+            # t_end = t_obs_end_SSB if t_obs_end > 0.0 else np.zeros_like(t_start)
+
+        # else:
+        # start and end times are defined in the LISA reference frame
+        t_obs_start_L   = t_obs_start * wfb.YRSID_SI
+        t_obs_end_L     = t_obs_end * wfb.YRSID_SI
+        # index at which to cut the signal
+        n_cut           = int((t_obs_end_L - t_obs_start_L) / dt)
+        # convert to SSB frame
+        t_obs_start_SSB = wfb.tSSBfromLframe(t_obs_start_L, lam, beta, 0.0)
+        # set up the end of response observation one day after merger
+        t_obs_final = np.where(
+                t_ref > t_obs_end_L,
+                t_ref + DAY_SI,
+                t_obs_end_L)
+        
+        t_obs_end_SSB = wfb.tSSBfromLframe(t_obs_final, lam, beta, 0.0)
+        
+        #t_obs_end_SSB = tSSBfromLframe(t_obs_end_L, lam, beta, 0.0)
+        # To avoid issues in cut signal we take t_ref + 1*DAY_SI
+        t_start = np.atleast_1d(t_obs_start_SSB)
+        t_end = np.atleast_1d(t_obs_end_SSB)
+
+        Tresponse = t_end - t_start
+        
+        self.length = length
+
+
+        # setup harmonic modes
+        if modes is None:
+            # default mode setup
+            self.num_modes = len(self.amp_phase_gen.allowable_modes)
+        else:
+            if not isinstance(modes, list):
+                raise ValueError("modes must be a list.")
+            self.num_modes = len(modes)
+
+        self.num_bin_all = len(m1)
+
+        out_buffer = self.xp.zeros(
+            (self.num_interp_params * self.length * self.num_modes * self.num_bin_all)
+        )
+
+
+        phi_ref_amp_phase = np.zeros_like(m1)
+
+
+        self.amp_phase_gen(
+            m1,
+            m2,
+            chi1z,
+            chi2z,
+            distance,
+            phi_ref_amp_phase,
+            f_ref,
+            t_ref,
+            length,
+            freqs=None,
+            out_buffer=out_buffer,
+            modes=modes,
+            Tobs=Tresponse,
+            direct=False,
+        )
+        
+        
+        # setup buffer to carry around all the quantities of interest
+        # params are amp, phase, tf, transferL1re, transferL1im, transferL2re, transferL2im, transferL3re, transferL3im
+        out_buffer = out_buffer.reshape(
+            self.num_interp_params, self.num_bin_all, self.num_modes, self.length
+        )
+        out_buffer = out_buffer.flatten().copy()
+
+        # compute response function
+        self.response_gen(
+            self.amp_phase_gen.freqs,
+            inc,
+            lam,
+            beta,
+            psi,
+            phi_ref,
+            length,
+            out_buffer=out_buffer,  # fill into this buffer
+            modes=self.amp_phase_gen.modes,
+            direct=False,
+        )
+
+        # for checking
+        self.out_buffer_final = out_buffer.reshape(
+            9, self.num_bin_all, self.num_modes, self.length
+        ).copy()
+
+        
+        #create time structure
+        f22_start = self.amp_phase_gen.freqs_shaped[:,0,0]
+        Mtots     = (m1 + m2 ) * wfb.MTSUN_SI
+        nu        = m1 * m2 / (m1 + m2)**2
+        T_step    = 1.5 * 5 / 256 / nu * (np.pi * Mtots * 0.8 * f22_start)**(-8./3.) * Mtots
+        # pad freq to powers of 2
+        # Unsure whether this is that much useful 
+        n         = 2**int(np.max(np.ceil(np.log2(T_step / dt))))
+        df        = 1. / n / dt
+        freqs     = np.arange(0, n//2 + 1) * df
+        # setup interpolant
+
+        self.freqs = freqs
+        spline = wfb.CubicSplineInterpolant(
+            self.amp_phase_gen.freqs,
+            out_buffer,
+            length=self.length,
+            num_interp_params=self.num_interp_params,
+            num_modes=self.num_modes,
+            num_bin_all=self.num_bin_all,
+            force_backend=self.force_backend
+        )
+        # TODO: try single block reduction for likelihood (will probably be worse for smaller batch, but maybe better for larger batch)?
+        template_channels = self.interp_response(
+            freqs,
+            spline.container,
+            t_start,
+            t_end,
+            self.length,
+            self.num_modes,
+            3,
+        )
+        # fill the data stream
+
+        if compress:
+            # put in separate data streams
+            data_FD = self.xp.zeros(
+                (self.num_bin_all, 3, n//2 + 1), dtype=self.xp.complex128
+            )
+            for bin_i, (temp, start_i, length_i) in enumerate(
+                zip(
+                    template_channels,
+                    self.interp_response.start_inds,
+                    self.interp_response.lengths,
+                )
+            ):
+                data_FD[bin_i, :, start_i : start_i + length_i] = temp    
+                #data_FD[bin_i, :, start_i : start_i + length_i] = temp    
+        else:
+            raise NotImplementedError("Not implemented")
+        if out_channel is None:
+            # Turn the object to TD
+            ifftseries= self.xp.fft.ifft(
+                np.dstack(
+            (data_FD[:,:,:-1], np.flip(data_FD[:,:,1:].conj(),axis=2))),
+            axis = 2).real / dt
+            # Rebuild time series from positive and negative times
+            #timeseries = np.dstack((ifftseries[:,:,n//2:], ifftseries[:,:,:n//2])).real
+            if n_cut <= n:
+                return ifftseries[:,:,:n_cut]
+            else:
+                return self.xp.pad(ifftseries, [(0,0),(0,0),(0,n_cut - n)])
+        else:
+            # Turn the object to TD
+            if isinstance(out_channel,(list,np.ndarray,tuple)):
+                ifftseries= self.xp.fft.ifft(
+                    np.dstack(
+                (data_FD[:,out_channel,:-1], np.flip(data_FD[:,out_channel,1:].conj(),axis = 2))),
+                axis = 2).real / dt
+                # Rebuild time series from positive and negative times
+                #timeseries = np.dstack((ifftseries[:,:,n//2:], ifftseries[:,:,:n//2])).real
+                if n_cut <= n:
+                    return ifftseries[:,:,:n_cut]
+                else:
+                    return self.xp.pad(ifftseries, [(0,0),(0,0),(0,n_cut - n)])
+
+            else:
+                ifftseries= self.xp.fft.ifft(
+                    np.hstack(
+                (data_FD[:,out_channel,:-1], np.flip(data_FD[:,out_channel,1:].conj(),axis = 1))),
+                axis = 1).real / dt
+                # Rebuild time series from positive and negative times
+                #timeseries = np.dstack((ifftseries[:,:,n//2:], ifftseries[:,:,:n//2])).real             
+                if n_cut <= n:
+                    return ifftseries[:,:n_cut]
+                else:
+                    return self.xp.pad(ifftseries, [(0,0),(0,n_cut - n)])

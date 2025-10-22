@@ -8,24 +8,31 @@ from tqdm import tqdm
 from lisatools.detector import EqualArmlengthOrbits
 import lisatools.sensitivity as lisasens
 
-from bbhx.waveformbuild import BBHWaveformFD, BBHWaveformTD
+from bbhx.waveformbuild import BBHWaveformFD
+from pembhb.utils import BBHWaveformTD
 from bbhx.response.fastfdresponse import LISATDIResponse
 from bbhx.utils.transform import LISA_to_SSB
 from bbhx.utils.constants import YRSID_SI, PC_SI
 
 from pembhb import ROOT_DIR
 from pembhb.sampler import UniformSampler
-
-gpu_available=False
+import sys
+gpu_available = False ### True does not work on coglians, needs nvcc
+if gpu_available: 
+    backend='cuda12x'
+else:
+    backend='cpu'
 WEEK_SI = 7 * 24 * 3600  # seconds in a week
 DAY_SI = 24 * 3600  # seconds in a day
+
 
 class LISAMBHBSimulator():
 
     def __init__(self, conf, sampler_init_kwargs):
         super().__init__()
         # initialise the waveform generator
-        orbits = EqualArmlengthOrbits(use_gpu=gpu_available)
+        raise NotImplementedError("Use LISAMBHBSimulatorTD for time domain simulations")
+        #orbits = EqualArmlengthOrbits()
         orbits.configure(linear_interp_setup=True)
 
         response_kwargs = {
@@ -37,7 +44,7 @@ class LISAMBHBSimulator():
         self.waveform_generator = BBHWaveformFD(
             amp_phase_kwargs = dict(run_phenomd=False),
             response_kwargs = response_kwargs,
-            use_gpu = gpu_available
+            force_backend = backend
         )
 
 
@@ -130,6 +137,21 @@ class LISAMBHBSimulator():
         if batch_size is None:
             batch_size = max(1,int(N/10.0))
         
+        if os.path.exists(filename):
+            if os.path.isdir(filename):
+                raise IsADirectoryError(f"'{filename}' is a directory.")
+            # Only prompt when running interactively
+            if sys.stdin.isatty():
+                resp = input(f"File '{filename}' already exists. Delete it and continue? [y/N]: ").strip().lower()
+                if resp in ("y", "yes"):
+                    os.remove(filename)
+                    print(f"Removed existing file '{filename}'.")
+                else:
+                    raise FileExistsError(f"Aborted: '{filename}' already exists.")
+            else:
+                raise FileExistsError(
+                    f"File '{filename}' exists. Run interactively to confirm deletion or remove the file manually."
+                )
         with h5py.File(filename, "a") as f:
             source_params = f.create_dataset("source_parameters", shape=(N, 11), dtype=np.float32)
             data_fd = f.create_dataset("data_fd", shape=(N, 4, self.n_pt), dtype=np.float32)
@@ -195,7 +217,7 @@ class LISAMBHBSimulatorTD():
     def __init__(self, conf, sampler_init_kwargs, seed=0):
         super().__init__()
         # initialise the waveform generator
-        orbits = EqualArmlengthOrbits(use_gpu=gpu_available)
+        orbits = EqualArmlengthOrbits(force_backend=backend)
         orbits.configure(linear_interp_setup=True)
         response_kwargs = {
             "TDItag": "AET", 
@@ -206,7 +228,7 @@ class LISAMBHBSimulatorTD():
         self.waveform_generator = BBHWaveformTD(
             amp_phase_kwargs = dict(run_phenomd=False),
             response_kwargs = response_kwargs,
-            use_gpu = gpu_available
+            force_backend = backend
         )
 
         #### SET UP FREQUENCY GRID from OBSERVATION TIME AND SAMPLING RATE ####
@@ -283,8 +305,8 @@ class LISAMBHBSimulatorTD():
 
         :param injection: injection parameteres in LISA frame, and in the bbhx format
         :type injection: list[np.array] of len=11, or np.array of shape (11, n_observations)
-        :return: simulated data in frequency domain
-        :rtype: np.array
+        :return: data in time domain, data in frequency domain, noise in frequency domain
+        :rtype: tuple[np.array, np.array, np.array]
         """
         injection[-1], injection[-4], injection[-3], injection[-2] = LISA_to_SSB(injection[-1], injection[-4], injection[-3], injection[-2])
         # generate wave in TD
@@ -333,7 +355,21 @@ class LISAMBHBSimulatorTD():
         """
         if batch_size is None:
             batch_size = max(1,int(N/10.0))
-        
+        if os.path.exists(filename):
+            if os.path.isdir(filename):
+                raise IsADirectoryError(f"'{filename}' is a directory.")
+            # Only prompt when running interactively
+            if sys.stdin.isatty():
+                resp = input(f"File '{filename}' already exists. Delete it and continue? [y/N]: ").strip().lower()
+                if resp in ("y", "yes"):
+                    os.remove(filename)
+                    print(f"Removed existing file '{filename}'.")
+                else:
+                    raise FileExistsError(f"Aborted: '{filename}' already exists.")
+            else:
+                raise FileExistsError(
+                    f"File '{filename}' exists. Run interactively to confirm deletion or remove the file manually."
+                )
         with h5py.File(filename, "a") as f:
             source_params = f.create_dataset("source_parameters", shape=(N, 11), dtype=np.float32)
             sample_frequencies = f.create_dataset("frequencies", data=self.grid_freq_noise, dtype=np.float32)

@@ -22,7 +22,7 @@ class MBHBDataset(Dataset):
         :param filename: name of the .h5 file where data are stored
         :type filename: str
         """
-
+        print("Loading data from file:", filename)
         self.channels_amp = torch.tensor([0,1], device=device, dtype=torch.int64)  # AE
         self.channels_phase = torch.tensor([2,3], device=device, dtype=torch.int64)  # AE
         self.filename = filename
