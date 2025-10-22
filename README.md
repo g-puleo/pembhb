@@ -1,9 +1,9 @@
 ### Installation
 
 
-2. activate your favorite python environment with pytorch installed 
+1. activate your favorite python environment with pytorch installed 
 
-3. install the bbhx library by 
+2. install the bbhx library by 
     ```
     pip install bbhx-cuda12x
     ```
@@ -12,7 +12,7 @@
     pip install bbhx
     ```
 
-4.  clone this repository and install the package: 
+3.  clone this repository and install the package: 
 
     ```
     git clone https://github.com/g-puleo/pembhb.git

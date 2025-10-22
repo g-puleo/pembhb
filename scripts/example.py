@@ -21,6 +21,6 @@ dataloader = DataLoader(dataset, batch_size=50, shuffle=True)
 for batch in dataloader:
     data_fd = batch['data_fd']
     data_td = batch['data_td']
-    source_params = batch['source_parameters']
+    source_params = batch['source_parameters'] #they are in the same format as the prior keys defined in config_td.yaml
 
     ## do whatever you want 
