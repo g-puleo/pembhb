@@ -32,7 +32,7 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
     try: 
         sim.sample_and_store(fname, N=50000, batch_size=200)
         print("Data saved to", fname)
-    except ValueError:
+    except FileExistsError:
         print("File might already exist, skipping sampling.")
 
 
@@ -52,8 +52,9 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
                     callbacks=[checkpoint_callback, early_stopping_callback]
                     )
     
-    model = InferenceNetwork(conf)
     data_module = MBHBDataModule(fname, conf)
+    data_module.setup(stage='fit')
+    model = InferenceNetwork(conf, td_normalisation=data_module.get_max_td())
 
     # find the learning rate. 
     # tuner = Tuner(trainer)
@@ -77,7 +78,7 @@ if __name__ == "__main__":
     config_path = args.config
     conf = read_config(config_path)
 
-    dataset_observation = MBHBDataset(os.path.join(ROOT_DIR, "data/observation.h5"),transform_fd=conf["training"]["transform_fd"], transform_td=conf["training"]["transform_td"])
+    dataset_observation = MBHBDataset(os.path.join(ROOT_DIR, "data/observation.h5"),transform_fd=conf["training"]["transform_fd"])
     # load observation
 
     # Create a figure with two subplots

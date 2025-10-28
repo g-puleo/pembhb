@@ -99,7 +99,7 @@ class InferenceNetwork(LightningModule):
     """ 
     Basic FC network for TMNRE of MBHB data. 
     """
-    def __init__(self,  conf: dict):  
+    def __init__(self,  conf: dict, td_normalisation: float):  
         super().__init__()
         self.model = PeregrineModel(conf)
         self.marginals = self.model.marginals
@@ -108,7 +108,7 @@ class InferenceNetwork(LightningModule):
         self.bounds_trained = self.model.bounds_trained
         self.scheduler_patience = conf["training"]["scheduler_patience"]
         self.scheduler_factor = conf["training"]["scheduler_factor"]
-        self.save_hyperparameters(conf)
+        self.save_hyperparameters(conf, td_normalisation, logger=True)
         self.output_names = []
         for d_idx, domain in enumerate(self.marginals):
             for i, marginal in enumerate(self.marginals[domain]):
@@ -118,7 +118,7 @@ class InferenceNetwork(LightningModule):
                     name_output += str(_ORDERED_PRIOR_KEYS[idx]) + "_"
                 name_output = name_output[:-1]  # remove trailing underscore
                 self.output_names.append(name_output)
-
+        self.td_normalisation = td_normalisation
     def forward(self, d_f, d_t, parameters):
         """
         Forward pass of the network.
@@ -127,7 +127,7 @@ class InferenceNetwork(LightningModule):
             data: Tensor of shape (batch_size, num_channels, num_features) containing the frequency domain signal in the TDI channels
             parameters: Tensor of shape (batch_size, 11) containing the parameters to be used in the classifier
         """
-        output = self.model(d_f, d_t, parameters)  # (batch_size, num_marginals)
+        output = self.model(d_f, d_t/self.td_normalisation, parameters)  # (batch_size, num_marginals)
         return output
 
     def calc_logits_losses(self, data_f, data_t, parameters):

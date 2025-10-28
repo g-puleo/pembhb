@@ -16,7 +16,7 @@ class MBHBDataset(Dataset):
         "normalise_max": "_transform_normalise_max"
     }
 
-    def __init__(self, filename: str, transform_fd: str = "none", transform_td: str = "none", device: str = "cpu"):
+    def __init__(self, filename: str, transform_fd: str = "none", device: str = "cpu"):
         """Initialize the dataset.
 
         :param filename: name of the .h5 file where data are stored
@@ -35,10 +35,6 @@ class MBHBDataset(Dataset):
                 self.PSD = torch.tensor(f["psd"][()], device="self.device", dtype=torch.float32)
             self.data_fd = self.transform_fd(torch.tensor(f["data_fd"][()], device=self.device, dtype=torch.float32))
             self.data_td = torch.tensor(f["data_td"][()], device=self.device, dtype=torch.float32)
-            if transform_td == "normalise_max":
-                self.max_td = torch.max(torch.abs(torch.tensor(f["data_td"][()], device=self.device, dtype=torch.float32)))
-                print(f"max_td is {self.max_td}. normalising data_td by this value.")
-                self.data_td/= self.max_td
             self.parameters =  torch.tensor(f["source_parameters"][()], device=self.device, dtype=torch.float32)
             self.frequencies = torch.tensor(f["frequencies"][()], device=self.device, dtype=torch.float32)
             self.times = torch.tensor(f["times_SI"][()], device=self.device, dtype=torch.float32)
@@ -118,7 +114,6 @@ class MBHBDataModule( L.LightningDataModule ):
         self.generator = torch.Generator().manual_seed(31415)
         self.filename = filename
         self.transform_fd = conf["training"]["transform_fd"]
-        self.transform_td = conf["training"]["transform_td"]
 
     def prepare_data(self):
 
@@ -127,12 +122,16 @@ class MBHBDataModule( L.LightningDataModule ):
     def setup(self, stage=None):
         """Setup the dataset."""
         if stage == "fit" or stage is None:
-            full_dataset = MBHBDataset(self.filename, transform_fd=self.transform_fd, transform_td=self.transform_td)
+            full_dataset = MBHBDataset(self.filename, transform_fd=self.transform_fd)
             self.train, self.val, self.test = random_split(full_dataset,  [0.85,0.095, 0.055], generator=self.generator)
-
+            
         elif stage == "test":
-            self.test = MBHBDataset(self.filename, transform_fd=self.transform_fd, transform_td=self.transform_td)
+            self.test = MBHBDataset(self.filename, transform_fd=self.transform_fd)
 
+    def get_max_td(self): 
+        """Get the maximum time-domain value from the training dataset."""
+        return self.train.dataset[:]["data_td"].abs().max()
+    
     def train_dataloader(self):
         return DataLoader(self.train, batch_size=self.batch_size, shuffle=True, num_workers=15)
     
