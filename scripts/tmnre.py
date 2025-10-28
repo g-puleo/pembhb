@@ -32,7 +32,7 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
     try: 
         sim.sample_and_store(fname, N=50000, batch_size=200)
         print("Data saved to", fname)
-    except ValueError:
+    except FileExistsError:
         print("File might already exist, skipping sampling.")
 
 

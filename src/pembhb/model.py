@@ -92,7 +92,7 @@ class MarginalClassifierHead(nn.Module):
             indices = marginal
             input_data = torch.cat([features, parameters[:, indices]], dim=-1)
             outputs.append(self.classifiers[i](input_data))
-
+            
         return torch.cat(outputs, dim=-1)
 
 class InferenceNetwork(LightningModule):
@@ -101,11 +101,11 @@ class InferenceNetwork(LightningModule):
     """
     def __init__(self,  conf: dict):  
         super().__init__()
-        self.model = PeregrineModel(conf)
-        self.marginals = self.model.marginals
+        self.data_summary = BrutalCompression(lowdim=20, N=100, in_channels=8, cnn_channels=(32, 64))
+        self.marginals = conf["tmnre"]["marginals"]
         self.loss = nn.BCEWithLogitsLoss(reduction='none')
         self.lr = conf["training"]["learning_rate"]
-        self.bounds_trained = self.model.bounds_trained
+        self.bounds_trained = conf["prior"]
         self.scheduler_patience = conf["training"]["scheduler_patience"]
         self.scheduler_factor = conf["training"]["scheduler_factor"]
         self.save_hyperparameters(conf)
@@ -118,7 +118,15 @@ class InferenceNetwork(LightningModule):
                     name_output += str(_ORDERED_PRIOR_KEYS[idx]) + "_"
                 name_output = name_output[:-1]  # remove trailing underscore
                 self.output_names.append(name_output)
-
+        
+        self.logratios_model_dict = nn.ModuleDict()
+        for key in self.marginals.keys():
+            self.logratios_model_dict[key] = MarginalClassifierHead(
+                #n_data_features=16*len(key),# key can be any of "f", "t", "ft", resulting in double input size if ft. 
+                n_data_features=20, # for brutal compression with lowdim=20
+                marginals=self.marginals[key], 
+                hlayersizes=(64, 32, 16, 8)
+            ).to(conf["device"])
     def forward(self, d_f, d_t, parameters):
         """
         Forward pass of the network.
@@ -127,8 +135,26 @@ class InferenceNetwork(LightningModule):
             data: Tensor of shape (batch_size, num_channels, num_features) containing the frequency domain signal in the TDI channels
             parameters: Tensor of shape (batch_size, 11) containing the parameters to be used in the classifier
         """
-        output = self.model(d_f, d_t, parameters)  # (batch_size, num_marginals)
-        return output
+        d_f, d_t = self.data_summary(d_f, d_t)
+        features_ft = None
+        
+        features_dict = {
+            "ft": features_ft,
+            "f": d_f,
+            "t": d_t
+        }
+        # print(f"features_t device: {features_t.device}")
+        # print(f"parameters device: {parameters.device}")
+        # print(f"features_f device: {features_f.device}")
+        # print(f"features_ft device: {features_ft.device}")
+        # #print(f"features_f shape: {features_f.shape}")
+
+        logratios_1d_list = []
+        for key in self.logratios_model_dict.keys():
+            #breakpoint()
+            logratios_1d_list.append(self.logratios_model_dict[key](features_dict[key], parameters))
+        logratios_1d = torch.cat(logratios_1d_list, dim=-1)        
+        return logratios_1d
 
     def calc_logits_losses(self, data_f, data_t, parameters):
 
@@ -143,6 +169,7 @@ class InferenceNetwork(LightningModule):
         all_loss= self.loss(all_logits, labels)
         loss_params = torch.mean(all_loss, dim=0)
         loss = torch.mean(loss_params)
+
         return all_logits, loss_params, loss
     
     def calc_accuracies(self, all_logits):
@@ -263,16 +290,6 @@ class SimpleModel(torch.nn.Module):
 class PeregrineModel(torch.nn.Module):
     def __init__(self, conf: dict):
         super().__init__()
-        self.batch_size = conf["training"]["batch_size"]
-        self.marginals = conf["tmnre"]["marginals"]
-        
-        # Validate keys of marginals
-        allowed_keys = {"f", "t", "ft"}
-        invalid_keys = set(self.marginals.keys()) - allowed_keys
-        if invalid_keys:
-            raise ValueError(f"Invalid keys in marginals: {invalid_keys}. Allowed keys are {allowed_keys}.")
-        
-        self.bounds_trained = conf["prior"]
 
         n_channels =  len(conf["waveform_params"]["channels"])
         n_timesteps = int(conf["waveform_params"]["duration"]*WEEK_SI/conf["waveform_params"]["dt"])
@@ -295,19 +312,13 @@ class PeregrineModel(torch.nn.Module):
         self.flatten = nn.Flatten(1)
         self.linear_t = LinearCompression(n_timesteps)
         self.linear_f = LinearCompression(n_freqs)
-        self.logratios_model_dict = nn.ModuleDict()
-        for key in self.marginals.keys():
-            self.logratios_model_dict[key] = MarginalClassifierHead(
-                n_data_features=16*len(key),# key can be any of "f", "t", "ft", resulting in double input size if ft. 
-                marginals=self.marginals[key], 
-                hlayersizes=(64, 32, 16, 8)
-            ).to(conf["device"])
 
 
 
 
 
-    def forward(self, d_f, d_t, parameters):
+
+    def forward(self, d_f, d_t):
         #print(f"d_f shape: {d_f.shape}")
         #d_f_norm = self.normalisation_f(d_f)
         #d_t_norm = self.normalisation_t(d_t)
@@ -319,28 +330,72 @@ class PeregrineModel(torch.nn.Module):
         flattened_t = self.flatten(d_t_processed)
 
         #print(f"flattened shape: {flattened.shape}")
-        features_f = self.linear_f(flattened_f)
-        features_t = self.linear_t(flattened_t)
-        features_ft = torch.cat((features_f, features_t), dim=-1)
-        
-        features_dict = {
-            "ft": features_ft,
-            "f": features_f,
-            "t": features_t
-        }
-        # print(f"features_t device: {features_t.device}")
-        # print(f"parameters device: {parameters.device}")
-        # print(f"features_f device: {features_f.device}")
-        # print(f"features_ft device: {features_ft.device}")
-        # #print(f"features_f shape: {features_f.shape}")
+        datasummary_fd = self.linear_f(flattened_f)
+        datasummary_td = self.linear_t(flattened_t)
 
-        logratios_1d_list = []
-        for key in self.logratios_model_dict.keys():
-            #breakpoint()
-            logratios_1d_list.append(self.logratios_model_dict[key](features_dict[key], parameters))
-        logratios_1d = torch.cat(logratios_1d_list, dim=-1)
-        return logratios_1d
+        return datasummary_fd, datasummary_td
 
+class BrutalCompression(nn.Module):
+    """
+    Take top-100 values per channel from d_f and corresponding indices normalized to [0,1].
+    Return tensor of shape (B, Nchannels*2, 100) where first Nchannels are values and
+    next Nchannels are normalized indices.
+
+    This implementation requires Nfreqs >= 100 and will raise a ValueError otherwise.
+    """
+    def __init__(self, lowdim: int, Nfreqs: int = 100, in_channels: int = 6, cnn_channels: Iterable[int] = (32, 64)): 
+        super().__init__()
+        self.N = Nfreqs
+        self.lowdim = lowdim
+        self.in_channels = in_channels
+        self.cnn_channels = tuple(cnn_channels)
+    
+        layers = []
+        layers.append(nn.Conv1d(in_channels, self.cnn_channels[0], kernel_size=3, padding=1, bias=False))
+        layers.append(nn.BatchNorm1d(self.cnn_channels[0]))
+        layers.append(nn.ReLU(inplace=True))
+
+        layers.append(nn.Conv1d(self.cnn_channels[0], self.cnn_channels[1], kernel_size=3, padding=1, bias=False))
+        layers.append(nn.BatchNorm1d(self.cnn_channels[1]))
+        layers.append(nn.ReLU(inplace=True))
+
+        # Pool to desired lowdim
+        layers.append(nn.AdaptiveAvgPool1d(self.lowdim))
+
+        # Final conv to get single channel output
+        layers.append(nn.Conv1d(self.cnn_channels[1], 1, kernel_size=1))
+
+        self.cnn = nn.Sequential(*layers)
+
+    def forward(self, d_f, d_t):
+        """
+        Args:
+            d_f: Tensor shape (B, C, Nfreqs)
+            d_t: passed through unchanged
+        Returns:
+            compressed: Tensor shape (B, 1, lowdim)
+            d_t: unchanged
+        """
+        B, C, Nfreqs = d_f.shape
+
+        if Nfreqs < self.N:
+            raise ValueError(f"BrutalCompression requires at least {self.N} frequencies, got {Nfreqs}")
+
+        k = self.N
+        # find top-k by absolute value per channel
+        _, indices = torch.topk(d_f.abs(), k=k, dim=2)  # indices: (B, C, k)
+
+        # gather original (signed) values using these indices
+        values = torch.gather(d_f, 2, indices)  # (B, C, k)
+
+        # normalize indices to [0,1]
+        indices_norm = indices.float() / (Nfreqs - 1)  # (B, C, k)
+
+        # concatenate values and normalized indices along channel dimension -> (B, 2*C, k)
+        stacked = torch.cat([values, indices_norm], dim=1)
+        compressed = self.cnn(stacked).squeeze(1)  # (B, 1, lowdim)
+        return compressed, d_t
+   
 ### THIS CHUNK OF CODE IS DIRECTLY COPIED FROM PEREGRINE
 # 1D Unet implementation below
 class DoubleConv(nn.Module):
