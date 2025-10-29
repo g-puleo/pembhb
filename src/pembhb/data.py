@@ -130,8 +130,10 @@ class MBHBDataModule( L.LightningDataModule ):
 
     def get_max_td(self): 
         """Get the maximum time-domain value from the training dataset."""
-        return self.train.dataset[:]["data_td"].abs().max()
-    
+        maxtd = self.train.dataset[:]["data_td"].abs().max()
+        print("Max td:", maxtd)
+        return maxtd
+
     def train_dataloader(self):
         return DataLoader(self.train, batch_size=self.batch_size, shuffle=True, num_workers=15)
     

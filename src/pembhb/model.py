@@ -108,7 +108,6 @@ class InferenceNetwork(LightningModule):
         self.bounds_trained = self.model.bounds_trained
         self.scheduler_patience = conf["training"]["scheduler_patience"]
         self.scheduler_factor = conf["training"]["scheduler_factor"]
-        self.save_hyperparameters(conf, td_normalisation, logger=True)
         self.output_names = []
         for d_idx, domain in enumerate(self.marginals):
             for i, marginal in enumerate(self.marginals[domain]):
@@ -119,6 +118,7 @@ class InferenceNetwork(LightningModule):
                 name_output = name_output[:-1]  # remove trailing underscore
                 self.output_names.append(name_output)
         self.td_normalisation = td_normalisation
+        self.save_hyperparameters(conf, td_normalisation, logger=True)
     def forward(self, d_f, d_t, parameters):
         """
         Forward pass of the network.

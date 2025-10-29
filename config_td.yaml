@@ -23,7 +23,7 @@ training:
   batch_size: 100
   epochs: 1000
   learning_rate: 0.0001
-  transform_td: "normalise_max" # options: "none", "logwhiten", "log", "whiten"
+  #transform_td: "normalise_max" # options: "none", "logwhiten", "log", "whiten"
   transform_fd: "log" # options: "none", "logwhiten", "log", "whiten", "normalise_max"
   early_stop_patience: 20
   scheduler_factor: 0.3
