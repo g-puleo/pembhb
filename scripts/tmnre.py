@@ -26,6 +26,7 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
     ######## DATA GENERATION #########
     sim = LISAMBHBSimulatorTD(conf, sampler_init_kwargs=sampler_init_kwargs)
     #sim = DummySimulator(sampler_init_kwargs=sampler_init_kwargs)
+<<<<<<< Updated upstream
     fname = os.path.join(ROOT_DIR, "data", f"simulated_data_round_{idx}.h5")
     print("Sampling from the simulator...")
     os.makedirs(os.path.join(ROOT_DIR, "data"), exist_ok=True)
@@ -34,6 +35,17 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
         print("Data saved to", fname)
     except FileExistsError:
         print("File might already exist, skipping sampling.")
+=======
+    #fname = os.path.join(ROOT_DIR, "data", f"simulated_data_round_{idx}.h5")
+    fname = os.path.join(ROOT_DIR, "data", f"small_training_set.h5")
+    # print("Sampling from the simulator...")
+    # os.makedirs(os.path.join(ROOT_DIR, "data"), exist_ok=True)
+    # try: 
+    #     sim.sample_and_store(fname, N=50000, batch_size=200)
+    #     print("Data saved to", fname)
+    # except ValueError:
+    #     print("File might already exist, skipping sampling.")
+>>>>>>> Stashed changes
 
 
 

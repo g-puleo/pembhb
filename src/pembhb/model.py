@@ -66,7 +66,7 @@ class MarginalClassifierHead(nn.Module):
         :type hidden_size: iterable[int]
         """
         super().__init__()
-        self.marginals = marginals
+        self.marginals_dict = marginals
         self.classifiers = nn.ModuleList()
         for marginal in marginals:
             classifier = nn.Sequential()
@@ -88,7 +88,7 @@ class MarginalClassifierHead(nn.Module):
 
     def forward(self, features, parameters):
         outputs = []
-        for i, marginal in enumerate(self.marginals):
+        for i, marginal in enumerate(self.marginals_dict):
             indices = marginal
             input_data = torch.cat([features, parameters[:, indices]], dim=-1)
             outputs.append(self.classifiers[i](input_data))
@@ -102,23 +102,32 @@ class InferenceNetwork(LightningModule):
     def __init__(self,  conf: dict, td_normalisation: float):  
         super().__init__()
         self.model = PeregrineModel(conf)
-        self.marginals = self.model.marginals
+        self.marginals_dict = self.model.marginals_dict
+        
+        breakpoint()
         self.loss = nn.BCEWithLogitsLoss(reduction='none')
         self.lr = conf["training"]["learning_rate"]
         self.bounds_trained = self.model.bounds_trained
         self.scheduler_patience = conf["training"]["scheduler_patience"]
         self.scheduler_factor = conf["training"]["scheduler_factor"]
         self.output_names = []
-        for d_idx, domain in enumerate(self.marginals):
-            for i, marginal in enumerate(self.marginals[domain]):
+        self.marginals_list = []
+        for d_idx, domain in enumerate(self.marginals_dict):
+            for i, marginal in enumerate(self.marginals_dict[domain]):
                 # create a nice string for the marginal 
                 name_output = ""
                 for idx in marginal: 
                     name_output += str(_ORDERED_PRIOR_KEYS[idx]) + "_"
                 name_output = name_output[:-1]  # remove trailing underscore
                 self.output_names.append(name_output)
+                self.marginals_list.append(marginal)
+
         self.td_normalisation = td_normalisation
-        self.save_hyperparameters(conf, td_normalisation, logger=True)
+        self.save_hyperparameters(conf, td_normalisation, logger=True)    
+        self.weights_loss = torch.nn.Parameter(torch.ones(len(self.marginals_list)) / len(self.marginals_list))  # one weight per marginal (for now)
+        self.model_was_called_once = False
+        self.alpha =  1
+        self.automatic_optimization=False
     def forward(self, d_f, d_t, parameters):
         """
         Forward pass of the network.
@@ -141,9 +150,12 @@ class InferenceNetwork(LightningModule):
         shape_logits_half = (all_logits.shape[0] // 2, all_logits.shape[1])
         labels = torch.cat((torch.ones(shape_logits_half, device="cuda"), torch.zeros(shape_logits_half, device="cuda")), dim=0)
         all_loss= self.loss(all_logits, labels)
-        loss_params = torch.mean(all_loss, dim=0)
-        loss = torch.mean(loss_params)
-        return all_logits, loss_params, loss
+        tails_losses = torch.mean(all_loss, dim=0)
+        weighted_loss_separate_tails = self.weights_loss*tails_losses
+        loss = torch.sum(weighted_loss_separate_tails)
+        self.initial_losses = tails_losses.detach()
+        self.model_was_called_once = True
+        return all_logits, tails_losses, loss
     
     def calc_accuracies(self, all_logits):
         # the first half of all_params contains parameters from the joint, associated with the first half of all_data
@@ -160,34 +172,78 @@ class InferenceNetwork(LightningModule):
 
         return accuracy_params, accuracy
 
-    def training_step(self, batch, batch_idx): 
-        data_f = batch['data_fd']
-        data_t = batch['data_td']
-        parameters = batch['source_parameters']
+    def training_step(self, batch, batch_idx):
+        model_opt, weights_opt = self.optimizers()
 
-        all_logits, loss_params, loss = self.calc_logits_losses(data_f, data_t, parameters)
+        data_f = batch["data_fd"]
+        data_t = batch["data_td"]
+        parameters = batch["source_parameters"]
+
+        #forward pass, per-task losses
+        all_logits, tails_losses, loss = self.calc_logits_losses(data_f, data_t, parameters)
         accuracy_params, accuracy = self.calc_accuracies(all_logits)
-        
-        self.log('train_loss', loss , on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        #log the per-task losses and the accuracies
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-
         overall_idx = 0
-        for d_idx, domain in enumerate(self.marginals.keys()):
-            for i, marginal in enumerate(self.marginals[domain]):
+        for d_idx, domain in enumerate(self.marginals_dict):
+            for i, marginal in enumerate(self.marginals_dict[domain]):
                 name = self.output_names[overall_idx]
-                self.log(f'train_accuracy_{name}', accuracy_params[i], on_step=True, on_epoch=True, prog_bar=True, logger=True)
-                self.log(f'train_loss_{name}', loss_params[i], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+                self.log(f'val_accuracy_{name}', accuracy_params[overall_idx], on_step=False, on_epoch=True, prog_bar=True, logger=True)
+                self.log(f'val_loss_{name}', tails_losses[overall_idx], on_step=False, on_epoch=True, prog_bar=True, logger=True)
                 overall_idx += 1
-        return loss
+        
 
+        #compute gradient norms G_W^{(i)}
+        shared_params = [p for p in self.model.linear_f.parameters() if p.requires_grad]
+        G_W = []
+        
+        for i, L_i in enumerate(tails_losses):
+            grads = torch.autograd.grad(
+                outputs=self.weights_loss[i] * L_i,
+                inputs=shared_params
+            )
+            # might optimize this by not using a for loop???
+            print(f"shape of grads for task {i}: {[g.shape for g in grads]}")
+            grad_norm = torch.norm(torch.cat([g.flatten() for g in grads]), p=2)
+            G_W.append(grad_norm)
+        G_W = torch.stack(G_W)
+        G_bar = G_W.mean()
+
+        #compute r_i(t) and GradNorm loss
+        loss_ratios = tails_losses / self.initial_losses  # L_i(t) / L_i(0)
+        inv_rate = loss_ratios / loss_ratios.mean()      # r_i(t)
+        targets = G_bar * (inv_rate ** self.alpha)
+        L_grad = torch.abs(G_W.detach() - targets.detach()).sum()  # treat targets as constant
+
+        #update weights w_i
+        weights_opt.zero_grad()
+        self.manual_backward(L_grad)
+        weights_opt.step()
+        with torch.no_grad():
+            self.weights_loss = self.weights_loss * len(self.weights_loss) / self.weights_loss.sum()  # renormalize
+
+        #update model params
+        weighted_loss = torch.sum(self.weights_loss.detach() * tails_losses)
+        model_opt.zero_grad()
+        self.manual_backward(weighted_loss)
+        model_opt.step()
+
+        self.log_dict(
+            {
+            "L_grad": L_grad,
+            "weighted_loss": weighted_loss,
+            "G_bar": G_bar
+            })
+        
     def validation_step(self, batch, batch_idx):
         all_logits, loss_params, loss= self.calc_logits_losses(batch['data_fd'], batch["data_td"], batch['source_parameters'])
         accuracy_params, accuracy = self.calc_accuracies(all_logits)
         self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('val_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         overall_idx = 0
-        for d_idx, domain in enumerate(self.marginals):
-            for i, marginal in enumerate(self.marginals[domain]):
+        for d_idx, domain in enumerate(self.marginals_dict):
+            for i, marginal in enumerate(self.marginals_dict[domain]):
                 name = self.output_names[overall_idx]
                 self.log(f'val_accuracy_{name}', accuracy_params[overall_idx], on_step=False, on_epoch=True, prog_bar=True, logger=True)
                 self.log(f'val_loss_{name}', loss_params[overall_idx], on_step=False, on_epoch=True, prog_bar=True, logger=True)
@@ -199,27 +255,25 @@ class InferenceNetwork(LightningModule):
         accuracy_params, accuracy = self.calc_accuracies(all_logits)
         # print accuracies on test set
         self.log('test_acc', accuracy, on_step=False, on_epoch=True)
-        for d_idx, domain in enumerate(self.marginals):
-            for i, marginal in enumerate(self.marginals[domain]):
+        for d_idx, domain in enumerate(self.marginals_dict):
+            for i, marginal in enumerate(self.marginals_dict[domain]):
                 self.log(f'test_accuracy_{domain}_{i}', accuracy_params[i], on_step=False, on_epoch=True)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=self.scheduler_factor, patience=self.scheduler_patience, min_lr=1e-6)
+        trainable_params = [p for n, p in self.named_parameters() if n != "weights_loss"]
+        optimizer_nre = torch.optim.AdamW(self.parameters(), lr=self.lr)
+
+        optimizer_gradnorm = torch.optim.Adam([self.weights_loss], lr=0.01)
+        #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=self.scheduler_factor, patience=self.scheduler_patience, min_lr=1e-6)
         #scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 10**(epoch//15) if epoch < 30 else 100)
         #scheduler = torch.optim.lr_scheduler.CyclicLR(
-        #     optimizer,
+        #     optimizer ,
         #     base_lr=0.0001,
         #     max_lr=0.001,
         #     step_size_up=15,
         # )
-        return {
-            'optimizer': optimizer,
-            'lr_scheduler': {
-                'scheduler': scheduler,
-                'monitor': 'val_loss'
-            }
-        }
+        
+        return optimizer_nre, optimizer_gradnorm
 
 class SimpleModel(torch.nn.Module):
     def __init__(self, num_features: int, num_channels: int,  hlayersizes: tuple,  marginals: dict[list[list]], marginal_hidden_size: int, lr: float):  
@@ -236,7 +290,7 @@ class SimpleModel(torch.nn.Module):
             input_size = output_size
         
         self.logratios = MarginalClassifierHead(input_size, marginals=marginals, hidden_size=marginal_hidden_size)
-        self.marginals = marginals
+        self.marginals_dict = marginals
         
 
     def forward(self, x, parameters):
@@ -264,11 +318,11 @@ class PeregrineModel(torch.nn.Module):
     def __init__(self, conf: dict):
         super().__init__()
         self.batch_size = conf["training"]["batch_size"]
-        self.marginals = conf["tmnre"]["marginals"]
+        self.marginals_dict = conf["tmnre"]["marginals"]
         
         # Validate keys of marginals
         allowed_keys = {"f", "t", "ft"}
-        invalid_keys = set(self.marginals.keys()) - allowed_keys
+        invalid_keys = set(self.marginals_dict.keys()) - allowed_keys
         if invalid_keys:
             raise ValueError(f"Invalid keys in marginals: {invalid_keys}. Allowed keys are {allowed_keys}.")
         
@@ -296,10 +350,10 @@ class PeregrineModel(torch.nn.Module):
         self.linear_t = LinearCompression(n_timesteps)
         self.linear_f = LinearCompression(n_freqs)
         self.logratios_model_dict = nn.ModuleDict()
-        for key in self.marginals.keys():
+        for key in self.marginals_dict.keys():
             self.logratios_model_dict[key] = MarginalClassifierHead(
                 n_data_features=16*len(key),# key can be any of "f", "t", "ft", resulting in double input size if ft. 
-                marginals=self.marginals[key], 
+                marginals=self.marginals_dict[key], 
                 hlayersizes=(64, 32, 16, 8)
             ).to(conf["device"])
 
