@@ -104,7 +104,6 @@ class InferenceNetwork(LightningModule):
         self.model = PeregrineModel(conf)
         self.marginals_dict = self.model.marginals_dict
         
-        breakpoint()
         self.loss = nn.BCEWithLogitsLoss(reduction='none')
         self.lr = conf["training"]["learning_rate"]
         self.bounds_trained = self.model.bounds_trained
@@ -201,10 +200,9 @@ class InferenceNetwork(LightningModule):
         for i, L_i in enumerate(tails_losses):
             grads = torch.autograd.grad(
                 outputs=self.weights_loss[i] * L_i,
-                inputs=shared_params
+                inputs=shared_params,
+                retain_graph=True
             )
-            # might optimize this by not using a for loop???
-            print(f"shape of grads for task {i}: {[g.shape for g in grads]}")
             grad_norm = torch.norm(torch.cat([g.flatten() for g in grads]), p=2)
             G_W.append(grad_norm)
         G_W = torch.stack(G_W)
@@ -214,14 +212,14 @@ class InferenceNetwork(LightningModule):
         loss_ratios = tails_losses / self.initial_losses  # L_i(t) / L_i(0)
         inv_rate = loss_ratios / loss_ratios.mean()      # r_i(t)
         targets = G_bar * (inv_rate ** self.alpha)
-        L_grad = torch.abs(G_W.detach() - targets.detach()).sum()  # treat targets as constant
+        L_grad = torch.abs(G_W - targets).sum()  # treat targets as constant
 
         #update weights w_i
         weights_opt.zero_grad()
-        self.manual_backward(L_grad)
+        self.manual_backward(L_grad, retain_graph=True)
         weights_opt.step()
         with torch.no_grad():
-            self.weights_loss = self.weights_loss * len(self.weights_loss) / self.weights_loss.sum()  # renormalize
+            self.weights_loss /= self.weights_loss.sum()  # renormalize
 
         #update model params
         weighted_loss = torch.sum(self.weights_loss.detach() * tails_losses)
@@ -235,7 +233,6 @@ class InferenceNetwork(LightningModule):
             "weighted_loss": weighted_loss,
             "G_bar": G_bar
             })
-        
     def validation_step(self, batch, batch_idx):
         all_logits, loss_params, loss= self.calc_logits_losses(batch['data_fd'], batch["data_td"], batch['source_parameters'])
         accuracy_params, accuracy = self.calc_accuracies(all_logits)
@@ -286,7 +283,7 @@ class SimpleModel(torch.nn.Module):
         for i, output_size in enumerate(hlayersizes):
             self.fc_blocks.add_module(f"fc_{i}", nn.Linear(input_size, output_size))
             self.fc_blocks.add_module(f"relu_{i}", nn.ReLU())
-            #self.fc_blocks.add_module(f"dropout_{i}", nn.Dropout(p=0.2))
+            # self.fc_blocks.add_module(f"dropout_{i}", nn.Dropout(p=0.2))
             input_size = output_size
         
         self.logratios = MarginalClassifierHead(input_size, marginals=marginals, hidden_size=marginal_hidden_size)
