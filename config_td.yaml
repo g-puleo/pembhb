@@ -8,16 +8,16 @@ waveform_params:
 
 prior:
   "logMchirp": [5, 6] # log10(Mchirp/Msun)
-  "q": [5, 5]
+  "q": [1, 5]
   "chi1": [0,0]
   "chi2": [0,0]
-  "dist": [4.0,4.0]  # dist in Gpc (note that we shall sample uniformly dist^3)
+  "dist": [4.0,40]  # dist in Gpc (note that we shall sample uniformly dist^3)
   "phi": [0.0, 6.28318530718]
   "inc": [-1.0 ,1.0]
   "lambda": [0.0, 6.28318530718]
   "beta": [-1.0, 1.0] # sin beta
   "psi": [0.0, 3.14159265358979]
-  "Deltat": [ -1, -1 ] # t_merger from end of observation in days
+  "Deltat": [ -2, -1 ] # t_merger from end of observation in days
 
 training: 
   batch_size: 100
@@ -32,7 +32,7 @@ training:
 tmnre:
   marginals: 
     #  f: [[0]]
-    ft: [[0], [1]]
+    f: [[0], [1]]
     # t: [[10]]
 
 

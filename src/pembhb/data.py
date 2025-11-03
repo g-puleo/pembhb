@@ -114,13 +114,15 @@ class MBHBDataModule( L.LightningDataModule ):
         self.generator = torch.Generator().manual_seed(31415)
         self.filename = filename
         self.transform_fd = conf["training"]["transform_fd"]
-
     def prepare_data(self):
 
         pass
     
     def setup(self, stage=None):
         """Setup the dataset."""
+        if hasattr(self, 'train') and stage == 'fit': 
+            # avoid running setup twice if it was already done. 
+            return
         if stage == "fit" or stage is None:
             full_dataset = MBHBDataset(self.filename, transform_fd=self.transform_fd)
             self.train, self.val, self.test = random_split(full_dataset,  [0.85,0.095, 0.055], generator=self.generator)

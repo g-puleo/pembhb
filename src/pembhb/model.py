@@ -201,7 +201,8 @@ class InferenceNetwork(LightningModule):
             grads = torch.autograd.grad(
                 outputs=self.weights_loss[i] * L_i,
                 inputs=shared_params,
-                retain_graph=True
+                retain_graph=True, 
+                create_graph=True
             )
             grad_norm = torch.norm(torch.cat([g.flatten() for g in grads]), p=2)
             G_W.append(grad_norm)
@@ -212,8 +213,9 @@ class InferenceNetwork(LightningModule):
         loss_ratios = tails_losses / self.initial_losses  # L_i(t) / L_i(0)
         inv_rate = loss_ratios / loss_ratios.mean()      # r_i(t)
         targets = G_bar * (inv_rate ** self.alpha)
-        L_grad = torch.abs(G_W - targets).sum()  # treat targets as constant
-
+        #breakpoint()
+        L_grad = torch.abs(G_W - targets.detach()).sum()  # treat targets as constant
+        
         #update weights w_i
         weights_opt.zero_grad()
         self.manual_backward(L_grad, retain_graph=True)
@@ -233,6 +235,8 @@ class InferenceNetwork(LightningModule):
             "weighted_loss": weighted_loss,
             "G_bar": G_bar
             })
+        for i in range(len(self.marginals_list)):
+            self.log(f"weight_{self.output_names[i]}", self.weights_loss[i], on_step=True, on_epoch=True, prog_bar=False, logger=True)
     def validation_step(self, batch, batch_idx):
         all_logits, loss_params, loss= self.calc_logits_losses(batch['data_fd'], batch["data_td"], batch['source_parameters'])
         accuracy_params, accuracy = self.calc_accuracies(all_logits)

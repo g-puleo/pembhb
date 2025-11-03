@@ -27,7 +27,7 @@ def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
     sim = LISAMBHBSimulatorTD(conf, sampler_init_kwargs=sampler_init_kwargs)
     #sim = DummySimulator(sampler_init_kwargs=sampler_init_kwargs)
     #fname = os.path.join(ROOT_DIR, "data", f"simulated_data_round_{idx}.h5")
-    fname = os.path.join(ROOT_DIR, "data", f"simulated_data_round_0.h5")
+    fname = os.path.join(ROOT_DIR, "data", f"simulated_data_fullprior.h5")
     # print("Sampling from the simulator...")
     # os.makedirs(os.path.join(ROOT_DIR, "data"), exist_ok=True)
     # try: 
