@@ -101,8 +101,8 @@ class InferenceNetwork(LightningModule):
     """
     def __init__(self,  conf: dict, td_normalisation: float):  
         super().__init__()
-        self.data_summary = BrutalCompression(lowdim=20, N=100, in_channels=8, cnn_channels=(32, 64))
-        self.marginals = conf["tmnre"]["marginals"]
+        self.data_summary = BrutalCompression(lowdim=20, Nfreqs=100, in_channels=4)
+        self.marginals_dict = conf["tmnre"]["marginals"]
         self.loss = nn.BCEWithLogitsLoss(reduction='none')
         self.lr = conf["training"]["learning_rate"]
         self.bounds_trained = conf["prior"]
@@ -122,16 +122,16 @@ class InferenceNetwork(LightningModule):
 
         self.td_normalisation = td_normalisation
         self.save_hyperparameters(conf, td_normalisation, logger=True)    
-        self.weights_loss = torch.nn.Parameter(torch.ones(len(self.marginals_list)) / len(self.marginals_list))  # one weight per marginal (for now)
+        self.weights_loss_logits = torch.nn.Parameter(torch.zeros(len(self.marginals_list)))
         self.model_was_called_once = False
         self.alpha =  1
         self.automatic_optimization=False        
         self.logratios_model_dict = nn.ModuleDict()
-        for key in self.marginals.keys():
+        for key in self.marginals_dict.keys():
             self.logratios_model_dict[key] = MarginalClassifierHead(
                 #n_data_features=16*len(key),# key can be any of "f", "t", "ft", resulting in double input size if ft. 
                 n_data_features=20, # for brutal compression with lowdim=20
-                marginals=self.marginals[key], 
+                marginals=self.marginals_dict[key], 
                 hlayersizes=(64, 32, 16, 8)
             ).to(conf["device"])
     def forward(self, d_f, d_t, parameters):
@@ -175,12 +175,14 @@ class InferenceNetwork(LightningModule):
         labels = torch.cat((torch.ones(shape_logits_half, device="cuda"), torch.zeros(shape_logits_half, device="cuda")), dim=0)
         all_loss= self.loss(all_logits, labels)
         tails_losses = torch.mean(all_loss, dim=0)
-        weighted_loss_separate_tails = self.weights_loss*tails_losses
-        loss = torch.sum(weighted_loss_separate_tails)
+        weights = torch.nn.functional.softmax(self.weights_loss_logits, dim=0)
+        weighted_tails_losses = weights * tails_losses
+        #breakpoint()
+        loss = torch.sum(weighted_tails_losses)
         self.initial_losses = tails_losses.detach()
         self.model_was_called_once = True
-        return all_logits, tails_losses, loss
-    
+        return all_logits, tails_losses, weighted_tails_losses, weights, loss
+
     def calc_accuracies(self, all_logits):
         # the first half of all_params contains parameters from the joint, associated with the first half of all_data
         # the second half of all_params contains parameters from the marginal, independent of the second half of all_data
@@ -204,7 +206,7 @@ class InferenceNetwork(LightningModule):
         parameters = batch["source_parameters"]
 
         #forward pass, per-task losses
-        all_logits, tails_losses, loss = self.calc_logits_losses(data_f, data_t, parameters)
+        all_logits, tails_losses, weighted_tails_losses, weights, loss = self.calc_logits_losses(data_f, data_t, parameters)
         accuracy_params, accuracy = self.calc_accuracies(all_logits)
         #log the per-task losses and the accuracies
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
@@ -218,19 +220,27 @@ class InferenceNetwork(LightningModule):
                 overall_idx += 1
         
 
+        #log weights (before update)
+        for i in range(len(self.marginals_list)):
+            self.log(f"weight_{self.output_names[i]}", weights[i], on_step=True, on_epoch=True, prog_bar=False, logger=True)
+
+        ########## GRADNORM LOGIC ###############
+
         #compute gradient norms G_W^{(i)}
-        shared_params = [p for p in self.model.linear_f.parameters() if p.requires_grad]
+        #shared_params = [p for p in self.data_summary.linear_f.parameters() if p.requires_grad] (uncomment for use with unet)
+        shared_params = [p for p in self.data_summary.final_mlp.parameters() if p.requires_grad]
         G_W = []
         
-        for i, L_i in enumerate(tails_losses):
+        for i, wL_i in enumerate(weighted_tails_losses):
             grads = torch.autograd.grad(
-                outputs=self.weights_loss[i] * L_i,
+                outputs=wL_i,
                 inputs=shared_params,
                 retain_graph=True, 
                 create_graph=True
             )
             grad_norm = torch.norm(torch.cat([g.flatten() for g in grads]), p=2)
             G_W.append(grad_norm)
+            self.log(f"gradient_norm_{self.output_names[i]}", grad_norm, on_step=True, on_epoch=True, prog_bar=False, logger=True)
         G_W = torch.stack(G_W)
         G_bar = G_W.mean()
 
@@ -241,29 +251,23 @@ class InferenceNetwork(LightningModule):
         #breakpoint()
         L_grad = torch.abs(G_W - targets.detach()).sum()  # treat targets as constant
         
-        #update weights w_i
+        #update weights w_i (actually we store their logits to ensure positivity)
         weights_opt.zero_grad()
         self.manual_backward(L_grad, retain_graph=True)
         weights_opt.step()
-        with torch.no_grad():
-            self.weights_loss /= self.weights_loss.sum()  # renormalize
-
         #update model params
-        weighted_loss = torch.sum(self.weights_loss.detach() * tails_losses)
         model_opt.zero_grad()
-        self.manual_backward(weighted_loss)
+        self.manual_backward(loss)
         model_opt.step()
-
         self.log_dict(
             {
             "L_grad": L_grad,
-            "weighted_loss": weighted_loss,
+            "weighted_loss": loss,
             "G_bar": G_bar
             })
-        for i in range(len(self.marginals_list)):
-            self.log(f"weight_{self.output_names[i]}", self.weights_loss[i], on_step=True, on_epoch=True, prog_bar=False, logger=True)
+        
     def validation_step(self, batch, batch_idx):
-        all_logits, loss_params, loss= self.calc_logits_losses(batch['data_fd'], batch["data_td"], batch['source_parameters'])
+        all_logits, losses_tails, weighted_losses_tails, weights,  loss= self.calc_logits_losses(batch['data_fd'], batch["data_td"], batch['source_parameters'])
         accuracy_params, accuracy = self.calc_accuracies(all_logits)
         self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('val_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
@@ -272,7 +276,7 @@ class InferenceNetwork(LightningModule):
             for i, marginal in enumerate(self.marginals_dict[domain]):
                 name = self.output_names[overall_idx]
                 self.log(f'val_accuracy_{name}', accuracy_params[overall_idx], on_step=False, on_epoch=True, prog_bar=True, logger=True)
-                self.log(f'val_loss_{name}', loss_params[overall_idx], on_step=False, on_epoch=True, prog_bar=True, logger=True)
+                self.log(f'val_loss_{name}', losses_tails[overall_idx], on_step=False, on_epoch=True, prog_bar=True, logger=True)
                 overall_idx += 1
         return loss
     
@@ -286,10 +290,10 @@ class InferenceNetwork(LightningModule):
                 self.log(f'test_accuracy_{domain}_{i}', accuracy_params[i], on_step=False, on_epoch=True)
 
     def configure_optimizers(self):
-        trainable_params = [p for n, p in self.named_parameters() if n != "weights_loss"]
-        optimizer_nre = torch.optim.AdamW(self.parameters(), lr=self.lr)
+        trainable_params = [p for n, p in self.named_parameters() if n != "weights_loss_logits"]
+        optimizer_nre = torch.optim.AdamW(trainable_params, lr=self.lr)
 
-        optimizer_gradnorm = torch.optim.Adam([self.weights_loss], lr=0.01)
+        optimizer_gradnorm = torch.optim.Adam([self.weights_loss_logits], lr=0.001)
         #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=self.scheduler_factor, patience=self.scheduler_patience, min_lr=1e-6)
         #scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 10**(epoch//15) if epoch < 30 else 100)
         #scheduler = torch.optim.lr_scheduler.CyclicLR(
@@ -396,34 +400,35 @@ class BrutalCompression(nn.Module):
 
     This implementation requires Nfreqs >= 100 and will raise a ValueError otherwise.
     """
-    def __init__(self, lowdim: int, Nfreqs: int = 100, in_channels: int = 6, cnn_channels: Iterable[int] = (32, 64)): 
+    def __init__(self, lowdim: int, Nfreqs: int,  in_channels: int  ): 
         super().__init__()
         self.N = Nfreqs
         self.lowdim = lowdim
         self.in_channels = in_channels
-        self.cnn_channels = tuple(cnn_channels)
-    
-        layers = []
-        layers.append(nn.Conv1d(in_channels, self.cnn_channels[0], kernel_size=3, padding=1, bias=False))
-        layers.append(nn.BatchNorm1d(self.cnn_channels[0]))
-        layers.append(nn.ReLU(inplace=True))
 
-        layers.append(nn.Conv1d(self.cnn_channels[0], self.cnn_channels[1], kernel_size=3, padding=1, bias=False))
-        layers.append(nn.BatchNorm1d(self.cnn_channels[1]))
-        layers.append(nn.ReLU(inplace=True))
+        self.channel_blocks = nn.ModuleList()
+        for _ in range(self.in_channels):
+            block = nn.Sequential(
+            nn.Flatten(),  # (B, 2, N) -> (B, 2*N)
+            nn.Linear(self.N, 10),
+            nn.ReLU(),
+            nn.Linear(10, 1)  # produce a single number per channel
+            )
+            self.channel_blocks.append(block)
 
-        # Pool to desired lowdim
-        layers.append(nn.AdaptiveAvgPool1d(self.lowdim))
+        # final 2-layer MLP: takes concatenated per-channel scalars (B, in_channels) -> lowdim
+        final_hidden = 30
+        self.final_mlp = nn.Sequential(
+            nn.Linear(self.in_channels, final_hidden),
+            nn.ReLU(),
+            nn.Linear(final_hidden, self.lowdim),
+        )
 
-        # Final conv to get single channel output
-        layers.append(nn.Conv1d(self.cnn_channels[1], 1, kernel_size=1))
-
-        self.cnn = nn.Sequential(*layers)
 
     def forward(self, d_f, d_t):
         """
         Args:
-            d_f: Tensor shape (B, C, Nfreqs)
+            d_f: Tensor shape (B, C, Ntot_freqs)
             d_t: passed through unchanged
         Returns:
             compressed: Tensor shape (B, 1, lowdim)
@@ -435,18 +440,26 @@ class BrutalCompression(nn.Module):
             raise ValueError(f"BrutalCompression requires at least {self.N} frequencies, got {Nfreqs}")
 
         k = self.N
-        # find top-k by absolute value per channel
-        _, indices = torch.topk(d_f.abs(), k=k, dim=2)  # indices: (B, C, k)
+        # compute top-k indices from channel 0 only
+        _, topk_idx = torch.topk(d_f[:, 0, :].abs(), k=k, dim=1)  # (B, k)
+        # expand to all channels for gathering
+        indices = topk_idx.unsqueeze(1).expand(-1, C, -1)  # (B, C, k)
 
-        # gather original (signed) values using these indices
-        values = torch.gather(d_f, 2, indices)  # (B, C, k)
+        # gather values for all channels at these indices
+        selected = torch.gather(d_f, 2, indices)  # (B, C, k)
 
-        # normalize indices to [0,1]
-        indices_norm = indices.float() / (Nfreqs - 1)  # (B, C, k)
+        # process each channel with its channel_block -> yields (B,1) per channel
+        channel_outputs = []
+        for c, block in enumerate(self.channel_blocks):
+            out = block(selected[:, c, :])  # (B, 1)
+            channel_outputs.append(out)
 
-        # concatenate values and normalized indices along channel dimension -> (B, 2*C, k)
-        stacked = torch.cat([values, indices_norm], dim=1)
-        compressed = self.cnn(stacked).squeeze(1)  # (B, 1, lowdim)
+        # concatenate per-channel scalars into (B, C)
+        per_channel_scalars = torch.cat(channel_outputs, dim=1)  # (B, C)
+
+        # final MLP to produce lowdim features (B, lowdim)
+        compressed = self.final_mlp(per_channel_scalars)  # (B, lowdim)
+
         return compressed, d_t
    
 ### THIS CHUNK OF CODE IS DIRECTLY COPIED FROM PEREGRINE
