@@ -17,6 +17,8 @@ from bbhx.utils.constants import YRSID_SI, PC_SI
 from pembhb import ROOT_DIR
 from pembhb.sampler import UniformSampler
 import sys
+import json
+import time
 gpu_available = False ### True does not work on coglians, needs nvcc
 if gpu_available: 
     backend='cuda12x'
@@ -288,6 +290,24 @@ class LISAMBHBSimulatorTD():
         self.n_channels = len(self.channels)
 
         self.sampler = UniformSampler(**sampler_init_kwargs)
+        # store initialization metadata for reproducibility / downstream use
+        self.info = {
+            "backend": backend,
+            "seed": seed,
+            "conf": conf,
+            "sampler_init_kwargs": sampler_init_kwargs,
+            "waveform_kwargs": self.waveform_kwargs,
+            "dt": self.dt,
+            "channels": list(self.channels),
+            "n_channels": self.n_channels,
+            "n_time_pt_noise": self.n_time_pt_noise,
+            "df_noise": self.df_noise,
+            "f_len_noise": self.f_len_noise,
+            "noise_factor_shape": self.noise_factor.shape,
+            # include sampler and waveform generator types for clarity (avoid heavy objects)
+            "sampler_type": type(self.sampler).__name__,
+            "waveform_generator_type": type(self.waveform_generator).__name__,
+        }
     def generate_noise_td( self, n_observations):
         noise_fd = self.noise_rng.normal(loc= 0.0,size = (n_observations , self.n_channels, self.f_len_noise)) + 1j*self.noise_rng.normal(loc= 0.0,size = (n_observations , self.n_channels, self.f_len_noise))
         #noise_fd *= self.window_fd_noise
@@ -313,6 +333,7 @@ class LISAMBHBSimulatorTD():
         # insert a set of zeros between injection[5] and injection[6]. this is the f_ref parameter , which in bbhx can be set to 0 in order to set f_ref @ t_chirp
         injection = np.insert(injection, 6, np.zeros(injection[5].shape), axis=0) 
         n_observations = injection.shape[1]
+        
         # add noise 
         noise_td , noise_fd = self.generate_noise_td(n_observations)
         signal_td = self.generate_signal_td(injection)
@@ -395,7 +416,44 @@ class LISAMBHBSimulatorTD():
                 data_td[i:batch_end] = data_td_batch
                 noise_fd[i:batch_end] = noise_fd_batch
                 snr[i:batch_end] = snr_batch
-    
+        self.save_info_json( filename=filename, overwrite=True )
+    def save_info_json(self, filename: str = None, overwrite: bool = False, indent: int = 2):
+        """
+        Save self.info as a JSON file. Numpy arrays and numpy scalars are converted to native types.
+        If filename is None a timestamped file in ROOT_DIR will be created.
+
+        :param filename: target json path
+        :param overwrite: allow overwriting existing file
+        :param indent: json indent level
+        """
+
+        if filename is None:
+            filename = os.path.join(ROOT_DIR, f"simulator_info_{int(time.time())}.json")
+
+        if os.path.exists(filename) and not overwrite:
+            raise FileExistsError(f"File '{filename}' already exists. Pass overwrite=True to replace it.")
+
+        def _convert(obj):
+            # handle common numpy types and containers
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, (np.integer, np.floating, np.bool_)):
+                return obj.item()
+            if isinstance(obj, complex):
+                return {"real": obj.real, "imag": obj.imag}
+            if isinstance(obj, dict):
+                return {k: _convert(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_convert(v) for v in obj]
+            # fallback to string for unsupported objects
+            return obj if isinstance(obj, (str, int, float, bool, type(None))) else str(obj)
+
+        data = _convert(self.info)
+
+        jsonpath = filename.removesuffix(".h5") + ".json"
+        with open(jsonpath, "w") as fh:
+            json.dump(data, fh, indent=indent)
+            
     def get_SNR_FD(self,
         signal
         ):
