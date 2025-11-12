@@ -68,7 +68,7 @@ class SequentialTrainer:
         trainer = Trainer(
             logger=logger,
             max_epochs=self.train_conf["epochs"],
-            accelerator="gpu",
+            accelerator=self.train_conf["device"],
             devices=1,
             enable_progress_bar=True,
             callbacks=[checkpoint_callback, early_stopping_callback],
