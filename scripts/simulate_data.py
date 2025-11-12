@@ -10,7 +10,7 @@ parser = argparse.ArgumentParser(
 parser.add_argument("--n", default=1)
 parser.add_argument("--fname", required=True)
 parser.add_argument("-s", "--seed", required=True)
-config_path = os.path.join(ROOT_DIR, "config_td.yaml")
+config_path = os.path.join(ROOT_DIR, "datagen_config.yaml")
 with open(config_path, "r") as file:
     conf = yaml.safe_load(file) 
 args = parser.parse_args()

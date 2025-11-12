@@ -33,11 +33,16 @@ class MBHBDataset(Dataset):
             self.len = f[self.keys[0]].shape[0]
             if transform_fd in ["logwhiten", "whiten"]:
                 self.PSD = torch.tensor(f["psd"][()], device="self.device", dtype=torch.float32)
-            self.data_fd = self.transform_fd(torch.tensor(f["data_fd"][()], device=self.device, dtype=torch.float32))
+            self.data_fd = torch.tensor(f["data_fd"][()], device=self.device, dtype=torch.float32) 
             self.data_td = torch.tensor(f["data_td"][()], device=self.device, dtype=torch.float32)
             self.parameters =  torch.tensor(f["source_parameters"][()], device=self.device, dtype=torch.float32)
             self.frequencies = torch.tensor(f["frequencies"][()], device=self.device, dtype=torch.float32)
             self.times = torch.tensor(f["times_SI"][()], device=self.device, dtype=torch.float32)
+    
+    def get_data_fd_complex(self):
+        print(self.data_fd.shape)
+        return self.data_fd[:,self.channels_amp] * torch.exp(1j * self.data_fd[:,self.channels_phase])
+    
     def _transform_identity(self, data):
         return data
     
@@ -74,10 +79,15 @@ class MBHBDataset(Dataset):
         #data is of shape (6, n) with channels sorted as AETAET, first half amplitude is , second half is phase
         #this line fetches only the channels in self.channels, in order. 
         # breakpoint()
-        data_ampl = torch.log10(data[:,self.channels_amp]+1e-33) # add a small value to avoid log(0)
-        data_phase = data[:,self.channels_phase]
-        return torch.concatenate((data_ampl, data_phase), dim=1)
-    
+        print(f"transform log called")
+        print(f" data shape before transform: {data.shape}")
+        data_ampl = torch.log10(data[self.channels_amp]+1e-33) # add a small value to avoid log(0)
+        data_phase = data[self.channels_phase]
+        print(f"data_ampl.shape: {data_ampl.shape}, data_phase.shape: {data_phase.shape}")
+        concatenated = torch.concatenate((data_ampl, data_phase), dim=0)
+        print(f"concatenated.shape: {concatenated.shape}")
+        return concatenated
+
     def _transform_whiten(self, data):
 
         print(self.PSD.shape, data[self.channels_amp].shape)
@@ -91,7 +101,7 @@ class MBHBDataset(Dataset):
     def __getitem__(self, idx):
         dict_out = {
             'source_parameters': self.parameters[idx],
-            'data_fd': self.data_fd[idx],
+            'data_fd': self.transform_fd(self.data_fd[idx]),
             'data_td': self.data_td[idx]
         }
         return dict_out
@@ -110,10 +120,11 @@ class MBHBDataModule( L.LightningDataModule ):
         :type conf: dict
         """
         super().__init__()
-        self.batch_size = conf["training"]["batch_size"]
+        self.batch_size = conf["batch_size"]
         self.generator = torch.Generator().manual_seed(31415)
         self.filename = filename
-        self.transform_fd = conf["training"]["transform_fd"]
+        self.transform_fd = conf["transform_fd"]
+    
     def prepare_data(self):
 
         pass

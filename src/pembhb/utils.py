@@ -59,7 +59,7 @@ def get_logratios_grid(dataset: MBHBDataset, model: 'InferenceNetwork', ngrid_po
 
     model.eval()
     model = model.to("cuda")
-    prior_trained_dict = model.hparams["prior"]
+    prior_trained_dict = model.hparams["dataset_info"]["conf"]["prior"]
     prior_bounds = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx]]
     low = prior_bounds[0]
     high = prior_bounds[1]
@@ -102,6 +102,7 @@ def get_logratios_grid(dataset: MBHBDataset, model: 'InferenceNetwork', ngrid_po
         results = torch.cat(results, dim=0).numpy()
         injection_params = torch.cat(injection_params, dim=0).numpy()
         grid = grid.detach().cpu().numpy()
+    return results, injection_params, grid
 
 def get_logratios_grid_2d(dataset: MBHBDataset, model: 'InferenceNetwork', ngrid_points: int, out_param_idx : int, in_param_idx : tuple):
     dataloader = DataLoader(dataset, batch_size=min(10, len(dataset)), shuffle=False)
@@ -145,6 +146,7 @@ def get_logratios_grid_2d(dataset: MBHBDataset, model: 'InferenceNetwork', ngrid
                 batched2_data_fd = batched2_data_fd.to("cuda")
                 batched2_data_td = batched2_data_td.to("cuda")
                 batched2_grid = batched2_grid.to("cuda")
+                breakpoint()
                 logratios= model(batched2_data_fd, batched2_data_td, batched2_grid)[:, out_param_idx]  
                 logratios_list.append(logratios)
             logratios = torch.cat(logratios_list, dim=0)
@@ -241,7 +243,7 @@ def get_pvalues_2d(logratios: np.array, grid_0: np.array , grid_1: np.array, inj
 
 
 
-def update_bounds(model: 'InferenceNetwork', observation_dataset: MBHBDataset, priordict: dict, in_param_idx: int, n_gridpoints: int = 100000, out_param_idx: int = None, eps: float = 1e-5):
+def update_bounds(model: 'InferenceNetwork', observation_dataset: MBHBDataset, priordict: dict, in_param_idx: int, n_gridpoints: int, out_param_idx: int, eps: float = 1e-5):
     """Update the prior bounds based on the posterior obtained from a model on a single observation. 
     Used to do truncation in MNRE. 
 
@@ -260,14 +262,22 @@ def update_bounds(model: 'InferenceNetwork', observation_dataset: MBHBDataset, p
     """
     print(f"Updating prior bounds for {_ORDERED_PRIOR_KEYS[in_param_idx]}...")
     # evaluate the model over a decently fine grid, which requires knowledge of previous prior region 
-    logratios, injection_params, grid = get_logratios_grid(observation_dataset, model, n_gridpoints, in_param_idx=in_param_idx, out_param_idx=out_param_idx)
-    # find the 95% two tail interval of the posterior 
-    print(f"injection_params are: {injection_params}")
-    cumsum = np.cumsum(np.exp(logratios))
-    cumsum /= cumsum[-1]  
-    idx_low = np.argwhere(cumsum < eps/2)[-1]
-    idx_high = np.argwhere(cumsum > 1-eps/2)[0]
-
+    prior_bounds_found = False
+    while prior_bounds_found==False:
+        try:
+            logratios, injection_params, grid = get_logratios_grid(observation_dataset, model, n_gridpoints, in_param_idx=in_param_idx, out_param_idx=out_param_idx)
+            # find the 95% two tail interval of the posterior 
+            print(f"injection_params are: {injection_params}")
+            cumsum = np.cumsum(np.exp(logratios))
+            cumsum /= cumsum[-1]  
+            idx_low = np.argwhere(cumsum < eps/2)[-1]
+            idx_high = np.argwhere(cumsum > 1-eps/2)[0]
+            print(f"prior bounds found with ngridpoints {n_gridpoints}")
+            prior_bounds_found = True
+        except IndexError:
+            print(f"cannot update prior bounds with current number of grid points: {n_gridpoints} and eps {eps}")
+            n_gridpoints *= 2
+        
     new_low = grid[idx_low]
     new_high = grid[idx_high]
 
@@ -277,7 +287,7 @@ def update_bounds(model: 'InferenceNetwork', observation_dataset: MBHBDataset, p
     
     return updated_prior
 
-def pp_plot( dataset, model , in_param_idx: int, name: str = None, out_param_idx: int = None):  
+def pp_plot( dataset, model , in_param_idx: int, name: str, out_param_idx: int):  
     """Generate a pp plot using the examples in dataset, and the posteriors obtained by the model . 
     :param dataset: dataset used to make the pp plot
     :type dataset: MBHBDataset

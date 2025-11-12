@@ -4,6 +4,7 @@ from lightning import LightningModule
 from torch import nn
 from torch.nn import functional as F
 from typing import Iterable
+from pembhb.data import MBHBDataset
 from pembhb.utils import _ORDERED_PRIOR_KEYS
 # class GWTransformer(LightningModule):
 #     def __init__(self, n_chunks=100, embed_dim=512, num_heads=8, num_layers=4):
@@ -52,6 +53,120 @@ from pembhb.utils import _ORDERED_PRIOR_KEYS
 
 #         return out
 WEEK_SI = 7 * 24 * 3600  # seconds in a week
+
+
+def build_data_summary(conf):
+    ''' 
+    conf must be from config.yaml "data_summary" section
+    '''
+    ds_type = conf["type"]
+    init_kwargs = conf[ds_type]
+    cls = DATA_SUMMARY_REGISTRY[conf["type"]]
+    return cls(**init_kwargs)
+
+class GradnormHandler : 
+
+    def __init__(self, parent_module: 'InferenceNetwork', config: dict ):
+        """Initialises gradnorm handler
+
+        :param parent_module: the parent lightning module (in lightningmodule __init__ call, it is 'self')
+        :type parent_module: LightningModule
+        :param config: must contain the following keys: 'alpha' , 'common_params', 
+        :type config: dict
+        """
+        self.model = parent_module
+        self.alpha=config["alpha"]
+        self.shared_layer = getattr(self.model.data_summary, config["common_params"])
+        self.shared_params_gradnorm = [p for p in self.shared_layer.parameters() if p.requires_grad]
+        self.model.model_was_called_once = False
+        self.model.automatic_optimization=False 
+    
+    def training_step(self, batch, batch_idx):
+        """Performs a training step.
+
+        :param batch: The input batch of data.
+        :type batch: dict
+        :param batch_idx: The index of the batch.
+        :type batch_idx: int
+        :return: _tuple: all_logits, task_losses, total_loss
+        :rtype: tuple
+        """
+        
+        data_f = batch['data_fd']
+        data_t = batch['data_td']
+        parameters = batch['source_parameters']
+
+        # same base call, but handler decides weighting logic
+        all_logits, all_loss = self.model._calc_logits_base(data_f, data_t, parameters)
+
+
+        #update task weights using gradnorm algorithm
+        task_losses, total_loss, gradnorm_loss = self.compute_gradnorm_loss(all_loss)       
+        #update weights w_i (actually we store their logits to ensure positivity)
+        optimizer_nre, optimizer_gradnorm = self.model.optimizers()
+        optimizer_gradnorm.zero_grad()
+        self.model.manual_backward(gradnorm_loss, retain_graph=True)
+        optimizer_gradnorm.step()
+        #update model params
+        optimizer_nre.zero_grad()
+        self.model.manual_backward(total_loss)
+        optimizer_nre.step()
+
+        self.model.log_dict(
+            {
+            "L_grad": gradnorm_loss,
+            "weighted_loss": total_loss
+            })
+
+        return  all_logits, task_losses, total_loss
+
+    def compute_gradnorm_loss(self, all_loss):
+        ########## GRADNORM LOGIC ###############
+        task_losses = torch.mean(all_loss, dim=0)
+        weights = torch.nn.functional.softmax(self.model.weights_loss_logits, dim=0)
+        weighted_task_losses = weights * task_losses
+        total_loss = torch.sum(weighted_task_losses)
+        #compute gradient norms G_W^{(i)}
+        G_W = []
+        
+        for i, wL_i in enumerate(weighted_task_losses):
+            grads = torch.autograd.grad(
+                outputs=wL_i,
+                inputs=self.shared_params_gradnorm,
+                retain_graph=True, 
+                create_graph=True
+            )
+            grad_norm = torch.norm(torch.cat([g.flatten() for g in grads]), p=2)
+            G_W.append(grad_norm)
+            self.model.log(f"gradient_norm_{self.model.output_names[i]}", grad_norm, on_step=True, on_epoch=True, prog_bar=False, logger=True)
+        G_W = torch.stack(G_W)
+        G_bar = G_W.mean()
+
+        #compute r_i(t) and GradNorm loss
+        loss_ratios = task_losses / self.initial_losses  # L_i(t) / L_i(0)
+        inv_rate = loss_ratios / loss_ratios.mean()      # r_i(t)
+        targets = G_bar * (inv_rate ** self.alpha)
+        #breakpoint()
+        gradnorm_loss = torch.abs(G_W - targets.detach()).sum()  # treat targets as constant
+        self.model.log("gradient_norm", G_bar, on_step=True, on_epoch=True, prog_bar=False, logger=True)
+        self.model
+        return task_losses, total_loss, gradnorm_loss
+
+
+    def calc_logits_losses_gradnorm(self, data_f, data_t, parameters):
+        '''
+        returns: 
+            all_logits: tensor of shape (2*B, num_marginals)
+            tails_losses: tensor of shape (num_marginals,), the non weighted losses
+            weighted_tails_losses: tensor of shape (num_marginals,) the weighted losses, for sparing computation
+            weights: tensor of shape (num_marginals,), the weights used for the weighted loss (after softmax)
+            loss: scalar tensor, the full weighted loss'''
+        all_logits, all_loss = self.model._calc_logits_base(data_f, data_t, parameters)
+        task_losses, total_loss, gradnorm_loss = self.compute_gradnorm_loss(all_loss)
+        self.initial_losses = task_losses.detach()
+        self.model_was_called_once = True
+        return all_logits, task_losses, total_loss, gradnorm_loss
+
 class MarginalClassifierHead(nn.Module):
 
     def __init__(self, n_data_features: int , marginals: list[list], hlayersizes: Iterable[int]):
@@ -99,15 +214,15 @@ class InferenceNetwork(LightningModule):
     """ 
     Basic FC network for TMNRE of MBHB data. 
     """
-    def __init__(self,  conf: dict, td_normalisation: float):  
+    def __init__(self,  train_conf: dict,  dataset_info: dict):  
         super().__init__()
-        self.data_summary = BrutalCompression(lowdim=20, Nfreqs=100, in_channels=4)
-        self.marginals_dict = conf["tmnre"]["marginals"]
+        self.data_summary = build_data_summary(train_conf["architecture"]["data_summary"])
+        self.marginals_dict = train_conf["marginals"]
         self.loss = nn.BCEWithLogitsLoss(reduction='none')
-        self.lr = conf["training"]["learning_rate"]
-        self.bounds_trained = conf["prior"]
-        self.scheduler_patience = conf["training"]["scheduler_patience"]
-        self.scheduler_factor = conf["training"]["scheduler_factor"]
+        self.lr = train_conf["learning_rate"]
+        self.bounds_trained = dataset_info["conf"]["prior"]
+        self.scheduler_patience = train_conf["scheduler_patience"]
+        self.scheduler_factor = train_conf["scheduler_factor"]
         self.output_names = []
         self.marginals_list = []
         for d_idx, domain in enumerate(self.marginals_dict):
@@ -120,20 +235,26 @@ class InferenceNetwork(LightningModule):
                 self.output_names.append(name_output)
                 self.marginals_list.append(marginal)
 
-        self.td_normalisation = td_normalisation
-        self.save_hyperparameters(conf, td_normalisation, logger=True)    
-        self.weights_loss_logits = torch.nn.Parameter(torch.zeros(len(self.marginals_list)))
-        self.model_was_called_once = False
-        self.alpha =  1
-        self.automatic_optimization=False        
+        self.td_normalisation = dataset_info["td_max"]
+        self.save_hyperparameters(logger=True)    
+        
+        self.use_gradnorm = train_conf["architecture"]["gradnorm"]["enabled"]
+
+        if self.use_gradnorm:
+            self.gradnorm = GradnormHandler(self, train_conf["architecture"]["gradnorm"])
+            self.weights_loss_logits = torch.nn.Parameter(torch.zeros(len(self.marginals_list)))
+            self.lr_gradnorm = train_conf["architecture"]["gradnorm"]["learning_rate"]
+
+       
         self.logratios_model_dict = nn.ModuleDict()
         for key in self.marginals_dict.keys():
             self.logratios_model_dict[key] = MarginalClassifierHead(
-                #n_data_features=16*len(key),# key can be any of "f", "t", "ft", resulting in double input size if ft. 
-                n_data_features=20, # for brutal compression with lowdim=20
+                n_data_features=16*len(key),# key can be any of "f", "t", "ft", resulting in double input size if ft. 
+                #n_data_features=20, # for brutal compression with lowdim=20
                 marginals=self.marginals_dict[key], 
                 hlayersizes=(64, 32, 16, 8)
-            ).to(conf["device"])
+            ).to(train_conf["device"])
+
     def forward(self, d_f, d_t, parameters):
         """
         Forward pass of the network.
@@ -163,25 +284,26 @@ class InferenceNetwork(LightningModule):
         logratios_1d = torch.cat(logratios_1d_list, dim=-1)        
         return logratios_1d
 
-    def calc_logits_losses(self, data_f, data_t, parameters):
-
+    def _calc_logits_base(self, data_f, data_t, parameters):
         all_data_f = torch.cat((data_f, data_f), dim=0)
         all_data_t = torch.cat((data_t, data_t), dim=0)
-
         scrambled_params = torch.roll(parameters, shifts=1, dims=0)
         all_params = torch.cat((parameters, scrambled_params), dim=0)
-        all_logits = self(all_data_f, all_data_t, all_params) 
-        shape_logits_half = (all_logits.shape[0] // 2, all_logits.shape[1])
-        labels = torch.cat((torch.ones(shape_logits_half, device="cuda"), torch.zeros(shape_logits_half, device="cuda")), dim=0)
-        all_loss= self.loss(all_logits, labels)
-        tails_losses = torch.mean(all_loss, dim=0)
-        weights = torch.nn.functional.softmax(self.weights_loss_logits, dim=0)
-        weighted_tails_losses = weights * tails_losses
-        #breakpoint()
-        loss = torch.sum(weighted_tails_losses)
-        self.initial_losses = tails_losses.detach()
-        self.model_was_called_once = True
-        return all_logits, tails_losses, weighted_tails_losses, weights, loss
+        all_logits = self(all_data_f, all_data_t, all_params)
+        shape_half = (all_logits.shape[0] // 2, all_logits.shape[1])
+        labels = torch.cat(
+            (torch.ones(shape_half, device="cuda"), torch.zeros(shape_half, device="cuda")),
+            dim=0,
+        )
+        all_loss = self.loss(all_logits, labels)
+        return all_logits, all_loss
+    
+
+    def calc_logits_losses(self, data_f, data_t, parameters):
+        all_logits, all_loss = self._calc_logits_base(data_f, data_t, parameters)
+        task_losses = torch.mean(all_loss, dim=0)
+        loss = torch.mean(task_losses)
+        return all_logits, task_losses, loss
 
     def calc_accuracies(self, all_logits):
         # the first half of all_params contains parameters from the joint, associated with the first half of all_data
@@ -198,76 +320,37 @@ class InferenceNetwork(LightningModule):
 
         return accuracy_params, accuracy
 
+        
     def training_step(self, batch, batch_idx):
-        model_opt, weights_opt = self.optimizers()
-
-        data_f = batch["data_fd"]
-        data_t = batch["data_td"]
-        parameters = batch["source_parameters"]
-
-        #forward pass, per-task losses
-        all_logits, tails_losses, weighted_tails_losses, weights, loss = self.calc_logits_losses(data_f, data_t, parameters)
+        data_f = batch['data_fd']
+        data_t = batch['data_td']
+        params = batch['source_parameters']
+        if self.use_gradnorm:
+            all_logits, task_losses, loss = self.gradnorm.training_step(batch, batch_idx)
+        else:
+            all_logits, task_losses, loss = self.calc_logits_losses(data_f, data_t, params)
+        
         accuracy_params, accuracy = self.calc_accuracies(all_logits)
-        #log the per-task losses and the accuracies
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+
+        self.log('train_loss', loss , on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('train_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+
         overall_idx = 0
-        for d_idx, domain in enumerate(self.marginals_dict):
+        for d_idx, domain in enumerate(self.marginals_dict.keys()):
             for i, marginal in enumerate(self.marginals_dict[domain]):
                 name = self.output_names[overall_idx]
-                self.log(f'val_accuracy_{name}', accuracy_params[overall_idx], on_step=False, on_epoch=True, prog_bar=True, logger=True)
-                self.log(f'val_loss_{name}', tails_losses[overall_idx], on_step=False, on_epoch=True, prog_bar=True, logger=True)
+                self.log(f'train_accuracy_{name}', accuracy_params[i], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+                self.log(f'train_loss_{name}', task_losses[i], on_step=True, on_epoch=True, prog_bar=True, logger=True)
                 overall_idx += 1
-        
 
-        #log weights (before update)
-        for i in range(len(self.marginals_list)):
-            self.log(f"weight_{self.output_names[i]}", weights[i], on_step=True, on_epoch=True, prog_bar=False, logger=True)
-
-        ########## GRADNORM LOGIC ###############
-
-        #compute gradient norms G_W^{(i)}
-        #shared_params = [p for p in self.data_summary.linear_f.parameters() if p.requires_grad] (uncomment for use with unet)
-        shared_params = [p for p in self.data_summary.final_mlp.parameters() if p.requires_grad]
-        G_W = []
-        
-        for i, wL_i in enumerate(weighted_tails_losses):
-            grads = torch.autograd.grad(
-                outputs=wL_i,
-                inputs=shared_params,
-                retain_graph=True, 
-                create_graph=True
-            )
-            grad_norm = torch.norm(torch.cat([g.flatten() for g in grads]), p=2)
-            G_W.append(grad_norm)
-            self.log(f"gradient_norm_{self.output_names[i]}", grad_norm, on_step=True, on_epoch=True, prog_bar=False, logger=True)
-        G_W = torch.stack(G_W)
-        G_bar = G_W.mean()
-
-        #compute r_i(t) and GradNorm loss
-        loss_ratios = tails_losses / self.initial_losses  # L_i(t) / L_i(0)
-        inv_rate = loss_ratios / loss_ratios.mean()      # r_i(t)
-        targets = G_bar * (inv_rate ** self.alpha)
-        #breakpoint()
-        L_grad = torch.abs(G_W - targets.detach()).sum()  # treat targets as constant
-        
-        #update weights w_i (actually we store their logits to ensure positivity)
-        weights_opt.zero_grad()
-        self.manual_backward(L_grad, retain_graph=True)
-        weights_opt.step()
-        #update model params
-        model_opt.zero_grad()
-        self.manual_backward(loss)
-        model_opt.step()
-        self.log_dict(
-            {
-            "L_grad": L_grad,
-            "weighted_loss": loss,
-            "G_bar": G_bar
-            })
-        
+        if not self.use_gradnorm:
+            return loss
+    
     def validation_step(self, batch, batch_idx):
-        all_logits, losses_tails, weighted_losses_tails, weights,  loss= self.calc_logits_losses(batch['data_fd'], batch["data_td"], batch['source_parameters'])
+        if self.use_gradnorm:
+            all_logits, task_losses, weighted_losses_tails, weights,  loss= self.gradnorm.calc_logits_losses_gradnorm(batch['data_fd'], batch["data_td"], batch['source_parameters'])
+        else:
+            all_logits, task_losses, loss= self.calc_logits_losses(batch['data_fd'], batch["data_td"], batch['source_parameters'])
         accuracy_params, accuracy = self.calc_accuracies(all_logits)
         self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('val_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
@@ -276,12 +359,12 @@ class InferenceNetwork(LightningModule):
             for i, marginal in enumerate(self.marginals_dict[domain]):
                 name = self.output_names[overall_idx]
                 self.log(f'val_accuracy_{name}', accuracy_params[overall_idx], on_step=False, on_epoch=True, prog_bar=True, logger=True)
-                self.log(f'val_loss_{name}', losses_tails[overall_idx], on_step=False, on_epoch=True, prog_bar=True, logger=True)
+                self.log(f'val_loss_{name}', task_losses[overall_idx], on_step=False, on_epoch=True, prog_bar=True, logger=True)
                 overall_idx += 1
         return loss
     
     def test_step(self, batch, batch_idx):
-        all_logits, loss_params, loss = self.calc_logits_losses(batch['data_fd'], batch['source_parameters'])
+        all_logits, task_losses, loss = self.calc_logits_losses(batch['data_fd'], batch['source_parameters'])
         accuracy_params, accuracy = self.calc_accuracies(all_logits)
         # print accuracies on test set
         self.log('test_acc', accuracy, on_step=False, on_epoch=True)
@@ -290,10 +373,16 @@ class InferenceNetwork(LightningModule):
                 self.log(f'test_accuracy_{domain}_{i}', accuracy_params[i], on_step=False, on_epoch=True)
 
     def configure_optimizers(self):
-        trainable_params = [p for n, p in self.named_parameters() if n != "weights_loss_logits"]
-        optimizer_nre = torch.optim.AdamW(trainable_params, lr=self.lr)
 
-        optimizer_gradnorm = torch.optim.Adam([self.weights_loss_logits], lr=0.001)
+        if self.use_gradnorm:
+            trainable_params = [p for n, p in self.named_parameters() if n != "weights_loss_logits"]
+            optimizer_nre = torch.optim.AdamW(trainable_params, lr=self.lr)
+            optimizer_gradnorm = torch.optim.Adam([self.weights_loss_logits], lr=self.lr_gradnorm)
+            return optimizer_nre, optimizer_gradnorm
+
+        else: 
+            optimizer_nre = torch.optim.AdamW(self.parameters(), lr=self.lr)
+            return optimizer_nre
         #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=self.scheduler_factor, patience=self.scheduler_patience, min_lr=1e-6)
         #scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 10**(epoch//15) if epoch < 30 else 100)
         #scheduler = torch.optim.lr_scheduler.CyclicLR(
@@ -303,7 +392,6 @@ class InferenceNetwork(LightningModule):
         #     step_size_up=15,
         # )
         
-        return optimizer_nre, optimizer_gradnorm
 
 class SimpleModel(torch.nn.Module):
     def __init__(self, num_features: int, num_channels: int,  hlayersizes: tuple,  marginals: dict[list[list]], marginal_hidden_size: int, lr: float):  
@@ -345,11 +433,10 @@ class SimpleModel(torch.nn.Module):
 
 
 class PeregrineModel(torch.nn.Module):
-    def __init__(self, conf: dict):
+    def __init__(self, n_channels: int , n_timesteps: int):
         super().__init__()
 
-        n_channels =  len(conf["waveform_params"]["channels"])
-        n_timesteps = int(conf["waveform_params"]["duration"]*WEEK_SI/conf["waveform_params"]["dt"])
+        
         n_freqs = n_timesteps // 2 
         #self.normalisation_f = nn.BatchNorm1d(num_features=n_channels*2)
         #self.normalisation_t = nn.BatchNorm1d(num_features=n_channels)
@@ -590,3 +677,59 @@ class LinearCompression(nn.Module):
 
     def forward(self, x):
         return self.sequential(x)
+    
+
+DATA_SUMMARY_REGISTRY = {
+    "BrutalCompression": BrutalCompression,
+    "PeregrineModel": PeregrineModel,
+}
+
+
+class ReducedOrderModel():  
+    ''' 
+    A class that uses a reduced order model to compress the data.
+    '''
+
+    def __init__(self, dataset: MBHBDataset, tolerance: float):
+        self.data_f = dataset.get_data_fd_complex().flatten(1) # shape (M_dataset, N_dimensions)
+        self.tolerance = tolerance
+
+        i=0 
+        sigma = float('inf')
+        n = len(self.data_f)
+        initial_seed = torch.randint(0,n)
+        self.basis = [self.data_f[initial_seed]] # [ shape (N_dimensions, ) ]
+        print(f"Building reduced order model with tolerance {tolerance}...")
+        while sigma>tolerance:
+            i = i+1
+            data_proj = self.project_onto_rb(self.data_f) # shape (M_dataset, N_dimensions)
+            residuals = self.data_f - data_proj # shape (M_dataset, N_dimensions)
+            residual_squared_norms = torch.sum(torch.abs(residuals)**2, dim=1) # shape (M_dataset, )
+            tmp_vector_idx = torch.argmax(residual_squared_norms)
+            tmp_vector = self.data_f[tmp_vector_idx] # shape (N_dimensions, )
+            new_basis_vector = self.gram_schmidt(tmp_vector, self.basis) # shape (N_dimensions, )
+            self.basis.append(new_basis_vector)
+        
+        print(f"Reduced order model built with {len(self.basis)} basis vectors to reach tolerance {self.tolerance}.")
+
+    def coefficient_rb( self, data: torch.Tensor) :
+        basis_tensor = torch.stack(self.basis) # shape (N_basis, N_dimensions) 
+        coefficients = torch.matmul(torch.conj(basis_tensor), data.T)
+        
+        return coefficients # shape (N_basis, M_dataset)
+
+    def project_onto_rb(self, data: torch.Tensor) :
+        coeff = self.coefficient_rb(data) # shape (N_basis, M_dataset)
+        basis_tensor = torch.stack(self.basis) # shape (N_basis, N_dimensions)
+        data_reconstructed = torch.matmul(basis_tensor.T, coeff).T
+        return data_reconstructed # shape (M_dataset, N_dimensions)
+    
+    def gram_schmidt(self, v: torch.Tensor, basis: list[torch.Tensor]) :
+        for b in basis:
+            v -= torch.dot(torch.conj(b), v) * b
+        return v / torch.norm(v)
+    
+    def compress(self, data: torch.Tensor) :
+        # assume data is of shape (M_dataset, N_dimensions)
+        coeff = self.coefficient_rb(data) # shape (N_basis, M_dataset)
+        return coeff.T # shape (M_dataset, N_basis)

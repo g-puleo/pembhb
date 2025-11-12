@@ -296,7 +296,6 @@ class LISAMBHBSimulatorTD():
             "seed": seed,
             "conf": conf,
             "sampler_init_kwargs": sampler_init_kwargs,
-            "waveform_kwargs": self.waveform_kwargs,
             "dt": self.dt,
             "channels": list(self.channels),
             "n_channels": self.n_channels,
@@ -304,9 +303,6 @@ class LISAMBHBSimulatorTD():
             "df_noise": self.df_noise,
             "f_len_noise": self.f_len_noise,
             "noise_factor_shape": self.noise_factor.shape,
-            # include sampler and waveform generator types for clarity (avoid heavy objects)
-            "sampler_type": type(self.sampler).__name__,
-            "waveform_generator_type": type(self.waveform_generator).__name__,
         }
     def generate_noise_td( self, n_observations):
         noise_fd = self.noise_rng.normal(loc= 0.0,size = (n_observations , self.n_channels, self.f_len_noise)) + 1j*self.noise_rng.normal(loc= 0.0,size = (n_observations , self.n_channels, self.f_len_noise))
@@ -401,6 +397,7 @@ class LISAMBHBSimulatorTD():
             snr = f.create_dataset("snr", shape = (N,), dtype=np.float32)
             psd_dataset = f.create_dataset("psd", data=self.PSD, dtype=np.float32)
             print("Sampling and storing simulations to ", filename)
+            maximum_timedomain = 0
             for i in tqdm(range(0, N, batch_size)):
                 batch_end = min(i + batch_size, N)
                 batch_size_actual = batch_end - i
@@ -408,6 +405,10 @@ class LISAMBHBSimulatorTD():
                 z_samples = out["parameters"]
                 data_fd_batch = out["data_fd"]
                 data_td_batch = out["data_td"]
+                current_max_td = np.max( np.abs(data_td_batch) )
+                #for normalisation purpose and easy access during training, store the maximum value across the time domain data
+                if current_max_td > maximum_timedomain:
+                    maximum_timedomain = current_max_td
                 noise_fd_batch = out["noise_fd"]
                 snr_batch = self.get_SNR_FD(data_fd_batch)
                 data_fd_amp_phase = np.concatenate((np.abs(data_fd_batch), np.angle(data_fd_batch)), axis=1)
@@ -416,22 +417,30 @@ class LISAMBHBSimulatorTD():
                 data_td[i:batch_end] = data_td_batch
                 noise_fd[i:batch_end] = noise_fd_batch
                 snr[i:batch_end] = snr_batch
-        self.save_info_json( filename=filename, overwrite=True )
-    def save_info_json(self, filename: str = None, overwrite: bool = False, indent: int = 2):
+        
+        self.info["td_max"] = maximum_timedomain
+        self.save_info_yaml( filename=filename, overwrite=True )
+
+    def save_info_yaml(self, filename: str = None, overwrite: bool = False, indent: int = 2):
         """
-        Save self.info as a JSON file. Numpy arrays and numpy scalars are converted to native types.
+        Save self.info['conf'] and self.info['sampler_init_kwargs'] as a YAML file.
         If filename is None a timestamped file in ROOT_DIR will be created.
 
-        :param filename: target json path
+        :param filename: target h5 path (used to derive .yaml). If no extension provided it's used directly.
         :param overwrite: allow overwriting existing file
-        :param indent: json indent level
+        :param indent: yaml indent level
+        :return: path to written yaml file
         """
-
         if filename is None:
-            filename = os.path.join(ROOT_DIR, f"simulator_info_{int(time.time())}.json")
+            yamlpath = os.path.join(ROOT_DIR, f"simulator_info_{int(time.time())}.yaml")
+        else:
+            # derive yaml path from provided filename (strip .h5 if present)
+            yamlpath = filename.removesuffix(".h5")
+            if not yamlpath.lower().endswith(".yaml"):
+                yamlpath = yamlpath + ".yaml"
 
-        if os.path.exists(filename) and not overwrite:
-            raise FileExistsError(f"File '{filename}' already exists. Pass overwrite=True to replace it.")
+        if os.path.exists(yamlpath) and not overwrite:
+            raise FileExistsError(f"File '{yamlpath}' already exists. Pass overwrite=True to replace it.")
 
         def _convert(obj):
             # handle common numpy types and containers
@@ -448,11 +457,18 @@ class LISAMBHBSimulatorTD():
             # fallback to string for unsupported objects
             return obj if isinstance(obj, (str, int, float, bool, type(None))) else str(obj)
 
-        data = _convert(self.info)
+        # Extract the two fields requested and convert
+        payload = {
+            "conf": _convert(self.info.get("conf", {})),
+            "sampler_init_kwargs": _convert(self.info.get("sampler_init_kwargs", {})),
+            "td_max": _convert(self.info.get("td_max", None))
+        }
 
-        jsonpath = filename.removesuffix(".h5") + ".json"
-        with open(jsonpath, "w") as fh:
-            json.dump(data, fh, indent=indent)
+        # Write YAML
+        with open(yamlpath, "w") as fh:
+            yaml.safe_dump(payload, fh, sort_keys=False, default_flow_style=False, indent=indent)
+
+        return yamlpath
             
     def get_SNR_FD(self,
         signal

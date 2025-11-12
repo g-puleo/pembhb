@@ -21,156 +21,143 @@ torch.set_float32_matmul_precision("medium")
 def get_timestamp():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 TIME_OF_EXECUTION = get_timestamp()
-def round(conf:dict, sampler_init_kwargs:dict, lr:float, idx:int=0):
+class SequentialTrainer:
+    def __init__(self, train_conf, datagen_conf, dataset_obs_path):
+        self.train_conf = train_conf
+        self.datagen_conf = datagen_conf
+        self.dataset_obs_path = dataset_obs_path
+        self.dataset_observation = MBHBDataset(dataset_obs_path, transform_fd=train_conf["transform_fd"])
 
-    ######## DATA GENERATION #########
-    sim = LISAMBHBSimulatorTD(conf, sampler_init_kwargs=sampler_init_kwargs)
-    #sim = DummySimulator(sampler_init_kwargs=sampler_init_kwargs)
-    #fname = os.path.join(ROOT_DIR, "data", f"simulated_data_round_{idx}.h5")
-    fname = os.path.join(ROOT_DIR, "data", f"simulated_data_fullprior.h5")
-    #fname = os.path.join(ROOT_DIR, "data", f"small_training_set.h5")
-    # print("Sampling from the simulator...")
-    # os.makedirs(os.path.join(ROOT_DIR, "data"), exist_ok=True)
-    # try: 
-    #     sim.sample_and_store(fname, N=50000, batch_size=200)
-    #     print("Data saved to", fname)
-    # except ValueError:
-    #     print("File might already exist, skipping sampling.")
+        self.logMchirp_lower = [datagen_conf["prior"]["logMchirp"][0]]
+        self.logMchirp_upper = [datagen_conf["prior"]["logMchirp"][1]]
+        self.q_lower = [datagen_conf["prior"]["q"][0]]
+        self.q_upper = [datagen_conf["prior"]["q"][1]]
 
+        self._setup_plot()
 
+    def _setup_plot(self):
+        self.fig, self.axes = plt.subplots(1, 2, figsize=(12, 6))
+        for ax, title, ylabel in zip(
+            self.axes,
+            ["logMchirp Prior Bounds", "q Prior Bounds"],
+            ["logMchirp", "q"],
+        ):
+            ax.set_title(title)
+            ax.set_xlabel("Iteration")
+            ax.set_ylabel(ylabel)
 
-    ######## DATA LOADING AND TRAINING THE MODEL #########
-
-
-    checkpoint_callback = ModelCheckpoint(monitor='val_loss', mode='min')
-    early_stopping_callback = EarlyStopping(monitor='val_accuracy', patience=conf["training"]["early_stop_patience"], mode='max', stopping_threshold=0.9)
-    logger = TensorBoardLogger(os.path.join(ROOT_DIR, f"logs"), name=f"{TIME_OF_EXECUTION}_round_{idx}")
-
-    trainer= Trainer(
-                    logger=logger,
-                    max_epochs=conf["training"]["epochs"], 
-                    accelerator="gpu", devices=1,
-                    enable_progress_bar=True, 
-                    callbacks=[checkpoint_callback, early_stopping_callback]
-                    )
-    
-    data_module = MBHBDataModule(fname, conf)
-    data_module.setup(stage='fit')
-    model = InferenceNetwork(conf, td_normalisation=data_module.get_max_td())
-
-    # find the learning rate. 
-    # tuner = Tuner(trainer)
-    # lr_finder = tuner.lr_find(model, datamodule=data_module, min_lr=1e-4, max_lr=1e-1)
-    # fig = lr_finder.plot(suggest=True)
-    # plt.yscale('log')
-    # fig.savefig(os.path.join(ROOT_DIR, f"plots/lr_finder_round_{idx}.png"))
-    # plt.close(fig)
-    
-    #model = InferenceNetwork(num_features=10, num_channels=6, hlayersizes=(100, 20), marginals=conf["tmnre"]["marginals"], marginal_hidden_size=10, lr=lr)
-    trainer.fit(model, data_module)
-    test_dataset = data_module.test
-    #trainer.save_checkpoint(os.path.join(ROOT_DIR, "checkpoints", f"tmnre_model_{idx}.ckpt"))
-    return model, test_dataset
-
-
-if __name__ == "__main__":  
-    parser = argparse.ArgumentParser(description="Train TMNRE model with configurable settings.")
-    parser.add_argument("--config", type=str, required=True, help="Path to the config YAML file.")
-    args = parser.parse_args()
-    config_path = args.config
-    conf = read_config(config_path)
-
-    dataset_observation = MBHBDataset(os.path.join(ROOT_DIR, "data/observation.h5"),transform_fd=conf["training"]["transform_fd"])
-    # load observation
-
-    # Create a figure with two subplots
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-    axes[0].set_title("logMchirp Prior Bounds")
-    axes[0].set_xlabel("Iteration")
-    axes[0].set_ylabel("logMchirp")
-    axes[1].set_title("q Prior Bounds")
-    axes[1].set_xlabel("Iteration")
-    axes[1].set_ylabel("q")
-
-    # Initialize lists to store prior bounds for plotting
-    logMchirp_lower = [conf["prior"]["logMchirp"][0]]
-    logMchirp_upper = [conf["prior"]["logMchirp"][1]]
-    q_lower = [conf["prior"]["q"][0]]
-    q_upper = [conf["prior"]["q"][1]]
-
-    for i in range(1): 
-        print(f"Running round {i}...")
-        # if i == 0: 
-        #     trained_model = InferenceNetwork.load_from_checkpoint("/u/g/gpuleo/pembhb/logs/logs_0804/peregrine_norm/version_1/checkpoints/epoch=136-step=23290.ckpt")
-        #     datamodule = MBHBDataModule(os.path.join(ROOT_DIR, "data", f"simulated_data_round_{i}.h5"), conf=conf)
-        #     datamodule.setup(stage='fit')
-        #     test_dataset = datamodule.test
-        # # elif i == 1: 
-        # #     trained_model = InferenceNetwork.load_from_checkpoint("/u/g/gpuleo/pembhb/logs/20250804_125709/round_1/version_0/checkpoints/epoch=36-step=3330.ckpt")
-        # #     datamodule = MBHBDataModule(os.path.join(ROOT_DIR, "data", f"simulated_data_round_{i}.h5"), conf=conf)
-        # #     datamodule.setup(stage='fit')
-        # #     test_dataset = datamodule.test
-        # else:
-        trained_model, test_dataset = round(conf, sampler_init_kwargs={'prior_bounds': conf["prior"]}, lr=conf["training"]["learning_rate"], idx=i)
+    def round(self, idx, sampler_init_kwargs):
         
-        out_idx = 0
-        updated_prior = conf["prior"].copy()
-        for key in conf["tmnre"]["marginals"]:
-            marginal_list = conf["tmnre"]["marginals"][key]
-            for marginal in marginal_list: 
-                if len(marginal) == 1: 
-                    inj_par_idx = marginal[0]
-                    inj_par_name = _ORDERED_PRIOR_KEYS[inj_par_idx]
-                    pp_plot(test_dataset, trained_model, in_param_idx=inj_par_idx, name=f"round_{i}_{key}")
-                    updated_prior = update_bounds(trained_model, dataset_observation, updated_prior, in_param_idx=inj_par_idx, n_gridpoints=10000, out_param_idx=out_idx)
-                elif len(marginal) == 2:
-                    inj_par_idx1 = marginal[0]
-                    inj_par_idx2 = marginal[1]
-                    inj_par_name1 = _ORDERED_PRIOR_KEYS[inj_par_idx1]
-                    inj_par_name2 = _ORDERED_PRIOR_KEYS[inj_par_idx2]
-                    lows = [conf["prior"][inj_par_name1][0], conf["prior"][inj_par_name2][0]]
-                    highs = [conf["prior"][inj_par_name1][1], conf["prior"][inj_par_name2][1]]
-                    pp_plot_2d(test_dataset, trained_model, lows=lows, highs=highs, in_param_idx=marginal, name=f"round_{inj_par_name1}_{inj_par_name2}")
-                out_idx += 1
+        sim = LISAMBHBSimulatorTD(self.datagen_conf, sampler_init_kwargs=sampler_init_kwargs)
+        fname_base = "simulated_data_fixmctc"
+        fname_h5 = os.path.join(ROOT_DIR, "data", f"{fname_base}.h5")
+        data_fname_yaml = os.path.join(ROOT_DIR, "data", f"{fname_base}.yaml")
+        datagen_info = read_config(data_fname_yaml)
 
-        #updated_prior = update_bounds(trained_model, dataset_observation, updated_prior, parameter_idx=1, n_gridpoints=1000)
-        print(f"Updated prior after round {i}:\nlog10Mchirp: {updated_prior['logMchirp']},\nmass ratio: {updated_prior['q']}\n")
-        conf["prior"] = updated_prior
-        
-        # Update the lists with new prior bounds
-        logMchirp_lower.append(updated_prior["logMchirp"][0])
-        logMchirp_upper.append(updated_prior["logMchirp"][1])
-        q_lower.append(updated_prior["q"][0])
-        q_upper.append(updated_prior["q"][1])
+        checkpoint_callback = ModelCheckpoint(monitor="val_loss", mode="min")
+        early_stopping_callback = EarlyStopping(
+            monitor="val_accuracy",
+            patience=self.train_conf["early_stop_patience"],
+            mode="max",
+            stopping_threshold=0.9,
+        )
+        logger = TensorBoardLogger(
+            os.path.join(ROOT_DIR, "logs"), name=f"{TIME_OF_EXECUTION}_round_{idx}"
+        )
 
-        # Clear the axes before updating the plots
-        axes[0].cla()
-        axes[1].cla()
+        trainer = Trainer(
+            logger=logger,
+            max_epochs=self.train_conf["epochs"],
+            accelerator="gpu",
+            devices=1,
+            enable_progress_bar=True,
+            callbacks=[checkpoint_callback, early_stopping_callback],
+        )
 
-        # Update the titles and labels
-        axes[0].set_title("logMchirp Prior Bounds")
-        axes[0].set_xlabel("Iterationmeeting were Pokémon and people who communicated with one another and helped one another. That was why I needed to confirm my beliefs by battling with you. I wanted to confront")
-        axes[0].set_ylabel("logMchirp")
-        axes[1].set_title("q Prior Bounds")
-        axes[1].set_xlabel("Iteration")
-        axes[1].set_ylabel("q")
+        data_module = MBHBDataModule(fname_h5, self.train_conf)
+        print(datagen_info.keys())
+        model = InferenceNetwork(train_conf=self.train_conf, dataset_info=datagen_info)
 
-        # Update the plots
-        axes[0].plot(range(len(logMchirp_lower)), logMchirp_lower, label="Lower Bound", color="blue")
-        axes[0].plot(range(len(logMchirp_upper)), logMchirp_upper, label="Upper Bound", color="blue")
-        axes[1].plot(range(len(q_lower)), q_lower, label="Lower Bound", color="blue")
-        axes[1].plot(range(len(q_upper)), q_upper, label="Upper Bound", color="orange")
+        trainer.fit(model, data_module)
+        test_dataset = data_module.test
+        return model, test_dataset
 
-        # Add legends
-        axes[0].legend()
-        axes[1].legend()
+    def _update_prior_and_plot(self, updated_prior):
+        self.logMchirp_lower.append(updated_prior["logMchirp"][0])
+        self.logMchirp_upper.append(updated_prior["logMchirp"][1])
+        self.q_lower.append(updated_prior["q"][0])
+        self.q_upper.append(updated_prior["q"][1])
 
-        # Save the updated figure
+        for ax in self.axes:
+            ax.cla()
+
+        self.axes[0].set_title("logMchirp Prior Bounds")
+        self.axes[0].set_xlabel("Iteration")
+        self.axes[0].set_ylabel("logMchirp")
+        self.axes[1].set_title("q Prior Bounds")
+        self.axes[1].set_xlabel("Iteration")
+        self.axes[1].set_ylabel("q")
+
+        self.axes[0].plot(range(len(self.logMchirp_lower)), self.logMchirp_lower, label="Lower Bound", color="blue")
+        self.axes[0].plot(range(len(self.logMchirp_upper)), self.logMchirp_upper, label="Upper Bound", color="orange")
+        self.axes[1].plot(range(len(self.q_lower)), self.q_lower, label="Lower Bound", color="blue")
+        self.axes[1].plot(range(len(self.q_upper)), self.q_upper, label="Upper Bound", color="orange")
+
+        self.axes[0].legend()
+        self.axes[1].legend()
         plt.tight_layout()
-        plt.savefig(os.path.join(ROOT_DIR, f"plots/prior_bounds_iteration_{i}.png"))
+        plt.savefig(os.path.join(ROOT_DIR, "plots", f"prior_bounds_iteration_{len(self.logMchirp_lower)-1}.png"))
 
-        # Free CUDA memory
-        del trained_model
-        torch.cuda.empty_cache()
+    def run(self, n_rounds=1):
+        for i in range(n_rounds):
+            print(f"Running round {i}...")
+            # model, test_dataset = self.round(
+            #     idx=i,
+            #     sampler_init_kwargs={"prior_bounds": self.datagen_conf["prior"]},
+            # )
+            model = InferenceNetwork.load_from_checkpoint("/u/g/gpuleo/pembhb/logs/20251111_100948_round_0/version_0/checkpoints/epoch=13-step=2380.ckpt")
+            test_datamodule = MBHBDataModule(os.path.join(ROOT_DIR, "data/simulated_data_fixmctc.h5"), self.train_conf)
+            test_datamodule.setup(stage="fit")
+            test_dataset = test_datamodule.test
+            updated_prior = self.datagen_conf["prior"].copy()
+            out_idx = 0
+            for key, marginal_list in self.train_conf["marginals"].items():
+                for marginal in marginal_list:
+                    if len(marginal) == 1:
+                        inj_idx = marginal[0]
+                        pp_plot(test_dataset, model, in_param_idx=inj_idx, name=f"round_{i}_{key}", out_param_idx=out_idx)
+                        updated_prior = update_bounds(
+                            model, self.dataset_observation, updated_prior,
+                            in_param_idx=inj_idx, n_gridpoints=10000, out_param_idx=out_idx
+                        )
+                    elif len(marginal) == 2:
+                        inj1, inj2 = marginal
+                        lows = [self.datagen_conf["prior"][_ORDERED_PRIOR_KEYS[inj1]][0],
+                                self.datagen_conf["prior"][_ORDERED_PRIOR_KEYS[inj2]][0]]
+                        highs = [self.datagen_conf["prior"][_ORDERED_PRIOR_KEYS[inj1]][1],
+                                 self.datagen_conf["prior"][_ORDERED_PRIOR_KEYS[inj2]][1]]
+                        pp_plot_2d(test_dataset, model, lows=lows, highs=highs, in_param_idx=marginal,
+                                   name=f"round_{_ORDERED_PRIOR_KEYS[inj1]}_{_ORDERED_PRIOR_KEYS[inj2]}")
+                    out_idx += 1
+
+            print(f"Updated prior after round {i}:\nlog10Mchirp: {updated_prior['logMchirp']},\nq: {updated_prior['q']}")
+            self.datagen_conf["prior"] = updated_prior
+            self._update_prior_and_plot(updated_prior)
+
+            del model
+            torch.cuda.empty_cache()
+
+if __name__ == "__main__":
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument("--config", type=str, required=True)
+    # args = parser.parse_args()
+    train_config_filename = "train_config.yaml"
+    datagen_config_filename = "datagen_config.yaml"
+    
+    train_config = read_config(os.path.join(ROOT_DIR, train_config_filename))
+    datagen_config = read_config(os.path.join(ROOT_DIR, datagen_config_filename))
+                               
+    trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path=os.path.join(ROOT_DIR, "data/observation.h5"))
+    trainer.run(n_rounds=1)
 
     #round(conf, sampler_init_kwargs={'low': 0.5, 'high': 1.0} , lr=conf["training"]["learning_rate"], idx=0)
