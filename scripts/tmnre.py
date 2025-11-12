@@ -49,7 +49,7 @@ class SequentialTrainer:
     def round(self, idx, sampler_init_kwargs):
         
         sim = LISAMBHBSimulatorTD(self.datagen_conf, sampler_init_kwargs=sampler_init_kwargs)
-        fname_base = "simulated_data_fixmctc"
+        fname_base = "fixall_notmcq"
         fname_h5 = os.path.join(ROOT_DIR, "data", f"{fname_base}.h5")
         data_fname_yaml = os.path.join(ROOT_DIR, "data", f"{fname_base}.yaml")
         datagen_info = read_config(data_fname_yaml)
@@ -111,12 +111,12 @@ class SequentialTrainer:
     def run(self, n_rounds=1):
         for i in range(n_rounds):
             print(f"Running round {i}...")
-            # model, test_dataset = self.round(
-            #     idx=i,
-            #     sampler_init_kwargs={"prior_bounds": self.datagen_conf["prior"]},
-            # )
-            model = InferenceNetwork.load_from_checkpoint("/u/g/gpuleo/pembhb/logs/20251111_100948_round_0/version_0/checkpoints/epoch=13-step=2380.ckpt")
-            test_datamodule = MBHBDataModule(os.path.join(ROOT_DIR, "data/simulated_data_fixmctc.h5"), self.train_conf)
+            model, test_dataset = self.round(
+                idx=i,
+                sampler_init_kwargs={"prior_bounds": self.datagen_conf["prior"]},
+            )
+            # model = InferenceNetwork.load_from_checkpoint("/u/g/gpuleo/pembhb/logs/20251111_100948_round_0/version_0/checkpoints/epoch=13-step=2380.ckpt")
+            test_datamodule = MBHBDataModule(os.path.join(ROOT_DIR, "data/fixall_notmcq.h5"), self.train_conf)
             test_datamodule.setup(stage="fit")
             test_dataset = test_datamodule.test
             updated_prior = self.datagen_conf["prior"].copy()
