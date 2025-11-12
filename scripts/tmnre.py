@@ -145,7 +145,8 @@ class SequentialTrainer:
             self._update_prior_and_plot(updated_prior)
 
             del model
-            torch.cuda.empty_cache()
+            if self.train_conf["device"] == "cuda":
+                torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     # parser = argparse.ArgumentParser()

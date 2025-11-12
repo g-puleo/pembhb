@@ -292,7 +292,7 @@ class InferenceNetwork(LightningModule):
         all_logits = self(all_data_f, all_data_t, all_params)
         shape_half = (all_logits.shape[0] // 2, all_logits.shape[1])
         labels = torch.cat(
-            (torch.ones(shape_half, device="cuda"), torch.zeros(shape_half, device="cuda")),
+            (torch.ones(shape_half, device=self.device), torch.zeros(shape_half, device=self.device)),
             dim=0,
         )
         all_loss = self.loss(all_logits, labels)
