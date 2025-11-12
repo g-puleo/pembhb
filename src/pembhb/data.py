@@ -79,13 +79,10 @@ class MBHBDataset(Dataset):
         #data is of shape (6, n) with channels sorted as AETAET, first half amplitude is , second half is phase
         #this line fetches only the channels in self.channels, in order. 
         # breakpoint()
-        print(f"transform log called")
-        print(f" data shape before transform: {data.shape}")
+        
         data_ampl = torch.log10(data[self.channels_amp]+1e-33) # add a small value to avoid log(0)
         data_phase = data[self.channels_phase]
-        print(f"data_ampl.shape: {data_ampl.shape}, data_phase.shape: {data_phase.shape}")
         concatenated = torch.concatenate((data_ampl, data_phase), dim=0)
-        print(f"concatenated.shape: {concatenated.shape}")
         return concatenated
 
     def _transform_whiten(self, data):
