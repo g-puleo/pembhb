@@ -13,7 +13,7 @@ marginals:
   # t: [[10]]
 
 
-device: "cuda"
+device: "cpu"
 
 
 architecture:

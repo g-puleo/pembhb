@@ -17,3 +17,5 @@ prior:
   "beta": [0.0,0.0] # sin ecliptic latitude
   "psi": [1.0, 1.0]
   "Deltat": [ -2, -2] # t_merger from end of observation in days
+
+backend: "cpu"
