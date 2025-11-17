@@ -33,6 +33,7 @@ class MBHBDataset(Dataset):
             self.len = f[self.keys[0]].shape[0]
             if transform_fd in ["logwhiten", "whiten"]:
                 self.PSD = torch.tensor(f["psd"][()], device="self.device", dtype=torch.float32)
+            raise NotImplementedError("data is now stored as re/im, have to update the loading code.")
             self.data_fd = torch.tensor(f["data_fd"][()], device=self.device, dtype=torch.float32) 
             self.data_td = torch.tensor(f["data_td"][()], device=self.device, dtype=torch.float32)
             self.parameters =  torch.tensor(f["source_parameters"][()], device=self.device, dtype=torch.float32)

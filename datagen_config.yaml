@@ -4,6 +4,7 @@ waveform_params:
   noise: "sangria"
   duration: 1 # weeks
   dt: 100 # seconds
+  t_max: 5 # days
 
 prior:
   "logMchirp": [5, 6] # log10(Mchirp/Msun)
