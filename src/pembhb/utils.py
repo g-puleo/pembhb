@@ -111,7 +111,7 @@ def get_logratios_grid_2d(dataset: MBHBDataset, model: 'InferenceNetwork', ngrid
 
     model.eval()
     model = model.to("cuda")
-    prior_trained_dict = model.hparams["prior"]
+    prior_trained_dict = model.hparams["dataset_info"]["conf"]["prior"]
     prior_bounds_0 = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx[0]]]
     prior_bounds_1 = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx[1]]]
     lows = [prior_bounds_0[0], prior_bounds_1[0]]
@@ -146,7 +146,6 @@ def get_logratios_grid_2d(dataset: MBHBDataset, model: 'InferenceNetwork', ngrid
                 batched2_data_fd = batched2_data_fd.to("cuda")
                 batched2_data_td = batched2_data_td.to("cuda")
                 batched2_grid = batched2_grid.to("cuda")
-                breakpoint()
                 logratios= model(batched2_data_fd, batched2_data_td, batched2_grid)[:, out_param_idx]  
                 logratios_list.append(logratios)
             logratios = torch.cat(logratios_list, dim=0)
@@ -319,7 +318,7 @@ def pp_plot( dataset, model , in_param_idx: int, name: str, out_param_idx: int):
 
 def pp_plot_2d(dataset, model,  in_param_idx: tuple, out_idx: int, name: str):
     print(f"Making pp plot for {name}...")
-    logratios, injection_params, grid_x, grid_y = get_logratios_grid_2d(dataset, model, ngrid_points=50, in_param_idx=in_param_idx, out_idx=out_idx)
+    logratios, injection_params, grid_x, grid_y = get_logratios_grid_2d(dataset, model, ngrid_points=50, out_param_idx=out_idx, in_param_idx=in_param_idx)
     p_values = get_pvalues_2d(logratios, grid_x, grid_y, injection_params)
     sorted_pvalues = np.sort(p_values)
     sorted_normalised_rank = np.arange(sorted_pvalues.shape[0])/sorted_pvalues.shape[0]

@@ -6,7 +6,7 @@ waveform_params:
   dt: 100 # seconds
 
 prior:
-  "logMchirp": [5, 6] # log10(Mchirp/Msun)
+  "logMchirp": [5.2, 5.3] # log10(Mchirp/Msun)
   "q":    [1,5]
   "chi1": [0,0]
   "chi2": [0,0]
@@ -16,4 +16,4 @@ prior:
   "lambda": [3.14,3.14] # ecliptic longitude
   "beta": [0.0,0.0] # sin ecliptic latitude
   "psi": [1.0, 1.0]
-  "Deltat": [ -2, -2] # t_merger from end of observation in days
+  "Deltat": [ -1, -0.9] # t_merger from end of observation in days

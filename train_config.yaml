@@ -3,14 +3,13 @@ epochs: 1000
 learning_rate: 0.001
 #transform_td: "normalise_max" # options: "none", "logwhiten", "log", "whiten"
 transform_fd: "log" # options: "none", "logwhiten", "log", "whiten", "normalise_max"
-early_stop_patience: 20
+early_stop_patience: 40
 scheduler_factor: 0.3
 scheduler_patience: 10
   
 marginals: 
   #  f: [[0]]
-  f: [[0], [1]]
-  # t: [[10]]
+  f: [[0], [1], [0,1]]
 
 
 device: "cuda"
@@ -20,8 +19,8 @@ architecture:
   gradnorm:
     enabled: False
     alpha: 1
-    learning_rate: 0.01
-    common_params: "final_mlp"
+    learning_rate: 0.00001
+    common_params: "linear_f"
 
 
   data_summary:

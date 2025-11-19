@@ -78,7 +78,7 @@ class GradnormHandler :
         self.alpha=config["alpha"]
         self.shared_layer = getattr(self.model.data_summary, config["common_params"])
         self.shared_params_gradnorm = [p for p in self.shared_layer.parameters() if p.requires_grad]
-        self.model.model_was_called_once = False
+        self.was_called_once = False
         self.model.automatic_optimization=False 
     
     def training_step(self, batch, batch_idx):
@@ -97,11 +97,7 @@ class GradnormHandler :
         parameters = batch['source_parameters']
 
         # same base call, but handler decides weighting logic
-        all_logits, all_loss = self.model._calc_logits_base(data_f, data_t, parameters)
-
-
-        #update task weights using gradnorm algorithm
-        task_losses, total_loss, gradnorm_loss = self.compute_gradnorm_loss(all_loss)       
+        all_logits, task_losses, total_loss, gradnorm_loss = self.calc_logits_losses_gradnorm(data_f, data_t, parameters)
         #update weights w_i (actually we store their logits to ensure positivity)
         optimizer_nre, optimizer_gradnorm = self.model.optimizers()
         optimizer_gradnorm.zero_grad()
@@ -117,18 +113,19 @@ class GradnormHandler :
             "L_grad": gradnorm_loss,
             "weighted_loss": total_loss
             })
-
+        weights_normalised = torch.nn.functional.softmax(self.model.weights_loss_logits, dim=0)
+        for i, w_i in enumerate(weights_normalised):
+            self.model.log(f"weight_{i}", w_i.detach(), on_step=True, on_epoch=True, prog_bar=False, logger=True)
         return  all_logits, task_losses, total_loss
 
-    def compute_gradnorm_loss(self, all_loss):
+    def compute_gradnorm_loss(self, task_losses_all):
         ########## GRADNORM LOGIC ###############
-        task_losses = torch.mean(all_loss, dim=0)
         weights = torch.nn.functional.softmax(self.model.weights_loss_logits, dim=0)
+        task_losses = torch.sum(task_losses_all, dim=0) 
         weighted_task_losses = weights * task_losses
         total_loss = torch.sum(weighted_task_losses)
         #compute gradient norms G_W^{(i)}
         G_W = []
-        
         for i, wL_i in enumerate(weighted_task_losses):
             grads = torch.autograd.grad(
                 outputs=wL_i,
@@ -150,7 +147,7 @@ class GradnormHandler :
         gradnorm_loss = torch.abs(G_W - targets.detach()).sum()  # treat targets as constant
         self.model.log("gradient_norm", G_bar, on_step=True, on_epoch=True, prog_bar=False, logger=True)
         self.model
-        return task_losses, total_loss, gradnorm_loss
+        return total_loss, gradnorm_loss
 
 
     def calc_logits_losses_gradnorm(self, data_f, data_t, parameters):
@@ -162,9 +159,12 @@ class GradnormHandler :
             weights: tensor of shape (num_marginals,), the weights used for the weighted loss (after softmax)
             loss: scalar tensor, the full weighted loss'''
         all_logits, all_loss = self.model._calc_logits_base(data_f, data_t, parameters)
-        task_losses, total_loss, gradnorm_loss = self.compute_gradnorm_loss(all_loss)
-        self.initial_losses = task_losses.detach()
-        self.model_was_called_once = True
+        task_losses = torch.mean(all_loss, dim=0)
+        if not self.was_called_once:
+            print("Setting initial losses for GradNorm")
+            self.initial_losses = task_losses.detach()
+        self.was_called_once = True
+        total_loss, gradnorm_loss = self.compute_gradnorm_loss(task_losses)
         return all_logits, task_losses, total_loss, gradnorm_loss
 
 class MarginalClassifierHead(nn.Module):
@@ -244,7 +244,6 @@ class InferenceNetwork(LightningModule):
             self.gradnorm = GradnormHandler(self, train_conf["architecture"]["gradnorm"])
             self.weights_loss_logits = torch.nn.Parameter(torch.zeros(len(self.marginals_list)))
             self.lr_gradnorm = train_conf["architecture"]["gradnorm"]["learning_rate"]
-
        
         self.logratios_model_dict = nn.ModuleDict()
         for key in self.marginals_dict.keys():
@@ -347,10 +346,10 @@ class InferenceNetwork(LightningModule):
             return loss
     
     def validation_step(self, batch, batch_idx):
-        if self.use_gradnorm:
-            all_logits, task_losses, weighted_losses_tails, weights,  loss= self.gradnorm.calc_logits_losses_gradnorm(batch['data_fd'], batch["data_td"], batch['source_parameters'])
-        else:
-            all_logits, task_losses, loss= self.calc_logits_losses(batch['data_fd'], batch["data_td"], batch['source_parameters'])
+        # if self.use_gradnorm:
+        #     all_logits, task_losses, weighted_losses_tails, weights,  loss= self.gradnorm.calc_logits_losses_gradnorm(batch['data_fd'], batch["data_td"], batch['source_parameters'])
+        # else:
+        all_logits, task_losses, loss= self.calc_logits_losses(batch['data_fd'], batch["data_td"], batch['source_parameters'])
         accuracy_params, accuracy = self.calc_accuracies(all_logits)
         self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('val_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)

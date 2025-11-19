@@ -115,7 +115,7 @@ class SequentialTrainer:
                 idx=i,
                 sampler_init_kwargs={"prior_bounds": self.datagen_conf["prior"]},
             )
-            # model = InferenceNetwork.load_from_checkpoint("/u/g/gpuleo/pembhb/logs/20251111_100948_round_0/version_0/checkpoints/epoch=13-step=2380.ckpt")
+            #model = InferenceNetwork.load_from_checkpoint("logs/20251112_164554_round_0/version_0/checkpoints/epoch=24-step=4250.ckpt")
             test_datamodule = MBHBDataModule(os.path.join(ROOT_DIR, "data/fixall_notmcq.h5"), self.train_conf)
             test_datamodule.setup(stage="fit")
             test_dataset = test_datamodule.test
@@ -132,14 +132,11 @@ class SequentialTrainer:
                         )
                     elif len(marginal) == 2:
                         inj1, inj2 = marginal
-                        lows = [self.datagen_conf["prior"][_ORDERED_PRIOR_KEYS[inj1]][0],
-                                self.datagen_conf["prior"][_ORDERED_PRIOR_KEYS[inj2]][0]]
-                        highs = [self.datagen_conf["prior"][_ORDERED_PRIOR_KEYS[inj1]][1],
-                                 self.datagen_conf["prior"][_ORDERED_PRIOR_KEYS[inj2]][1]]
-                        pp_plot_2d(test_dataset, model, lows=lows, highs=highs, in_param_idx=marginal,
+                        pp_plot_2d(test_dataset, model, in_param_idx=marginal, out_idx=out_idx,
                                    name=f"round_{_ORDERED_PRIOR_KEYS[inj1]}_{_ORDERED_PRIOR_KEYS[inj2]}")
                     out_idx += 1
 
+            exit(1)
             print(f"Updated prior after round {i}:\nlog10Mchirp: {updated_prior['logMchirp']},\nq: {updated_prior['q']}")
             self.datagen_conf["prior"] = updated_prior
             self._update_prior_and_plot(updated_prior)
