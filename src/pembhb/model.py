@@ -433,11 +433,11 @@ class SimpleModel(torch.nn.Module):
 
 
 class PeregrineModel(torch.nn.Module):
-    def __init__(self, n_channels: int , n_timesteps: int):
+    def __init__(self, n_channels: int , n_timesteps: int, n_freqs: int):
         super().__init__()
 
         
-        n_freqs = n_timesteps // 2 
+        
         #self.normalisation_f = nn.BatchNorm1d(num_features=n_channels*2)
         #self.normalisation_t = nn.BatchNorm1d(num_features=n_channels)
         self.unet_f = Unet(

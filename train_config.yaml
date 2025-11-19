@@ -35,6 +35,7 @@ architecture:
     PeregrineModel:
       n_channels: 2 # number of channels used (AE--> 2, AET-->3)
       n_timesteps: 6048
+      n_freqs: 4096
       # Nfreqs: 100
       # lowdim: 16
       # in_channels: 6

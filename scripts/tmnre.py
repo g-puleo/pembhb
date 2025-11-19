@@ -1,6 +1,6 @@
 import os
 import torch
-from pembhb.simulator import LISAMBHBSimulatorTD, DummySimulator
+from pembhb.simulator import MBHBSimulatorFD_TD, DummySimulator
 from pembhb.model import InferenceNetwork, PeregrineModel
 from pembhb.data import MBHBDataModule, MBHBDataset
 
@@ -48,8 +48,8 @@ class SequentialTrainer:
 
     def round(self, idx, sampler_init_kwargs):
         
-        sim = LISAMBHBSimulatorTD(self.datagen_conf, sampler_init_kwargs=sampler_init_kwargs)
-        fname_base = "fixall_notmcq"
+        sim = MBHBSimulatorFD_TD(self.datagen_conf, sampler_init_kwargs=sampler_init_kwargs)
+        fname_base = "new_data_gen_1000"
         fname_h5 = os.path.join(ROOT_DIR, "data", f"{fname_base}.h5")
         data_fname_yaml = os.path.join(ROOT_DIR, "data", f"{fname_base}.yaml")
         datagen_info = read_config(data_fname_yaml)
