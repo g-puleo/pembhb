@@ -1,9 +1,9 @@
 batch_size: 50
 epochs: 1000
-learning_rate: 0.001
+learning_rate: 0.00001
 #transform_td: "normalise_max" # options: "none", "logwhiten", "log", "whiten"
 transform_fd: "log" # options: "none", "logwhiten", "log", "whiten", "normalise_max"
-early_stop_patience: 20
+early_stop_patience: 50
 scheduler_factor: 0.3
 scheduler_patience: 10
   
@@ -13,15 +13,15 @@ marginals:
   # t: [[10]]
 
 
-device: "cpu"
+device: "cuda"
 
 
 architecture:
   gradnorm:
-    enabled: False
+    enabled: True
     alpha: 1
-    learning_rate: 0.01
-    common_params: "final_mlp"
+    learning_rate: 0.0001
+    common_params: "linear_f"
 
 
   data_summary:

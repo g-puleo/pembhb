@@ -49,7 +49,7 @@ class SequentialTrainer:
     def round(self, idx, sampler_init_kwargs):
         
         sim = MBHBSimulatorFD_TD(self.datagen_conf, sampler_init_kwargs=sampler_init_kwargs)
-        fname_base = "new_data_gen_1000"
+        fname_base = "fix_all_notmcq_newdata"
         fname_h5 = os.path.join(ROOT_DIR, "data", f"{fname_base}.h5")
         data_fname_yaml = os.path.join(ROOT_DIR, "data", f"{fname_base}.yaml")
         datagen_info = read_config(data_fname_yaml)
@@ -116,9 +116,6 @@ class SequentialTrainer:
                 sampler_init_kwargs={"prior_bounds": self.datagen_conf["prior"]},
             )
             # model = InferenceNetwork.load_from_checkpoint("/u/g/gpuleo/pembhb/logs/20251111_100948_round_0/version_0/checkpoints/epoch=13-step=2380.ckpt")
-            test_datamodule = MBHBDataModule(os.path.join(ROOT_DIR, "data/fixall_notmcq.h5"), self.train_conf)
-            test_datamodule.setup(stage="fit")
-            test_dataset = test_datamodule.test
             updated_prior = self.datagen_conf["prior"].copy()
             out_idx = 0
             for key, marginal_list in self.train_conf["marginals"].items():
@@ -158,7 +155,7 @@ if __name__ == "__main__":
     train_config = read_config(os.path.join(ROOT_DIR, train_config_filename))
     datagen_config = read_config(os.path.join(ROOT_DIR, datagen_config_filename))
                                
-    trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path=os.path.join(ROOT_DIR, "data/observation.h5"))
+    trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path=os.path.join(ROOT_DIR, "data/observation_fix_all_notmcq_newdata.h5"))
     trainer.run(n_rounds=1)
 
     #round(conf, sampler_init_kwargs={'low': 0.5, 'high': 1.0} , lr=conf["training"]["learning_rate"], idx=0)
