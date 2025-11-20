@@ -9,8 +9,7 @@ scheduler_patience: 10
   
 marginals: 
   #  f: [[0]]
-  f: [[0], [1]]
-  # t: [[10]]
+  f: [[0], [1], [0,1]]
 
 
 device: "cuda"
