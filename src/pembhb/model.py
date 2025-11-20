@@ -684,51 +684,70 @@ DATA_SUMMARY_REGISTRY = {
 }
 
 
-class ReducedOrderModel():  
-    ''' 
-    A class that uses a reduced order model to compress the data.
-    '''
-
-    def __init__(self, dataset: MBHBDataset, tolerance: float):
-        self.data_f = dataset.get_data_fd_complex().flatten(1) # shape (M_dataset, N_dimensions)
+class ReducedOrderModel:
+    def __init__(self, dataset: MBHBDataset, tolerance: float, batch_size=512):
+        self.data_f = dataset.wave_fd[:, 0, :].cpu()        # keep large data on cpu
         self.tolerance = tolerance
+        self.batch_size = batch_size
 
-        i=0 
-        sigma = float('inf')
         n = len(self.data_f)
-        initial_seed = torch.randint(0,n)
-        self.basis = [self.data_f[initial_seed]] # [ shape (N_dimensions, ) ]
-        print(f"Building reduced order model with tolerance {tolerance}...")
-        while sigma>tolerance:
-            i = i+1
-            data_proj = self.project_onto_rb(self.data_f) # shape (M_dataset, N_dimensions)
-            residuals = self.data_f - data_proj # shape (M_dataset, N_dimensions)
-            residual_squared_norms = torch.sum(torch.abs(residuals)**2, dim=1) # shape (M_dataset, )
-            tmp_vector_idx = torch.argmax(residual_squared_norms)
-            tmp_vector = self.data_f[tmp_vector_idx] # shape (N_dimensions, )
-            new_basis_vector = self.gram_schmidt(tmp_vector, self.basis) # shape (N_dimensions, )
-            self.basis.append(new_basis_vector)
-        
-        print(f"Reduced order model built with {len(self.basis)} basis vectors to reach tolerance {self.tolerance}.")
+        seed = torch.randint(0, n, (1,)).item()
+        first = self.data_f[seed].to("cuda", non_blocking=True)
+        first = first / first.norm()
+        self.basis = first.unsqueeze(0)  # shape (1, D)
+        sigma = float("inf")
+        i = 0
 
-    def coefficient_rb( self, data: torch.Tensor) :
-        basis_tensor = torch.stack(self.basis) # shape (N_basis, N_dimensions) 
-        coefficients = torch.matmul(torch.conj(basis_tensor), data.T)
-        
-        return coefficients # shape (N_basis, M_dataset)
+        while sigma > tolerance:
+            i += 1
+            if i%50 == 0:
+                print(f"  ROM building iteration {i}, current sigma={sigma:.3e}")
+            residual_norms = self._max_residual_index()  # cpu float array
+            sigma, idx = residual_norms.max(0)
+            sigma = sigma.item()
+            idx = idx.item()
 
-    def project_onto_rb(self, data: torch.Tensor) :
-        coeff = self.coefficient_rb(data) # shape (N_basis, M_dataset)
-        basis_tensor = torch.stack(self.basis) # shape (N_basis, N_dimensions)
-        data_reconstructed = torch.matmul(basis_tensor.T, coeff).T
-        return data_reconstructed # shape (M_dataset, N_dimensions)
-    
-    def gram_schmidt(self, v: torch.Tensor, basis: list[torch.Tensor]) :
-        for b in basis:
-            v -= torch.dot(torch.conj(b), v) * b
-        return v / torch.norm(v)
-    
-    def compress(self, data: torch.Tensor) :
-        # assume data is of shape (M_dataset, N_dimensions)
-        coeff = self.coefficient_rb(data) # shape (N_basis, M_dataset)
-        return coeff.T # shape (M_dataset, N_basis)
+            v = self.data_f[idx].to("cuda", non_blocking=True)
+            v = self._gram_schmidt(v)
+            self.basis = torch.cat([self.basis, v.unsqueeze(0)], dim=0)
+
+        print(f"ROM built with {len(self.basis)} basis vectors to tolerance {tolerance}")
+        self.basis = self.basis.to("cuda")
+
+    # ---------------- internal ops ---------------- #
+
+    def _project_batch(self, batch_cpu):
+        batch = batch_cpu.to("cuda", non_blocking=True)
+        B = self.basis                                    # (k, D)
+        coeff = (B.conj() @ batch.T)                      # (k, m)
+        proj = (B.T @ coeff).T   
+        return proj.cpu()
+
+    def _max_residual_index(self):
+        N = len(self.data_f)
+        norms = torch.empty(N)
+
+        bs = self.batch_size
+        for start in range(0, N, bs):
+            end = min(start + bs, N)
+            batch = self.data_f[start:end]
+
+            proj = self._project_batch(batch)
+            r = (batch - proj)/batch.norm(dim=1, keepdim=True)
+            norms[start:end] = (r.abs()**2).sum(dim=1)
+
+        return norms
+
+    def _gram_schmidt(self, v):
+        B = self.basis                                    # (k, D)
+        coeff = (B.conj() @ v)                            # (k,)
+        v = v - coeff @ B                                 # subtract all at once
+        return v / v.norm()
+
+    # ---------------- public API ---------------- #
+
+    def compress(self, data):
+        data = data.to("cuda")
+        B = self.basis
+        coeff = (B.conj() @ data.T).T
+        return coeff
