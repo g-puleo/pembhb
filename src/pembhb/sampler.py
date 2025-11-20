@@ -54,6 +54,8 @@ class UniformSampler ():
         tmnre_input = unif_samples * (self.upper_bounds - self.lower_bounds) + self.lower_bounds
         #NB IT IS VERY IMPORTANT TO USE .copy() OTHERWISE THE OPERATIONS WILL BE PERFORMED IN-PLACE
         bbhx_input = self.samples_to_bbhx_input(tmnre_input.copy(), t_obs_end)
+        ## insert f_ref=0
+        bbhx_input = np.insert(bbhx_input, 6, np.zeros(n_samples), axis=0)
         return bbhx_input , tmnre_input
 
     def samples_to_bbhx_input(self, samples: np.array, t_obs_end: float) -> np.array:

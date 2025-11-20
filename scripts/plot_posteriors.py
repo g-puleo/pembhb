@@ -1,9 +1,9 @@
 import argparse
 from pembhb import utils
-from pembhb.data import MBHBDataset
+from pembhb.data import MBHBDataset, mbhb_collate_fn
 from pembhb.model import InferenceNetwork
 from glob import glob
-from torch.utils.data import Subset
+from torch.utils.data import Subset, DataLoader
 import numpy as np
 import  matplotlib.pyplot as plt
 from pembhb.utils import _ORDERED_PRIOR_KEYS
@@ -54,7 +54,9 @@ def main():
     # fname = glob("/u/g/gpuleo/pembhb/logs/20250919_155210_round_0/version_0/checkpoints/*.ckpt")[0]#mc, q 2d, 0.9 threshold
     #fname = "/u/g/gpuleo/pembhb/logs/20251111_100948_round_0/version_0/checkpoints/epoch=13-step=2380.ckpt"
     # fname = "/u/g/gpuleo/pembhb/logs/20251112_164554_round_0/version_0/checkpoints/epoch=24-step=4250.ckpt"
-    fname = "/u/g/gpuleo/pembhb/logs/20251117_093429_round_0/version_0/checkpoints/epoch=121-step=20740.ckpt"
+    # fname = "/u/g/gpuleo/pembhb/logs/20251117_093429_round_0/version_0/checkpoints/epoch=121-step=20740.ckpt"
+    fname = glob("/u/g/gpuleo/pembhb/logs/20251120_093021_round_0/version_0/checkpoints/*.ckpt")[0] # trained with new data format and noise shuffling
+
     # Compute logratios
 
     # Plot 1D posteriors
@@ -74,9 +76,11 @@ def main():
     
     ####### THIS CODE PLOTS BOTH 1D AND 2D POSTERIORS FOR THE PARAMETERS OF INTEREST. 
         # trained_model = InferenceNetwork.load_from_checkpoint(fname)
-    logratios_q , params_q , grid_q = utils.get_logratios_grid(dataset_to_compute, trained_model, ngrid_points=1000, in_param_idx=param_idx_dict['q'], out_param_idx=out_param_idx_dict['q'])
-    logratios_Mc, params_Mc, grid_Mc = utils.get_logratios_grid(dataset_to_compute, trained_model, ngrid_points=1000, in_param_idx=param_idx_dict['Mc'], out_param_idx=out_param_idx_dict['Mc'])
-    logratios_qMc, params_qMc, grid_x, grid_y = utils.get_logratios_grid_2d(dataset_to_compute, trained_model, ngrid_points=100, in_param_idx=param_idx_dict['qMc'], out_param_idx=out_param_idx_dict['qMc'])
+    dataloader = DataLoader(dataset_to_compute, batch_size=min(10, len(dataset_to_compute)), shuffle=False, collate_fn=lambda b: mbhb_collate_fn(b, dataset_to_compute))
+
+    logratios_q , params_q , grid_q = utils.get_logratios_grid(dataloader, trained_model, ngrid_points=1000, in_param_idx=param_idx_dict['q'], out_param_idx=out_param_idx_dict['q'])
+    logratios_Mc, params_Mc, grid_Mc = utils.get_logratios_grid(dataloader, trained_model, ngrid_points=1000, in_param_idx=param_idx_dict['Mc'], out_param_idx=out_param_idx_dict['Mc'])
+    logratios_qMc, params_qMc, grid_x, grid_y = utils.get_logratios_grid_2d(dataloader, trained_model, ngrid_points=100, in_param_idx=param_idx_dict['qMc'], out_param_idx=out_param_idx_dict['qMc'])
 
     ratios_q = np.exp(logratios_q)
     ratios_Mc = np.exp(logratios_Mc)
@@ -98,6 +102,7 @@ def main():
     for i in range(N_events):
         fig, ax = plt.subplots(1,3,figsize=(3*PAGE_WIDTH_INCHES/2, PAGE_WIDTH_INCHES/2))
         fig.tight_layout()
+        # breakpoint()
         plot_posterior_1d(grid_Mc, normalised_ratios_Mc[i], params_Mc[i], ax[0], xlabel_dict['Mc'], idx=i, color='blue', label='From 1D NRE')
         plot_posterior_1d(grid_q, normalised_ratios_q[i], params_q[i], ax[1], xlabel_dict['q'], idx=i, color='blue', label='From 1D NRE')
         plot_posterior_1d(grid_mc_from2d, marginalised_Mc_from2d[i], params_qMc[i][0], ax[0], xlabel_dict['Mc'], idx=i, color='orange', linestyle='--', label='From 2D NRE')

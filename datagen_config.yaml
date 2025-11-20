@@ -7,7 +7,7 @@ waveform_params:
   t_max: 5 # days
 
 prior:
-  "logMchirp": [5.2, 5.3] # log10(Mchirp/Msun)
+  "logMchirp": [5, 6] # log10(Mchirp/Msun)
   "q":    [1,5]
   "chi1": [0,0]
   "chi2": [0,0]

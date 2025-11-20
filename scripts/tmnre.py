@@ -59,7 +59,7 @@ class SequentialTrainer:
             monitor="val_accuracy",
             patience=self.train_conf["early_stop_patience"],
             mode="max",
-            stopping_threshold=0.9,
+            stopping_threshold=0.99,
         )
         logger = TensorBoardLogger(
             os.path.join(ROOT_DIR, "logs"), name=f"{TIME_OF_EXECUTION}_round_{idx}"

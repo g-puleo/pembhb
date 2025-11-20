@@ -3,7 +3,8 @@ import torch
 import os 
 from pembhb import ROOT_DIR
 import numpy as np
-from pembhb.data import MBHBDataset
+from pembhb.data import MBHBDataset, mbhb_collate_fn
+
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -32,7 +33,7 @@ def read_config(fname: str):
         conf = yaml.safe_load(file)
     return conf
 
-def get_logratios_grid(dataset: MBHBDataset, model: 'InferenceNetwork', ngrid_points: int, in_param_idx : int, out_param_idx: int):
+def get_logratios_grid(dataloader: torch.utils.data.DataLoader, model: 'InferenceNetwork', ngrid_points: int, in_param_idx : int, out_param_idx: int):
     """Generate a grid of logratios for a given observation and model.
     This is useful for plotting the posterior and to make pp plots
     
@@ -52,7 +53,6 @@ def get_logratios_grid(dataset: MBHBDataset, model: 'InferenceNetwork', ngrid_po
     :type out_param_idx: int
     :return: logratios for the grid, with shape [batchsize, ngrid_points], injection parameters with shape [batchsize, 11], grid with shape [ngrid_points, 1]
     """
-    dataloader = DataLoader(dataset, batch_size=min(10, len(dataset)), shuffle=False)
 
     results = []
     injection_params = []
@@ -104,8 +104,7 @@ def get_logratios_grid(dataset: MBHBDataset, model: 'InferenceNetwork', ngrid_po
         grid = grid.detach().cpu().numpy()
     return results, injection_params, grid
 
-def get_logratios_grid_2d(dataset: MBHBDataset, model: 'InferenceNetwork', ngrid_points: int, out_param_idx : int, in_param_idx : tuple):
-    dataloader = DataLoader(dataset, batch_size=min(10, len(dataset)), shuffle=False)
+def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'InferenceNetwork', ngrid_points: int, out_param_idx : int, in_param_idx : tuple):
     results = []
     injection_params = []
 
@@ -302,7 +301,8 @@ def pp_plot( dataset, model , in_param_idx: int, name: str, out_param_idx: int):
     :type name: str, optional
     """
     print(f"Making pp plot for {name}...")
-    logratios, injection_params, grid = get_logratios_grid(dataset, model, ngrid_points=100, in_param_idx=in_param_idx, out_param_idx=out_param_idx)
+    dataloader = DataLoader(dataset, batch_size=min(10, len(dataset)), shuffle=False, collate_fn = lambda b: mbhb_collate_fn(b, dataset))
+    logratios, injection_params, grid = get_logratios_grid(dataloader, model, ngrid_points=100, in_param_idx=in_param_idx, out_param_idx=out_param_idx)
     p_values = get_pvalues_1d(logratios, grid, injection_params)
     sorted_pvalues = np.sort(p_values)
     sorted_rank = np.arange(sorted_pvalues.shape[0])
@@ -318,7 +318,8 @@ def pp_plot( dataset, model , in_param_idx: int, name: str, out_param_idx: int):
 
 def pp_plot_2d(dataset, model,  in_param_idx: tuple, out_idx: int, name: str):
     print(f"Making pp plot for {name}...")
-    logratios, injection_params, grid_x, grid_y = get_logratios_grid_2d(dataset, model, ngrid_points=50, out_param_idx=out_idx, in_param_idx=in_param_idx)
+    dataloader = DataLoader(dataset, batch_size=min(10, len(dataset)), shuffle=False, collate_fn = lambda b: mbhb_collate_fn(b, dataset))
+    logratios, injection_params, grid_x, grid_y = get_logratios_grid_2d(dataloader, model, ngrid_points=50, out_param_idx=out_idx, in_param_idx=in_param_idx)
     p_values = get_pvalues_2d(logratios, grid_x, grid_y, injection_params)
     sorted_pvalues = np.sort(p_values)
     sorted_normalised_rank = np.arange(sorted_pvalues.shape[0])/sorted_pvalues.shape[0]
@@ -717,3 +718,5 @@ class BBHWaveformTD(wfb.BBHxParallelModule):
                     return ifftseries[:,:n_cut]
                 else:
                     return self.xp.pad(ifftseries, [(0,0),(0,n_cut - n)])
+
+

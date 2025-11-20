@@ -1,4 +1,6 @@
 import torch
+import os
+import time
 import torch.nn as nn
 from lightning import LightningModule
 from torch import nn
@@ -685,24 +687,43 @@ DATA_SUMMARY_REGISTRY = {
 
 
 class ReducedOrderModel:
-    def __init__(self, dataset: MBHBDataset, tolerance: float, batch_size=512):
-        self.data_f = dataset.wave_fd[:, 0, :].cpu()        # keep large data on cpu
+    def __init__(self, dataset=None, tolerance=None, batch_size=512, filename=None):
+        self.basis = None
+
+        if filename is not None and os.path.exists(filename):
+            self.from_file(filename)
+            return
+
+        if dataset is None:
+            raise ValueError("need dataset to build ROM")
+
+        n_channels = dataset.wave_fd.shape[1]
+        raw = dataset.wave_fd.cpu()                     # (N_pts, C, F)
+        self.data_f = raw.reshape(raw.shape[0], -1)     # (N_pts, C*F)
+
         self.tolerance = tolerance
         self.batch_size = batch_size
+        self.n_channels = n_channels
+        self.n_freq = raw.shape[2]
 
         n = len(self.data_f)
         seed = torch.randint(0, n, (1,)).item()
+
+        t0 = time.time()
+
         first = self.data_f[seed].to("cuda", non_blocking=True)
         first = first / first.norm()
-        self.basis = first.unsqueeze(0)  # shape (1, D)
+        self.basis = first.unsqueeze(0)
+
         sigma = float("inf")
         i = 0
 
         while sigma > tolerance:
             i += 1
-            if i%50 == 0:
-                print(f"  ROM building iteration {i}, current sigma={sigma:.3e}")
-            residual_norms = self._max_residual_index()  # cpu float array
+            if i % 50 == 0:
+                print(f"[ROM] iter {i}, sigma={sigma:.3e}, elapsed={time.time()-t0:.1f}s")
+
+            residual_norms = self._max_residual_index()
             sigma, idx = residual_norms.max(0)
             sigma = sigma.item()
             idx = idx.item()
@@ -711,43 +732,71 @@ class ReducedOrderModel:
             v = self._gram_schmidt(v)
             self.basis = torch.cat([self.basis, v.unsqueeze(0)], dim=0)
 
-        print(f"ROM built with {len(self.basis)} basis vectors to tolerance {tolerance}")
+        total = time.time() - t0
+        print(f"[ROM] done. basis={len(self.basis)}, time={total:.1f}s")
+
         self.basis = self.basis.to("cuda")
 
-    # ---------------- internal ops ---------------- #
+    # save/load unchanged except storing channel/freq info
+    def to_file(self, filename):
+        torch.save(
+            {
+                "basis": self.basis.cpu(),
+                "tolerance": self.tolerance,
+                "batch_size": self.batch_size,
+                "n_channels": self.n_channels,
+                "n_freq": self.n_freq,
+            },
+            filename,
+        )
+
+    def from_file(self, filename):
+        s = torch.load(filename, map_location="cpu")
+        self.basis = s["basis"].to("cuda")
+        self.tolerance = s["tolerance"]
+        self.batch_size = s["batch_size"]
+        self.n_channels = s["n_channels"]
+        self.n_freq = s["n_freq"]
+
+    # internal ops same as before
 
     def _project_batch(self, batch_cpu):
         batch = batch_cpu.to("cuda", non_blocking=True)
-        B = self.basis                                    # (k, D)
-        coeff = (B.conj() @ batch.T)                      # (k, m)
-        proj = (B.T @ coeff).T   
+        B = self.basis
+        coeff = B.conj() @ batch.T
+        proj = (B.T @ coeff).T
         return proj.cpu()
 
     def _max_residual_index(self):
         N = len(self.data_f)
         norms = torch.empty(N)
-
         bs = self.batch_size
-        for start in range(0, N, bs):
-            end = min(start + bs, N)
-            batch = self.data_f[start:end]
 
+        for s in range(0, N, bs):
+            e = min(s + bs, N)
+            batch = self.data_f[s:e]
             proj = self._project_batch(batch)
-            r = (batch - proj)/batch.norm(dim=1, keepdim=True)
-            norms[start:end] = (r.abs()**2).sum(dim=1)
+            r = (batch - proj) / batch.norm(dim=1, keepdim=True)
+            norms[s:e] = (r.abs()**2).sum(dim=1)
 
         return norms
 
     def _gram_schmidt(self, v):
-        B = self.basis                                    # (k, D)
-        coeff = (B.conj() @ v)                            # (k,)
-        v = v - coeff @ B                                 # subtract all at once
+        B = self.basis
+        coeff = B.conj() @ v
+        v = v - coeff @ B
         return v / v.norm()
 
-    # ---------------- public API ---------------- #
-
+    # public API with flatten → project → unflatten
     def compress(self, data):
-        data = data.to("cuda")
+        # data: (N_pts, C, F)
+        d = data.reshape(data.shape[0], -1).to("cuda")
         B = self.basis
-        coeff = (B.conj() @ data.T).T
+        coeff = (B.conj() @ d.T).T
         return coeff
+
+    def reconstruct(self, coeff):
+        # optional: decompress
+        B = self.basis
+        x = (B.T @ coeff.T).T
+        return x.reshape(x.shape[0], self.n_channels, self.n_freq)

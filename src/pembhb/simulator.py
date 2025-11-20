@@ -137,7 +137,7 @@ class MBHBSimulatorFD_TD:
         n_obs = inj.shape[1]
 
         # insert f_ref=0
-        inj = np.insert(inj, 6, np.zeros(n_obs), axis=0)
+        #inj = np.insert(inj, 6, np.zeros(n_obs), axis=0)
 
         wave_pos = self._waveform_fd(inj).astype(np.complex64)
         wave_pos = wave_pos[:, self.channels_idx,:]
@@ -160,6 +160,7 @@ class MBHBSimulatorFD_TD:
         noise_fd, wave_fd, noise_td, wave_td = self.generate(z)
         return {
             "parameters": inj,
+            "bbhx_parameters": z,
             "noise_fd": noise_fd,
             "wave_fd": wave_fd,
             "noise_td": noise_td,
@@ -196,6 +197,7 @@ class MBHBSimulatorFD_TD:
                 )
         with h5py.File(filename, "a") as f:
             source_params = f.create_dataset("source_parameters", shape=(N, 11), dtype=np.float32)
+            bbhx_params = f.create_dataset("bbhx_parameters", shape=(N, 12), dtype=np.float32)
             sample_frequencies = f.create_dataset("frequencies", data=self.freqs_pos, dtype=np.float32)
             sample_times_SI = f.create_dataset("times_SI", data=np.arange(0, self.n_time)*self.dt, dtype=np.float32)
             wave_fd = f.create_dataset("wave_fd", shape=(N, self.n_channels, self.n_freqs_pos), dtype=np.complex64)
@@ -215,6 +217,7 @@ class MBHBSimulatorFD_TD:
                 wave_fd_batch = out["wave_fd"]
                 noise_td_batch = out["noise_td"]
                 wave_td_batch = out["wave_td"]
+                bbhx_params_batch = out["bbhx_parameters"].T
                 current_max_td = np.max( np.abs(wave_td_batch) )
                 #for normalisation purpose and easy access during training, store the maximum value across the time domain data
                 if current_max_td > maximum_timedomain:
@@ -226,6 +229,7 @@ class MBHBSimulatorFD_TD:
                 wave_td[i:batch_end] = wave_td_batch
                 noise_fd[i:batch_end] = noise_fd_batch
                 noise_td[i:batch_end] = noise_td_batch
+                bbhx_params[i:batch_end] = bbhx_params_batch
                 snr[i:batch_end] = snr_batch
         # print all shapes
             print("HDF5 dataset shapes (current state):")
