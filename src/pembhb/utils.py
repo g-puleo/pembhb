@@ -107,25 +107,24 @@ def get_logratios_grid(dataloader: torch.utils.data.DataLoader, model: 'Inferenc
 def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'InferenceNetwork', ngrid_points: int, out_param_idx : int, in_param_idx : tuple):
     results = []
     injection_params = []
-
-    model.eval()
-    model = model.to("cuda")
-    prior_trained_dict = model.hparams["dataset_info"]["conf"]["prior"]
-    prior_bounds_0 = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx[0]]]
-    prior_bounds_1 = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx[1]]]
-    lows = [prior_bounds_0[0], prior_bounds_1[0]]
-    highs = [prior_bounds_0[1], prior_bounds_1[1]]
-    grid_0 = torch.linspace(lows[0], highs[0], ngrid_points).reshape(-1)
-    grid_1 = torch.linspace(lows[1], highs[1], ngrid_points).reshape(-1)
-
-    grid_x, grid_y = torch.meshgrid(grid_0, grid_1)# grid_x and grid_y have shape (ngrid_points, ngrid_points)
-    flattened_x = grid_x.flatten() # values of param_0 to test
-    flattened_y = grid_y.flatten() # values of param_1 to test
-    grid = torch.stack((flattened_x, flattened_y), dim=1).to("cuda")  # Shape: [ngrid_points^2, 2]
-    padder = torch.zeros(ngrid_points**2, 9).to("cuda") # pass zero as other parameters
-    grid_padded_input = torch.cat((grid, padder), dim=1)  # Shape: [ngrid_points^2, 11]
-
     with torch.no_grad():
+        model.eval()
+        model = model.to("cuda")
+        prior_trained_dict = model.hparams["dataset_info"]["conf"]["prior"]
+        prior_bounds_0 = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx[0]]]
+        prior_bounds_1 = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx[1]]]
+        lows = [prior_bounds_0[0], prior_bounds_1[0]]
+        highs = [prior_bounds_0[1], prior_bounds_1[1]]
+        grid_0 = torch.linspace(lows[0], highs[0], ngrid_points).reshape(-1)
+        grid_1 = torch.linspace(lows[1], highs[1], ngrid_points).reshape(-1)
+
+        grid_x, grid_y = torch.meshgrid(grid_0, grid_1)# grid_x and grid_y have shape (ngrid_points, ngrid_points)
+        flattened_x = grid_x.flatten() # values of param_0 to test
+        flattened_y = grid_y.flatten() # values of param_1 to test
+        grid = torch.stack((flattened_x, flattened_y), dim=1).to("cuda")  # Shape: [ngrid_points^2, 2]
+        padder = torch.zeros(ngrid_points**2, 9).to("cuda") # pass zero as other parameters
+        grid_padded_input = torch.cat((grid, padder), dim=1)  # Shape: [ngrid_points^2, 11]
+
         for batch in tqdm(dataloader):
             data_fd = batch["data_fd"].to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
             source_parameters = batch["source_parameters"]
@@ -138,7 +137,7 @@ def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'Infer
             batched_grid = grid_expanded.reshape(-1, grid_expanded.shape[-1])  # Flatten batch and ngrid_points
             batched_data_td = data_td_expanded.reshape(-1, data_td_expanded.shape[-2], data_td_expanded.shape[-1])
             batched2dataset = TensorDataset(batched_data_fd, batched_data_td, batched_grid)
-            batched2dataloader = DataLoader(batched2dataset, batch_size=75, shuffle=False)
+            batched2dataloader = DataLoader(batched2dataset, batch_size=20, shuffle=False)
             logratios_list = []
             for batch2 in batched2dataloader:
                 batched2_data_fd, batched2_data_td, batched2_grid = batch2
@@ -157,7 +156,7 @@ def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'Infer
         results = torch.cat(results, dim=0).numpy().reshape(-1, ngrid_points, ngrid_points)
         injection_params = torch.cat(injection_params, dim=0).numpy()
 
-    return results, injection_params, grid_x , grid_y
+    return results, injection_params, grid_x.cpu().numpy(), grid_y.cpu().numpy()
 
 def get_pvalues_1d(logratios: np.array, grid: np.array, inj_param: np.array):
     """Calculate p-values for a 1D logratios array. 
@@ -236,12 +235,9 @@ def get_pvalues_2d(logratios: np.array, grid_0: np.array , grid_1: np.array, inj
 
 
 
-    
 
 
-
-
-def update_bounds(model: 'InferenceNetwork', observation_dataset: MBHBDataset, priordict: dict, in_param_idx: int, n_gridpoints: int, out_param_idx: int, eps: float = 1e-5):
+def update_bounds(model: 'InferenceNetwork', observation_loader: DataLoader, priordict: dict, in_param_idx: int, n_gridpoints: int, out_param_idx: int, eps: float = 1e-5):
     """Update the prior bounds based on the posterior obtained from a model on a single observation. 
     Used to do truncation in MNRE. 
 
@@ -263,7 +259,8 @@ def update_bounds(model: 'InferenceNetwork', observation_dataset: MBHBDataset, p
     prior_bounds_found = False
     while prior_bounds_found==False:
         try:
-            logratios, injection_params, grid = get_logratios_grid(observation_dataset, model, n_gridpoints, in_param_idx=in_param_idx, out_param_idx=out_param_idx)
+            
+            logratios, injection_params, grid = get_logratios_grid(observation_loader, model, n_gridpoints, in_param_idx=in_param_idx, out_param_idx=out_param_idx)
             # find the 95% two tail interval of the posterior 
             print(f"injection_params are: {injection_params}")
             cumsum = np.cumsum(np.exp(logratios))
@@ -285,7 +282,7 @@ def update_bounds(model: 'InferenceNetwork', observation_dataset: MBHBDataset, p
     
     return updated_prior
 
-def pp_plot( dataset, model , in_param_idx: int, name: str, out_param_idx: int):  
+def pp_plot( dataloader, model , in_param_idx: int, name: str, out_param_idx: int):  
     """Generate a pp plot using the examples in dataset, and the posteriors obtained by the model . 
     :param dataset: dataset used to make the pp plot
     :type dataset: MBHBDataset
@@ -301,7 +298,6 @@ def pp_plot( dataset, model , in_param_idx: int, name: str, out_param_idx: int):
     :type name: str, optional
     """
     print(f"Making pp plot for {name}...")
-    dataloader = DataLoader(dataset, batch_size=min(10, len(dataset)), shuffle=False, collate_fn = lambda b: mbhb_collate_fn(b, dataset))
     logratios, injection_params, grid = get_logratios_grid(dataloader, model, ngrid_points=100, in_param_idx=in_param_idx, out_param_idx=out_param_idx)
     p_values = get_pvalues_1d(logratios, grid, injection_params)
     sorted_pvalues = np.sort(p_values)
@@ -316,9 +312,8 @@ def pp_plot( dataset, model , in_param_idx: int, name: str, out_param_idx: int):
         fig.savefig(os.path.join(ROOT_DIR, "plots", f"{name}_pp_plot.png"))
     plt.close()
 
-def pp_plot_2d(dataset, model,  in_param_idx: tuple, out_idx: int, name: str):
+def pp_plot_2d(dataloader, model,  in_param_idx: tuple, out_idx: int, name: str):
     print(f"Making pp plot for {name}...")
-    dataloader = DataLoader(dataset, batch_size=min(10, len(dataset)), shuffle=False, collate_fn = lambda b: mbhb_collate_fn(b, dataset))
     logratios, injection_params, grid_x, grid_y = get_logratios_grid_2d(dataloader, model, ngrid_points=50, out_param_idx=out_idx, in_param_idx=in_param_idx)
     p_values = get_pvalues_2d(logratios, grid_x, grid_y, injection_params)
     sorted_pvalues = np.sort(p_values)
@@ -720,3 +715,76 @@ class BBHWaveformTD(wfb.BBHxParallelModule):
                     return self.xp.pad(ifftseries, [(0,0),(0,n_cut - n)])
 
 
+
+def plot_posterior_1d(grid: np.array,  normalised_ratios: np.array, true_value: float,  ax_buffer: plt.Axes, parameter_name: str, title: int=0, **plot_kwargs):
+    ax_buffer.plot(grid, normalised_ratios, **plot_kwargs)
+    ax_buffer.axvline(x=true_value, color='r', linestyle='--')
+    ax_buffer.set_title(f"Event {title}")
+    ax_buffer.set_xlabel(parameter_name)
+    ax_buffer.set_ylabel("Posterior Density")
+    ax_buffer.grid()
+
+def plot_posterior_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, true_values: list, ax_buffer: plt.Axes, parameter_names: list, title_plot: int=0):
+    # dx = grid_x[1]-grid_x[0] # assuming uniform spacing
+    # dy = grid_y[1]-grid_y[0]
+    # #normalised_ratios = ratios / np.sum(ratios*dx*dy)
+    c = ax_buffer.pcolormesh(grid_x, grid_y, ratios, shading='auto')
+    # add contour lines at a few percentile levels of the density
+    flat = ratios.flatten()
+
+    # sort by density, high -> low
+    idx = np.argsort(flat)[::-1]
+    sorted_density = flat[idx]
+
+    # cumulative mass (area factor omitted; cancels on uniform grid)
+    cum = np.cumsum(sorted_density)
+    cum /= cum[-1]
+
+    # credible levels
+    targets = [0.6827, 0.9545, 0.9973, 1-1e-4, 1-1e-5]
+
+    # density thresholds
+    thresh = []
+    for t in targets:
+        i = np.searchsorted(cum, t)
+        thresh.append(sorted_density[i])
+
+    # contour wants increasing levels: widest -> narrowest
+    levels = np.sort(thresh)
+    sorted_index_levels = np.argsort(thresh)
+    targets_sorted = np.array(targets)[sorted_index_levels]
+    cont = ax_buffer.contour(
+        grid_x, grid_y, ratios,
+        levels=levels,
+        colors='white',
+        linewidths=0.8
+    )
+    fmt = {lev: f"{p:.3f}" for lev, p in zip(cont.levels, targets_sorted)}
+    boxes = []
+
+
+    for lvl_segs in cont.allsegs:
+        xs = []
+        ys = []
+        for seg in lvl_segs:
+            xs.append(seg[:, 0])
+            ys.append(seg[:, 1])
+        xs = np.concatenate(xs)
+        ys = np.concatenate(ys)
+        boxes.append((xs.min(), xs.max(), ys.min(), ys.max()))
+
+    # for lvl, box in zip(levels, boxes):
+    #     print(lvl, box)
+
+    # for lvl, (xmin, xmax, ymin, ymax) in zip(levels, boxes):
+    #     print(f"level {lvl}: xmin={xmin}, xmax={xmax}, ymin={ymin}, ymax={ymax}")
+    ax_buffer.clabel(cont, fmt=fmt, fontsize=8)
+    ax_buffer.axvline(x=true_values[0], color='r', linestyle='--', label='True Value')
+    ax_buffer.axhline(y=true_values[1], color='r', linestyle='--')
+    ax_buffer.set_title(title_plot)
+    ax_buffer.set_xlabel(parameter_names[0])
+    ax_buffer.set_ylabel(parameter_names[1])
+    #plt.colorbar(c, ax=ax_buffer, label='Posterior Density')
+
+    ax_buffer.grid()
+    return boxes[-1]

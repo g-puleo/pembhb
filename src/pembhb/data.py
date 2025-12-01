@@ -161,7 +161,7 @@ class DummyDataset(Dataset):
     def __getitem__(self, idx):
         return {'source_parameters': self.params[idx], 'data_fd': self.data[idx]}
 
-def mbhb_collate_fn(batch, subset: torch.utils.data.Subset):
+def mbhb_collate_fn(batch, subset: torch.utils.data.Subset, noise_shuffling=True):
     B = len(batch)
     device = subset.dataset.device
 
@@ -170,8 +170,11 @@ def mbhb_collate_fn(batch, subset: torch.utils.data.Subset):
     params  = torch.stack([b["params"]  for b in batch])
 
     # sample noise indices from the subset
-    subset_idxs = torch.tensor(subset.indices, device=device)
-    pick = subset_idxs[torch.randint(0, len(subset_idxs), (B,), device=device)]
+    if noise_shuffling:
+        subset_idxs = torch.tensor(subset.indices, device=device)
+        pick = subset_idxs[torch.randint(0, len(subset_idxs), (B,), device=device)]
+    else: 
+        pick = subset.indices
     noise_fd = subset.dataset.noise_fd[pick]
     noise_td = subset.dataset.noise_td[pick]
 

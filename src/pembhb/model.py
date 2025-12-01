@@ -1,6 +1,8 @@
 import torch
 import os
 import time
+from tqdm import tqdm
+from line_profiler import profile
 import torch.nn as nn
 from lightning import LightningModule
 from torch import nn
@@ -685,88 +687,86 @@ DATA_SUMMARY_REGISTRY = {
     "PeregrineModel": PeregrineModel,
 }
 
-
 class ReducedOrderModel:
-    def __init__(self, dataset=None, tolerance=None, batch_size=512, filename=None):
+    def __init__(self, batch_size=500, tolerance=1e-3, device="cuda"):
         self.basis = None
-
-        if filename is not None and os.path.exists(filename):
-            self.from_file(filename)
-            return
-
-        if dataset is None:
-            raise ValueError("need dataset to build ROM")
-
-        n_channels = dataset.wave_fd.shape[1]
-        raw = dataset.wave_fd.cpu()                     # (N_pts, C, F)
-        self.data_f = raw.reshape(raw.shape[0], -1)     # (N_pts, C*F)
-
-        self.tolerance = tolerance
+        self.data_f = None
+        self.n_channels = None
+        self.n_freq = None
         self.batch_size = batch_size
-        self.n_channels = n_channels
-        self.n_freq = raw.shape[2]
+        self.device = device
+        self.tolerance = tolerance
 
-        n = len(self.data_f)
-        seed = torch.randint(0, n, (1,)).item()
+    @classmethod
+    def from_file(cls, filename):
+        s = torch.load(filename, map_location="cpu")
+        obj = cls()
+        obj.n_channels = s["n_channels"]
+        obj.n_freq = s["n_freq"]
+        obj.device = s["device"]
+        obj.basis = s["basis"].to(s["device"])
+        return obj
 
-        t0 = time.time()
-
-        first = self.data_f[seed].to("cuda", non_blocking=True)
-        first = first / first.norm()
-        self.basis = first.unsqueeze(0)
-
-        sigma = float("inf")
-        i = 0
-
-        while sigma > tolerance:
-            i += 1
-            if i % 50 == 0:
-                print(f"[ROM] iter {i}, sigma={sigma:.3e}, elapsed={time.time()-t0:.1f}s")
-
-            residual_norms = self._max_residual_index()
-            sigma, idx = residual_norms.max(0)
-            sigma = sigma.item()
-            idx = idx.item()
-
-            v = self.data_f[idx].to("cuda", non_blocking=True)
-            v = self._gram_schmidt(v)
-            self.basis = torch.cat([self.basis, v.unsqueeze(0)], dim=0)
-
-        total = time.time() - t0
-        print(f"[ROM] done. basis={len(self.basis)}, time={total:.1f}s")
-
-        self.basis = self.basis.to("cuda")
-
-    # save/load unchanged except storing channel/freq info
     def to_file(self, filename):
         torch.save(
             {
                 "basis": self.basis.cpu(),
                 "tolerance": self.tolerance,
-                "batch_size": self.batch_size,
                 "n_channels": self.n_channels,
                 "n_freq": self.n_freq,
+                "device": self.device,
             },
             filename,
         )
 
-    def from_file(self, filename):
-        s = torch.load(filename, map_location="cpu")
-        self.basis = s["basis"].to("cuda")
-        self.tolerance = s["tolerance"]
-        self.batch_size = s["batch_size"]
-        self.n_channels = s["n_channels"]
-        self.n_freq = s["n_freq"]
+    @profile
+    def train(self, dataset):
+        print(f"[ROM] training with tolerance={self.tolerance:.1e} on device={self.device}")
+        raw = dataset.wave_fd.cpu()                    # (N_pts, C, F)
+        self.data_f = raw.reshape(raw.shape[0], -1)
+        self.n_channels = raw.shape[1]
+        self.n_freq = raw.shape[2]
 
-    # internal ops same as before
+        n = len(self.data_f)
+        seed = torch.randint(0, n, (1,)).item()
 
+        first = self.data_f[seed].to(self.device, non_blocking=True)
+        first = first / first.norm()
+        self.basis = first.unsqueeze(0)
+
+        sigma = float("inf")
+        i = 0
+        t0 = time.time()
+        pbar = tqdm(total=0, bar_format='{desc}{postfix}', position=0, leave=True)  # dynamic manual updates
+        while sigma > self.tolerance:
+            i += 1
+            residual_norms = self._max_residual_index()
+            sigma, idx = residual_norms.max(0)
+            sigma = sigma.item()
+            idx = idx.item()
+
+            v = self.data_f[idx].to(self.device, non_blocking=True)
+            v = self._gram_schmidt(v)
+            self.basis = torch.cat([self.basis, v.unsqueeze(0)], dim=0)
+            if i % 10 == 0:  # update every 10 iterations
+                elapsed = time.time() - t0
+                pbar.set_postfix_str(f"N_basis_elems={self.basis.shape[0]}, iter={i}, sigma={sigma:.3e}, elapsed={elapsed:.1f}s")
+                pbar.update(0)  # just refresh the display
+
+        total = time.time() - t0
+        print(f"[ROM] done. basis={len(self.basis)}, time={total:.1f}s")
+
+        self.basis = self.basis.to(self.device)
+
+    @profile
     def _project_batch(self, batch_cpu):
-        batch = batch_cpu.to("cuda", non_blocking=True)
+        batch = batch_cpu.to(self.device, non_blocking=True)
         B = self.basis
         coeff = B.conj() @ batch.T
         proj = (B.T @ coeff).T
         return proj.cpu()
 
+    @profile
     def _max_residual_index(self):
         N = len(self.data_f)
         norms = torch.empty(N)
@@ -781,6 +781,7 @@ class ReducedOrderModel:
 
         return norms
 
+    @profile
     def _gram_schmidt(self, v):
         B = self.basis
         coeff = B.conj() @ v
@@ -790,7 +791,7 @@ class ReducedOrderModel:
     # public API with flatten → project → unflatten
     def compress(self, data):
         # data: (N_pts, C, F)
-        d = data.reshape(data.shape[0], -1).to("cuda")
+        d = data.reshape(data.shape[0], -1).to(self.device)
         B = self.basis
         coeff = (B.conj() @ d.T).T
         return coeff
