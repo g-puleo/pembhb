@@ -716,15 +716,16 @@ class BBHWaveformTD(wfb.BBHxParallelModule):
 
 
 
-def plot_posterior_1d(grid: np.array,  normalised_ratios: np.array, true_value: float,  ax_buffer: plt.Axes, parameter_name: str, title: int=0, **plot_kwargs):
+def plot_posterior_1d(grid: np.array,  normalised_ratios: np.array, true_value: float,  ax_buffer: plt.Axes, parameter_name: str, title: str=None, **plot_kwargs):
     ax_buffer.plot(grid, normalised_ratios, **plot_kwargs)
     ax_buffer.axvline(x=true_value, color='r', linestyle='--')
-    ax_buffer.set_title(f"Event {title}")
+    if title is not None:
+        ax_buffer.set_title(title)
     ax_buffer.set_xlabel(parameter_name)
     ax_buffer.set_ylabel("Posterior Density")
     ax_buffer.grid()
 
-def plot_posterior_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, true_values: list, ax_buffer: plt.Axes, parameter_names: list, title_plot: int=0):
+def plot_posterior_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, true_values: list, ax_buffer: plt.Axes, parameter_names: list, title: str=None):
     # dx = grid_x[1]-grid_x[0] # assuming uniform spacing
     # dy = grid_y[1]-grid_y[0]
     # #normalised_ratios = ratios / np.sum(ratios*dx*dy)
@@ -781,7 +782,8 @@ def plot_posterior_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, true
     ax_buffer.clabel(cont, fmt=fmt, fontsize=8)
     ax_buffer.axvline(x=true_values[0], color='r', linestyle='--', label='True Value')
     ax_buffer.axhline(y=true_values[1], color='r', linestyle='--')
-    ax_buffer.set_title(title_plot)
+    if title is not None:
+        ax_buffer.set_title(title)
     ax_buffer.set_xlabel(parameter_names[0])
     ax_buffer.set_ylabel(parameter_names[1])
     #plt.colorbar(c, ax=ax_buffer, label='Posterior Density')

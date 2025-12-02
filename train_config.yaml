@@ -1,5 +1,5 @@
 batch_size: 50
-epochs: 1000
+epochs: 50
 learning_rate: 0.001
 #transform_td: "normalise_max" # options: "none", "logwhiten", "log", "whiten"
 transform_fd: "log" # options: "none", "logwhiten", "log", "whiten", "normalise_max"

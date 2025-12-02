@@ -14,7 +14,7 @@ from pembhb import ROOT_DIR
 from pembhb import utils
 
 import argparse 
-from datetime import datetime
+from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 
 torch.set_float32_matmul_precision("medium")
@@ -23,7 +23,7 @@ def get_timestamp():
 TIME_OF_EXECUTION = get_timestamp()
 
 class PlotPosteriorCallback(Callback):
-    def __init__(self, timestamp: str, obs_loader: DataLoader, input_idx_list: list, output_idx_list: list, call_every_n_epochs=1): 
+    def __init__(self, timestamp: str, obs_loader: DataLoader, input_idx_list: list, output_idx_list: list, round_idx: int , call_every_n_epochs=1): 
         self.epochs_elapsed = 0
         self.call_every_n_epochs = call_every_n_epochs
         self.timestamp = timestamp
@@ -32,7 +32,7 @@ class PlotPosteriorCallback(Callback):
         self.output_idx_list = output_idx_list
         self.n_marginals = len(input_idx_list)
         self.init_time = datetime.now()
-
+        self.round_idx = round_idx
     def on_validation_epoch_end(self, trainer, pl_module):
         if self.epochs_elapsed == 0: 
             os.makedirs(os.path.join(ROOT_DIR, "plots", TIME_OF_EXECUTION), exist_ok=True)
@@ -41,31 +41,122 @@ class PlotPosteriorCallback(Callback):
         if self.epochs_elapsed % self.call_every_n_epochs == 0:
             print("plotting posteriors on observed data")
             # plot the posterior on the observed data , using the current model
-            self.train_time = datetime.now() - self.init_time
-            title_plot = f"training time={self.train_time}s"
+            train_time = datetime.now() - self.init_time
+            td_trunc = train_time - timedelta(microseconds=train_time.microseconds)
+            title_plot = f"training time={td_trunc}s"
             for i in range(self.n_marginals):
-                fig, ax = plt.subplots(figsize=(5, 5))
                 in_param_idx = self.input_idx_list[i]
                 out_param_idx = self.output_idx_list[i]
+
                 if len(in_param_idx) == 1:
-                    logratios, inj_params, grid = utils.get_logratios_grid(self.obs_loader, pl_module, ngrid_points=1000, in_param_idx=in_param_idx[0], out_param_idx=out_param_idx)
-                    ratios = np.exp(logratios)
-                    dparam = (grid[1] - grid[0]).reshape(-1)
-                    normalised_ratios = (ratios /np.sum(ratios * dparam, axis=1, keepdims=True)).reshape(-1)
-                    utils.plot_posterior_1d(grid, normalised_ratios, true_value=inj_params[0], ax_buffer=ax, parameter_name=utils._ORDERED_PRIOR_KEYS[in_param_idx[0]], title=title_plot)
-                    fig.savefig(os.path.join(ROOT_DIR, f"plots/{self.timestamp}", f"posterior_epoch_{trainer.current_epoch}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}.png"))
-                    plt.close(fig)
-                elif len(in_param_idx) == 2:
-                    logratios, inj_params, grid_x, grid_y = utils.get_logratios_grid_2d(self.obs_loader, pl_module, ngrid_points=100, in_param_idx=in_param_idx, out_param_idx=out_param_idx)
-                    ratios = np.exp(logratios)
-                    dp1 = grid_x[1,0] - grid_x[0,0]
-                    dp2 = grid_y[0,1] - grid_y[0,0]
-                    normalised_ratios = ratios / np.sum(ratios * dp2 * dp1, axis=(1,2), keepdims=True)
-                    widest_box = utils.plot_posterior_2d(grid_x, grid_y, normalised_ratios[0], inj_params[0], ax_buffer=ax, parameter_names=[utils._ORDERED_PRIOR_KEYS[in_param_idx[0]], utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]], title_plot=title_plot)
-                    pl_module.widest_box = widest_box
-                    fname_current = os.path.join(ROOT_DIR, f"plots/{self.timestamp}", f"posterior_epoch_{trainer.current_epoch}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]}.png")
-                    fig.savefig(fname_current)
-                    plt.close(fig)
+                    continue  # skip pure 1D entries; handled in the 2D block
+
+                # 2D
+                fig, ax = plt.subplots(1, 3, figsize=(12, 4))
+                fig.tight_layout()
+                fig.suptitle(f"Round {self.round_idx} - Epoch {trainer.current_epoch} - {title_plot}", fontsize=10)
+                logratios, inj_params, gx, gy = utils.get_logratios_grid_2d(
+                    self.obs_loader,
+                    pl_module,
+                    ngrid_points=100,
+                    in_param_idx=in_param_idx,
+                    out_param_idx=out_param_idx
+                    )
+
+                ratios = np.exp(logratios)
+                dp1 = (gx[1, 0] - gx[0, 0])
+                dp2 = (gy[0, 1] - gy[0, 0])
+                norm2d = ratios / np.sum(ratios * dp1 * dp2, axis=(1, 2), keepdims=True)
+
+                # 1D marginals
+                gx_np = gx[:, 0]
+                gy_np = gy[0, :]
+
+                marg_x = np.sum(norm2d * dp2, axis=2)
+                marg_y = np.sum(norm2d * dp1, axis=1)
+
+                # also compute the standalone 1D posteriors for comparison
+                log1_x, inj1_x, grid1_x = utils.get_logratios_grid(
+                    self.obs_loader,
+                    pl_module,
+                    ngrid_points=1000,
+                    in_param_idx=in_param_idx[0],
+                    out_param_idx=out_param_idx
+                    )
+                log1_y, inj1_y, grid1_y = utils.get_logratios_grid(
+                    self.obs_loader,
+                    pl_module,
+                    ngrid_points=1000,
+                    in_param_idx=in_param_idx[1],
+                    out_param_idx=out_param_idx
+                )
+
+                r1x = np.exp(log1_x)
+                r1y = np.exp(log1_y)
+                dx1 = (grid1_x[1] - grid1_x[0])
+                dy1 = (grid1_y[1] - grid1_y[0])
+                n1x = r1x / np.sum(r1x * dx1, axis=1, keepdims=True)
+                n1y = r1y / np.sum(r1y * dy1, axis=1, keepdims=True)
+
+                # plot x-marginal
+                utils.plot_posterior_1d(
+                    grid1_x,
+                    n1x[0],
+                    inj1_x[0],
+                    ax[0],
+                    parameter_name=utils._ORDERED_PRIOR_KEYS[in_param_idx[0]],
+                    label="Standalone 1D"
+                )
+                utils.plot_posterior_1d(
+                    gx_np,
+                    marg_x[0],
+                    inj_params[0][0],
+                    ax[0],
+                    parameter_name=utils._ORDERED_PRIOR_KEYS[in_param_idx[0]],
+                    label="From 2D"
+                )
+                # plot y-marginal
+                utils.plot_posterior_1d(
+                    grid1_y,
+                    n1y[0],
+                    inj1_y[0],
+                    ax[1],
+                    parameter_name=utils._ORDERED_PRIOR_KEYS[in_param_idx[1]],
+                    label="Standalone 1D",
+                )
+                utils.plot_posterior_1d(
+                    gy_np,
+                    marg_y[0],
+                    inj_params[0][1],
+                    ax[1],
+                    parameter_name=utils._ORDERED_PRIOR_KEYS[in_param_idx[1]],
+                    label="From 2D",
+                )
+
+                # plot 2D
+                widest_box = utils.plot_posterior_2d(
+                    gx,
+                    gy,
+                    norm2d[0],
+                    inj_params[0],
+                    ax_buffer=ax[2],
+                    parameter_names=[
+                        utils._ORDERED_PRIOR_KEYS[in_param_idx[0]],
+                        utils._ORDERED_PRIOR_KEYS[in_param_idx[1]],
+                    ],
+                    title="",
+                )
+                pl_module.widest_box = widest_box  # store for later use
+
+                out = os.path.join(
+                    ROOT_DIR,
+                    "plots",
+                    self.timestamp,
+                    f"posterior_epoch_{trainer.current_epoch}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]}.png",
+                )
+                fig.savefig(out, dpi=200, bbox_inches="tight")
+                plt.close(fig)
+
             print("done plotting posteriors")
 
     def on_train_end(self, trainer, pl_module):
@@ -137,6 +228,7 @@ class SequentialTrainer:
             obs_loader=self.dataloader_obs,
             input_idx_list=self.model.marginals_list,
             output_idx_list=list(range(len(self.model.marginals_list))),
+            round_idx=idx,
             call_every_n_epochs=10)
 
         trainer = Trainer(
