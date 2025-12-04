@@ -1,4 +1,4 @@
-import os
+import os, shutil
 import torch
 from pembhb.simulator import MBHBSimulatorFD_TD, DummySimulator
 from pembhb.model import InferenceNetwork, PeregrineModel
@@ -10,8 +10,10 @@ from lightning.pytorch.callbacks import ModelCheckpoint, Callback
 from lightning.pytorch.tuner import Tuner
 from torch.utils.data import DataLoader , random_split, Subset
 import numpy as np
-from pembhb import ROOT_DIR
+from pembhb import ROOT_DIR, DATA_ROOT_DIR
 from pembhb import utils
+from glob import glob
+
 
 import argparse 
 from datetime import datetime, timedelta
@@ -38,7 +40,7 @@ class PlotPosteriorCallback(Callback):
             os.makedirs(os.path.join(ROOT_DIR, "plots", TIME_OF_EXECUTION), exist_ok=True)
 
         self.epochs_elapsed += 1
-        if self.epochs_elapsed % self.call_every_n_epochs == 0:
+        if (self.epochs_elapsed-2) % self.call_every_n_epochs == 0:
             print("plotting posteriors on observed data")
             # plot the posterior on the observed data , using the current model
             train_time = datetime.now() - self.init_time
@@ -48,111 +50,118 @@ class PlotPosteriorCallback(Callback):
                 in_param_idx = self.input_idx_list[i]
                 out_param_idx = self.output_idx_list[i]
 
+                # if pure 1D, skip (unchanged)
                 if len(in_param_idx) == 1:
-                    continue  # skip pure 1D entries; handled in the 2D block
+                    continue
 
-                # 2D
-                fig, ax = plt.subplots(1, 3, figsize=(12, 4))
+                # 2D setup
+                fig, ax = plt.subplots(1, 3 if self.n_marginals > 1 else 1, figsize=(12, 4))
                 fig.tight_layout()
-                fig.suptitle(f"Round {self.round_idx} - Epoch {trainer.current_epoch} - {title_plot}", fontsize=10)
+                fig.suptitle(
+                    f"Round {self.round_idx} - Epoch {trainer.current_epoch} - {title_plot}",
+                    fontsize=10,
+                )
+
                 logratios, inj_params, gx, gy = utils.get_logratios_grid_2d(
                     self.obs_loader,
                     pl_module,
                     ngrid_points=100,
                     in_param_idx=in_param_idx,
-                    out_param_idx=out_param_idx
-                    )
+                    out_param_idx=out_param_idx,
+                )
 
                 ratios = np.exp(logratios)
-                dp1 = (gx[1, 0] - gx[0, 0])
-                dp2 = (gy[0, 1] - gy[0, 0])
+                dp1 = gx[1, 0] - gx[0, 0]
+                dp2 = gy[0, 1] - gy[0, 0]
                 norm2d = ratios / np.sum(ratios * dp1 * dp2, axis=(1, 2), keepdims=True)
 
-                # 1D marginals
-                gx_np = gx[:, 0]
-                gy_np = gy[0, :]
+                # only compute and plot 1d marginals if there are multiple marginals
+                if self.n_marginals == 3: # assumes format [ [0], [1], [0,1] ]
+                    gx_np = gx[:, 0]
+                    gy_np = gy[0, :]
 
-                marg_x = np.sum(norm2d * dp2, axis=2)
-                marg_y = np.sum(norm2d * dp1, axis=1)
+                    marg_x = np.sum(norm2d * dp2, axis=2)
+                    marg_y = np.sum(norm2d * dp1, axis=1)
 
-                # also compute the standalone 1D posteriors for comparison
-                log1_x, inj1_x, grid1_x = utils.get_logratios_grid(
-                    self.obs_loader,
-                    pl_module,
-                    ngrid_points=1000,
-                    in_param_idx=in_param_idx[0],
-                    out_param_idx=out_param_idx
+                    log1_x, inj1_x, grid1_x = utils.get_logratios_grid(
+                        self.obs_loader,
+                        pl_module,
+                        ngrid_points=1000,
+                        in_param_idx=in_param_idx[0],
+                        out_param_idx=out_param_idx,
                     )
-                log1_y, inj1_y, grid1_y = utils.get_logratios_grid(
-                    self.obs_loader,
-                    pl_module,
-                    ngrid_points=1000,
-                    in_param_idx=in_param_idx[1],
-                    out_param_idx=out_param_idx
-                )
+                    log1_y, inj1_y, grid1_y = utils.get_logratios_grid(
+                        self.obs_loader,
+                        pl_module,
+                        ngrid_points=1000,
+                        in_param_idx=in_param_idx[1],
+                        out_param_idx=out_param_idx,
+                    )
 
-                r1x = np.exp(log1_x)
-                r1y = np.exp(log1_y)
-                dx1 = (grid1_x[1] - grid1_x[0])
-                dy1 = (grid1_y[1] - grid1_y[0])
-                n1x = r1x / np.sum(r1x * dx1, axis=1, keepdims=True)
-                n1y = r1y / np.sum(r1y * dy1, axis=1, keepdims=True)
+                    r1x = np.exp(log1_x)
+                    r1y = np.exp(log1_y)
+                    dx1 = grid1_x[1] - grid1_x[0]
+                    dy1 = grid1_y[1] - grid1_y[0]
+                    n1x = r1x / np.sum(r1x * dx1, axis=1, keepdims=True)
+                    n1y = r1y / np.sum(r1y * dy1, axis=1, keepdims=True)
 
-                # plot x-marginal
-                utils.plot_posterior_1d(
-                    grid1_x,
-                    n1x[0],
-                    inj1_x[0],
-                    ax[0],
-                    parameter_name=utils._ORDERED_PRIOR_KEYS[in_param_idx[0]],
-                    label="Standalone 1D"
-                )
-                utils.plot_posterior_1d(
-                    gx_np,
-                    marg_x[0],
-                    inj_params[0][0],
-                    ax[0],
-                    parameter_name=utils._ORDERED_PRIOR_KEYS[in_param_idx[0]],
-                    label="From 2D"
-                )
-                # plot y-marginal
-                utils.plot_posterior_1d(
-                    grid1_y,
-                    n1y[0],
-                    inj1_y[0],
-                    ax[1],
-                    parameter_name=utils._ORDERED_PRIOR_KEYS[in_param_idx[1]],
-                    label="Standalone 1D",
-                )
-                utils.plot_posterior_1d(
-                    gy_np,
-                    marg_y[0],
-                    inj_params[0][1],
-                    ax[1],
-                    parameter_name=utils._ORDERED_PRIOR_KEYS[in_param_idx[1]],
-                    label="From 2D",
-                )
+                    utils.plot_posterior_1d(
+                        grid1_x,
+                        n1x[0],
+                        inj1_x[0],
+                        ax[0],
+                        parameter_name=utils._ORDERED_PRIOR_KEYS[in_param_idx[0]],
+                        label="Standalone 1D",
+                    )
+                    utils.plot_posterior_1d(
+                        gx_np,
+                        marg_x[0],
+                        inj_params[0][0],
+                        ax[0],
+                        parameter_name=utils._ORDERED_PRIOR_KEYS[in_param_idx[0]],
+                        label="From 2D",
+                    )
 
-                # plot 2D
+                    utils.plot_posterior_1d(
+                        grid1_y,
+                        n1y[0],
+                        inj1_y[0],
+                        ax[1],
+                        parameter_name=utils._ORDERED_PRIOR_KEYS[in_param_idx[1]],
+                        label="Standalone 1D",
+                    )
+                    utils.plot_posterior_1d(
+                        gy_np,
+                        marg_y[0],
+                        inj_params[0][1],
+                        ax[1],
+                        parameter_name=utils._ORDERED_PRIOR_KEYS[in_param_idx[1]],
+                        label="From 2D",
+                    )
+                    ax_2d = ax[2]
+                else:
+                    # only 2D → ax is a single axis
+                    ax_2d = ax
+
                 widest_box = utils.plot_posterior_2d(
                     gx,
                     gy,
                     norm2d[0],
                     inj_params[0],
-                    ax_buffer=ax[2],
+                    ax_buffer=ax_2d,
                     parameter_names=[
                         utils._ORDERED_PRIOR_KEYS[in_param_idx[0]],
                         utils._ORDERED_PRIOR_KEYS[in_param_idx[1]],
                     ],
                     title="",
                 )
-                pl_module.widest_box = widest_box  # store for later use
+                pl_module.widest_box = widest_box
 
                 out = os.path.join(
                     ROOT_DIR,
                     "plots",
                     self.timestamp,
-                    f"posterior_epoch_{trainer.current_epoch}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]}.png",
+                    f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]}.png",
                 )
                 fig.savefig(out, dpi=200, bbox_inches="tight")
                 plt.close(fig)
@@ -168,13 +177,12 @@ class SequentialTrainer:
         self.datagen_conf = datagen_conf
         self.dataset_obs_path = dataset_obs_path
         # Subset is there because utils.mbhb_collate_fn expects a Subset, it will access its dataset attribute
-        self.dataset_observation = Subset(MBHBDataset(dataset_obs_path, transform_fd=train_conf["transform_fd"]), indices=[0])
+        self.dataset_observation = Subset(MBHBDataset(dataset_obs_path, transform_fd=train_conf["transform_fd"]), indices=[1])
         self.dataloader_obs = DataLoader(self.dataset_observation, batch_size=train_conf["batch_size"], shuffle=False, collate_fn=lambda b: utils.mbhb_collate_fn(b, self.dataset_observation, noise_shuffling=False))
         self.logMchirp_lower = [datagen_conf["prior"]["logMchirp"][0]]
         self.logMchirp_upper = [datagen_conf["prior"]["logMchirp"][1]]
         self.q_lower = [datagen_conf["prior"]["q"][0]]
         self.q_upper = [datagen_conf["prior"]["q"][1]]
-
         self._setup_plot()
 
     def _setup_plot(self):
@@ -191,25 +199,35 @@ class SequentialTrainer:
     def round(self, idx, sampler_init_kwargs):
         
         fname_base = f"fix_all_notmcq_newdata_round_{idx}"
-        fname_h5 = os.path.join(ROOT_DIR, "data", f"{fname_base}.h5")
-
+        if idx!=0:
+            fname_h5 = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION,  f"{fname_base}.h5")
+            os.makedirs(os.path.dirname(fname_h5), exist_ok=True)
+        else: 
+            fname_h5 = os.path.join( DATA_ROOT_DIR, f"{fname_base}.h5")
         sim = MBHBSimulatorFD_TD(self.datagen_conf, sampler_init_kwargs=sampler_init_kwargs)
         if not os.path.exists(fname_h5):
-            sim.sample_and_store(fname_h5, N=10000, batch_size=250)
+            sim.sample_and_store(fname_h5, N=50000, batch_size=250)
         else: 
             print(f"Using existing dataset at {fname_h5}")
-        data_fname_yaml = os.path.join(ROOT_DIR, "data", f"{fname_base}.yaml")
+        data_fname_yaml = fname_h5.replace(".h5", ".yaml")
         datagen_info = utils.read_config(data_fname_yaml)
         data_module = MBHBDataModule(fname_h5, self.train_conf)
         print(datagen_info.keys())
+
+
+        logger = TensorBoardLogger(
+            os.path.join(DATA_ROOT_DIR, "logs"), name=f"{TIME_OF_EXECUTION}_round_{idx}"
+        )
         
         #self.model = InferenceNetwork.load_from_checkpoint("logs/20251121_122224_round_0/version_0/checkpoints/epoch=205-step=35020.ckpt")
+        copy_bounds_file = False
         if not hasattr(self, 'model'):
             self.model = InferenceNetwork(train_conf=self.train_conf, dataset_info=datagen_info)
         elif not self.train_conf["keep_ckpt"]:
             self.model = InferenceNetwork(train_conf=self.train_conf, dataset_info=datagen_info)
         else : 
-            pass
+            # book keeping of the prior bounds, when the prior is updated, the model.hparams are not updated, so need to copy explicitly the file
+            copy_bounds_file = True
         checkpoint_callback = ModelCheckpoint(monitor="val_loss", mode="min")
         early_stopping_callback = EarlyStopping(
             monitor="val_accuracy",
@@ -217,19 +235,15 @@ class SequentialTrainer:
             mode="max",
             stopping_threshold=self.train_conf["early_stop_threshold"],
         )
-
-
-        logger = TensorBoardLogger(
-            os.path.join(ROOT_DIR, "logs"), name=f"{TIME_OF_EXECUTION}_round_{idx}"
-        )
-
+        
+        
         plot_posterior_callback = PlotPosteriorCallback(
             timestamp=TIME_OF_EXECUTION,
             obs_loader=self.dataloader_obs,
             input_idx_list=self.model.marginals_list,
             output_idx_list=list(range(len(self.model.marginals_list))),
             round_idx=idx,
-            call_every_n_epochs=10)
+            call_every_n_epochs=1)
 
         trainer = Trainer(
             logger=logger,
@@ -246,6 +260,9 @@ class SequentialTrainer:
         #     pass
 
         trainer.fit(self.model, data_module)
+        if copy_bounds_file: 
+            shutil.copy(data_fname_yaml, logger.log_dir)
+
         test_dataloader = data_module.test_dataloader()
         return test_dataloader
 

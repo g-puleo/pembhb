@@ -742,7 +742,7 @@ def plot_posterior_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, true
     cum /= cum[-1]
 
     # credible levels
-    targets = [0.6827, 0.9545, 0.9973, 1-1e-4, 1-1e-5]
+    targets = [0.6827, 0.9545, 0.9973, 1-1e-4]
 
     # density thresholds
     thresh = []
@@ -753,35 +753,38 @@ def plot_posterior_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, true
     # contour wants increasing levels: widest -> narrowest
     levels = np.sort(thresh)
     sorted_index_levels = np.argsort(thresh)
+
     targets_sorted = np.array(targets)[sorted_index_levels]
-    cont = ax_buffer.contour(
-        grid_x, grid_y, ratios,
-        levels=levels,
-        colors='white',
-        linewidths=0.8
-    )
-    fmt = {lev: f"{p:.3f}" for lev, p in zip(cont.levels, targets_sorted)}
-    boxes = []
+    # cont = ax_buffer.contour(
+    #     grid_x, grid_y, ratios,
+    #     levels=levels,
+    #     colors='white',
+    #     linewidths=0.8
+    # )
+    # fmt = {lev: f"{p:.3f}" for lev, p in zip(cont.levels, targets_sorted)}
+    # boxes = []
 
 
-    for lvl_segs in cont.allsegs:
-        xs = []
-        ys = []
-        for seg in lvl_segs:
-            xs.append(seg[:, 0])
-            ys.append(seg[:, 1])
-        xs = np.concatenate(xs)
-        ys = np.concatenate(ys)
-        boxes.append((xs.min(), xs.max(), ys.min(), ys.max()))
+    # for lvl_segs in cont.allsegs:
+    #     xs = []
+    #     ys = []
+    #     for seg in lvl_segs:
+    #         xs.append(seg[:, 0])
+    #         ys.append(seg[:, 1])
+    #     xs = np.concatenate(xs)
+    #     ys = np.concatenate(ys)
+    #     boxes.append((xs.min(), xs.max(), ys.min(), ys.max()))
 
-    # for lvl, box in zip(levels, boxes):
-    #     print(lvl, box)
+    # # for lvl, box in zip(levels, boxes):
+    # #     print(lvl, box)
 
-    # for lvl, (xmin, xmax, ymin, ymax) in zip(levels, boxes):
-    #     print(f"level {lvl}: xmin={xmin}, xmax={xmax}, ymin={ymin}, ymax={ymax}")
-    ax_buffer.clabel(cont, fmt=fmt, fontsize=8)
+    # # for lvl, (xmin, xmax, ymin, ymax) in zip(levels, boxes):
+    # #     print(f"level {lvl}: xmin={xmin}, xmax={xmax}, ymin={ymin}, ymax={ymax}")
+    # ax_buffer.clabel(cont, fmt=fmt, fontsize=8)
     ax_buffer.axvline(x=true_values[0], color='r', linestyle='--', label='True Value')
     ax_buffer.axhline(y=true_values[1], color='r', linestyle='--')
+    cbar = plt.colorbar(c, ax=ax_buffer)
+    cbar.set_label('Posterior Density')
     if title is not None:
         ax_buffer.set_title(title)
     ax_buffer.set_xlabel(parameter_names[0])
@@ -789,4 +792,4 @@ def plot_posterior_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, true
     #plt.colorbar(c, ax=ax_buffer, label='Posterior Density')
 
     ax_buffer.grid()
-    return boxes[-1]
+    return #boxes[-1]

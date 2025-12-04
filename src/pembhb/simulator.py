@@ -88,6 +88,19 @@ class MBHBSimulatorFD_TD:
             "df": self.df,
             "f_len": len(self.freqs_pos)
         }
+        t0 = self.t_obs_start_SI / YRSID_SI
+        t1 = self.t_obs_end_SI / YRSID_SI
+        self.waveform_kwargs = {
+            "t_obs_start": t0,
+            "t_obs_end": t1,
+            "freqs": self.freqs_pos,
+            "modes": self.modes,
+            "direct": False,
+            "fill": True,
+            "compress": True,
+            "squeeze": False,
+            "length": 1024
+        }
     # -----------------------------------------
     def _build_asd(self, conf):
         asd = np.zeros((len(self.channels), len(self.freqs_pos)))
@@ -117,19 +130,7 @@ class MBHBSimulatorFD_TD:
 
     # -----------------------------------------
     def _waveform_fd(self, inj):
-        t0 = self.t_obs_start_SI / YRSID_SI
-        t1 = self.t_obs_end_SI / YRSID_SI
-
-        return self.wfd(*inj,
-                        t_obs_start=t0,
-                        t_obs_end=t1,
-                        freqs=self.freqs_pos,
-                        modes=self.modes,
-                        direct=False,
-                        fill=True,
-                        compress=True,
-                        squeeze=False,
-                        length=1024)
+        return self.wfd(*inj, **self.waveform_kwargs)
 
     # -----------------------------------------
     def generate(self, inj):

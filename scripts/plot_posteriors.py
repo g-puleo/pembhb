@@ -63,7 +63,8 @@ def main():
 
     # logratios_q , params_q , grid_q = utils.get_logratios_grid(dataloader, trained_model, ngrid_points=1000, in_param_idx=param_idx_dict['q'], out_param_idx=out_param_idx_dict['q'])
     # logratios_Mc, params_Mc, grid_Mc = utils.get_logratios_grid(dataloader, trained_model, ngrid_points=1000, in_param_idx=param_idx_dict['Mc'], out_param_idx=out_param_idx_dict['Mc'])
-    logratios_qMc, params_qMc, grid_x, grid_y = utils.get_logratios_grid_2d(dataloader, trained_model, ngrid_points=100, in_param_idx=param_idx_dict['qMc'], out_param_idx=out_param_idx_dict['qMc'])
+    N_grid_points = 100
+    logratios_qMc, params_qMc, grid_x, grid_y = utils.get_logratios_grid_2d(dataloader, trained_model, ngrid_points=N_grid_points, in_param_idx=param_idx_dict['qMc'], out_param_idx=out_param_idx_dict['qMc'])
 
     # ratios_q = np.exp(logratios_q)
     # ratios_Mc = np.exp(logratios_Mc)
@@ -74,27 +75,30 @@ def main():
     # normalised_ratios_Mc = ratios_Mc / np.sum(ratios_Mc * dMc_1d, axis=1, keepdims=True)
     ratios_qMc = np.exp(logratios_qMc) # shape (N_events, ngrid, ngrid)
 
-    dq = (grid_y[0,1]-grid_y[0,0]).cpu().numpy() # assuming uniform spacing
-    dMc = (grid_x[1,0]-grid_x[0,0]).cpu().numpy()
+    dq = (grid_y[0,1]-grid_y[0,0]) # assuming uniform spacing
+    dMc = (grid_x[1,0]-grid_x[0,0])
     normalised_ratios_qmc = ratios_qMc / np.sum(ratios_qMc* dq * dMc, axis=(1,2), keepdims=True)
     marginalised_q_from2d = np.sum(normalised_ratios_qmc*dMc, axis=1)
     marginalised_Mc_from2d = np.sum(normalised_ratios_qmc*dq, axis=2)
 
-    grid_mc_from2d = grid_x[:, 0].reshape(-1).cpu().numpy()
-    grid_q_from2d = grid_y[0, :].reshape(-1).cpu().numpy()
+    grid_mc_from2d = grid_x[:, 0].reshape(-1)
+    grid_q_from2d = grid_y[0, :].reshape(-1)
     for i in range(N_events):
-        fig, ax = plt.subplots(1,3,figsize=(3*PAGE_WIDTH_INCHES/2, PAGE_WIDTH_INCHES/2))
+        fig, ax = plt.subplots(1,2,figsize=(3*PAGE_WIDTH_INCHES/2, PAGE_WIDTH_INCHES/2))
         fig.tight_layout()
         # breakpoint()
         # plot_posterior_1d(grid_Mc, normalised_ratios_Mc[i], params_Mc[i], ax[0], xlabel_dict['Mc'], idx=i, color='blue', label='From 1D NRE')
         # plot_posterior_1d(grid_q, normalised_ratios_q[i], params_q[i], ax[1], xlabel_dict['q'], idx=i, color='blue', label='From 1D NRE')
         # plot_posterior_1d(grid_mc_from2d, marginalised_Mc_from2d[i], params_qMc[i][0], ax[0], xlabel_dict['Mc'], idx=i, color='orange', linestyle='--', label='From 2D NRE')
         # plot_posterior_1d(grid_q_from2d, marginalised_q_from2d[i], params_qMc[i][1], ax[1], xlabel_dict['q'], idx=i, color='orange', linestyle='--', label='From 2D NRE')
-        plot_posterior_2d(grid_x.cpu().numpy(), grid_y.cpu().numpy(), normalised_ratios_qmc[i], params_qMc[i], ax[2], [xlabel_dict['Mc'], xlabel_dict['q']], idx=i)
+        plot_posterior_2d(grid_x, grid_y, normalised_ratios_qmc[i], params_qMc[i], ax[0], [xlabel_dict['Mc'], xlabel_dict['q']], title=f"TMNRE loglikelihood")
         ax[0].legend()
         ax[1].legend()
-    
-        fig.savefig(f"plots/{timestamp}/posterior1d2d_fixallparams_event_{i+1}.png", bbox_inches='tight', dpi=300)
-
+        # also plot the true likelihood for the event 
+        out = np.load("plots/likelihood_values_fullgrid.npy")
+        Z = out.reshape((N_grid_points, N_grid_points))
+        #Z-= np.max(Z)  # for numerical stability
+        plot_posterior_2d(grid_x, grid_y, np.exp(Z-np.max(Z)),  params_qMc[i],  ax[1], [r"$\log_{10}(\mathcal{M}_c/M_{\odot})$", r"$q$"], title="true loglikelihood")
+        fig.savefig(f"plots/{timestamp}/posterior1d2d_exponential_fixallparams_event_{i+1}.png", bbox_inches='tight', dpi=300)
 if __name__ == "__main__":
     main()

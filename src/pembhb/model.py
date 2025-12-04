@@ -125,9 +125,9 @@ class GradnormHandler :
     def compute_gradnorm_loss(self, task_losses_all):
         ########## GRADNORM LOGIC ###############
         weights = torch.nn.functional.softmax(self.model.weights_loss_logits, dim=0)
-        task_losses = torch.sum(task_losses_all, dim=0) 
+        task_losses = torch.mean(task_losses_all, dim=0) 
         weighted_task_losses = weights * task_losses
-        total_loss = torch.sum(weighted_task_losses)
+        total_loss = torch.mean(weighted_task_losses)
         #compute gradient norms G_W^{(i)}
         G_W = []
         for i, wL_i in enumerate(weighted_task_losses):

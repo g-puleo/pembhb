@@ -129,7 +129,7 @@ class MBHBDataModule( L.LightningDataModule ):
             return
         if stage == "fit" or stage is None:
             full_dataset = MBHBDataset(self.filename, transform_fd=self.transform_fd)
-            self.train, self.val, self.test = random_split(full_dataset,  [0.85,0.095, 0.055], generator=self.generator)
+            self.train, self.val, self.test = random_split(full_dataset,  [0.7,0.15, 0.05], generator=self.generator)
             
         elif stage == "test":
             self.test = MBHBDataset(self.filename, transform_fd=self.transform_fd)

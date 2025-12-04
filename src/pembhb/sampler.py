@@ -4,6 +4,7 @@
 
 ### 
 import numpy as np
+import copy
 from bbhx.utils.constants import PC_SI
 from pembhb.utils import _ORDERED_PRIOR_KEYS
 DAY_SI = 24 * 3600  # seconds in a day
@@ -30,7 +31,7 @@ class UniformSampler ():
         :param prior_bounds: dict of prior bounds
         :type prior_bounds: dict
         """
-        self.prior_bounds = prior_bounds.copy()
+        self.prior_bounds = copy.deepcopy(prior_bounds)
         ## value is in Gpc^3
         self.prior_bounds["dist"][0]   = self.prior_bounds["dist"][0]**3
         self.prior_bounds["dist"][1]   = self.prior_bounds["dist"][1]**3
@@ -55,7 +56,6 @@ class UniformSampler ():
         #NB IT IS VERY IMPORTANT TO USE .copy() OTHERWISE THE OPERATIONS WILL BE PERFORMED IN-PLACE
         bbhx_input = self.samples_to_bbhx_input(tmnre_input.copy(), t_obs_end)
         ## insert f_ref=0
-        bbhx_input = np.insert(bbhx_input, 6, np.zeros(n_samples), axis=0)
         return bbhx_input , tmnre_input
 
     def samples_to_bbhx_input(self, samples: np.array, t_obs_end: float) -> np.array:
@@ -68,6 +68,7 @@ class UniformSampler ():
         :return: MBHB parameters in the following order: m1, m2, chi1, chi2, distance, phase, inclination, lambda, beta, psi, Deltat
         :rtype: np.array
         """
+        n_samples = samples.shape[1]
         samples_ = samples.copy()
         samples_[0:2] = lMcq_m1m2(samples_[0:2]) # log(Mc), q --> m1, m2
         samples_[4] = np.cbrt(samples_[4]) * 1e9 * PC_SI # d^3 -->distance
@@ -78,4 +79,6 @@ class UniformSampler ():
         # 9: psi is already in 0,pi
         # 10: Deltat is already in seconds
         samples_[10] = samples_[10]*DAY_SI + t_obs_end # offset t_ref by the observation time
+        samples_ = np.insert(samples_, 6, np.zeros(n_samples), axis=0)
+
         return samples_
