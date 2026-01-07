@@ -3,7 +3,7 @@ epochs: 1000
 learning_rate: 0.0001
 #transform_td: "normalise_max" # options: "none", "logwhiten", "log", "whiten"
 transform_fd: "log" # options: "none", "logwhiten", "log", "whiten", "normalise_max"
-early_stop_patience: 100
+early_stop_patience: 50
 early_stop_threshold: 0.999
 scheduler_factor: 0.3
 scheduler_patience: 10
@@ -26,9 +26,9 @@ architecture:
 
   data_summary:
 
-    type: "PeregrineModel"
+    type: "ROM"
     BrutalCompression:
-      Nfreqs: 100
+      Nfreqs: 1000
       lowdim: 16
       in_channels: 4
 
@@ -40,6 +40,10 @@ architecture:
       # lowdim: 16
       # in_channels: 6
       # cnn_channels: [32, 64]
-
-
+    ROM:
+      filename: "/data/gpuleo/mbhb/rom.pt"
+      device: "cuda"
   
+baseline_model:
+  use: True
+  filename: "/data/gpuleo/mbhb/logs/20251205_100028_round_0/version_0/checkpoints/epoch=474-step=133000.ckpt"

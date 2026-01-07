@@ -7,6 +7,7 @@ from torch.utils.data import Subset, DataLoader
 import numpy as np
 import  matplotlib.pyplot as plt
 from pembhb.utils import plot_posterior_1d, plot_posterior_2d
+from pembhb.import_utils import import_model
 
 PAGE_WIDTH_INCHES = 4.791
 def main():
@@ -14,8 +15,6 @@ def main():
     parser.add_argument("filename", type=str, help="Path to dataset file")
     parser.add_argument("-n", "--num_events", type=int, default=10, help="Number of events to process")
     args = parser.parse_args()
-
-    # Load dataset
     dataset = MBHBDataset(args.filename, transform_fd='log', device='cpu')
     N_events = min(args.num_events, len(dataset))
     dataset_to_compute = Subset(dataset, range(N_events))
@@ -35,15 +34,13 @@ def main():
     #fname = "/u/g/gpuleo/pembhb/logs/20251111_100948_round_0/version_0/checkpoints/epoch=13-step=2380.ckpt"
     # fname = "/u/g/gpuleo/pembhb/logs/20251112_164554_round_0/version_0/checkpoints/epoch=24-step=4250.ckpt"
     # fname = "/u/g/gpuleo/pembhb/logs/20251117_093429_round_0/version_0/checkpoints/epoch=121-step=20740.ckpt"
-    timestamp = "20251128_160310"
-    out_dir = os.path.join(ROOT_DIR, "plots", timestamp)
-    os.makedirs(out_dir, exist_ok=True)
-    fname = glob(f"/u/g/gpuleo/pembhb/logs/{timestamp}_round_0/version_0/checkpoints/*.ckpt")[0] # trained with new data format and noise shuffling
+    #timestamp = "20251128_160310"
+    timestamp = "20251205_100028"
 
     # Compute logratios
 
     # Plot 1D posteriors
-    trained_model = InferenceNetwork.load_from_checkpoint(fname)
+    trained_model = import_model(timestamp)
     # for param in ['Mc', 'q']:
     #     xlabel = xlabel_dict[param]
     #     inj_param_idx = param_idx_dict[param]   
@@ -84,21 +81,45 @@ def main():
     grid_mc_from2d = grid_x[:, 0].reshape(-1)
     grid_q_from2d = grid_y[0, :].reshape(-1)
     for i in range(N_events):
-        fig, ax = plt.subplots(1,2,figsize=(3*PAGE_WIDTH_INCHES/2, PAGE_WIDTH_INCHES/2))
+        fig, ax = plt.subplots(1,1,figsize=(1.3*PAGE_WIDTH_INCHES/2, PAGE_WIDTH_INCHES/2))
+        ax.set_facecolor('black')
+        fig.patch.set_facecolor('black')
+
+        ax.tick_params(colors='white')
+        ax.xaxis.label.set_color('white')
+        ax.yaxis.label.set_color('white')
+        # keep only left and bottom spines
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+
+        # style remaining spines
+        ax.spines['left'].set_color('white')
+        ax.spines['bottom'].set_color('white')
+
+        # ticks only on left/bottom
+        ax.xaxis.set_ticks_position('bottom')
+        ax.yaxis.set_ticks_position('left')
+        for spine in ax.spines.values():
+            spine.set_color('white')
         fig.tight_layout()
         # breakpoint()
         # plot_posterior_1d(grid_Mc, normalised_ratios_Mc[i], params_Mc[i], ax[0], xlabel_dict['Mc'], idx=i, color='blue', label='From 1D NRE')
         # plot_posterior_1d(grid_q, normalised_ratios_q[i], params_q[i], ax[1], xlabel_dict['q'], idx=i, color='blue', label='From 1D NRE')
         # plot_posterior_1d(grid_mc_from2d, marginalised_Mc_from2d[i], params_qMc[i][0], ax[0], xlabel_dict['Mc'], idx=i, color='orange', linestyle='--', label='From 2D NRE')
         # plot_posterior_1d(grid_q_from2d, marginalised_q_from2d[i], params_qMc[i][1], ax[1], xlabel_dict['q'], idx=i, color='orange', linestyle='--', label='From 2D NRE')
-        plot_posterior_2d(grid_x, grid_y, normalised_ratios_qmc[i], params_qMc[i], ax[0], [xlabel_dict['Mc'], xlabel_dict['q']], title=f"TMNRE loglikelihood")
-        ax[0].legend()
-        ax[1].legend()
+        plot_posterior_2d(grid_x, grid_y, normalised_ratios_qmc[i], params_qMc[i], ax, [xlabel_dict['Mc'], xlabel_dict['q']], title=f"Neural Posterior")
+        cax = fig.axes[-1]   # colorbar axis
+        cax.tick_params(colors='white')
+
+        for spine in cax.spines.values():
+            spine.set_color('white')
+        ax.legend()
+        #ax[1].legend()
         # also plot the true likelihood for the event 
-        out = np.load("plots/likelihood_values_fullgrid.npy")
-        Z = out.reshape((N_grid_points, N_grid_points))
+        #out = np.load("plots/likelihood_values_fullgrid.npy")
+        #Z = out.reshape((N_grid_points, N_grid_points))
         #Z-= np.max(Z)  # for numerical stability
-        plot_posterior_2d(grid_x, grid_y, np.exp(Z-np.max(Z)),  params_qMc[i],  ax[1], [r"$\log_{10}(\mathcal{M}_c/M_{\odot})$", r"$q$"], title="true loglikelihood")
+        #plot_posterior_2d(grid_x, grid_y, np.exp(Z-np.max(Z)),  params_qMc[i],  ax[1], [r"$\log_{10}(\mathcal{M}_c/M_{\odot})$", r"$q$"], title="true loglikelihood")
         fig.savefig(f"plots/{timestamp}/posterior1d2d_exponential_fixallparams_event_{i+1}.png", bbox_inches='tight', dpi=300)
 if __name__ == "__main__":
     main()

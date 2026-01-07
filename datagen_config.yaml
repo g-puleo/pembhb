@@ -7,8 +7,8 @@ waveform_params:
   t_max: 5 # days
 
 prior:
-  "logMchirp": [5.426, 5.8585] # log10(Mchirp/Msun)
-  "q":    [2.0555,2.4946]
+  "logMchirp": [5,6] # log10(Mchirp/Msun)
+  "q":    [1,5]
   "chi1": [0,0]
   "chi2": [0,0]
   "dist":  [10,10]  # dist in Gpc (note that we shall sample uniformly dist^3)

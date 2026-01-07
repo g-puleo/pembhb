@@ -49,8 +49,8 @@ ax_td.plot(times/DAY_SI, noise_td[0,0], label='A (noise)', linestyle='--', alpha
 #ax_td.plot(times/DAY_SI, noise_td[0,1], label='E (noise)', linestyle='--', alpha=0.7)
 ax_td.plot(times/DAY_SI, wave_td[0,0] + noise_td[0,0], label='A (wave+noise)', linestyle='-.', color='C3')
 #ax_td.plot(times/DAY_SI, wave_td[0,1] + noise_td[0,1], label='E (wave+noise)', linestyle='-.', color='C4')
-ax_td.set_xlim(1,1.2)
-ax_td.set_ylim(-2e-21, 2e-21)
+# ax_td.set_xlim(1,1.2)
+# ax_td.set_ylim(-2e-21, 2e-21)
 
 #ax_td.set_title('data_td Example 1')
 ax_td.set_xlabel('Time (days)')
@@ -62,21 +62,57 @@ fig_td.tight_layout()
 fig_td.savefig('data_td_example_presentation.png')
 
 
-fig_fd, ax_fd = plt.subplots(figsize=(6, 3))
+fig_fd, ax_fd = plt.subplots(figsize=(2.5, 2))
+ax_fd.set_facecolor('black')
+fig_fd.patch.set_facecolor('black')
+
+ax_fd.tick_params(colors='white')
+ax_fd.xaxis.label.set_color('white')
+ax_fd.yaxis.label.set_color('white')
+# keep only left and bottom spines
+ax_fd.spines['top'].set_visible(False)
+ax_fd.spines['right'].set_visible(False)
+
+# style remaining spines
+ax_fd.spines['left'].set_color('white')
+ax_fd.spines['bottom'].set_color('white')
+
+# ticks only on left/bottom
+ax_fd.xaxis.set_ticks_position('bottom')
+ax_fd.yaxis.set_ticks_position('left')
+for spine in ax_fd.spines.values():
+    spine.set_color('white')
+# ax_fd.annotate('', xy=(1, 0), xytext=(0, 0),
+#             xycoords='axes fraction',
+#             arrowprops=dict(arrowstyle='->', color='white'))
+
+# ax_fd.annotate('', xy=(0, 1), xytext=(0, 0),
+#             xycoords='axes fraction',
+#             arrowprops=dict(arrowstyle='->', color='white'))
 # frequency-domain plots: magnitudes (fd data are complex)
 abs_wave = np.abs(wave_fd[0, 0])
 abs_noise = np.abs(noise_fd[0, 0])
 abs_sum = np.abs(wave_fd[0, 0] + noise_fd[0, 0])
 
-ax_fd.plot(frequencies, abs_wave, label='wave (|A|)')
-ax_fd.plot(frequencies, abs_noise, label='noise (|A|)', linestyle='--')
+counts = []
+for i in range(10):
+    aw = np.abs(wave_fd[i, 0])
+    an = np.abs(noise_fd[i, 0])
+    cnt = int(np.count_nonzero(aw > an))
+    counts.append(cnt)
+    print(f"i={i}: {cnt} frequencies where |wave| > |noise|")
+
+counts_array = np.array(counts)
+print(f"Average number of frequencies where |wave| > |noise|: {np.mean(counts_array)} ± {np.std(counts_array)}")
+# ax_fd.plot(frequencies, abs_wave, label='wave (|A|)')
+# ax_fd.plot(frequencies, abs_noise, label='noise (|A|)', linestyle='--')
 ax_fd.plot(frequencies, abs_sum, label='wave + noise (|A+N|)', linestyle='-.', color='C3')
 
 ax_fd.set_xlabel('Frequency (Hz)')
 ax_fd.set_ylabel('Amplitude')
 ax_fd.set_yscale('log')
 ax_fd.set_xscale('log')
-ax_fd.legend()
-ax_fd.grid(True)
+# ax_fd.legend()
+# ax_fd.grid(True)
 fig_fd.tight_layout()
-fig_fd.savefig('data_fd_example_presentation.png')
+fig_fd.savefig('data_fd_example_presentation.png', dpi=600)

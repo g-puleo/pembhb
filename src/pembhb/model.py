@@ -9,6 +9,7 @@ from torch import nn
 from torch.nn import functional as F
 from typing import Iterable
 from pembhb.data import MBHBDataset
+from torch.utils.data import DataLoader
 from pembhb.utils import _ORDERED_PRIOR_KEYS
 # class GWTransformer(LightningModule):
 #     def __init__(self, n_chunks=100, embed_dim=512, num_heads=8, num_layers=4):
@@ -218,9 +219,12 @@ class InferenceNetwork(LightningModule):
     """ 
     Basic FC network for TMNRE of MBHB data. 
     """
-    def __init__(self,  train_conf: dict,  dataset_info: dict):  
+    def __init__(self,  train_conf: dict,  dataset_info: dict, data_summarizer: nn.Module=None):  
         super().__init__()
-        self.data_summary = build_data_summary(train_conf["architecture"]["data_summary"])
+        if data_summarizer is not None:
+            self.data_summary = data_summarizer
+        else:
+            self.data_summary = build_data_summary(train_conf["architecture"]["data_summary"])
         self.marginals_dict = train_conf["marginals"]
         self.loss = nn.BCEWithLogitsLoss(reduction='none')
         self.lr = train_conf["learning_rate"]
@@ -482,25 +486,32 @@ class PeregrineModel(torch.nn.Module):
 
         return datasummary_fd, datasummary_td
 
-class BrutalCompression(nn.Module):
-    """
-    Take top-100 values per channel from d_f and corresponding indices normalized to [0,1].
-    Return tensor of shape (B, Nchannels*2, 100) where first Nchannels are values and
-    next Nchannels are normalized indices.
-
-    This implementation requires Nfreqs >= 100 and will raise a ValueError otherwise.
+class ChannelizedLinearCompression(nn.Module): 
+    """a linear compression that operates along dimension 1 (channels) independently, and produces, one number for each channel, then concatenates them and passes through a final MLP to get lowdim features.
     """
     def __init__(self, lowdim: int, Nfreqs: int,  in_channels: int  ): 
+        """Initializes the ChannelizedLinearCompression module.
+
+        :param lowdim: the output features will be of dimension lowdim
+        :type lowdim: int
+        :param Nfreqs: the number of frequency bins
+        :type Nfreqs: int
+        :param in_channels: the number of input channels (note: each TDI channel corresponds to TWO channels in this module, because amplitude and phase are treated separately)
+        :type in_channels: int
+        """
         super().__init__()
         self.N = Nfreqs
         self.lowdim = lowdim
         self.in_channels = in_channels
 
         self.channel_blocks = nn.ModuleList()
+        int_dimension = (self.N*10)**(0.5)
         for _ in range(self.in_channels):
             block = nn.Sequential(
-            nn.Flatten(),  # (B, 2, N) -> (B, 2*N)
-            nn.Linear(self.N, 10),
+            nn.Flatten(),  # (B, 1, N) -> (B, N)
+            nn.Linear(self.N, int(int_dimension)),
+            nn.ReLU(),
+            nn.Linear(int(int_dimension), 10),
             nn.ReLU(),
             nn.Linear(10, 1)  # produce a single number per channel
             )
@@ -513,6 +524,40 @@ class BrutalCompression(nn.Module):
             nn.ReLU(),
             nn.Linear(final_hidden, self.lowdim),
         )
+    
+    def forward(self, x):
+        # x shape: (B, C, N)
+        B, C, N = x.shape
+
+        # process each channel with its channel_block -> yields (B,1) per channel
+        channel_outputs = []
+        for c, block in enumerate(self.channel_blocks):
+            out = block(x[:, c, :])  # (B, 1)
+            channel_outputs.append(out)
+
+        # concatenate per-channel scalars into (B, C)
+        per_channel_scalars = torch.cat(channel_outputs, dim=1)  # (B, C)
+
+        # final MLP to produce lowdim features (B, lowdim)
+        compressed = self.final_mlp(per_channel_scalars)  # (B, lowdim)
+
+        return compressed
+
+
+class BrutalCompression(nn.Module):
+    """
+    Take top-100 values per channel from d_f and corresponding indices normalized to [0,1].
+    Return tensor of shape (B, Nchannels*2, 100) where first Nchannels are values and
+    next Nchannels are normalized indices.
+
+    This implementation requires Nfreqs >= 100 and will raise a ValueError otherwise.
+    """
+    def __init__(self, lowdim: int, Nfreqs: int,  in_channels: int  ): 
+        super().__init__()
+        self.N = 100  # number of top frequencies to select
+        self.lowdim = lowdim
+        self.in_channels = in_channels
+        self.network = ChannelizedLinearCompression(lowdim, self.N, in_channels)
 
 
     def forward(self, d_f, d_t):
@@ -538,17 +583,7 @@ class BrutalCompression(nn.Module):
         # gather values for all channels at these indices
         selected = torch.gather(d_f, 2, indices)  # (B, C, k)
 
-        # process each channel with its channel_block -> yields (B,1) per channel
-        channel_outputs = []
-        for c, block in enumerate(self.channel_blocks):
-            out = block(selected[:, c, :])  # (B, 1)
-            channel_outputs.append(out)
-
-        # concatenate per-channel scalars into (B, C)
-        per_channel_scalars = torch.cat(channel_outputs, dim=1)  # (B, C)
-
-        # final MLP to produce lowdim features (B, lowdim)
-        compressed = self.final_mlp(per_channel_scalars)  # (B, lowdim)
+        compressed = self.network(selected)  # (B, lowdim)
 
         return compressed, d_t
    
@@ -682,30 +717,30 @@ class LinearCompression(nn.Module):
         return self.sequential(x)
     
 
-DATA_SUMMARY_REGISTRY = {
-    "BrutalCompression": BrutalCompression,
-    "PeregrineModel": PeregrineModel,
-}
 
 class ReducedOrderModel:
-    def __init__(self, batch_size=500, tolerance=1e-3, device="cuda"):
-        self.basis = None
-        self.data_f = None
-        self.n_channels = None
-        self.n_freq = None
-        self.batch_size = batch_size
-        self.device = device
-        self.tolerance = tolerance
+    def __init__(self, batch_size=500, tolerance=1e-3, device="cpu", filename=None):
+        if filename is not None: 
+            print("[ROM] initializing from file {filename}.\n Other arguments will be ignored.")
+            self.device = device
+            self.from_file(filename)
+            
+        else: 
+            self.basis = None
+            self.n_channels = None
+            self.n_freq = None
+            self.batch_size = batch_size
+            self.device = device
+            self.tolerance = tolerance
 
-    @classmethod
-    def from_file(cls, filename):
-        s = torch.load(filename, map_location="cpu")
-        obj = cls()
-        obj.n_channels = s["n_channels"]
-        obj.n_freq = s["n_freq"]
-        obj.device = s["device"]
-        obj.basis = s["basis"].to(s["device"])
-        return obj
+
+    def from_file(self, filename):
+        s = torch.load(filename, map_location=self.device)
+        self.n_channels = s["n_channels"]
+        self.n_freq = s["n_freq"]
+        self.basis = s["basis"].to(self.device)
+        print("[ROM] basis loaded.\nn_freq =", self.n_freq, ", n_channels =", self.n_channels, ", n_basis =", len(self.basis))
+        return 
 
     def to_file(self, filename):
         torch.save(
@@ -722,16 +757,24 @@ class ReducedOrderModel:
     @profile
     def train(self, dataset):
         print(f"[ROM] training with tolerance={self.tolerance:.1e} on device={self.device}")
-        raw = dataset.wave_fd.cpu()                    # (N_pts, C, F)
-        self.data_f = raw.reshape(raw.shape[0], -1)
-        self.n_channels = raw.shape[1]
-        self.n_freq = raw.shape[2]
+        dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False, num_workers=8, pin_memory=True)
+        #raw = dataset.wave_fd                 # (N_pts, C, F)
+        # self.data_f = raw.reshape(raw.shape[0], -1)
+        # self.n_channels = raw.shape[1]
+        # self.n_freq = raw.shape[2]
+        # self.data_f = raw.reshape(raw.shape[0], -1)
+        # self.n_channels = raw.shape[1]
+        # self.n_freq = raw.shape[2]
 
-        n = len(self.data_f)
+        # n = raw.shape[0]
+        n = len(dataset)
         seed = torch.randint(0, n, (1,)).item()
 
-        first = self.data_f[seed].to(self.device, non_blocking=True)
+        breakpoint()
+        first = dataset[seed]['wave_fd'].to(self.device)
+        first = self.data_f[seed].to(self.device)
         first = first / first.norm()
+        first = first.reshape(-1)
         self.basis = first.unsqueeze(0)
 
         sigma = float("inf")
@@ -740,18 +783,16 @@ class ReducedOrderModel:
         pbar = tqdm(total=0, bar_format='{desc}{postfix}', position=0, leave=True)  # dynamic manual updates
         while sigma > self.tolerance:
             i += 1
-            residual_norms = self._max_residual_index()
-            sigma, idx = residual_norms.max(0)
+            sigma, idx = self._max_residual_index(dataloader)
             sigma = sigma.item()
             idx = idx.item()
 
             v = self.data_f[idx].to(self.device, non_blocking=True)
             v = self._gram_schmidt(v)
             self.basis = torch.cat([self.basis, v.unsqueeze(0)], dim=0)
-            if i % 10 == 0:  # update every 10 iterations
-                elapsed = time.time() - t0
-                pbar.set_postfix_str(f"N_basis_elems={self.basis.shape[0]}, iter={i}, sigma={sigma:.3e}, elapsed={elapsed:.1f}s")
-                pbar.update(0)  # just refresh the display
+            elapsed = time.time() - t0
+            pbar.set_postfix({f"N_basis_elems":self.basis.shape[0], "iter":i, "sigma":f"{sigma:.3e}", "elapsed":f"{elapsed:.1f}s", "rate":f"{i/elapsed:.1f} it/s"})
+            pbar.update(0)  # just refresh the display
 
         total = time.time() - t0
         print(f"[ROM] done. basis={len(self.basis)}, time={total:.1f}s")
@@ -759,27 +800,38 @@ class ReducedOrderModel:
         self.basis = self.basis.to(self.device)
 
     @profile
-    def _project_batch(self, batch_cpu):
-        batch = batch_cpu.to(self.device, non_blocking=True)
+    def _project_batch(self, batch):
         B = self.basis
-        coeff = B.conj() @ batch.T
-        proj = (B.T @ coeff).T
-        return proj.cpu()
+        coeff = B.conj() @ batch.T # shape ( N_basis, N_dim) @ (N_dim, B_size)--> (Nbasis, B_size)
+        proj = (B.T @ coeff).T # shape ( N_dim, N_basis) @ (N_basis, B_size) ---> (N_dim , B_size)
+        return proj
 
     @profile
-    def _max_residual_index(self):
+    def _max_residual_index(self, dataloader):
         N = len(self.data_f)
-        norms = torch.empty(N)
-        bs = self.batch_size
+        max_seen = 0
+        seen_points = 0
+        for batch in dataloader: 
+            bsize = batch['wave_fd'].shape[0]
+            wave_fd_batch = batch['wave_fd'].to(self.device)
+            wave_fd_batch = wave_fd_batch.reshape(wave_fd_batch.shape[0], -1)
+            proj = self._project_batch(wave_fd_batch)
+            r = (wave_fd_batch - proj) / wave_fd_batch.norm(dim=1, keepdim=True)
+            batch_norms = (r.abs()**2).sum(dim=1)
+            current_max, current_idx = batch_norms.max(0)  
+            if current_max.item() > max_seen:
+                max_seen = current_max.item()
+                max_index = current_idx.item() + seen_points          
+            seen_points += bsize
 
-        for s in range(0, N, bs):
-            e = min(s + bs, N)
-            batch = self.data_f[s:e]
-            proj = self._project_batch(batch)
-            r = (batch - proj) / batch.norm(dim=1, keepdim=True)
-            norms[s:e] = (r.abs()**2).sum(dim=1)
+        # for s in range(0, N, bs):
+        #     e = min(s + bs, N)
+        #     batch = self.data_f[s:e]
+        #     proj = self._project_batch(batch)
+        #     r = (batch - proj) / batch.norm(dim=1, keepdim=True)
+        #     norms[s:e] = (r.abs()**2).sum(dim=1)
 
-        return norms
+        return max_seen , max_index
 
     @profile
     def _gram_schmidt(self, v):
@@ -801,3 +853,32 @@ class ReducedOrderModel:
         B = self.basis
         x = (B.T @ coeff.T).T
         return x.reshape(x.shape[0], self.n_channels, self.n_freq)
+    
+    def __call__(self, d_f, d_t): 
+        """ process data through ROM and return compressed representation, assumes d_f is in complex form split into log10(amplitude+1e-33) and phase."""
+        n_channels = d_f.shape[1]//2
+        amplitudes = torch.exp(d_f[:,:n_channels]) - 1e-33
+        d_f_complex = amplitudes * torch.exp(1j * d_f[:,n_channels:])
+        compressed_ = self.compress(d_f_complex).unsqueeze(1)
+        compressed_ampl = torch.abs(compressed_)
+        compressed_phase = torch.angle(compressed_)
+
+        compressed = torch.cat([compressed_ampl, compressed_phase], dim=1)
+        return compressed, d_t
+
+
+class ROMWrapper(nn.Module): 
+    def __init__(self, filename: str, device: str = "cuda"): 
+        super().__init__()
+        self.rom = ReducedOrderModel(filename=filename, device=device)
+        self.channelised_net = ChannelizedLinearCompression(
+            lowdim=16, 
+            Nfreqs=len(self.rom.basis), 
+            in_channels=2# amplitude and phase
+        )
+    def forward(self, d_f, d_t): 
+        y , d_t = self.rom(d_f=d_f, d_t=d_t)
+        compressed = self.channelised_net(y) 
+        return compressed, d_t
+
+DATA_SUMMARY_REGISTRY = { "BrutalCompression": BrutalCompression, "PeregrineModel": PeregrineModel, "ROM": ROMWrapper}

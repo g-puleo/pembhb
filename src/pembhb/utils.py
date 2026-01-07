@@ -3,8 +3,8 @@ import torch
 import os 
 from pembhb import ROOT_DIR
 import numpy as np
-from pembhb.data import MBHBDataset, mbhb_collate_fn
-
+# from pembhb.data import MBHBDataset, mbhb_collate_fn
+from glob import glob
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -104,17 +104,40 @@ def get_logratios_grid(dataloader: torch.utils.data.DataLoader, model: 'Inferenc
         grid = grid.detach().cpu().numpy()
     return results, injection_params, grid
 
-def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'InferenceNetwork', ngrid_points: int, out_param_idx : int, in_param_idx : tuple):
+def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'InferenceNetwork', ngrid_points: int, out_param_idx : int, in_param_idx : tuple, 
+                          bounds_0: tuple = None, bounds_1: tuple = None):
+    """
+    Compute logratios on a 2D grid for two input parameters.
+
+    :param dataloader: the data loader providing the observations
+    :type dataloader: torch.utils.data.DataLoader
+    :param model: the inference model
+    :type model: InferenceNetwork
+    :param ngrid_points: the number of grid points in each dimension
+    :type ngrid_points: int
+    :param out_param_idx: will fetch the logratios corresponding to output[out_param_idx]
+    :type out_param_idx: int
+    :param in_param_idx: the indices of the input parameters
+    :type in_param_idx: tuple
+    :param prior_bounds_0: the bounds of the interval on which the first input parameter is defined, defaults to the trained prior
+    :type prior_bounds_0: tuple, optional
+    :param prior_bounds_1: the bounds of the interval on which the second input parameter is defined, defaults to trained prior
+    :type prior_bounds_1: tuple, optional
+    :return: results, injection_params, grid_x, grid_y where results has shape (batch size, ngrid_points, ngrid_points), injection_params has shape (batch size, 2), grid_x and grid_y have shape (ngrid_points, ngrid_points)
+    :rtype: _type_
+    """
     results = []
     injection_params = []
     with torch.no_grad():
         model.eval()
         model = model.to("cuda")
         prior_trained_dict = model.hparams["dataset_info"]["conf"]["prior"]
-        prior_bounds_0 = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx[0]]]
-        prior_bounds_1 = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx[1]]]
-        lows = [prior_bounds_0[0], prior_bounds_1[0]]
-        highs = [prior_bounds_0[1], prior_bounds_1[1]]
+        if bounds_0 is None:
+            bounds_0 = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx[0]]]
+        if bounds_1 is None:
+            bounds_1 = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx[1]]]
+        lows = [bounds_0[0], bounds_1[0]]
+        highs = [bounds_0[1], bounds_1[1]]
         grid_0 = torch.linspace(lows[0], highs[0], ngrid_points).reshape(-1)
         grid_1 = torch.linspace(lows[1], highs[1], ngrid_points).reshape(-1)
 
@@ -281,6 +304,13 @@ def update_bounds(model: 'InferenceNetwork', observation_loader: DataLoader, pri
     print(f"Updated prior for {_ORDERED_PRIOR_KEYS[in_param_idx]}: {updated_prior[_ORDERED_PRIOR_KEYS[in_param_idx]]}")
     
     return updated_prior
+
+def update_bounds_2d(model: 'InferenceNetwork', observation_loader: DataLoader, priordict: dict, in_param_idx: tuple, n_gridpoints: int, out_param_idx: int, eps: float = 1e-5):
+
+    # predict the model on the loader by getting the logratios 
+    logratios = get_logratios_grid_2d(observation_loader, model, n_gridpoints, out_param_idx=out_param_idx, in_param_idx=in_param_idx)
+
+    # get the grid of 
 
 def pp_plot( dataloader, model , in_param_idx: int, name: str, out_param_idx: int):  
     """Generate a pp plot using the examples in dataset, and the posteriors obtained by the model . 
@@ -725,71 +755,155 @@ def plot_posterior_1d(grid: np.array,  normalised_ratios: np.array, true_value: 
     ax_buffer.set_ylabel("Posterior Density")
     ax_buffer.grid()
 
-def plot_posterior_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, true_values: list, ax_buffer: plt.Axes, parameter_names: list, title: str=None):
-    # dx = grid_x[1]-grid_x[0] # assuming uniform spacing
-    # dy = grid_y[1]-grid_y[0]
-    # #normalised_ratios = ratios / np.sum(ratios*dx*dy)
-    c = ax_buffer.pcolormesh(grid_x, grid_y, ratios, shading='auto')
-    # add contour lines at a few percentile levels of the density
-    flat = ratios.flatten()
+# def plot_posterior_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, true_values: list, ax_buffer: plt.Axes, parameter_names: list, title: str=None):
+#     # dx = grid_x[1]-grid_x[0] # assuming uniform spacing
+#     # dy = grid_y[1]-grid_y[0]
+#     # #normalised_ratios = ratios / np.sum(ratios*dx*dy)
+#     c = ax_buffer.pcolormesh(grid_x, grid_y, ratios, shading='auto', cmap="inferno")
+    
+#     # add contour lines at a few percentile levels of the density
+#     flat = ratios.flatten()
 
-    # sort by density, high -> low
+#     # sort by density, high -> low
+#     idx = np.argsort(flat)[::-1]
+#     sorted_density = flat[idx]
+
+#     # cumulative mass (area factor omitted; cancels on uniform grid)
+#     cum = np.cumsum(sorted_density)
+#     cum /= cum[-1]
+
+#     # credible levels
+#     targets = [0.6827, 0.9545, 0.9973]#1-1e-4]
+
+#     # density thresholds
+#     thresh = []
+#     for t in targets:
+#         i = np.searchsorted(cum, t)
+#         thresh.append(sorted_density[i])
+
+#     # contour wants increasing levels: widest -> narrowest
+#     levels = np.sort(thresh)
+#     sorted_index_levels = np.argsort(thresh)
+
+#     targets_sorted = np.array(targets)[sorted_index_levels]
+#     cont = ax_buffer.contour(
+#         grid_x, grid_y, ratios,
+#         levels=levels,
+#         colors='white',
+#         linewidths=0.8
+#     )
+#     fmt = {lev: f"{p:.3f}" for lev, p in zip(cont.levels, targets_sorted)}
+#     boxes = []
+
+
+#     for lvl_segs in cont.allsegs:
+#         xs = []
+#         ys = []
+#         for seg in lvl_segs:
+#             xs.append(seg[:, 0])
+#             ys.append(seg[:, 1])
+#         xs = np.concatenate(xs)
+#         ys = np.concatenate(ys)
+#         boxes.append((xs.min(), xs.max(), ys.min(), ys.max()))
+
+#     # for lvl, box in zip(levels, boxes):
+#     #     print(lvl, box)
+
+#     # for lvl, (xmin, xmax, ymin, ymax) in zip(levels, boxes):
+#     #     print(f"level {lvl}: xmin={xmin}, xmax={xmax}, ymin={ymin}, ymax={ymax}")
+#     ax_buffer.clabel(cont, fmt=fmt, fontsize=8)
+#     ax_buffer.axvline(x=true_values[0], color='r', linestyle='--', label='True Value')
+#     ax_buffer.axhline(y=true_values[1], color='r', linestyle='--')
+#     cbar = plt.colorbar(c, ax=ax_buffer)
+#     cbar.set_label('Posterior Density')
+#     if title is not None:
+#         ax_buffer.set_title(title)
+#     ax_buffer.set_xlabel(parameter_names[0])
+#     ax_buffer.set_ylabel(parameter_names[1])
+#     #plt.colorbar(c, ax=ax_buffer, label='Posterior Density')
+
+#     ax_buffer.grid()
+#     return boxes[-1]
+
+def contour_levels(ratios, targets=(0.6827, 0.9545, 0.9973, 0.9999)):
+    flat = ratios.ravel()
     idx = np.argsort(flat)[::-1]
     sorted_density = flat[idx]
 
-    # cumulative mass (area factor omitted; cancels on uniform grid)
     cum = np.cumsum(sorted_density)
     cum /= cum[-1]
 
-    # credible levels
-    targets = [0.6827, 0.9545, 0.9973, 1-1e-4]
-
-    # density thresholds
     thresh = []
     for t in targets:
         i = np.searchsorted(cum, t)
         thresh.append(sorted_density[i])
 
-    # contour wants increasing levels: widest -> narrowest
-    levels = np.sort(thresh)
-    sorted_index_levels = np.argsort(thresh)
+    sorted_levels = np.sort(thresh)
+    sorted_targets = np.array(targets)[np.argsort(thresh)]
+    return sorted_levels, sorted_targets
 
-    targets_sorted = np.array(targets)[sorted_index_levels]
-    # cont = ax_buffer.contour(
-    #     grid_x, grid_y, ratios,
-    #     levels=levels,
-    #     colors='white',
-    #     linewidths=0.8
-    # )
-    # fmt = {lev: f"{p:.3f}" for lev, p in zip(cont.levels, targets_sorted)}
-    # boxes = []
+def contour_boxes(grid_x, grid_y, ratios, levels, ax=None):
 
+    if ax:
+        cs = ax.contour(grid_x, grid_y, ratios, levels=levels) 
+    else:
+        fig, ax = plt.subplots()
+        cs = ax.contour(grid_x, grid_y, ratios, levels=levels)
 
-    # for lvl_segs in cont.allsegs:
-    #     xs = []
-    #     ys = []
-    #     for seg in lvl_segs:
-    #         xs.append(seg[:, 0])
-    #         ys.append(seg[:, 1])
-    #     xs = np.concatenate(xs)
-    #     ys = np.concatenate(ys)
-    #     boxes.append((xs.min(), xs.max(), ys.min(), ys.max()))
+    boxes = []
+    for lvl_segs in cs.allsegs:
+        xs = np.concatenate([seg[:,0] for seg in lvl_segs])
+        ys = np.concatenate([seg[:,1] for seg in lvl_segs])
+        boxes.append((xs.min(), xs.max(), ys.min(), ys.max()))
+    plt.close(fig)
+    return boxes, cs
 
-    # # for lvl, box in zip(levels, boxes):
-    # #     print(lvl, box)
+def posterior_contours_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, true_values: list, ax_buffer: plt.Axes, parameter_names: list, levels: np.array, levels_labels: list[str], title: str=None, do_plot=False, **plot_kwargs):
+    """
+    Find the bounding box of the contour levels specified in levels. 
 
-    # # for lvl, (xmin, xmax, ymin, ymax) in zip(levels, boxes):
-    # #     print(f"level {lvl}: xmin={xmin}, xmax={xmax}, ymin={ymin}, ymax={ymax}")
-    # ax_buffer.clabel(cont, fmt=fmt, fontsize=8)
-    ax_buffer.axvline(x=true_values[0], color='r', linestyle='--', label='True Value')
-    ax_buffer.axhline(y=true_values[1], color='r', linestyle='--')
-    cbar = plt.colorbar(c, ax=ax_buffer)
-    cbar.set_label('Posterior Density')
-    if title is not None:
-        ax_buffer.set_title(title)
-    ax_buffer.set_xlabel(parameter_names[0])
-    ax_buffer.set_ylabel(parameter_names[1])
-    #plt.colorbar(c, ax=ax_buffer, label='Posterior Density')
+    :param grid_x: the grid of x coordinates over which the ratios are evaluated
+    :type grid_x: np.array
+    :param grid_y: the grid of y coordinates over which the ratios are evaluated
+    :type grid_y: np.array
+    :param ratios: the values of the function to be contoured
+    :type ratios: np.array
+    :param true_values: the true values of the parameters being estimated
+    :type true_values: list
+    :param ax_buffer: the axes on which to plot the contours
+    :type ax_buffer: plt.Axes
+    :param parameter_names: the names of the parameters being estimated
+    :type parameter_names: list
+    :param levels: the contour levels to be plotted
+    :type levels: np.array
+    :param levels_labels: the labels for the contour levels
+    :type levels_labels: list[str]
+    :param title: the title of the plot, defaults to None
+    :type title: str, optional
+    :param do_plot: if True, make also a plot of the contour on the axis defined by ax_buffer, defaults to False
+    :type do_plot: bool, optional
+    :return: the bounding box of the contour levels
+    :rtype: tuple
+    """
+    if do_plot: 
+        # make a colormesh on the ax_buffer
+        c = ax_buffer.pcolormesh(grid_x, grid_y, ratios, shading='auto', cmap="inferno", **plot_kwargs)
+        # add contour lines
+        boxes, cs = contour_boxes(grid_x, grid_y, ratios, levels, ax=ax_buffer)
+        fmt = {lev: f"{p:.3f}" for lev, p in zip(levels, levels_labels)}
+        ax_buffer.clabel(cs, fmt=fmt, fontsize=8)
+        ax_buffer.axvline(x=true_values[0], color='r', linestyle='--', label='True Value')
+        ax_buffer.axhline(y=true_values[1], color='r', linestyle='--')
+        cbar = plt.colorbar(c, ax=ax_buffer)
+        cbar.set_label('Posterior Density')
+        if title is not None:
+            ax_buffer.set_title(title)
+        ax_buffer.set_xlabel(parameter_names[0])
+        ax_buffer.set_ylabel(parameter_names[1])
+        ax_buffer.grid()
+    else: 
+        boxes , cs = contour_boxes(grid_x, grid_y, ratios, levels, ax=None)
+        plt.close()
+    
+    return boxes
 
-    ax_buffer.grid()
-    return #boxes[-1]
