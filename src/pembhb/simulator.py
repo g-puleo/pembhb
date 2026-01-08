@@ -181,21 +181,7 @@ class MBHBSimulatorFD_TD:
         """
         if batch_size is None:
             batch_size = max(1,int(N/10.0))
-        if os.path.exists(filename):
-            if os.path.isdir(filename):
-                raise IsADirectoryError(f"'{filename}' is a directory.")
-            # Only prompt when running interactively
-            if sys.stdin.isatty():
-                resp = input(f"File '{filename}' already exists. Delete it and continue? [y/N]: ").strip().lower()
-                if resp in ("y", "yes"):
-                    os.remove(filename)
-                    print(f"Removed existing file '{filename}'.")
-                else:
-                    raise FileExistsError(f"Aborted: '{filename}' already exists.")
-            else:
-                raise FileExistsError(
-                    f"File '{filename}' exists. Run interactively to confirm deletion or remove the file manually."
-                )
+        
         with h5py.File(filename, "a") as f:
             source_params = f.create_dataset("source_parameters", shape=(N, 11), dtype=np.float32)
             bbhx_params = f.create_dataset("bbhx_parameters", shape=(N, 12), dtype=np.float32)

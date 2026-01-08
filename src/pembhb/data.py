@@ -3,6 +3,7 @@ import lightning as L
 import torch
 import numpy as np
 import h5py
+import gc
 # i want a class / function that can : 
 # generate data and store in memory using a sampler and a simulator 
 # optionally save and load the data to/from disk
@@ -14,9 +15,8 @@ class MBHBDataset(Dataset):
         "log": "_transform_log",
     }
 
-    def __init__(self, filename: str, transform_fd: str = "none", device: str = "cpu", cache_in_memory: bool = False):
+    def __init__(self, filename: str, transform_fd: str = "none", cache_in_memory: bool = False):
         self.filename = filename
-        self.device = device
         self.transform_fd = getattr(self, self._TRANSFORMS[transform_fd])
         self.cache_in_memory = cache_in_memory
 
@@ -26,22 +26,26 @@ class MBHBDataset(Dataset):
             self.len = f["wave_fd"].shape[0]
 
             if cache_in_memory:
-                self.wave_fd = torch.tensor(f["wave_fd"][()], device=self.device, dtype=torch.complex64)
-                self.wave_td = torch.tensor(f["wave_td"][()], device=self.device, dtype=torch.float32)
-                self.noise_fd = torch.tensor(f["noise_fd"][()], device=self.device, dtype=torch.complex64)
-                self.noise_td = torch.tensor(f["noise_td"][()], device=self.device, dtype=torch.float32)
-                self.source_parameters = torch.tensor(f["source_parameters"][()], device=self.device, dtype=torch.float32)
+                self.wave_fd = torch.tensor(f["wave_fd"][()], device="cpu", dtype=torch.complex64)
+                self.wave_td = torch.tensor(f["wave_td"][()], device="cpu", dtype=torch.float32)
+                self.noise_fd = torch.tensor(f["noise_fd"][()], device="cpu", dtype=torch.complex64)
+                self.noise_td = torch.tensor(f["noise_td"][()], device="cpu", dtype=torch.float32)
+                self.source_parameters = torch.tensor(f["source_parameters"][()], device="cpu", dtype=torch.float32)
             else:
                 self.wave_fd = self.wave_td = self.parameters = None
                 # noise_fd / noise_td not loaded; collate_fn will handle sampling
 
-    def _load(self, key, idx, dtype):
         if self.cache_in_memory:
-            data = getattr(self, key)
-            return data[idx]
-        else:
-            with h5py.File(self.filename, "r") as f:
-                return torch.tensor(f[key][idx], device=self.device, dtype=dtype)
+            self._load = self._load_from_memory
+        else: 
+            self._load  = self._load_from_disk
+        
+    def _load_from_memory(self, key, idx, dtype):
+        data = getattr(self, key)
+        return data[idx]
+    def _load_from_disk(self, key, idx, dtype):
+        with h5py.File(self.filename, "r") as f:
+            return torch.tensor(f[key][idx], device="cpu", dtype=dtype)
 
     def _transform_identity(self, data):
         return data
@@ -65,8 +69,24 @@ class MBHBDataset(Dataset):
             "wave_td": wave_td,
             "params": params,
         }
-
     
+    def to(self, device):
+        if self.cache_in_memory:
+            for k in ["wave_fd","wave_td","source_parameters","noise_fd","noise_td"]:
+                setattr(self, k, getattr(self, k).to(device))
+            self.device = device
+
+
+    # def clear_cache(self): 
+    #     if self.cache_in_memory:
+    #         del self.wave_fd, self.wave_td, self.source_parameters, self.noise_fd, self.noise_td
+    #         gc.collect()
+    #         torch.cuda.empty_cache()
+    #     else: 
+    #         print("Dataset not cached in memory; nothing to clear.")
+    #         return
+    #     self.cache_in_memory = False
+    #     self._load = self._load_from_disk
 
 class MBHBDataModule( L.LightningDataModule ): 
 
@@ -94,8 +114,8 @@ class MBHBDataModule( L.LightningDataModule ):
             # avoid running setup twice if it was already done. 
             return
         if stage == "fit" or stage is None:
-            full_dataset = MBHBDataset(self.filename, transform_fd=self.transform_fd)
-            self.train, self.val, self.test = random_split(full_dataset,  [0.7,0.25, 0.05], generator=self.generator)
+            self.full_dataset = MBHBDataset(self.filename, transform_fd=self.transform_fd, cache_in_memory=True)
+            self.train, self.val, self.test = random_split(self.full_dataset,  [0.7,0.25, 0.05], generator=self.generator)
             
         elif stage == "test":
             self.test = MBHBDataset(self.filename, transform_fd=self.transform_fd)
@@ -113,7 +133,7 @@ class MBHBDataModule( L.LightningDataModule ):
         return DataLoader(self.val, batch_size=self.batch_size, shuffle=False, num_workers=15, collate_fn=lambda b: mbhb_collate_fn(b, self.val))
     
     def test_dataloader(self):
-        return DataLoader(self.test, batch_size=self.batch_size, shuffle=False, num_workers=15, collate_fn=lambda b: mbhb_collate_fn(b, self.test))
+        return DataLoader(self.test, batch_size=10, shuffle=False, num_workers=15, collate_fn=lambda b: mbhb_collate_fn(b, self.test))
 
 
 class DummyDataset(Dataset):
@@ -129,7 +149,6 @@ class DummyDataset(Dataset):
 
 def mbhb_collate_fn(batch, subset: torch.utils.data.Subset, noise_shuffling=True):
     B = len(batch)
-    device = subset.dataset.device
 
     wave_fd = torch.stack([b["wave_fd"] for b in batch])
     wave_td = torch.stack([b["wave_td"] for b in batch])
@@ -137,8 +156,8 @@ def mbhb_collate_fn(batch, subset: torch.utils.data.Subset, noise_shuffling=True
 
     # pick noise indices randomly
     if noise_shuffling:
-        subset_idxs = torch.tensor(subset.indices, device=device)
-        pick = subset_idxs[torch.randint(0, len(subset_idxs), (B,), device=device)]
+        subset_idxs = torch.tensor(subset.indices)
+        pick = subset_idxs[torch.randint(0, len(subset_idxs), (B,))]
     else:
         pick = subset.indices
 
@@ -164,6 +183,4 @@ def mbhb_collate_fn(batch, subset: torch.utils.data.Subset, noise_shuffling=True
         "noise_td": noise_td,
         "noise_index": pick,
     }
-
-
 

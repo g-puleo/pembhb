@@ -719,7 +719,7 @@ class LinearCompression(nn.Module):
 
 
 class ReducedOrderModel:
-    def __init__(self, batch_size=500, tolerance=1e-3, device="cpu", filename=None):
+    def __init__(self, batch_size=1000, tolerance=1e-3, device="cpu", filename=None):
         if filename is not None: 
             print("[ROM] initializing from file {filename}.\n Other arguments will be ignored.")
             self.device = device
@@ -755,9 +755,10 @@ class ReducedOrderModel:
         )
 
     @profile
-    def train(self, dataset):
+    def train(self, train_subset: torch.utils.data.Subset):
         print(f"[ROM] training with tolerance={self.tolerance:.1e} on device={self.device}")
-        dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False, num_workers=8, pin_memory=True)
+        train_subset.dataset.to(self.device) # move the dataset to the right device.
+        dataloader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=False, num_workers=0)
         #raw = dataset.wave_fd                 # (N_pts, C, F)
         # self.data_f = raw.reshape(raw.shape[0], -1)
         # self.n_channels = raw.shape[1]
@@ -767,12 +768,9 @@ class ReducedOrderModel:
         # self.n_freq = raw.shape[2]
 
         # n = raw.shape[0]
-        n = len(dataset)
+        n = len(train_subset)
         seed = torch.randint(0, n, (1,)).item()
-
-        breakpoint()
-        first = dataset[seed]['wave_fd'].to(self.device)
-        first = self.data_f[seed].to(self.device)
+        first = train_subset[seed]['wave_fd'].to(self.device)
         first = first / first.norm()
         first = first.reshape(-1)
         self.basis = first.unsqueeze(0)
@@ -784,10 +782,8 @@ class ReducedOrderModel:
         while sigma > self.tolerance:
             i += 1
             sigma, idx = self._max_residual_index(dataloader)
-            sigma = sigma.item()
-            idx = idx.item()
 
-            v = self.data_f[idx].to(self.device, non_blocking=True)
+            v = train_subset[idx]['wave_fd'].reshape(-1)
             v = self._gram_schmidt(v)
             self.basis = torch.cat([self.basis, v.unsqueeze(0)], dim=0)
             elapsed = time.time() - t0
@@ -808,7 +804,6 @@ class ReducedOrderModel:
 
     @profile
     def _max_residual_index(self, dataloader):
-        N = len(self.data_f)
         max_seen = 0
         seen_points = 0
         for batch in dataloader: 

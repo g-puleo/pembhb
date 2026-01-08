@@ -36,6 +36,7 @@ class PlotPosteriorCallback(Callback):
         self.n_marginals = len(input_idx_list)
         self.init_time = datetime.now()
         self.round_idx = round_idx
+        self.flag_first_epoch = True
     def on_validation_epoch_end(self, trainer, pl_module):
         if self.epochs_elapsed == 0: 
             os.makedirs(os.path.join(ROOT_DIR, "plots", TIME_OF_EXECUTION), exist_ok=True)
@@ -55,7 +56,7 @@ class PlotPosteriorCallback(Callback):
                 if len(in_param_idx) == 1:
                     continue
 
-                fig, ax = plt.subplots(1, 1, figsize=(12, 4))
+                fig, ax = plt.subplots(1, 1, figsize=(4, 4))
                 fig.tight_layout()
                 fig.suptitle(
                     f"Round {self.round_idx} - Epoch {trainer.current_epoch} - {title_plot}",
@@ -67,7 +68,7 @@ class PlotPosteriorCallback(Callback):
                     pl_module,
                     ngrid_points=100,
                     in_param_idx=in_param_idx,
-                    out_param_idx=out_param_idx,
+                    out_param_idx=out_param_idx
                 )
 
                 ratios = np.exp(logratios)
@@ -79,22 +80,30 @@ class PlotPosteriorCallback(Callback):
                 ax_2d = ax
                 levels, labels = utils.contour_levels(norm2d)
                 # find the levels corresponding to 68%, 95%, 99.7, %
-                widest_box = utils.posterior_contours_2d(
-                    gx,
-                    gy,
-                    norm2d[0],
-                    inj_params[0],
-                    ax_buffer=ax_2d,
-                    parameter_names=[
-                        utils._ORDERED_PRIOR_KEYS[in_param_idx[0]],
-                        utils._ORDERED_PRIOR_KEYS[in_param_idx[1]],
-                    ],
-                    title="",
-                    levels=levels,
-                    levels_labels=labels
-                )
-                pl_module.widest_box = widest_box
+                try: 
+                    boxes = utils.posterior_contours_2d(
+                        gx,
+                        gy,
+                        norm2d[0],
+                        inj_params[0],
+                        ax_buffer=ax_2d,
+                        parameter_names=[
+                            utils._ORDERED_PRIOR_KEYS[in_param_idx[0]],
+                            utils._ORDERED_PRIOR_KEYS[in_param_idx[1]],
+                        ],
+                        title="",
+                        levels=levels,
+                        levels_labels=labels,
+                        do_plot=True
+                    )
 
+                except ValueError: 
+                    print("caught ValueError during contour plotting, skipping this plot")
+                    continue
+                pl_module.widest_box = boxes[-1]
+                if self.round_idx==1 and self.flag_first_epoch:
+                    breakpoint()
+                    self.flag_first_epoch = False
                 out = os.path.join(
                     ROOT_DIR,
                     "plots",
@@ -115,39 +124,42 @@ class SequentialTrainer:
         self.datagen_conf = datagen_conf
         self.dataset_obs_path = dataset_obs_path
         # Subset is there because utils.mbhb_collate_fn expects a Subset, it will access its dataset attribute
-        self.dataset_observation = Subset(MBHBDataset(dataset_obs_path, transform_fd=train_conf["transform_fd"]), indices=[1])
+        self.dataset_observation = Subset(MBHBDataset(dataset_obs_path, transform_fd=train_conf["transform_fd"]), indices=[2])
         self.dataloader_obs = DataLoader(self.dataset_observation, batch_size=train_conf["batch_size"], shuffle=False, collate_fn=lambda b: mbhb_collate_fn(b, self.dataset_observation, noise_shuffling=False))
         self.logMchirp_lower = [datagen_conf["prior"]["logMchirp"][0]]
         self.logMchirp_upper = [datagen_conf["prior"]["logMchirp"][1]]
         self.q_lower = [datagen_conf["prior"]["q"][0]]
         self.q_upper = [datagen_conf["prior"]["q"][1]]
         self._setup_plot()
-
+        
         # load baseline model to update prior before training new model
         if self.train_conf["baseline_model"]["use"]:
             self.model = InferenceNetwork.load_from_checkpoint(self.train_conf["baseline_model"]["filename"])
-            logratios, inj_params, gx, gy = utils.get_logratios_grid_2d(
-                self.dataloader_obs,
-                self.model,   # already trained model
-                ngrid_points=100,
-                in_param_idx=(0,1),
-                out_param_idx=0,
-            )
+            widest_box = self._get_widest_box(self.model, self.dataloader_obs)
 
-            ratios = np.exp(logratios)
-            dp1 = gx[1, 0] - gx[0, 0]
-            dp2 = gy[0, 1] - gy[0, 0]
-            norm2d = ratios / np.sum(ratios * dp1 * dp2)
-            levels, labels = utils.contour_levels(norm2d)
-            boxes = utils.posterior_contours_2d(gx, gy, norm2d[0],
-                                                inj_params[0], ax_buffer=None, parameter_names=['log10Mc', 'q'],
-                                                levels=levels, levels_labels=labels)
-            widest_box = boxes[-1]
-        
             # update prior based on model performance
             self.datagen_conf["prior"]["logMchirp"] = [widest_box[0], widest_box[1]]
             self.datagen_conf["prior"]["q"] = [widest_box[2], widest_box[3]]
-    
+            print(f"Updated prior based on baseline model:\nlog10Mchirp: {self.datagen_conf['prior']['logMchirp']},\nq: {self.datagen_conf['prior']['q']}")
+    def _get_widest_box(self, model, dataloader):
+        logratios, inj_params, gx, gy = utils.get_logratios_grid_2d(
+            dataloader,
+            model,
+            ngrid_points=100,
+            in_param_idx=(0,1),
+            out_param_idx=0,
+        )
+
+        ratios = np.exp(logratios)
+        dp1 = gx[1, 0] - gx[0, 0]
+        dp2 = gy[0, 1] - gy[0, 0]
+        norm2d = ratios / np.sum(ratios * dp1 * dp2)
+        levels, labels = utils.contour_levels(norm2d)
+        boxes = utils.posterior_contours_2d(gx, gy, norm2d[0],
+                                            inj_params[0], ax_buffer=None, parameter_names=['log10Mc', 'q'],
+                                            levels=levels, levels_labels=labels)
+        widest_box = boxes[-1]
+        return widest_box
     def _setup_plot(self):
         self.fig, self.axes = plt.subplots(1, 2, figsize=(12, 6))
         for ax, title, ylabel in zip(
@@ -165,27 +177,53 @@ class SequentialTrainer:
         os.makedirs(os.path.dirname(fname_h5), exist_ok=True)
         sim = MBHBSimulatorFD_TD(self.datagen_conf, sampler_init_kwargs=sampler_init_kwargs)
         if not os.path.exists(fname_h5):
-            sim.sample_and_store(fname_h5, N=500, batch_size=250)
+            sim.sample_and_store(fname_h5, N=50000, batch_size=250)
         else: 
-            print(f"Using existing dataset at {fname_h5}")
-        
+            try:
+                resp = input(f"Dataset file {fname_h5} already exists. Resample and overwrite? [y/N]: ").strip().lower()
+            except Exception:
+                # non-interactive environment, default to not retrain
+                resp = "n"
+            if resp in ("y", "yes"):
+                os.remove(fname_h5)
+                sim.sample_and_store(fname_h5, N=500, batch_size=250)
+                print(f"Resampled dataset and saved to {fname_h5}")
+            else:
+                print(f"Using existing dataset at {fname_h5}")
         self.data_fname_yaml = fname_h5.replace(".h5", ".yaml")
-        datagen_info = utils.read_config(self.data_fname_yaml)
+        self.datagen_info = utils.read_config(self.data_fname_yaml)
         self.data_module = MBHBDataModule(fname_h5, self.train_conf)
         self.data_module.setup(stage="fit")
         self.test_dataloader = self.data_module.test_dataloader()
 
     def _train_rom ( self, round_idx) : 
         print("Training ROM...")
-        rom = ReducedOrderModel(tolerance=1e-3, device="cuda")
-        rom.train(self.data_module.train)
+        rom = ReducedOrderModel(tolerance=1e-3, device="cuda", batch_size=5000)
         filename = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION, f"rom_round_{round_idx}.pt")
-        rom.to_file(filename)
+        if not os.path.exists(filename):
+            rom.train(self.data_module.train)
+            rom.to_file(filename)
+        else: 
+            # existing ROM file found: ask whether to retrain or reuse
+            resp = None
+            try:
+                resp = input(f"ROM file {filename} already exists. Retrain and overwrite? [y/N]: ").strip().lower()
+            except Exception:
+                # non-interactive environment, default to not retrain
+                resp = "n"
+            if resp in ("y", "yes"):
+                rom.train(self.data_module.train)
+                rom.to_file(filename)
+                print(f"Retrained ROM and saved to {filename}")
+            else:
+                print(f"Using existing ROM at {filename}")
+
         self.data_summary = ROMWrapper(filename=filename, device=self.train_conf["device"])
-    
+        self.data_module.full_dataset.to("cpu") # go back to loading from cpu
+
     def _train_inference_network ( self, round_idx) :
         #  initialise data summarizer (ROM) 
-        self.model = InferenceNetwork(train_conf=self.train_conf, dataset_info=self.data_module, data_summarizer=self.data_summary)
+        self.model = InferenceNetwork(train_conf=self.train_conf, dataset_info=self.datagen_info, data_summarizer=self.data_summary)
         self.model.train()
         copy_bounds_file = True
 
@@ -198,6 +236,7 @@ class SequentialTrainer:
             monitor="val_accuracy",
             patience=self.train_conf["early_stop_patience"],
             mode="max",
+            min_delta=self.train_conf["early_stop_min_delta"],
             stopping_threshold=self.train_conf["early_stop_threshold"],
         )
         
@@ -208,7 +247,7 @@ class SequentialTrainer:
             input_idx_list=self.model.marginals_list,
             output_idx_list=list(range(len(self.model.marginals_list))),
             round_idx=round_idx,
-            call_every_n_epochs=10)
+            call_every_n_epochs=1)
 
         trainer = Trainer(
             logger=logger,
@@ -218,7 +257,13 @@ class SequentialTrainer:
             enable_progress_bar=True,
             callbacks=[checkpoint_callback, early_stopping_callback, plot_posterior_callback],
         )
+
+        # if round_idx == 0: 
+        #     self.model = InferenceNetwork.load_from_checkpoint("/data/gpuleo/mbhb/logs/20260107_v1_round_4/version_0/checkpoints/epoch=78-step=11060.ckpt")
+        #     self.model.widest_box = self._get_widest_box(self.model, self.dataloader_obs)
+        # else: 
         trainer.fit(self.model, self.data_module)
+        print(f"Widest box after training: {self.model.widest_box}")
         if copy_bounds_file: 
             shutil.copy(self.data_fname_yaml, logger.log_dir)
 
@@ -226,6 +271,7 @@ class SequentialTrainer:
     def round(self, idx, sampler_init_kwargs):
         self._generate_data(round_idx=idx, sampler_init_kwargs=sampler_init_kwargs)
         self._train_rom(round_idx=idx)
+        
         self._train_inference_network(round_idx=idx)
 
     def _plot_updated_prior_bounds(self, updated_prior):
@@ -243,7 +289,6 @@ class SequentialTrainer:
         self.axes[1].set_title("q Prior Bounds")
         self.axes[1].set_xlabel("Iteration")
         self.axes[1].set_ylabel("q")
-
         self.axes[0].plot(range(len(self.logMchirp_lower)), self.logMchirp_lower, label="Lower Bound", color="blue")
         self.axes[0].plot(range(len(self.logMchirp_upper)), self.logMchirp_upper, label="Upper Bound", color="orange")
         self.axes[1].plot(range(len(self.q_lower)), self.q_lower, label="Lower Bound", color="blue")
@@ -251,8 +296,8 @@ class SequentialTrainer:
 
         self.axes[0].legend()
         self.axes[1].legend()
-        plt.tight_layout()
-        plt.savefig(os.path.join(ROOT_DIR, "plots", f"prior_bounds_iteration_{len(self.logMchirp_lower)-1}.png"))
+        self.fig.tight_layout()
+        self.fig.savefig(os.path.join(ROOT_DIR, "plots", TIME_OF_EXECUTION, f"prior_bounds_iteration_{len(self.logMchirp_lower)-1}.png"))
 
     def run(self, n_rounds=1):
         for i in range(n_rounds):
@@ -274,8 +319,9 @@ class SequentialTrainer:
                         # )
                     elif len(marginal) == 2:
                         inj1, inj2 = marginal
-                        utils.pp_plot_2d(self.test_dataloader, self.model, in_param_idx=marginal, out_idx=out_idx,
-                                   name=f"round_{utils._ORDERED_PRIOR_KEYS[inj1]}_{utils._ORDERED_PRIOR_KEYS[inj2]}")
+                        #utils.pp_plot_2d(self.test_dataloader, self.model, in_param_idx=marginal, out_idx=out_idx,
+                        #           name=f"{ROOT_DIR}/plots/{TIME_OF_EXECUTION}/round_{i}_{utils._ORDERED_PRIOR_KEYS[inj1]}_{utils._ORDERED_PRIOR_KEYS[inj2]}")
+            
                         tmp_prior = copy.deepcopy(self.datagen_conf["prior"])
                         tmp_prior[utils._ORDERED_PRIOR_KEYS[inj1]] = [self.model.widest_box[0], self.model.widest_box[1]]
                         tmp_prior[utils._ORDERED_PRIOR_KEYS[inj2]] = [self.model.widest_box[2], self.model.widest_box[3]]
@@ -299,6 +345,6 @@ if __name__ == "__main__":
     datagen_config = utils.read_config(os.path.join(ROOT_DIR, datagen_config_filename))
                                
     trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path=os.path.join(ROOT_DIR, "data/testes_newdata_fixall_notmcq.h5"))
-    trainer.run(n_rounds=1)
+    trainer.run(n_rounds=7)
 
     #round(conf, sampler_init_kwargs={'low': 0.5, 'high': 1.0} , lr=conf["training"]["learning_rate"], idx=0)

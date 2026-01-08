@@ -132,10 +132,14 @@ def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'Infer
         model.eval()
         model = model.to("cuda")
         prior_trained_dict = model.hparams["dataset_info"]["conf"]["prior"]
+        print("calling get_logratios_grid_2d with in_param_idx:", in_param_idx)
+        print("prior trained dict:")
+        print(prior_trained_dict)
         if bounds_0 is None:
             bounds_0 = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx[0]]]
         if bounds_1 is None:
             bounds_1 = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx[1]]]
+        
         lows = [bounds_0[0], bounds_1[0]]
         highs = [bounds_0[1], bounds_1[1]]
         grid_0 = torch.linspace(lows[0], highs[0], ngrid_points).reshape(-1)
@@ -845,8 +849,10 @@ def contour_levels(ratios, targets=(0.6827, 0.9545, 0.9973, 0.9999)):
 def contour_boxes(grid_x, grid_y, ratios, levels, ax=None):
 
     if ax:
+        print(f"using provided ax for contour boxes")
         cs = ax.contour(grid_x, grid_y, ratios, levels=levels) 
     else:
+        print(f"creating new fig for contour boxes")
         fig, ax = plt.subplots()
         cs = ax.contour(grid_x, grid_y, ratios, levels=levels)
 
@@ -855,7 +861,8 @@ def contour_boxes(grid_x, grid_y, ratios, levels, ax=None):
         xs = np.concatenate([seg[:,0] for seg in lvl_segs])
         ys = np.concatenate([seg[:,1] for seg in lvl_segs])
         boxes.append((xs.min(), xs.max(), ys.min(), ys.max()))
-    plt.close(fig)
+    if not ax: 
+        plt.close(fig)
     return boxes, cs
 
 def posterior_contours_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, true_values: list, ax_buffer: plt.Axes, parameter_names: list, levels: np.array, levels_labels: list[str], title: str=None, do_plot=False, **plot_kwargs):
@@ -894,8 +901,8 @@ def posterior_contours_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, 
         ax_buffer.clabel(cs, fmt=fmt, fontsize=8)
         ax_buffer.axvline(x=true_values[0], color='r', linestyle='--', label='True Value')
         ax_buffer.axhline(y=true_values[1], color='r', linestyle='--')
-        cbar = plt.colorbar(c, ax=ax_buffer)
-        cbar.set_label('Posterior Density')
+        fig = ax_buffer.get_figure()
+        cbar = fig.colorbar(c, ax=ax_buffer)
         if title is not None:
             ax_buffer.set_title(title)
         ax_buffer.set_xlabel(parameter_names[0])
