@@ -195,6 +195,7 @@ class MBHBSimulatorFD_TD:
             asd_dataset = f.create_dataset("asd", data=self.asd, dtype=np.float32)
             print("Sampling and storing simulations to ", filename)
             maximum_timedomain = 0
+            
             for i in tqdm(range(0, N, batch_size)):
                 batch_end = min(i + batch_size, N)
                 batch_size_actual = batch_end - i

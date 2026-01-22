@@ -68,8 +68,9 @@ def get_logratios_grid(dataloader: torch.utils.data.DataLoader, model: 'Inferenc
     grid_padded = torch.cat((zero_pad1d[:, :in_param_idx], grid, zero_pad1d[:, in_param_idx:]), dim=1)  # Shape: [ngrid_points, 11]
     with torch.no_grad():
         for batch in tqdm( dataloader ) :
-            data_fd = batch["data_fd"].to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
-            data_td = batch["data_td"].to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
+            
+            data_fd = (batch["wave_fd"]+batch["noise_fd"]).to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
+            data_td = (batch["wave_td"]+batch["noise_td"]).to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
             source_parameters = batch["source_parameters"]  # Shape: [batchsize, 11]
 
 
@@ -153,9 +154,9 @@ def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'Infer
         grid_padded_input = torch.cat((grid, padder), dim=1)  # Shape: [ngrid_points^2, 11]
 
         for batch in tqdm(dataloader):
-            data_fd = batch["data_fd"].to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
+            data_fd = (batch["wave_fd"] + batch["noise_fd"]).to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
             source_parameters = batch["source_parameters"]
-            data_td  = batch["data_td"].to("cuda")  
+            data_td  = (batch["wave_td"] + batch["noise_td"]).to("cuda")  
             batch_size = data_fd.shape[0]
             data_fd_expanded = data_fd.unsqueeze(1).expand(-1, ngrid_points**2, -1, -1)  # Shape: [batchsize, ngrid_points^2, n_channels, n_datapoints]
             grid_expanded = grid_padded_input.unsqueeze(0).expand(batch_size, -1, -1) # shape is [batchsize, ngrid_points^2, 11]
@@ -895,6 +896,55 @@ def posterior_contours_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, 
     if do_plot: 
         # make a colormesh on the ax_buffer
         c = ax_buffer.pcolormesh(grid_x, grid_y, ratios, shading='auto', cmap="inferno", **plot_kwargs)
+        # add contour lines
+        boxes, cs = contour_boxes(grid_x, grid_y, ratios, levels, ax=ax_buffer)
+        fmt = {lev: f"{p:.3f}" for lev, p in zip(levels, levels_labels)}
+        ax_buffer.clabel(cs, fmt=fmt, fontsize=8)
+        ax_buffer.axvline(x=true_values[0], color='r', linestyle='--', label='True Value')
+        ax_buffer.axhline(y=true_values[1], color='r', linestyle='--')
+        fig = ax_buffer.get_figure()
+        cbar = fig.colorbar(c, ax=ax_buffer)
+        if title is not None:
+            ax_buffer.set_title(title)
+        ax_buffer.set_xlabel(parameter_names[0])
+        ax_buffer.set_ylabel(parameter_names[1])
+        ax_buffer.grid()
+    else: 
+        boxes , cs = contour_boxes(grid_x, grid_y, ratios, levels, ax=None)
+        plt.close()
+    
+    return boxes
+
+def posterior_contours_2d_imshow(grid_x: np.array, grid_y: np.array, ratios: np.array, true_values: list, ax_buffer: plt.Axes, parameter_names: list, levels: np.array, levels_labels: list[str], title: str=None, do_plot=False, **plot_kwargs):
+    """
+    Find the bounding box of the contour levels specified in levels. 
+
+    :param grid_x: the grid of x coordinates over which the ratios are evaluated
+    :type grid_x: np.array
+    :param grid_y: the grid of y coordinates over which the ratios are evaluated
+    :type grid_y: np.array
+    :param ratios: the values of the function to be contoured
+    :type ratios: np.array
+    :param true_values: the true values of the parameters being estimated
+    :type true_values: list
+    :param ax_buffer: the axes on which to plot the contours
+    :type ax_buffer: plt.Axes
+    :param parameter_names: the names of the parameters being estimated
+    :type parameter_names: list
+    :param levels: the contour levels to be plotted
+    :type levels: np.array
+    :param levels_labels: the labels for the contour levels
+    :type levels_labels: list[str]
+    :param title: the title of the plot, defaults to None
+    :type title: str, optional
+    :param do_plot: if True, make also a plot of the contour on the axis defined by ax_buffer, defaults to False
+    :type do_plot: bool, optional
+    :return: the bounding box of the contour levels
+    :rtype: tuple
+    """
+    if do_plot: 
+        # make a colormesh on the ax_buffer
+        
         # add contour lines
         boxes, cs = contour_boxes(grid_x, grid_y, ratios, levels, ax=ax_buffer)
         fmt = {lev: f"{p:.3f}" for lev, p in zip(levels, levels_labels)}

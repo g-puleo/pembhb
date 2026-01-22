@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 torch.set_float32_matmul_precision("medium")
 def get_timestamp():
     return datetime.now().strftime("%Y%m%d")
-TIME_OF_EXECUTION = get_timestamp()+"_v0"
+TIME_OF_EXECUTION = get_timestamp()+"_narrowprior_v0"
 
 class PlotPosteriorCallback(Callback):
     def __init__(self, timestamp: str, obs_loader: DataLoader, input_idx_list: list, output_idx_list: list, round_idx: int , call_every_n_epochs=1): 
@@ -36,7 +36,6 @@ class PlotPosteriorCallback(Callback):
         self.n_marginals = len(input_idx_list)
         self.init_time = datetime.now()
         self.round_idx = round_idx
-        self.flag_first_epoch = True
     def on_validation_epoch_end(self, trainer, pl_module):
         if self.epochs_elapsed == 0: 
             os.makedirs(os.path.join(ROOT_DIR, "plots", TIME_OF_EXECUTION), exist_ok=True)
@@ -101,16 +100,8 @@ class PlotPosteriorCallback(Callback):
                     print("caught ValueError during contour plotting, skipping this plot")
                     continue
                 pl_module.widest_box = boxes[-1]
-                if self.round_idx==1 and self.flag_first_epoch:
-                    breakpoint()
-                    self.flag_first_epoch = False
-                out = os.path.join(
-                    ROOT_DIR,
-                    "plots",
-                    self.timestamp,
-                    f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]}.png",
-                )
-                fig.savefig(out, dpi=200, bbox_inches="tight")
+                out = os.path.join( ROOT_DIR,"plots",self.timestamp,f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]}.pdf")
+                fig.savefig(out, bbox_inches="tight")
                 plt.close(fig)
 
             print("done plotting posteriors")
@@ -124,7 +115,7 @@ class SequentialTrainer:
         self.datagen_conf = datagen_conf
         self.dataset_obs_path = dataset_obs_path
         # Subset is there because utils.mbhb_collate_fn expects a Subset, it will access its dataset attribute
-        self.dataset_observation = Subset(MBHBDataset(dataset_obs_path, transform_fd=train_conf["transform_fd"]), indices=[2])
+        self.dataset_observation = Subset(MBHBDataset(dataset_obs_path, cache_in_memory=True), indices=[2])
         self.dataloader_obs = DataLoader(self.dataset_observation, batch_size=train_conf["batch_size"], shuffle=False, collate_fn=lambda b: mbhb_collate_fn(b, self.dataset_observation, noise_shuffling=False))
         self.logMchirp_lower = [datagen_conf["prior"]["logMchirp"][0]]
         self.logMchirp_upper = [datagen_conf["prior"]["logMchirp"][1]]
@@ -141,6 +132,7 @@ class SequentialTrainer:
             self.datagen_conf["prior"]["logMchirp"] = [widest_box[0], widest_box[1]]
             self.datagen_conf["prior"]["q"] = [widest_box[2], widest_box[3]]
             print(f"Updated prior based on baseline model:\nlog10Mchirp: {self.datagen_conf['prior']['logMchirp']},\nq: {self.datagen_conf['prior']['q']}")
+    
     def _get_widest_box(self, model, dataloader):
         logratios, inj_params, gx, gy = utils.get_logratios_grid_2d(
             dataloader,
@@ -160,6 +152,7 @@ class SequentialTrainer:
                                             levels=levels, levels_labels=labels)
         widest_box = boxes[-1]
         return widest_box
+    
     def _setup_plot(self):
         self.fig, self.axes = plt.subplots(1, 2, figsize=(12, 6))
         for ax, title, ylabel in zip(
@@ -186,19 +179,19 @@ class SequentialTrainer:
                 resp = "n"
             if resp in ("y", "yes"):
                 os.remove(fname_h5)
-                sim.sample_and_store(fname_h5, N=500, batch_size=250)
+                sim.sample_and_store(fname_h5, N=50000, batch_size=250)
                 print(f"Resampled dataset and saved to {fname_h5}")
             else:
                 print(f"Using existing dataset at {fname_h5}")
         self.data_fname_yaml = fname_h5.replace(".h5", ".yaml")
         self.datagen_info = utils.read_config(self.data_fname_yaml)
-        self.data_module = MBHBDataModule(fname_h5, self.train_conf)
+        self.data_module = MBHBDataModule(fname_h5, train_config["batch_size"], cache_in_memory=True)
         self.data_module.setup(stage="fit")
         self.test_dataloader = self.data_module.test_dataloader()
 
     def _train_rom ( self, round_idx) : 
         print("Training ROM...")
-        rom = ReducedOrderModel(tolerance=1e-3, device="cuda", batch_size=5000)
+        rom = ReducedOrderModel(tolerance=5e-6, device="cuda", batch_size=5000)
         filename = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION, f"rom_round_{round_idx}.pt")
         if not os.path.exists(filename):
             rom.train(self.data_module.train)
@@ -221,9 +214,13 @@ class SequentialTrainer:
         self.data_summary = ROMWrapper(filename=filename, device=self.train_conf["device"])
         self.data_module.full_dataset.to("cpu") # go back to loading from cpu
 
-    def _train_inference_network ( self, round_idx) :
+    def _train_inference_network ( self, round_idx, data_summary=None) :
         #  initialise data summarizer (ROM) 
-        self.model = InferenceNetwork(train_conf=self.train_conf, dataset_info=self.datagen_info, data_summarizer=self.data_summary)
+        mean, std = self.data_module.get_params_mean_std()
+        normalisation = {"td_normalisation": np.array(self.data_module.get_max_td()), 
+                         "param_mean": np.array(mean),
+                         "param_std": np.array(std)}
+        self.model = InferenceNetwork(train_conf=self.train_conf, dataset_info=self.datagen_info, normalisation=normalisation, data_summarizer=data_summary)
         self.model.train()
         copy_bounds_file = True
 
@@ -270,10 +267,11 @@ class SequentialTrainer:
 
     def round(self, idx, sampler_init_kwargs):
         self._generate_data(round_idx=idx, sampler_init_kwargs=sampler_init_kwargs)
-        self._train_rom(round_idx=idx)
-        
-        self._train_inference_network(round_idx=idx)
-
+        if self.train_conf["architecture"]["data_summary"]["type"] == "ROM":
+            self._train_rom(round_idx=idx)
+            self._train_inference_network(round_idx=idx, data_summary=self.data_summary)
+        else:
+            self._train_inference_network(round_idx=idx, data_summary=None)
     def _plot_updated_prior_bounds(self, updated_prior):
         self.logMchirp_lower.append(updated_prior["logMchirp"][0])
         self.logMchirp_upper.append(updated_prior["logMchirp"][1])
@@ -345,6 +343,6 @@ if __name__ == "__main__":
     datagen_config = utils.read_config(os.path.join(ROOT_DIR, datagen_config_filename))
                                
     trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path=os.path.join(ROOT_DIR, "data/testes_newdata_fixall_notmcq.h5"))
-    trainer.run(n_rounds=7)
+    trainer.run(n_rounds=2)
 
     #round(conf, sampler_init_kwargs={'low': 0.5, 'high': 1.0} , lr=conf["training"]["learning_rate"], idx=0)

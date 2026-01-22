@@ -1,4 +1,4 @@
-from torch.utils.data import Dataset, random_split, DataLoader
+from torch.utils.data import Dataset, random_split, DataLoader, Subset 
 import lightning as L
 import torch
 import numpy as np
@@ -10,16 +10,10 @@ import gc
 
 
 class MBHBDataset(Dataset):
-    _TRANSFORMS = {
-        "none": "_transform_identity",
-        "log": "_transform_log",
-    }
 
-    def __init__(self, filename: str, transform_fd: str = "none", cache_in_memory: bool = False):
+    def __init__(self, filename: str, cache_in_memory: bool = False):
         self.filename = filename
-        self.transform_fd = getattr(self, self._TRANSFORMS[transform_fd])
         self.cache_in_memory = cache_in_memory
-
         self.data_cache = {} if cache_in_memory else None
 
         with h5py.File(self.filename, "r") as f:
@@ -40,29 +34,23 @@ class MBHBDataset(Dataset):
         else: 
             self._load  = self._load_from_disk
         
-    def _load_from_memory(self, key, idx, dtype):
+    def _load_from_memory(self, key, idx):
         data = getattr(self, key)
         return data[idx]
-    def _load_from_disk(self, key, idx, dtype):
+    def _load_from_disk(self, key, idx):
         with h5py.File(self.filename, "r") as f:
-            return torch.tensor(f[key][idx], device="cpu", dtype=dtype)
+            return torch.tensor(f[key][idx], device="cpu")
 
     def _transform_identity(self, data):
         return data
-
-    def _transform_log(self, data):
-        return torch.log10(data + 1e-33)
 
     def __len__(self):
         return self.len
 
     def __getitem__(self, idx):
-        wave_fd = self._load("wave_fd", idx, torch.complex64)
-        wave_td = self._load("wave_td", idx, torch.float32)
-        params = self._load("source_parameters", idx, torch.float32)
-
-        wave_fd = self.transform_fd(wave_fd)
-
+        wave_fd = self._load("wave_fd", idx)
+        wave_td = self._load("wave_td", idx)
+        params = self._load("source_parameters", idx)
         return {
             "idx": idx,
             "wave_fd": wave_fd,
@@ -73,10 +61,16 @@ class MBHBDataset(Dataset):
     def to(self, device):
         if self.cache_in_memory:
             for k in ["wave_fd","wave_td","source_parameters","noise_fd","noise_td"]:
+
                 setattr(self, k, getattr(self, k).to(device))
+                # data = torch.tensor(getattr(self, k), device=device)
+                # setattr(self, k, data)
+
             self.device = device
 
-
+        else: 
+            print("Dataset not cached in memory; cannot move to device.")
+            return
     # def clear_cache(self): 
     #     if self.cache_in_memory:
     #         del self.wave_fd, self.wave_td, self.source_parameters, self.noise_fd, self.noise_td
@@ -90,20 +84,24 @@ class MBHBDataset(Dataset):
 
 class MBHBDataModule( L.LightningDataModule ): 
 
-    def __init__(self, filename: str, conf: dict):
+    def __init__(self, filename: str, batch_size: int, num_workers: int = 15, cache_in_memory: bool = False, shuffle_data: bool = True):
         """Initialize the data module.
 
         :param filename: Path to the HDF5 file.
         :type filename: str
-        :param conf: Configuration dictionary, used to set the batch size and the transformation to apply to the frequency domain data.
-        :type conf: dict
+        :param batch_size: Batch size for data loading.
+        :type batch_size: int
+        :param transform_fd: Transformation to apply to the frequency domain data.
+        :type transform_fd: str
         """
         super().__init__()
-        self.batch_size = conf["batch_size"]
+        self.batch_size = batch_size
         self.generator = torch.Generator().manual_seed(31415)
         self.filename = filename
-        self.transform_fd = conf["transform_fd"]
-    
+        self.num_workers = num_workers
+        self.cache_in_memory = cache_in_memory
+        self.shuffle_data = shuffle_data 
+
     def prepare_data(self):
 
         pass
@@ -114,26 +112,47 @@ class MBHBDataModule( L.LightningDataModule ):
             # avoid running setup twice if it was already done. 
             return
         if stage == "fit" or stage is None:
-            self.full_dataset = MBHBDataset(self.filename, transform_fd=self.transform_fd, cache_in_memory=True)
+            self.full_dataset = MBHBDataset(self.filename, cache_in_memory=self.cache_in_memory)
             self.train, self.val, self.test = random_split(self.full_dataset,  [0.7,0.25, 0.05], generator=self.generator)
-            
+            self.train_indices = sorted(self.train.indices)
+            self.val_indices = sorted(self.val.indices)
+            self.test_indices = sorted(self.test.indices)
+
         elif stage == "test":
-            self.test = MBHBDataset(self.filename, transform_fd=self.transform_fd)
+            test_dataset = MBHBDataset(self.filename, cache_in_memory=self.cache_in_memory)
+            self.test = Subset(test_dataset, indices=range(len(test_dataset)))
 
     def get_max_td(self): 
         """Get the maximum time-domain value from the training dataset."""
-        maxtd = self.train.dataset[:]["data_td"].abs().max()
+        maxtd = self.train.dataset[self.train_indices]["wave_td"].abs().max()
         print("Max td:", maxtd)
         return maxtd
-
-    def train_dataloader(self):
-        return DataLoader(self.train, batch_size=self.batch_size, shuffle=True, num_workers=15, collate_fn=lambda b: mbhb_collate_fn(b, self.train))
     
+    def get_params_mean_std(self):
+        """get mean of source parameters from training dataset."""
+
+        params = self.train.dataset[self.train_indices]["params"]
+        return params.mean(dim=0), params.std(dim=0)
+
+    # def get_params_std(self):
+    #     """get std of source parameters from training dataset."""
+    #     params = self.train.dataset[self.train_indices]["params"]
+    #     return params.std(dim=0)
+    
+    def get_freqs(self):
+        """Get the frequency bins from the dataset."""
+        with h5py.File(self.filename, "r") as f:
+            freqs = f["frequencies"][()]
+        return freqs
+
+    def train_dataloader(self, shuffle=True):
+        return DataLoader(self.train, batch_size=self.batch_size, shuffle=shuffle, num_workers=self.num_workers, collate_fn=lambda b: mbhb_collate_fn(b, self.train, noise_shuffling=shuffle))
+
     def val_dataloader(self):
-        return DataLoader(self.val, batch_size=self.batch_size, shuffle=False, num_workers=15, collate_fn=lambda b: mbhb_collate_fn(b, self.val))
+        return DataLoader(self.val, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, collate_fn=lambda b: mbhb_collate_fn(b, self.val))
     
     def test_dataloader(self):
-        return DataLoader(self.test, batch_size=10, shuffle=False, num_workers=15, collate_fn=lambda b: mbhb_collate_fn(b, self.test))
+        return DataLoader(self.test, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, collate_fn=lambda b: mbhb_collate_fn(b, self.test))
 
 
 class DummyDataset(Dataset):
@@ -149,7 +168,6 @@ class DummyDataset(Dataset):
 
 def mbhb_collate_fn(batch, subset: torch.utils.data.Subset, noise_shuffling=True):
     B = len(batch)
-
     wave_fd = torch.stack([b["wave_fd"] for b in batch])
     wave_td = torch.stack([b["wave_td"] for b in batch])
     params  = torch.stack([b["params"] for b in batch])
@@ -159,28 +177,21 @@ def mbhb_collate_fn(batch, subset: torch.utils.data.Subset, noise_shuffling=True
         subset_idxs = torch.tensor(subset.indices)
         pick = subset_idxs[torch.randint(0, len(subset_idxs), (B,))]
     else:
-        pick = subset.indices
+        pick = torch.tensor([b["idx"] for b in batch])
 
-    # load noise (cached or lazy)
-    noise_fd = torch.stack([subset.dataset._load("noise_fd", i, torch.complex64) for i in pick])
-    noise_td = torch.stack([subset.dataset._load("noise_td", i, torch.float32) for i in pick])
 
-    # combine waveform + noise
-    data_fd_re_im = wave_fd + noise_fd
-    data_fd_ampl = subset.dataset.transform_fd(torch.abs(data_fd_re_im))
-    data_fd_phase = torch.angle(data_fd_re_im)
-    data_fd = torch.cat((data_fd_ampl, data_fd_phase), dim=1)
+    noise_fd = torch.stack([subset.dataset._load("noise_fd", i) for i in pick])
+    noise_td = torch.stack([subset.dataset._load("noise_td", i) for i in pick])
 
-    data_td = wave_td + noise_td
-
+    # delivers waveform and a random instance of the noise. 
     return {
         "source_parameters": params,
-        "data_fd": data_fd,
-        "data_td": data_td,
         "wave_fd": wave_fd,
         "wave_td": wave_td,
         "noise_fd": noise_fd,
         "noise_td": noise_td,
         "noise_index": pick,
     }
+
+
 

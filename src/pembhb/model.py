@@ -2,6 +2,7 @@ import torch
 import os
 import time
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 from line_profiler import profile
 import torch.nn as nn
 from lightning import LightningModule
@@ -11,6 +12,8 @@ from typing import Iterable
 from pembhb.data import MBHBDataset
 from torch.utils.data import DataLoader
 from pembhb.utils import _ORDERED_PRIOR_KEYS
+from pembhb import ROOT_DIR
+import numpy as np
 # class GWTransformer(LightningModule):
 #     def __init__(self, n_chunks=100, embed_dim=512, num_heads=8, num_layers=4):
 #         super().__init__()
@@ -219,7 +222,7 @@ class InferenceNetwork(LightningModule):
     """ 
     Basic FC network for TMNRE of MBHB data. 
     """
-    def __init__(self,  train_conf: dict,  dataset_info: dict, data_summarizer: nn.Module=None):  
+    def __init__(self,  train_conf: dict,  dataset_info: dict, normalisation: dict,  data_summarizer: nn.Module=None):  
         super().__init__()
         if data_summarizer is not None:
             self.data_summary = data_summarizer
@@ -242,8 +245,11 @@ class InferenceNetwork(LightningModule):
                 name_output = name_output[:-1]  # remove trailing underscore
                 self.output_names.append(name_output)
                 self.marginals_list.append(marginal)
-
-        self.td_normalisation = dataset_info["td_max"]
+        self.td_normalisation = normalisation["td_normalisation"].item()
+        self.param_mean = torch.Tensor(normalisation["param_mean"]).to(train_conf["device"])
+        self.param_std = torch.Tensor(normalisation["param_std"]).to(train_conf["device"])
+        print("Parameter mean:", self.param_mean.shape)
+        print("Parameter std:", self.param_std.shape)
         self.save_hyperparameters(logger=True)    
         
         self.use_gradnorm = train_conf["architecture"]["gradnorm"]["enabled"]
@@ -262,15 +268,40 @@ class InferenceNetwork(LightningModule):
                 hlayersizes=(64, 32, 16, 8)
             ).to(train_conf["device"])
 
+
+    def transform_td(self, data_t):
+        """Applies time-domain normalisation to the input data.
+
+        :param data_t: Tensor of shape (batch_size, num_channels, num_timebins) containing the time domain signal in the TDI channels
+        :type data_t: torch.Tensor
+        :return: Normalised time-domain data.
+        :rtype: torch.Tensor
+        """
+        return data_t / self.td_normalisation
+    
+    def transform_log(self, complex_data):
+        """Applies log transformation to the complex input data, with separate channels for amplitude and phase.
+        """
+        amplitude = torch.abs(complex_data)
+        phase = torch.angle(complex_data)
+        log_amplitude = torch.log(amplitude+1e-33)
+        # cat 
+        transformed_data = torch.cat((log_amplitude, phase), dim=1)
+        return transformed_data 
+    
     def forward(self, d_f, d_t, parameters):
         """
         Forward pass of the network.
         
         Args:
-            data: Tensor of shape (batch_size, num_channels, num_features) containing the frequency domain signal in the TDI channels
+            d_f: complex Tensor of shape (batch_size, num_channels, num_freqbins) containing the frequency domain signal in the TDI channels.
+            d_t: real Tensor of shape (batch_size, num_channels, num_timebins) containing the time domain signal in the TDI channels
             parameters: Tensor of shape (batch_size, 11) containing the parameters to be used in the classifier
         """
-        d_f, d_t = self.data_summary(d_f, d_t/self.td_normalisation)
+        # preprocessing 
+        # here, d_f is a complex array of raw data (wave + noise), and d_t is real array of raw data (wave + noise)
+        d_f, d_t = self.data_summary(d_f, d_t)
+
         features_ft = None
         
         features_dict = {
@@ -283,15 +314,19 @@ class InferenceNetwork(LightningModule):
         # print(f"features_f device: {features_f.device}")
         # print(f"features_ft device: {features_ft.device}")
         # #print(f"features_f shape: {features_f.shape}")
-
+        breakpoint()
+        normalised_parameters = (parameters - self.param_mean) / self.param_std
         logratios_1d_list = []
         for key in self.logratios_model_dict.keys():
             #breakpoint()
-            logratios_1d_list.append(self.logratios_model_dict[key](features_dict[key], parameters))
+            logratios_1d_list.append(self.logratios_model_dict[key](features_dict[key], normalised_parameters))
         logratios_1d = torch.cat(logratios_1d_list, dim=-1)        
         return logratios_1d
 
-    def _calc_logits_base(self, data_f, data_t, parameters):
+    def _calc_logits_base(self, batch):
+        data_f = batch['wave_fd']+batch["noise_fd"]
+        data_t = batch['wave_td']+batch["noise_td"]
+        parameters = batch['source_parameters']
         all_data_f = torch.cat((data_f, data_f), dim=0)
         all_data_t = torch.cat((data_t, data_t), dim=0)
         scrambled_params = torch.roll(parameters, shifts=1, dims=0)
@@ -306,8 +341,8 @@ class InferenceNetwork(LightningModule):
         return all_logits, all_loss
     
 
-    def calc_logits_losses(self, data_f, data_t, parameters):
-        all_logits, all_loss = self._calc_logits_base(data_f, data_t, parameters)
+    def calc_logits_losses(self, batch):
+        all_logits, all_loss = self._calc_logits_base(batch)
         task_losses = torch.mean(all_loss, dim=0)
         loss = torch.mean(task_losses)
         return all_logits, task_losses, loss
@@ -329,14 +364,12 @@ class InferenceNetwork(LightningModule):
 
         
     def training_step(self, batch, batch_idx):
-        data_f = batch['data_fd']
-        data_t = batch['data_td']
-        params = batch['source_parameters']
+        # these are complex representations
         if self.use_gradnorm:
             all_logits, task_losses, loss = self.gradnorm.training_step(batch, batch_idx)
         else:
-            all_logits, task_losses, loss = self.calc_logits_losses(data_f, data_t, params)
-        
+            all_logits, task_losses, loss = self.calc_logits_losses(batch)
+
         accuracy_params, accuracy = self.calc_accuracies(all_logits)
 
         self.log('train_loss', loss , on_step=True, on_epoch=True, prog_bar=True, logger=True)
@@ -357,7 +390,7 @@ class InferenceNetwork(LightningModule):
         # if self.use_gradnorm:
         #     all_logits, task_losses, weighted_losses_tails, weights,  loss= self.gradnorm.calc_logits_losses_gradnorm(batch['data_fd'], batch["data_td"], batch['source_parameters'])
         # else:
-        all_logits, task_losses, loss= self.calc_logits_losses(batch['data_fd'], batch["data_td"], batch['source_parameters'])
+        all_logits, task_losses, loss= self.calc_logits_losses(batch)
         accuracy_params, accuracy = self.calc_accuracies(all_logits)
         self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log('val_accuracy', accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
@@ -687,6 +720,7 @@ class Unet(nn.Module):
         self.outc = OutConv(sizes[0], n_out_channels)
 
     def forward(self, x):
+        raise NotImplementedError("Unet forward pass is not implemented. The data should be transformed before passing to the Unet.")
         x1 = self.inc(x)
         x2 = self.down1(x1)
         x3 = self.down2(x2)
@@ -719,27 +753,41 @@ class LinearCompression(nn.Module):
 
 
 class ReducedOrderModel:
-    def __init__(self, batch_size=1000, tolerance=1e-3, device="cpu", filename=None):
+    def __init__(self, batch_size=1000, tolerance=1e-3, device="cpu", filename=None, debugging=False):
         if filename is not None: 
             print("[ROM] initializing from file {filename}.\n Other arguments will be ignored.")
             self.device = device
             self.from_file(filename)
             
         else: 
+            self.debugging = debugging
             self.basis = None
             self.n_channels = None
             self.n_freq = None
             self.batch_size = batch_size
             self.device = device
             self.tolerance = tolerance
-
-
+            if debugging:
+                self.plot_dir_debug = os.path.join(ROOT_DIR, "plots", "debug_plots_{time}".format(time=time.strftime("%Y%m%d-%H%M%S"))) 
+                os.makedirs(self.plot_dir_debug, exist_ok=True)
+    
     def from_file(self, filename):
         s = torch.load(filename, map_location=self.device)
         self.n_channels = s["n_channels"]
         self.n_freq = s["n_freq"]
         self.basis = s["basis"].to(self.device)
+        self.global_scale_factor = s["global_scale_factor"]
+        self.mean_vec = s["mean_vec"].to(self.device)
         print("[ROM] basis loaded.\nn_freq =", self.n_freq, ", n_channels =", self.n_channels, ", n_basis =", len(self.basis))
+        return 
+
+    def load_diagnostics(self, filename):
+        self.training_diagnostics = torch.load(filename, map_location=self.device)
+        return
+
+    def save_diagnostics(self, filename):
+        torch.save(self.training_diagnostics, filename)
+        print(f"[ROM] diagnostics saved to {filename}")
         return 
 
     def to_file(self, filename):
@@ -750,6 +798,8 @@ class ReducedOrderModel:
                 "n_channels": self.n_channels,
                 "n_freq": self.n_freq,
                 "device": self.device,
+                "global_scale_factor": self.global_scale_factor,
+                "mean_vec": self.mean_vec
             },
             filename,
         )
@@ -759,111 +809,344 @@ class ReducedOrderModel:
         print(f"[ROM] training with tolerance={self.tolerance:.1e} on device={self.device}")
         train_subset.dataset.to(self.device) # move the dataset to the right device.
         dataloader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=False, num_workers=0)
-        #raw = dataset.wave_fd                 # (N_pts, C, F)
+        self.n_freq = train_subset[0]['wave_fd'].shape[1]
+        self.n_channels = train_subset[0]['wave_fd'].shape[0]
+        self.global_scale_factor, self.mean_vec = self._compute_global_scale(dataloader)
+        self.mean_vec = self.mean_vec.to(self.device)
+        print(f"[ROM] global scale factor: {self.global_scale_factor:.3e}")
+        
+        # raw = dataset.wave_fd # (N_pts, C, F)
         # self.data_f = raw.reshape(raw.shape[0], -1)
         # self.n_channels = raw.shape[1]
         # self.n_freq = raw.shape[2]
-        # self.data_f = raw.reshape(raw.shape[0], -1)
-        # self.n_channels = raw.shape[1]
-        # self.n_freq = raw.shape[2]
-
         # n = raw.shape[0]
+
         n = len(train_subset)
         seed = torch.randint(0, n, (1,)).item()
-        first = train_subset[seed]['wave_fd'].to(self.device)
+                
+
+        first = (train_subset[seed]['wave_fd'].reshape(-1).to(self.device) - self.mean_vec) / self.global_scale_factor
         first = first / first.norm()
-        first = first.reshape(-1)
         self.basis = first.unsqueeze(0)
+        self.basis_indices = [seed]
+
 
         sigma = float("inf")
-        i = 0
+        self.epoch = 0
         t0 = time.time()
         pbar = tqdm(total=0, bar_format='{desc}{postfix}', position=0, leave=True)  # dynamic manual updates
-        while sigma > self.tolerance:
-            i += 1
-            sigma, idx = self._max_residual_index(dataloader)
+        
+        log10mc_values = []
+        q_values = []
+        sigmas = []
+        sigmas_unnorm = []
+        picked = [seed]
+        picked_set = {seed}
+        self.gs_diagnose =  {
+            "norm_v_original": [],
+            "norm_v_trunc": [],
+            "norm_projection": [],
+            "max_cosine_angle_unnormalised": [],
+            "max_cosine_angle_normalised":[]
+        }
+        self.training_diagnostics = {
+            "log10mc_values": log10mc_values,
+            "q_values": q_values,
+            "sigmas": sigmas,
+            "sigmas_unnorm": sigmas_unnorm,
+            "max_pointwise_relerrors_real": [],
+            "max_pointwise_relerrors_imag": [],
+            "picked_indices": picked,
+            "gs_diagnose": self.gs_diagnose
+        }
 
-            v = train_subset[idx]['wave_fd'].reshape(-1)
-            v = self._gram_schmidt(v)
-            self.basis = torch.cat([self.basis, v.unsqueeze(0)], dim=0)
-            elapsed = time.time() - t0
-            pbar.set_postfix({f"N_basis_elems":self.basis.shape[0], "iter":i, "sigma":f"{sigma:.3e}", "elapsed":f"{elapsed:.1f}s", "rate":f"{i/elapsed:.1f} it/s"})
-            pbar.update(0)  # just refresh the display
-
+        try:
+            sigma_last = torch.tensor(float("inf"), device=self.device)
+        
+            while sigma > self.tolerance:
+                self.epoch += 1 # epoch 1 --> N_basis = 1
+                sigma, idx , sigma_unnorm = self._max_residual_index(dataloader, picked_set)
+                if sigma >= sigma_last: 
+                    print(f"\ntraining stopped early at iteration {self.epoch} because sigma did not decrease (sigma={sigma:.3e}, last sigma={sigma_last:.3e})")
+                    break
+                sigma_last = sigma
+                picked_set.add(idx)
+                picked.append(idx)
+                log10mc_values.append(train_subset[idx]["params"][0])
+                q_values.append(train_subset[idx]["params"][1])
+                picked.append(idx)
+                sigmas.append(sigma)
+                sigmas_unnorm.append(sigma_unnorm)
+                v = (train_subset[idx]['wave_fd'].reshape(-1) - self.mean_vec) / self.global_scale_factor
+                v = self._modified_gram_schmidt(v)
+                self.basis = torch.cat([self.basis, v.unsqueeze(0)], dim=0)
+                elapsed = time.time() - t0
+                pbar.set_postfix({f"N_basis_elems":self.basis.shape[0], "iter":self.epoch, "sigma":f"{sigma:.3e}", "elapsed":f"{elapsed:.1f}s", "rate":f"{self.epoch/elapsed:.1f} it/s"})
+                pbar.update(0)  # just refresh the display
+        except KeyboardInterrupt:
+            print("\n[ROM] training interrupted by user.")
         total = time.time() - t0
         print(f"[ROM] done. basis={len(self.basis)}, time={total:.1f}s")
 
-        self.basis = self.basis.to(self.device)
-
+        
     @profile
     def _project_batch(self, batch):
+        """Project the input batch onto the ROM basis.
+
+        :param batch: Input batch of waveforms, with shape (B_size, N_dim). 
+        :type batch: torch.Tensor
+        :return: Projected batch.
+        :rtype: torch.Tensor
+        """
         B = self.basis
         coeff = B.conj() @ batch.T # shape ( N_basis, N_dim) @ (N_dim, B_size)--> (Nbasis, B_size)
-        proj = (B.T @ coeff).T # shape ( N_dim, N_basis) @ (N_basis, B_size) ---> (N_dim , B_size)
+        proj = coeff.T @ B # shape ( B_size, N_basis) @ (N_basis, N_dim) ---> (B_size , N_dim)
         return proj
 
     @profile
-    def _max_residual_index(self, dataloader):
-        max_seen = 0
+    def _max_residual_index(self, dataloader, picked_set):
+        max_seen = -1.0
+        max_seen_unnorm = -1.0
+        max_index = None
         seen_points = 0
-        for batch in dataloader: 
+        max_relerr_re = 0
+        max_relerr_im = 0
+        for idx, batch in enumerate(dataloader):
             bsize = batch['wave_fd'].shape[0]
-            wave_fd_batch = batch['wave_fd'].to(self.device)
-            wave_fd_batch = wave_fd_batch.reshape(wave_fd_batch.shape[0], -1)
+            
+            original_wave_batch = batch['wave_fd'].reshape(bsize, -1).to(self.device)
+            # centered and scaled waveforms
+            wave_fd_batch = (original_wave_batch - self.mean_vec) / self.global_scale_factor  # shape (B_size, N_dim)
+            # project onto basis (aka : compute coefficients and then reconstruct)
             proj = self._project_batch(wave_fd_batch)
+
+            # back to original space
+            reconstruction_original_space = proj * self.global_scale_factor + self.mean_vec
+            residual_original_space = original_wave_batch - reconstruction_original_space
+
+            # compute residuals in normalized space
             r = (wave_fd_batch - proj) / wave_fd_batch.norm(dim=1, keepdim=True)
-            batch_norms = (r.abs()**2).sum(dim=1)
-            current_max, current_idx = batch_norms.max(0)  
+            scale_re  = wave_fd_batch.real.abs().amax(dim=1, keepdim=True)
+            scale_im = wave_fd_batch.imag.abs().amax(dim=1, keepdim=True)
+            # breakpoint()
+            max_rel_error_real_batch = torch.amax((wave_fd_batch.real - proj.real).abs()/scale_re ) 
+            max_rel_error_imag_batch = torch.amax((wave_fd_batch.imag - proj.imag).abs()/scale_im )
+            max_relerr_re = max(max_relerr_re, max_rel_error_real_batch.item())
+            max_relerr_im = max(max_relerr_im, max_rel_error_imag_batch.item())
+            r_unnorm = wave_fd_batch - proj
+
+            norms = (r.abs() ** 2).sum(dim=1)
+            norms_unnorm = (r_unnorm.abs() ** 2).sum(dim=1)
+            if self.debugging and idx == 0 and self.epoch <= 10:
+                # plot the residuals as function of frequency
+                for jj in range(min(3, bsize)):
+                    plt.figure(figsize=(12,6))
+                    plt.subplot(1,2,1)
+                    plt.plot(wave_fd_batch[jj][:self.n_freq].abs().cpu().numpy(), label="original")
+                    plt.plot(proj[jj][:self.n_freq].abs().cpu().numpy(), label="projected", linestyle="--")
+                    plt.plot(r[jj][:self.n_freq].abs().cpu().numpy(), label=f"residual")
+                    params = batch['params'][jj][:2].cpu().numpy()
+                    plt.suptitle(f"log10mc: {params[0]:.8e} q: {params[1]:.8e} sum of abs square residual : {norms[jj].item():.3e}")
+                    plt.title("channel 1")
+                    # plt.plot(r[0][self.n_freq:], label=f"channel 2")
+                    plt.xlabel("Frequency index")
+                    plt.xscale("log")
+                    plt.yscale("log")
+                    plt.title("channel 1")
+                    plt.legend()
+
+                    plt.subplot(1,2,2)
+                    plt.plot(wave_fd_batch[jj][self.n_freq:].abs().cpu().numpy(), label="original")
+                    plt.plot(proj[jj][self.n_freq:].abs().cpu().numpy(), label="projected", linestyle="--")
+                    plt.plot(r[jj][self.n_freq:].abs().cpu().numpy(), label=f"residual")
+
+                    plt.title("channel 2")
+                    plt.xlabel("Frequency index")
+                    plt.xscale("log")
+                    plt.yscale("log")
+                    plt.legend()
+                    plt.savefig(os.path.join(self.plot_dir_debug, f"residuals_epoch{self.epoch}_batch{idx}_event{jj}.png"))
+
+                    plt.close()
+
+                for jj in range(min(3, bsize)):
+                    plt.figure(figsize=(12,6))
+                    
+                    plt.subplot(1,2,1)
+                    plt.plot(reconstruction_original_space[jj][:self.n_freq].abs().cpu().numpy(), label="reconstruction")
+                    plt.plot(original_wave_batch[jj][:self.n_freq].reshape(-1).abs().cpu().numpy(), label="original", linestyle="--")
+                    plt.plot(residual_original_space[jj][:self.n_freq].abs().cpu().numpy(), label="residuals")
+                    plt.xlabel("Frequency index")
+                    plt.xscale("log")
+                    plt.yscale("log")
+                    plt.suptitle("Original space reconstruction and residuals")
+                    plt.legend()
+                    plt.title("Channel 1")
+
+                    plt.subplot(1,2,2)
+                    plt.plot(reconstruction_original_space[jj][self.n_freq:].abs().cpu().numpy(), label="reconstruction")
+                    plt.plot(original_wave_batch[jj][self.n_freq:].reshape(-1).abs().cpu().numpy(), label="original", linestyle="--")
+                    plt.plot(residual_original_space[jj][self.n_freq:].abs().cpu().numpy(), label="residuals")
+                    plt.xlabel("Frequency index")
+                    plt.xscale("log")
+                    plt.yscale("log")
+                    plt.title("Channel 2")
+                    plt.legend()
+                    plt.savefig(os.path.join(self.plot_dir_debug, f"{self.epoch}_batch{idx}_event{jj}.png"))
+                    plt.close()
+            # mask picked dataset indices
+            batch_ids = torch.arange(bsize) + seen_points
+            mask = torch.tensor(
+                [(idx.item() not in picked_set) for idx in batch_ids],
+                device=norms.device,
+                dtype=torch.bool,
+            ) # indicates which points are NOT picked yet
+
+            if not mask.any():
+                seen_points += bsize
+                continue 
+            masked_norms = norms.clone()
+            # set already picked indices to -1 so they are ignored in max search
+            masked_norms[~mask] = -1.0  # safe since norms >= 0
+
+            current_max, current_idx = masked_norms.max(0)
+
             if current_max.item() > max_seen:
                 max_seen = current_max.item()
-                max_index = current_idx.item() + seen_points          
+                max_index = (current_idx + seen_points).item()
+                max_seen_unnorm = norms_unnorm[current_idx].item()
+
             seen_points += bsize
 
-        # for s in range(0, N, bs):
-        #     e = min(s + bs, N)
-        #     batch = self.data_f[s:e]
-        #     proj = self._project_batch(batch)
-        #     r = (batch - proj) / batch.norm(dim=1, keepdim=True)
-        #     norms[s:e] = (r.abs()**2).sum(dim=1)
+        self.training_diagnostics["max_pointwise_relerrors_real"].append(max_relerr_re)
+        self.training_diagnostics["max_pointwise_relerrors_imag"].append(max_relerr_im)
+        return max_seen, max_index, max_seen_unnorm
+    
+    def _compute_global_scale(self, dataloader):
+        max_val = 0.0
+        mean_vec = torch.zeros(self.n_channels * self.n_freq, device=self.device)
+        for batch in dataloader:
+            v = batch['wave_fd'].to(self.device)
+            max_val = max(max_val, v.abs().max().item())
+            mean_vec = mean_vec + v.reshape(v.shape[0], -1).sum(dim=0)
+        mean_vec = mean_vec / len(dataloader.dataset)
+        return max_val, mean_vec
+    
 
-        return max_seen , max_index
+    def _modified_gram_schmidt(self, v) : 
+        B = self.basis
+        v_trunc = v.clone()
+        for i in range(B.shape[0]):
+            bi = B[i]
+            coeff = (bi.conj() @ v_trunc) / (bi.conj() @ bi)
+            v_trunc = v_trunc - coeff * bi
+        normalised = v_trunc / v_trunc.norm()
+
+        scalar_products = B.conj() @ v_trunc  # shape (N_basis, )
+        cosines_vtrunc = scalar_products / (B.norm(dim=1) * v_trunc.norm())
+        scalar_products_v_normalised = B.conj() @ normalised
+        cosines_vnormalised = scalar_products_v_normalised / (B.norm(dim=1) * normalised.norm())
+        self.gs_diagnose["max_cosine_angle_unnormalised"].append(cosines_vtrunc.abs().max().item())
+        self.gs_diagnose["max_cosine_angle_normalised"].append(cosines_vnormalised.abs().max().item())
+        #max_abs_scalar_product = scalar_products.abs().max().item()
+
+        self.gs_diagnose["norm_v_original"].append(v.norm().item())
+        self.gs_diagnose["norm_v_trunc"].append(v_trunc.norm().item())
+        self.gs_diagnose["norm_projection"].append( (v - v_trunc).norm().item())
+
+        return normalised
 
     @profile
     def _gram_schmidt(self, v):
         B = self.basis
-        coeff = B.conj() @ v
-        v = v - coeff @ B
-        return v / v.norm()
+        coeff = B.conj() @ v # shape (N_basis, N_dim) @ (N_dim, )  #/ torch.einsum("ik,ik->i", B.conj(), B)
+        projection = coeff @ B # shape (N_basis) @ (N_basis, N_dim) = > (N_dim, )
+        v_trunc = v - projection# now v is orthogonal to the basis
+        normalised = v_trunc / v_trunc.norm()# normalise before adding to the reduced basis. 
+        scalar_products = B.conj() @ v_trunc  # shape (N_basis, )
+        cosines_vtrunc = scalar_products / (B.norm(dim=1) * v_trunc.norm())
+        scalar_products_v_normalised = B.conj() @ normalised
+        cosines_vnormalised = scalar_products_v_normalised / (B.norm(dim=1) * normalised.norm())
+        self.gs_diagnose["max_cosine_angle_unnormalised"].append(cosines_vtrunc.abs().max().item())
+        self.gs_diagnose["max_cosine_angle_normalised"].append(cosines_vnormalised.abs().max().item())
+        max_abs_scalar_product = scalar_products.abs().max().item()
+
+        if self.debugging and self.epoch <= 10: 
+            # check orthogonality between v_trunc and basis B
+
+            print(f"[ROM][debug] max abs scalar product between v_trunc and basis elements: {max_abs_scalar_product:.3e}")
+            # plot the difference between cosines and cosines after normalisation (should be zero)
+            cosine_residual = (cosines_vtrunc - cosines_vnormalised).abs()
+            max_cosine_residual = cosine_residual.max().item()
+            print(f"[ROM][debug] max abs difference between cosines before and after normalisation: {max_cosine_residual:.3e}")
+            plt.plot(cosine_residual.cpu().numpy())
+            plt.yscale("log")
+            plt.xlabel("Basis element index")
+            plt.title("Difference between cosines before and after normalisation")
+            plt.savefig(os.path.join(self.plot_dir_debug, f"cosine_residual_epoch{self.epoch}.png"))
+            plt.close()
+
+        # compute max abs of removed part 
+
+        norm_projection = projection.norm()
+        norm_v_trunc = v_trunc.norm()
+        norm_v_original = v.norm()
+        self.gs_diagnose["norm_v_original"].append(norm_v_original.item())
+        self.gs_diagnose["norm_projection"].append(norm_projection.item())
+        self.gs_diagnose["norm_v_trunc"].append(norm_v_trunc.item())
+
+        # triangular inequality checks
+        assert norm_v_original <= norm_v_trunc + norm_projection, "Triangular inequality violated"
+        assert norm_v_trunc <= norm_v_original + norm_projection, "Triangular inequality violated"
+        assert norm_projection <= norm_v_original + norm_v_trunc, "Triangular inequality violated"
+        ### debug line:  check orthogonality
+        # try:
+        #     assert torch.allclose((B.conj() @ v), torch.zeros_like(coeff), atol=1e-6), "Gram-Schmidt failed to produce orthogonal vector."
+        # except AssertionError as e:
+        #     print(e)
+        #     print("if divide coefficients by norm of basis elements:")
+        #     coeff_normed = coeff / torch.einsum("ik,ik->i", B.conj(), B)
+        #     new_v = v - coeff_normed @ B
+        #     assert torch.allclose((B.conj() @ new_v), torch.zeros_like(coeff), atol=1e-6), "Gram-Schmidt failed to produce orthogonal vector even after normalizing coefficients by basis element norms."
+        
+        return normalised
 
     # public API with flatten → project → unflatten
     def compress(self, data):
+        """compress data into reduced basis coefficients.
+
+        :param data: Input data to compress with shape (Batch_size, Channels, Physics_dimension).
+        :type data: torch.Tensor
+        :return: Compressed representation of shape (Batch_size, N_basis).
+        :rtype: torch.Tensor
+        """
+        
         # data: (N_pts, C, F)
-        d = data.reshape(data.shape[0], -1).to(self.device)
+        d = (data.reshape(data.shape[0], -1) - self.mean_vec) / self.global_scale_factor  # shape (B_size, N_dim)
         B = self.basis
-        coeff = (B.conj() @ d.T).T
+        coeff = (B.conj() @ d.T).T # shape [(N_basis, N_dim) @ (N_dim, B_size)]^T --> (B_size, N_basis)
         return coeff
 
     def reconstruct(self, coeff):
-        # optional: decompress
-        B = self.basis
-        x = (B.T @ coeff.T).T
-        return x.reshape(x.shape[0], self.n_channels, self.n_freq)
+        """reconstruct data from reduced basis coefficients. Assume 
+        
+        :param coeff: Input coefficients with shape (Batch_size, N_basis).
+        :type coeff: torch.Tensor
+        :return: Reconstructed data with shape (Batch_size, Channels, Physics_dimension).
+        :rtype: torch.Tensor
+        
+        """
+        B = self.basis # shape (N_basis, N_dim)
+        x = (( coeff @ B ).T * self.global_scale_factor)  # shape [ (B_size, N_basis) @ (N_basis, N_dim) ]^T --> (N_dim, B_size)
+        xT = x.T+ self.mean_vec # shape (B_size, N_dim)
+        return xT.reshape(xT.shape[0], self.n_channels, self.n_freq)
     
-    def __call__(self, d_f, d_t): 
-        """ process data through ROM and return compressed representation, assumes d_f is in complex form split into log10(amplitude+1e-33) and phase."""
-        n_channels = d_f.shape[1]//2
-        amplitudes = torch.exp(d_f[:,:n_channels]) - 1e-33
-        d_f_complex = amplitudes * torch.exp(1j * d_f[:,n_channels:])
-        compressed_ = self.compress(d_f_complex).unsqueeze(1)
-        compressed_ampl = torch.abs(compressed_)
-        compressed_phase = torch.angle(compressed_)
-
-        compressed = torch.cat([compressed_ampl, compressed_phase], dim=1)
-        return compressed, d_t
-
 
 class ROMWrapper(nn.Module): 
-    def __init__(self, filename: str, device: str = "cuda"): 
+    """A wrapper nn.Module around the ReducedOrderModel to be used as a data summarizer in the InferenceNetwork. Couples the ROM with a ChannelizedLinearCompression to produce lowdim features.
+    """
+    def __init__(self, filename: str, device: str = "cuda"):
+
         super().__init__()
         self.rom = ReducedOrderModel(filename=filename, device=device)
         self.channelised_net = ChannelizedLinearCompression(
@@ -872,8 +1155,21 @@ class ROMWrapper(nn.Module):
             in_channels=2# amplitude and phase
         )
     def forward(self, d_f, d_t): 
-        y , d_t = self.rom(d_f=d_f, d_t=d_t)
-        compressed = self.channelised_net(y) 
-        return compressed, d_t
+        """forward pass of the ROMWrapper.
+
+        :param d_f: raw data in the frequency domain , complex tensor of shape (B, C, F)
+        :type d_f: torch.Tensor
+        :param d_t: raw data in the time domain , real tensor of shape (B, C, T)
+        :type d_t: torch.Tensor
+        :return: compressed representation and time domain data
+        :rtype: Tuple[torch.Tensor, torch.Tensor]
+        """
+
+        compressed_df = self.rom.compress(d_f).unsqueeze(1)
+        compressed_ampl = torch.abs(compressed_df)
+        compressed_phase = torch.angle(compressed_df)
+        compressed_ampl_phase = torch.cat([compressed_ampl, compressed_phase], dim=1)  # shape (B, 2, N_basis)
+        nn_compression = self.channelised_net(compressed_ampl_phase) 
+        return nn_compression, d_t
 
 DATA_SUMMARY_REGISTRY = { "BrutalCompression": BrutalCompression, "PeregrineModel": PeregrineModel, "ROM": ROMWrapper}
