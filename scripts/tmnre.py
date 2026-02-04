@@ -115,8 +115,8 @@ class SequentialTrainer:
         self.datagen_conf = datagen_conf
         self.dataset_obs_path = dataset_obs_path
         # Subset is there because utils.mbhb_collate_fn expects a Subset, it will access its dataset attribute
-        #self.dataset_observation = Subset(MBHBDataset(dataset_obs_path, cache_in_memory=True), indices=[2])
-        self.dataset_observation = Subset(MBHBDataset(dataset_obs_path, cache_in_memory=True),indices =[0])
+        self.dataset_observation = Subset(MBHBDataset(dataset_obs_path, cache_in_memory=True), indices=[2])
+        #self.dataset_observation = Subset(MBHBDataset(dataset_obs_path, cache_in_memory=True),indices =[0])
         self.dataloader_obs = DataLoader(self.dataset_observation, batch_size=train_conf["batch_size"], shuffle=False, collate_fn=lambda b: mbhb_collate_fn(b, self.dataset_observation, noise_shuffling=False, noise_factor=self.train_conf["noise_factor"]))
         self.logMchirp_lower = [datagen_conf["prior"]["logMchirp"][0]]
         self.logMchirp_upper = [datagen_conf["prior"]["logMchirp"][1]]
@@ -170,8 +170,10 @@ class SequentialTrainer:
         fname_h5 = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION,  f"{fname_base}.h5")
         os.makedirs(os.path.dirname(fname_h5), exist_ok=True)
         sim = MBHBSimulatorFD_TD(self.datagen_conf, sampler_init_kwargs=sampler_init_kwargs)
+        N_simulations = 50000
+        batch_size_generation = 250
         if not os.path.exists(fname_h5):
-            sim.sample_and_store(fname_h5, N=50000, batch_size=250)
+            sim.sample_and_store(fname_h5, N=N_simulations, batch_size=batch_size_generation)
         else: 
             try:
                 resp = input(f"Dataset file {fname_h5} already exists. Resample and overwrite? [y/N]: ").strip().lower()
@@ -180,7 +182,7 @@ class SequentialTrainer:
                 resp = "n"
             if resp in ("y", "yes"):
                 os.remove(fname_h5)
-                sim.sample_and_store(fname_h5, N=50000, batch_size=250)
+                sim.sample_and_store(fname_h5, N=N_simulations, batch_size=batch_size_generation)
                 print(f"Resampled dataset and saved to {fname_h5}")
             else:
                 print(f"Using existing dataset at {fname_h5}")
@@ -343,10 +345,10 @@ if __name__ == "__main__":
     train_config   = utils.read_config(os.path.join(ROOT_DIR, "configs", train_config_filename))
     datagen_config = utils.read_config(os.path.join(ROOT_DIR, "configs", datagen_config_filename))
                                
-    #trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path=os.path.join(ROOT_DIR, "data/testes_newdata_fixall_notmcq.h5"))
+    trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path=os.path.join(ROOT_DIR, "data/testes_newdata_fixall_notmcq.h5"))
     
     # run with low noise: 
-    trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path=os.path.join(ROOT_DIR, "/data/gpuleo/mbhb/observation_low_noise.h5"))
+    # trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path=os.path.join(ROOT_DIR, "/data/gpuleo/mbhb/observation_low_noise.h5"))
     trainer.run(n_rounds=2)
 
     #round(conf, sampler_init_kwargs={'low': 0.5, 'high': 1.0} , lr=conf["training"]["learning_rate"], idx=0)
