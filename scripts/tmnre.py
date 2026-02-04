@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 torch.set_float32_matmul_precision("medium")
 def get_timestamp():
     return datetime.now().strftime("%Y%m%d")
-TIME_OF_EXECUTION = get_timestamp()+"_narrowprior_v0"
+TIME_OF_EXECUTION = get_timestamp()+"_narrowprior_v1"
 
 class PlotPosteriorCallback(Callback):
     def __init__(self, timestamp: str, obs_loader: DataLoader, input_idx_list: list, output_idx_list: list, round_idx: int , call_every_n_epochs=1): 
@@ -42,7 +42,7 @@ class PlotPosteriorCallback(Callback):
 
         self.epochs_elapsed += 1
         if (self.epochs_elapsed-2) % self.call_every_n_epochs == 0:
-            print("plotting posteriors on observed data")
+            #print("plotting posteriors on observed data")
             train_time = datetime.now() - self.init_time
             td_trunc = train_time - timedelta(microseconds=train_time.microseconds)
             title_plot = f"training time={td_trunc}s"
@@ -104,7 +104,7 @@ class PlotPosteriorCallback(Callback):
                 fig.savefig(out, bbox_inches="tight")
                 plt.close(fig)
 
-            print("done plotting posteriors")
+            #print("done plotting posteriors")
 
     def on_train_end(self, trainer, pl_module):
         self.on_validation_epoch_end(trainer, pl_module)
@@ -115,8 +115,9 @@ class SequentialTrainer:
         self.datagen_conf = datagen_conf
         self.dataset_obs_path = dataset_obs_path
         # Subset is there because utils.mbhb_collate_fn expects a Subset, it will access its dataset attribute
-        self.dataset_observation = Subset(MBHBDataset(dataset_obs_path, cache_in_memory=True), indices=[2])
-        self.dataloader_obs = DataLoader(self.dataset_observation, batch_size=train_conf["batch_size"], shuffle=False, collate_fn=lambda b: mbhb_collate_fn(b, self.dataset_observation, noise_shuffling=False))
+        #self.dataset_observation = Subset(MBHBDataset(dataset_obs_path, cache_in_memory=True), indices=[2])
+        self.dataset_observation = Subset(MBHBDataset(dataset_obs_path, cache_in_memory=True),indices =[0])
+        self.dataloader_obs = DataLoader(self.dataset_observation, batch_size=train_conf["batch_size"], shuffle=False, collate_fn=lambda b: mbhb_collate_fn(b, self.dataset_observation, noise_shuffling=False, noise_factor=self.train_conf["noise_factor"]))
         self.logMchirp_lower = [datagen_conf["prior"]["logMchirp"][0]]
         self.logMchirp_upper = [datagen_conf["prior"]["logMchirp"][1]]
         self.q_lower = [datagen_conf["prior"]["q"][0]]
@@ -185,7 +186,7 @@ class SequentialTrainer:
                 print(f"Using existing dataset at {fname_h5}")
         self.data_fname_yaml = fname_h5.replace(".h5", ".yaml")
         self.datagen_info = utils.read_config(self.data_fname_yaml)
-        self.data_module = MBHBDataModule(fname_h5, train_config["batch_size"], cache_in_memory=True)
+        self.data_module = MBHBDataModule(fname_h5, train_config["batch_size"], cache_in_memory=True, noise_factor=self.train_conf["noise_factor"])
         self.data_module.setup(stage="fit")
         self.test_dataloader = self.data_module.test_dataloader()
 
@@ -339,10 +340,13 @@ if __name__ == "__main__":
     train_config_filename = "train_config.yaml"
     datagen_config_filename = "datagen_config.yaml"
     
-    train_config   = utils.read_config(os.path.join(ROOT_DIR, train_config_filename))
-    datagen_config = utils.read_config(os.path.join(ROOT_DIR, datagen_config_filename))
+    train_config   = utils.read_config(os.path.join(ROOT_DIR, "configs", train_config_filename))
+    datagen_config = utils.read_config(os.path.join(ROOT_DIR, "configs", datagen_config_filename))
                                
-    trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path=os.path.join(ROOT_DIR, "data/testes_newdata_fixall_notmcq.h5"))
+    #trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path=os.path.join(ROOT_DIR, "data/testes_newdata_fixall_notmcq.h5"))
+    
+    # run with low noise: 
+    trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path=os.path.join(ROOT_DIR, "/data/gpuleo/mbhb/observation_low_noise.h5"))
     trainer.run(n_rounds=2)
 
     #round(conf, sampler_init_kwargs={'low': 0.5, 'high': 1.0} , lr=conf["training"]["learning_rate"], idx=0)

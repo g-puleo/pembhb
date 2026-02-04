@@ -1,5 +1,6 @@
 from torch.utils.data import Dataset, random_split, DataLoader, Subset 
 import lightning as L
+from pembhb.utils import mbhb_collate_fn
 import torch
 import numpy as np
 import h5py
@@ -84,7 +85,7 @@ class MBHBDataset(Dataset):
 
 class MBHBDataModule( L.LightningDataModule ): 
 
-    def __init__(self, filename: str, batch_size: int, num_workers: int = 15, cache_in_memory: bool = False, shuffle_data: bool = True):
+    def __init__(self, filename: str, batch_size: int, num_workers: int = 15, cache_in_memory: bool = False, shuffle_data: bool = True, noise_factor=1.0):
         """Initialize the data module.
 
         :param filename: Path to the HDF5 file.
@@ -101,7 +102,7 @@ class MBHBDataModule( L.LightningDataModule ):
         self.num_workers = num_workers
         self.cache_in_memory = cache_in_memory
         self.shuffle_data = shuffle_data 
-
+        self.noise_factor = noise_factor
     def prepare_data(self):
 
         pass
@@ -146,14 +147,13 @@ class MBHBDataModule( L.LightningDataModule ):
         return freqs
 
     def train_dataloader(self, shuffle=True):
-        return DataLoader(self.train, batch_size=self.batch_size, shuffle=shuffle, num_workers=self.num_workers, collate_fn=lambda b: mbhb_collate_fn(b, self.train, noise_shuffling=shuffle))
+        return DataLoader(self.train, batch_size=self.batch_size, shuffle=shuffle, num_workers=self.num_workers, collate_fn=lambda b: mbhb_collate_fn(b, self.train, self.noise_factor, noise_shuffling=shuffle))
 
-    def val_dataloader(self):
-        return DataLoader(self.val, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, collate_fn=lambda b: mbhb_collate_fn(b, self.val))
+    def val_dataloader(self, shuffle=True):
+        return DataLoader(self.val, batch_size=self.batch_size, shuffle=shuffle, num_workers=self.num_workers, collate_fn=lambda b: mbhb_collate_fn(b, self.val, self.noise_factor, noise_shuffling=shuffle))
     
     def test_dataloader(self):
-        return DataLoader(self.test, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, collate_fn=lambda b: mbhb_collate_fn(b, self.test))
-
+        return DataLoader(self.test, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, collate_fn=lambda b: mbhb_collate_fn(b, self.test, self.noise_factor, noise_shuffling=False))
 
 class DummyDataset(Dataset):
     def __init__(self, params, data):
@@ -166,32 +166,6 @@ class DummyDataset(Dataset):
     def __getitem__(self, idx):
         return {'source_parameters': self.params[idx], 'data_fd': self.data[idx]}
 
-def mbhb_collate_fn(batch, subset: torch.utils.data.Subset, noise_shuffling=True):
-    B = len(batch)
-    wave_fd = torch.stack([b["wave_fd"] for b in batch])
-    wave_td = torch.stack([b["wave_td"] for b in batch])
-    params  = torch.stack([b["params"] for b in batch])
-
-    # pick noise indices randomly
-    if noise_shuffling:
-        subset_idxs = torch.tensor(subset.indices)
-        pick = subset_idxs[torch.randint(0, len(subset_idxs), (B,))]
-    else:
-        pick = torch.tensor([b["idx"] for b in batch])
-
-
-    noise_fd = torch.stack([subset.dataset._load("noise_fd", i) for i in pick])
-    noise_td = torch.stack([subset.dataset._load("noise_td", i) for i in pick])
-
-    # delivers waveform and a random instance of the noise. 
-    return {
-        "source_parameters": params,
-        "wave_fd": wave_fd,
-        "wave_td": wave_td,
-        "noise_fd": noise_fd,
-        "noise_td": noise_td,
-        "noise_index": pick,
-    }
 
 
 

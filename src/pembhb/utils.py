@@ -133,9 +133,9 @@ def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'Infer
         model.eval()
         model = model.to("cuda")
         prior_trained_dict = model.hparams["dataset_info"]["conf"]["prior"]
-        print("calling get_logratios_grid_2d with in_param_idx:", in_param_idx)
-        print("prior trained dict:")
-        print(prior_trained_dict)
+        # print("calling get_logratios_grid_2d with in_param_idx:", in_param_idx)
+        # print("prior trained dict:")
+        # print(prior_trained_dict)
         if bounds_0 is None:
             bounds_0 = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx[0]]]
         if bounds_1 is None:
@@ -210,7 +210,7 @@ def get_pvalues_1d(logratios: np.array, grid: np.array, inj_param: np.array):
 
     cumsum =  np.cumsum(sorted_ratios, axis=1)
     cumsum /= cumsum[:,-1:]  # normalize to get a cumulative distribution
-    print(idx_rank.shape, idx.shape)
+    #print(idx_rank.shape, idx.shape)
     p_values = cumsum[idx_rank, idx]
 
     return p_values
@@ -850,10 +850,10 @@ def contour_levels(ratios, targets=(0.6827, 0.9545, 0.9973, 0.9999)):
 def contour_boxes(grid_x, grid_y, ratios, levels, ax=None):
 
     if ax:
-        print(f"using provided ax for contour boxes")
+        #print(f"using provided ax for contour boxes")
         cs = ax.contour(grid_x, grid_y, ratios, levels=levels) 
     else:
-        print(f"creating new fig for contour boxes")
+        #print(f"creating new fig for contour boxes")
         fig, ax = plt.subplots()
         cs = ax.contour(grid_x, grid_y, ratios, levels=levels)
 
@@ -964,3 +964,32 @@ def posterior_contours_2d_imshow(grid_x: np.array, grid_y: np.array, ratios: np.
     
     return boxes
 
+
+
+
+def mbhb_collate_fn(batch, subset: torch.utils.data.Subset, noise_factor, noise_shuffling=True):
+    B = len(batch)
+    wave_fd = torch.stack([b["wave_fd"] for b in batch])
+    wave_td = torch.stack([b["wave_td"] for b in batch])
+    params  = torch.stack([b["params"] for b in batch])
+
+    # pick noise indices randomly
+    if noise_shuffling:
+        subset_idxs = torch.tensor(subset.indices)
+        pick = subset_idxs[torch.randint(0, len(subset_idxs), (B,))]
+    else:
+        pick = torch.tensor([b["idx"] for b in batch])
+
+
+    noise_fd = noise_factor*torch.stack([subset.dataset._load("noise_fd", i) for i in pick])
+    noise_td = noise_factor*torch.stack([subset.dataset._load("noise_td", i) for i in pick])
+
+    # delivers waveform and a random instance of the noise. 
+    return {
+        "source_parameters": params,
+        "wave_fd": wave_fd,
+        "wave_td": wave_td,
+        "noise_fd": noise_fd,
+        "noise_td": noise_td,
+        "noise_index": pick,
+    }

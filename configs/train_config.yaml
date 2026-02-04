@@ -1,8 +1,9 @@
 batch_size: 250
-epochs: 400
-learning_rate: 0.00001
+epochs: 500
+learning_rate: 0.0001
 #transform_td: "normalise_max" # options: "none", "logwhiten", "log", "whiten"
 transform_fd: "log" # options: "none", "logwhiten", "log", "whiten", "normalise_max"
+noise_factor: 1.0
 early_stop_patience: 90
 early_stop_min_delta: 0.001
 early_stop_threshold: 0.999

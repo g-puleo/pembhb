@@ -11,7 +11,8 @@ from torch.nn import functional as F
 from typing import Iterable
 from pembhb.data import MBHBDataset
 from torch.utils.data import DataLoader
-from pembhb.utils import _ORDERED_PRIOR_KEYS
+
+from pembhb.utils import _ORDERED_PRIOR_KEYS, mbhb_collate_fn
 from pembhb import ROOT_DIR
 import numpy as np
 # class GWTransformer(LightningModule):
@@ -228,6 +229,8 @@ class InferenceNetwork(LightningModule):
             self.data_summary = data_summarizer
         else:
             self.data_summary = build_data_summary(train_conf["architecture"]["data_summary"])
+        
+        self.n_features_summary = self.data_summary.get_n_features() 
         self.marginals_dict = train_conf["marginals"]
         self.loss = nn.BCEWithLogitsLoss(reduction='none')
         self.lr = train_conf["learning_rate"]
@@ -262,8 +265,7 @@ class InferenceNetwork(LightningModule):
         self.logratios_model_dict = nn.ModuleDict()
         for key in self.marginals_dict.keys():
             self.logratios_model_dict[key] = MarginalClassifierHead(
-                n_data_features=16*len(key),# key can be any of "f", "t", "ft", resulting in double input size if ft. 
-                #n_data_features=20, # for brutal compression with lowdim=20
+                n_data_features=self.n_features_summary*len(key),
                 marginals=self.marginals_dict[key], 
                 hlayersizes=(64, 32, 16, 8)
             ).to(train_conf["device"])
@@ -314,7 +316,7 @@ class InferenceNetwork(LightningModule):
         # print(f"features_f device: {features_f.device}")
         # print(f"features_ft device: {features_ft.device}")
         # #print(f"features_f shape: {features_f.shape}")
-        breakpoint()
+        #breakpoint()
         normalised_parameters = (parameters - self.param_mean) / self.param_std
         logratios_1d_list = []
         for key in self.logratios_model_dict.keys():
@@ -803,15 +805,26 @@ class ReducedOrderModel:
             },
             filename,
         )
+        filename_diagnostics = filename.replace(".pt", "_diagnostics.pt")
+        self.save_diagnostics(filename_diagnostics)
+        print(f"[ROM] basis saved to {filename}")
+        return
 
     @profile
-    def train(self, train_subset: torch.utils.data.Subset):
+    def train(self, train_dataloader: torch.utils.data.DataLoader):
+        """Train the reduced order model
+
+        Args:
+            train_dataloader (torch.utils.data.DataLoader): the training dataloader, that has the training Subset as attribute
+        """
         print(f"[ROM] training with tolerance={self.tolerance:.1e} on device={self.device}")
-        train_subset.dataset.to(self.device) # move the dataset to the right device.
-        dataloader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=False, num_workers=0)
+        train_subset = train_dataloader.dataset
+        if not isinstance(train_dataloader.dataset, torch.utils.data.Subset):
+            raise ValueError("[ROM] train_dataloader.dataset must be a torch.utils.data.Subset")
+        train_subset.dataset.to(self.device) # move the (full) dataset to the right device.
         self.n_freq = train_subset[0]['wave_fd'].shape[1]
         self.n_channels = train_subset[0]['wave_fd'].shape[0]
-        self.global_scale_factor, self.mean_vec = self._compute_global_scale(dataloader)
+        self.global_scale_factor, self.mean_vec = self._compute_global_scale(train_dataloader)
         self.mean_vec = self.mean_vec.to(self.device)
         print(f"[ROM] global scale factor: {self.global_scale_factor:.3e}")
         
@@ -825,13 +838,14 @@ class ReducedOrderModel:
         seed = torch.randint(0, n, (1,)).item()
                 
 
-        first = (train_subset[seed]['wave_fd'].reshape(-1).to(self.device) - self.mean_vec) / self.global_scale_factor
+        first = self._normalize(train_subset[seed]['wave_fd'].unsqueeze(0).to(self.device)).squeeze(0)
         first = first / first.norm()
         self.basis = first.unsqueeze(0)
         self.basis_indices = [seed]
 
 
         sigma = float("inf")
+        
         self.epoch = 0
         t0 = time.time()
         pbar = tqdm(total=0, bar_format='{desc}{postfix}', position=0, leave=True)  # dynamic manual updates
@@ -840,6 +854,7 @@ class ReducedOrderModel:
         q_values = []
         sigmas = []
         sigmas_unnorm = []
+        sigmas_data = []
         picked = [seed]
         picked_set = {seed}
         self.gs_diagnose =  {
@@ -854,6 +869,7 @@ class ReducedOrderModel:
             "q_values": q_values,
             "sigmas": sigmas,
             "sigmas_unnorm": sigmas_unnorm,
+            "sigmas_data": sigmas_data,
             "max_pointwise_relerrors_real": [],
             "max_pointwise_relerrors_imag": [],
             "picked_indices": picked,
@@ -865,11 +881,12 @@ class ReducedOrderModel:
         
             while sigma > self.tolerance:
                 self.epoch += 1 # epoch 1 --> N_basis = 1
-                sigma, idx , sigma_unnorm = self._max_residual_index(dataloader, picked_set)
-                if sigma >= sigma_last: 
-                    print(f"\ntraining stopped early at iteration {self.epoch} because sigma did not decrease (sigma={sigma:.3e}, last sigma={sigma_last:.3e})")
+                sigma, idx , sigma_unnorm, sigma_data, idx_data = self._max_residual_index(train_dataloader, picked_set)
+                if sigma_data >= sigma_last_data: 
+                    print(f"\ntraining stopped early at iteration {self.epoch} because sigma did not decrease (sigma={sigma_data:.3e}, last sigma={sigma_last_data:.3e})")
                     break
-                sigma_last = sigma
+
+                sigma_last_data = sigma_data
                 picked_set.add(idx)
                 picked.append(idx)
                 log10mc_values.append(train_subset[idx]["params"][0])
@@ -877,8 +894,9 @@ class ReducedOrderModel:
                 picked.append(idx)
                 sigmas.append(sigma)
                 sigmas_unnorm.append(sigma_unnorm)
-                v = (train_subset[idx]['wave_fd'].reshape(-1) - self.mean_vec) / self.global_scale_factor
-                v = self._modified_gram_schmidt(v)
+                sigmas_data.append(sigma_data)
+                v = self._normalize(train_subset[idx]['wave_fd'].unsqueeze(0)).squeeze(0)
+                v = self._gram_schmidt_reorthogonalize(v)
                 self.basis = torch.cat([self.basis, v.unsqueeze(0)], dim=0)
                 elapsed = time.time() - t0
                 pbar.set_postfix({f"N_basis_elems":self.basis.shape[0], "iter":self.epoch, "sigma":f"{sigma:.3e}", "elapsed":f"{elapsed:.1f}s", "rate":f"{self.epoch/elapsed:.1f} it/s"})
@@ -893,39 +911,42 @@ class ReducedOrderModel:
     def _project_batch(self, batch):
         """Project the input batch onto the ROM basis.
 
-        :param batch: Input batch of waveforms, with shape (B_size, N_dim). 
+        :param batch: Input batch of normalized waveforms, with shape (B_size, N_dim). 
         :type batch: torch.Tensor
-        :return: Projected batch.
+        :return: Projected batch in normalized space.
         :rtype: torch.Tensor
         """
-        B = self.basis
-        coeff = B.conj() @ batch.T # shape ( N_basis, N_dim) @ (N_dim, B_size)--> (Nbasis, B_size)
-        proj = coeff.T @ B # shape ( B_size, N_basis) @ (N_basis, N_dim) ---> (B_size , N_dim)
+        # batch is already centered and scaled, so we work in normalized space
+        # This is equivalent to compress-then-reconstruct without denormalization
+        coeff = self._compress_normalized(batch)
+        proj = self._reconstruct_normalized(coeff)
         return proj
 
     @profile
-    def _max_residual_index(self, dataloader, picked_set):
+    def _max_residual_index(self, train_dataloader, picked_set):
         max_seen = -1.0
         max_seen_unnorm = -1.0
+        max_seen_data = -1.0
+        max_index = -1
         max_index = None
         seen_points = 0
         max_relerr_re = 0
         max_relerr_im = 0
-        for idx, batch in enumerate(dataloader):
+        for idx, batch in enumerate(train_dataloader):
             bsize = batch['wave_fd'].shape[0]
             
             original_wave_batch = batch['wave_fd'].reshape(bsize, -1).to(self.device)
             # centered and scaled waveforms
-            wave_fd_batch = (original_wave_batch - self.mean_vec) / self.global_scale_factor  # shape (B_size, N_dim)
+            wave_fd_batch = self._normalize(batch['wave_fd'].to(self.device))  # shape (B_size, N_dim)
             # project onto basis (aka : compute coefficients and then reconstruct)
             proj = self._project_batch(wave_fd_batch)
-
             # back to original space
-            reconstruction_original_space = proj * self.global_scale_factor + self.mean_vec
+            reconstruction_original_space = self._denormalize(proj)
             residual_original_space = original_wave_batch - reconstruction_original_space
 
             # compute residuals in normalized space
             r = (wave_fd_batch - proj) / wave_fd_batch.norm(dim=1, keepdim=True)
+            # compute max pointwise relative error in this batch
             scale_re  = wave_fd_batch.real.abs().amax(dim=1, keepdim=True)
             scale_im = wave_fd_batch.imag.abs().amax(dim=1, keepdim=True)
             # breakpoint()
@@ -934,9 +955,15 @@ class ReducedOrderModel:
             max_relerr_re = max(max_relerr_re, max_rel_error_real_batch.item())
             max_relerr_im = max(max_relerr_im, max_rel_error_imag_batch.item())
             r_unnorm = wave_fd_batch - proj
-
             norms = (r.abs() ** 2).sum(dim=1)
             norms_unnorm = (r_unnorm.abs() ** 2).sum(dim=1)
+
+
+            original_data_batch = (batch['wave_fd'] + batch['noise_fd']).reshape(bsize, -1).to(self.device)
+            normalised_data_batch = self._normalize(original_data_batch)
+            data_proj = self._project_batch(normalised_data_batch)
+            #data_reconstruction_original_space = self._denormalize(data_proj)
+            norms_residual_data = ((wave_fd_batch - data_proj).abs() ** 2).sum(dim=1)
             if self.debugging and idx == 0 and self.epoch <= 10:
                 # plot the residuals as function of frequency
                 for jj in range(min(3, bsize)):
@@ -1010,17 +1037,20 @@ class ReducedOrderModel:
             masked_norms[~mask] = -1.0  # safe since norms >= 0
 
             current_max, current_idx = masked_norms.max(0)
-
+            current_max_data , current_idx_data = norms_residual_data.max(0)
             if current_max.item() > max_seen:
                 max_seen = current_max.item()
                 max_index = (current_idx + seen_points).item()
                 max_seen_unnorm = norms_unnorm[current_idx].item()
 
+            if current_max_data.item() > max_seen_data:
+                max_seen_data = current_max_data.item()
+                max_index_data = (current_idx_data + seen_points).item()
             seen_points += bsize
 
         self.training_diagnostics["max_pointwise_relerrors_real"].append(max_relerr_re)
         self.training_diagnostics["max_pointwise_relerrors_imag"].append(max_relerr_im)
-        return max_seen, max_index, max_seen_unnorm
+        return max_seen, max_index, max_seen_unnorm, max_seen_data, max_index_data
     
     def _compute_global_scale(self, dataloader):
         max_val = 0.0
@@ -1032,6 +1062,51 @@ class ReducedOrderModel:
         mean_vec = mean_vec / len(dataloader.dataset)
         return max_val, mean_vec
     
+
+    def _gram_schmidt_reorthogonalize(self, v): 
+        """the gram-schmidt algorithm with reorthogonalization step as described in https://drum.lib.umd.edu/items/fe4fed4a-c5a2-49fb-844b-05457b532a89 
+        """
+        B = self.basis
+        coeff = B.conj() @ v # shape (N_basis, N_dim) @ (N_dim, )  #/ torch.einsum("ik,ik->i", B.conj(), B)
+        projection = coeff @ B # shape (N_basis) @ (N_basis, N_dim) = > (N_dim, )
+        v_trunc = v - projection# now v is orthogonal to the basis
+
+        # reorthogonalisation step 
+        coeff2 = B.conj() @ v_trunc
+        projection2 = coeff2 @ B
+        v_trunc = v_trunc - projection2
+        normalised = v_trunc / v_trunc.norm()# normalise before adding to the reduced basis. 
+        scalar_products = B.conj() @ v_trunc  # shape (N_basis, )
+        cosines_vtrunc = scalar_products / (B.norm(dim=1) * v_trunc.norm())
+        scalar_products_v_normalised = B.conj() @ normalised
+        cosines_vnormalised = scalar_products_v_normalised / (B.norm(dim=1) * normalised.norm())
+        self.gs_diagnose["max_cosine_angle_unnormalised"].append(cosines_vtrunc.abs().max().item())
+        self.gs_diagnose["max_cosine_angle_normalised"].append(cosines_vnormalised.abs().max().item())
+        max_abs_scalar_product = scalar_products.abs().max().item()
+        # compute max abs of removed part 
+
+        norm_projection = projection.norm()
+        norm_v_trunc = v_trunc.norm()
+        norm_v_original = v.norm()
+        self.gs_diagnose["norm_v_original"].append(norm_v_original.item())
+        self.gs_diagnose["norm_projection"].append(norm_projection.item())
+        self.gs_diagnose["norm_v_trunc"].append(norm_v_trunc.item())
+
+        # triangular inequality checks
+        assert norm_v_original <= norm_v_trunc + norm_projection, "Triangular inequality violated"
+        assert norm_v_trunc <= norm_v_original + norm_projection, "Triangular inequality violated"
+        assert norm_projection <= norm_v_original + norm_v_trunc, "Triangular inequality violated"
+        ### debug line:  check orthogonality
+        # try:
+        #     assert torch.allclose((B.conj() @ v), torch.zeros_like(coeff), atol=1e-6), "Gram-Schmidt failed to produce orthogonal vector."
+        # except AssertionError as e:
+        #     print(e)
+        #     print("if divide coefficients by norm of basis elements:")
+        #     coeff_normed = coeff / torch.einsum("ik,ik->i", B.conj(), B)
+        #     new_v = v - coeff_normed @ B
+        #     assert torch.allclose((B.conj() @ new_v), torch.zeros_like(coeff), atol=1e-6), "Gram-Schmidt failed to produce orthogonal vector even after normalizing coefficients by basis element norms."
+        
+        return normalised
 
     def _modified_gram_schmidt(self, v) : 
         B = self.basis
@@ -1111,6 +1186,55 @@ class ReducedOrderModel:
         
         return normalised
 
+    def _normalize(self, data):
+        """Center and scale data to normalized space.
+        
+        :param data: Input data with shape (Batch_size, Channels, Physics_dimension) or (Batch_size, N_dim).
+        :type data: torch.Tensor
+        :return: Normalized data with shape (Batch_size, N_dim).
+        :rtype: torch.Tensor
+        """
+        # Flatten if needed
+        if data.ndim == 3:
+            d = data.reshape(data.shape[0], -1)
+        else:
+            d = data
+        # Center and scale
+        return (d - self.mean_vec) / self.global_scale_factor
+    
+    def _denormalize(self, data):
+        """Unscale and uncenter data from normalized space.
+        
+        :param data: Normalized data with shape (Batch_size, N_dim).
+        :type data: torch.Tensor
+        :return: Denormalized data with shape (Batch_size, N_dim).
+        :rtype: torch.Tensor
+        """
+        return data * self.global_scale_factor + self.mean_vec
+    
+    def _compress_normalized(self, normalized_data):
+        """Compress normalized data into reduced basis coefficients.
+        
+        :param normalized_data: Normalized input data with shape (Batch_size, N_dim).
+        :type normalized_data: torch.Tensor
+        :return: Compressed representation of shape (Batch_size, N_basis).
+        :rtype: torch.Tensor
+        """
+        B = self.basis
+        coeff = (B.conj() @ normalized_data.T).T  # shape (B_size, N_basis)
+        return coeff
+    
+    def _reconstruct_normalized(self, coeff):
+        """Reconstruct normalized data from reduced basis coefficients.
+        
+        :param coeff: Input coefficients with shape (Batch_size, N_basis).
+        :type coeff: torch.Tensor
+        :return: Reconstructed normalized data with shape (Batch_size, N_dim).
+        :rtype: torch.Tensor
+        """
+        B = self.basis
+        return coeff @ B  # shape (B_size, N_dim)
+
     # public API with flatten → project → unflatten
     def compress(self, data):
         """compress data into reduced basis coefficients.
@@ -1120,15 +1244,11 @@ class ReducedOrderModel:
         :return: Compressed representation of shape (Batch_size, N_basis).
         :rtype: torch.Tensor
         """
-        
-        # data: (N_pts, C, F)
-        d = (data.reshape(data.shape[0], -1) - self.mean_vec) / self.global_scale_factor  # shape (B_size, N_dim)
-        B = self.basis
-        coeff = (B.conj() @ d.T).T # shape [(N_basis, N_dim) @ (N_dim, B_size)]^T --> (B_size, N_basis)
-        return coeff
+        normalized_data = self._normalize(data)
+        return self._compress_normalized(normalized_data)
 
     def reconstruct(self, coeff):
-        """reconstruct data from reduced basis coefficients. Assume 
+        """reconstruct data from reduced basis coefficients.
         
         :param coeff: Input coefficients with shape (Batch_size, N_basis).
         :type coeff: torch.Tensor
@@ -1136,10 +1256,9 @@ class ReducedOrderModel:
         :rtype: torch.Tensor
         
         """
-        B = self.basis # shape (N_basis, N_dim)
-        x = (( coeff @ B ).T * self.global_scale_factor)  # shape [ (B_size, N_basis) @ (N_basis, N_dim) ]^T --> (N_dim, B_size)
-        xT = x.T+ self.mean_vec # shape (B_size, N_dim)
-        return xT.reshape(xT.shape[0], self.n_channels, self.n_freq)
+        normalized_data = self._reconstruct_normalized(coeff)
+        denormalized_data = self._denormalize(normalized_data)
+        return denormalized_data.reshape(denormalized_data.shape[0], self.n_channels, self.n_freq)
     
 
 class ROMWrapper(nn.Module): 
@@ -1149,11 +1268,14 @@ class ROMWrapper(nn.Module):
 
         super().__init__()
         self.rom = ReducedOrderModel(filename=filename, device=device)
-        self.channelised_net = ChannelizedLinearCompression(
-            lowdim=16, 
-            Nfreqs=len(self.rom.basis), 
-            in_channels=2# amplitude and phase
-        )
+        # self.channelised_net = ChannelizedLinearCompression(
+        #     lowdim=16, 
+        #     Nfreqs=len(self.rom.basis), 
+        #     in_channels=2# amplitude and phase
+        # )
+    def get_n_features(self):
+        return 2*self.rom.basis.shape[0]
+    
     def forward(self, d_f, d_t): 
         """forward pass of the ROMWrapper.
 
@@ -1165,11 +1287,14 @@ class ROMWrapper(nn.Module):
         :rtype: Tuple[torch.Tensor, torch.Tensor]
         """
 
-        compressed_df = self.rom.compress(d_f).unsqueeze(1)
-        compressed_ampl = torch.abs(compressed_df)
-        compressed_phase = torch.angle(compressed_df)
-        compressed_ampl_phase = torch.cat([compressed_ampl, compressed_phase], dim=1)  # shape (B, 2, N_basis)
-        nn_compression = self.channelised_net(compressed_ampl_phase) 
-        return nn_compression, d_t
+        compressed_df = self.rom.compress(d_f)
+        # compressed_ampl = torch.abs(compressed_df)
+        # compressed_phase = torch.angle(compressed_df)
+        # compressed_amplphase = torch.cat([compressed_ampl, compressed_phase], dim=1)  # shape (B, 2, N_basis)
+        compressed_real = compressed_df.real
+        compressed_imag = compressed_df.imag
+        compressed_reim = torch.cat([compressed_real, compressed_imag], dim=1)  # shape (B, 2, N_basis)
+        #nn_compression = self.channelised_net(compressed_amplphase) 
+        return compressed_reim, d_t
 
 DATA_SUMMARY_REGISTRY = { "BrutalCompression": BrutalCompression, "PeregrineModel": PeregrineModel, "ROM": ROMWrapper}
