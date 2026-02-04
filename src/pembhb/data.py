@@ -146,8 +146,11 @@ class MBHBDataModule( L.LightningDataModule ):
             freqs = f["frequencies"][()]
         return freqs
 
-    def train_dataloader(self, shuffle=True):
-        return DataLoader(self.train, batch_size=self.batch_size, shuffle=shuffle, num_workers=self.num_workers, collate_fn=lambda b: mbhb_collate_fn(b, self.train, self.noise_factor, noise_shuffling=shuffle))
+    def train_dataloader(self, shuffle=True, num_workers=None):
+        if num_workers is None:
+            num_workers = self.num_workers  
+
+        return DataLoader(self.train, batch_size=self.batch_size, shuffle=shuffle, num_workers=num_workers, collate_fn=lambda b: mbhb_collate_fn(b, self.train, self.noise_factor, noise_shuffling=shuffle))
 
     def val_dataloader(self, shuffle=True):
         return DataLoader(self.val, batch_size=self.batch_size, shuffle=shuffle, num_workers=self.num_workers, collate_fn=lambda b: mbhb_collate_fn(b, self.val, self.noise_factor, noise_shuffling=shuffle))

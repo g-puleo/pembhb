@@ -877,7 +877,7 @@ class ReducedOrderModel:
         }
 
         try:
-            sigma_last = torch.tensor(float("inf"), device=self.device)
+            sigma_last_data = torch.tensor(float("inf"), device=self.device)
         
             while sigma > self.tolerance:
                 self.epoch += 1 # epoch 1 --> N_basis = 1

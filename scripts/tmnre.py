@@ -195,7 +195,7 @@ class SequentialTrainer:
         rom = ReducedOrderModel(tolerance=5e-6, device="cuda", batch_size=5000)
         filename = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION, f"rom_round_{round_idx}.pt")
         if not os.path.exists(filename):
-            rom.train(self.data_module.train)
+            rom.train(self.data_module.train_dataloader(num_workers=0))
             rom.to_file(filename)
         else: 
             # existing ROM file found: ask whether to retrain or reuse
