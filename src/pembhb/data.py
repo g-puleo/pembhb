@@ -153,7 +153,7 @@ class MBHBDataModule( L.LightningDataModule ):
         return DataLoader(self.train, batch_size=self.batch_size, shuffle=shuffle, num_workers=num_workers, collate_fn=lambda b: mbhb_collate_fn(b, self.train, self.noise_factor, noise_shuffling=shuffle))
 
     def val_dataloader(self, shuffle=True):
-        return DataLoader(self.val, batch_size=self.batch_size, shuffle=shuffle, num_workers=self.num_workers, collate_fn=lambda b: mbhb_collate_fn(b, self.val, self.noise_factor, noise_shuffling=shuffle))
+        return DataLoader(self.val, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, collate_fn=lambda b: mbhb_collate_fn(b, self.val, self.noise_factor, noise_shuffling=False))
     
     def test_dataloader(self):
         return DataLoader(self.test, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, collate_fn=lambda b: mbhb_collate_fn(b, self.test, self.noise_factor, noise_shuffling=False))

@@ -878,7 +878,7 @@ class ReducedOrderModel:
 
         try:
             sigma_last_data = torch.tensor(float("inf"), device=self.device)
-        
+            breakpoint()
             while sigma > self.tolerance:
                 self.epoch += 1 # epoch 1 --> N_basis = 1
                 sigma, idx , sigma_unnorm, sigma_data, idx_data = self._max_residual_index(train_dataloader, picked_set)

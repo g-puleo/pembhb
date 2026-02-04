@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 torch.set_float32_matmul_precision("medium")
 def get_timestamp():
     return datetime.now().strftime("%Y%m%d")
-TIME_OF_EXECUTION = get_timestamp()+"_narrowprior_v1"
+TIME_OF_EXECUTION = get_timestamp()+"_widerprior_v1"
 
 class PlotPosteriorCallback(Callback):
     def __init__(self, timestamp: str, obs_loader: DataLoader, input_idx_list: list, output_idx_list: list, round_idx: int , call_every_n_epochs=1): 
@@ -194,7 +194,7 @@ class SequentialTrainer:
 
     def _train_rom ( self, round_idx) : 
         print("Training ROM...")
-        rom = ReducedOrderModel(tolerance=5e-6, device="cuda", batch_size=5000)
+        rom = ReducedOrderModel(tolerance=1e-9, device="cuda", batch_size=5000)
         filename = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION, f"rom_round_{round_idx}.pt")
         if not os.path.exists(filename):
             rom.train(self.data_module.train_dataloader(num_workers=0))
@@ -208,7 +208,7 @@ class SequentialTrainer:
                 # non-interactive environment, default to not retrain
                 resp = "n"
             if resp in ("y", "yes"):
-                rom.train(self.data_module.train)
+                rom.train(self.data_module.train_dataloader(num_workers=0))
                 rom.to_file(filename)
                 print(f"Retrained ROM and saved to {filename}")
             else:
