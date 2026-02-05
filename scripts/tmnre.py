@@ -95,18 +95,18 @@ class PlotPosteriorCallback(Callback):
                         levels_labels=labels,
                         do_plot=True
                     )
+                    # Store widest_box keyed by the marginal (tuple of input parameter indices)
+                    if not hasattr(pl_module, 'widest_boxes'):
+                        pl_module.widest_boxes = {}
+                    marginal_key = tuple(in_param_idx)
+                    pl_module.widest_boxes[marginal_key] = boxes[-1]
+                    out = os.path.join( ROOT_DIR,"plots",self.timestamp,f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]}.pdf")
+                    fig.savefig(out, bbox_inches="tight")
+                    plt.close(fig)
 
                 except ValueError: 
                     print("caught ValueError during contour plotting, skipping this plot")
                     continue
-                # Store widest_box keyed by the marginal (tuple of input parameter indices)
-                if not hasattr(pl_module, 'widest_boxes'):
-                    pl_module.widest_boxes = {}
-                marginal_key = tuple(in_param_idx)
-                pl_module.widest_boxes[marginal_key] = boxes[-1]
-                out = os.path.join( ROOT_DIR,"plots",self.timestamp,f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]}.pdf")
-                fig.savefig(out, bbox_inches="tight")
-                plt.close(fig)
 
             #print("done plotting posteriors")
 
