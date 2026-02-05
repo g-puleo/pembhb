@@ -848,7 +848,6 @@ def contour_levels(ratios, targets=(0.6827, 0.9545, 0.9973, 0.9999)):
     return sorted_levels, sorted_targets
 
 def contour_boxes(grid_x, grid_y, ratios, levels, ax=None):
-
     if ax:
         #print(f"using provided ax for contour boxes")
         cs = ax.contour(grid_x, grid_y, ratios, levels=levels) 
@@ -897,9 +896,13 @@ def posterior_contours_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, 
         # make a colormesh on the ax_buffer
         c = ax_buffer.pcolormesh(grid_x, grid_y, ratios, shading='auto', cmap="inferno", **plot_kwargs)
         # add contour lines
-        boxes, cs = contour_boxes(grid_x, grid_y, ratios, levels, ax=ax_buffer)
-        fmt = {lev: f"{p:.3f}" for lev, p in zip(levels, levels_labels)}
-        ax_buffer.clabel(cs, fmt=fmt, fontsize=8)
+        try:
+            boxes, cs = contour_boxes(grid_x, grid_y, ratios, levels, ax=ax_buffer)
+            fmt = {lev: f"{p:.3f}" for lev, p in zip(levels, levels_labels)}
+            ax_buffer.clabel(cs, fmt=fmt, fontsize=8)
+        except Exception as e:
+            print(f"Error in contour_boxes: {e}")
+            boxes, cs = None, None
         ax_buffer.axvline(x=true_values[0], color='r', linestyle='--', label='True Value')
         ax_buffer.axhline(y=true_values[1], color='r', linestyle='--')
         fig = ax_buffer.get_figure()

@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 torch.set_float32_matmul_precision("medium")
 def get_timestamp():
     return datetime.now().strftime("%Y%m%d")
-TIME_OF_EXECUTION = get_timestamp()+"_widerprior_v1"
+TIME_OF_EXECUTION = get_timestamp()+"withsky_v1"
 
 class PlotPosteriorCallback(Callback):
     def __init__(self, timestamp: str, obs_loader: DataLoader, input_idx_list: list, output_idx_list: list, round_idx: int , call_every_n_epochs=1): 
@@ -99,7 +99,11 @@ class PlotPosteriorCallback(Callback):
                 except ValueError: 
                     print("caught ValueError during contour plotting, skipping this plot")
                     continue
-                pl_module.widest_box = boxes[-1]
+                # Store widest_box keyed by the marginal (tuple of input parameter indices)
+                if not hasattr(pl_module, 'widest_boxes'):
+                    pl_module.widest_boxes = {}
+                marginal_key = tuple(in_param_idx)
+                pl_module.widest_boxes[marginal_key] = boxes[-1]
                 out = os.path.join( ROOT_DIR,"plots",self.timestamp,f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]}.pdf")
                 fig.savefig(out, bbox_inches="tight")
                 plt.close(fig)
@@ -127,20 +131,28 @@ class SequentialTrainer:
         # load baseline model to update prior before training new model
         if self.train_conf["baseline_model"]["use"]:
             self.model = InferenceNetwork.load_from_checkpoint(self.train_conf["baseline_model"]["filename"])
-            widest_box = self._get_widest_box(self.model, self.dataloader_obs)
-
-            # update prior based on model performance
-            self.datagen_conf["prior"]["logMchirp"] = [widest_box[0], widest_box[1]]
-            self.datagen_conf["prior"]["q"] = [widest_box[2], widest_box[3]]
-            print(f"Updated prior based on baseline model:\nlog10Mchirp: {self.datagen_conf['prior']['logMchirp']},\nq: {self.datagen_conf['prior']['q']}")
+            
+            # update prior based on model performance for all 2D marginals
+            out_idx = 0
+            for key, marginal_list in self.train_conf["marginals"].items():
+                for marginal in marginal_list:
+                    if len(marginal) == 2:
+                        widest_box = self._get_widest_box(self.model, self.dataloader_obs, 
+                                                          in_param_idx=tuple(marginal), out_param_idx=out_idx)
+                        inj1, inj2 = marginal
+                        self.datagen_conf["prior"][utils._ORDERED_PRIOR_KEYS[inj1]] = [widest_box[0], widest_box[1]]
+                        self.datagen_conf["prior"][utils._ORDERED_PRIOR_KEYS[inj2]] = [widest_box[2], widest_box[3]]
+                        print(f"Updated prior based on baseline model for marginal ({utils._ORDERED_PRIOR_KEYS[inj1]}, {utils._ORDERED_PRIOR_KEYS[inj2]})")
+                    out_idx += 1
+            print(f"Updated prior after baseline model: {self.datagen_conf['prior']}")
     
-    def _get_widest_box(self, model, dataloader):
+    def _get_widest_box(self, model, dataloader, in_param_idx, out_param_idx):
         logratios, inj_params, gx, gy = utils.get_logratios_grid_2d(
             dataloader,
             model,
             ngrid_points=100,
-            in_param_idx=(0,1),
-            out_param_idx=0,
+            in_param_idx=in_param_idx,
+            out_param_idx=out_param_idx,
         )
 
         ratios = np.exp(logratios)
@@ -149,7 +161,7 @@ class SequentialTrainer:
         norm2d = ratios / np.sum(ratios * dp1 * dp2)
         levels, labels = utils.contour_levels(norm2d)
         boxes = utils.posterior_contours_2d(gx, gy, norm2d[0],
-                                            inj_params[0], ax_buffer=None, parameter_names=['log10Mc', 'q'],
+                                            inj_params[0], ax_buffer=None, parameter_names=[utils._ORDERED_PRIOR_KEYS[in_param_idx[0]], utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]],
                                             levels=levels, levels_labels=labels)
         widest_box = boxes[-1]
         return widest_box
@@ -263,7 +275,8 @@ class SequentialTrainer:
         #     self.model.widest_box = self._get_widest_box(self.model, self.dataloader_obs)
         # else: 
         trainer.fit(self.model, self.data_module)
-        print(f"Widest box after training: {self.model.widest_box}")
+        if hasattr(self.model, 'widest_boxes'):
+            print(f"Widest boxes after training: {self.model.widest_boxes}")
         if copy_bounds_file: 
             shutil.copy(self.data_fname_yaml, logger.log_dir)
 
@@ -323,13 +336,19 @@ class SequentialTrainer:
                         #utils.pp_plot_2d(self.test_dataloader, self.model, in_param_idx=marginal, out_idx=out_idx,
                         #           name=f"{ROOT_DIR}/plots/{TIME_OF_EXECUTION}/round_{i}_{utils._ORDERED_PRIOR_KEYS[inj1]}_{utils._ORDERED_PRIOR_KEYS[inj2]}")
             
-                        tmp_prior = copy.deepcopy(self.datagen_conf["prior"])
-                        tmp_prior[utils._ORDERED_PRIOR_KEYS[inj1]] = [self.model.widest_box[0], self.model.widest_box[1]]
-                        tmp_prior[utils._ORDERED_PRIOR_KEYS[inj2]] = [self.model.widest_box[2], self.model.widest_box[3]]
-                        self.datagen_conf["prior"] = tmp_prior
+                        # Get widest_box for this specific marginal from the dictionary
+                        marginal_key = tuple(marginal)
+                        if hasattr(self.model, 'widest_boxes') and marginal_key in self.model.widest_boxes:
+                            widest_box = self.model.widest_boxes[marginal_key]
+                            tmp_prior = copy.deepcopy(self.datagen_conf["prior"])
+                            tmp_prior[utils._ORDERED_PRIOR_KEYS[inj1]] = [widest_box[0], widest_box[1]]
+                            tmp_prior[utils._ORDERED_PRIOR_KEYS[inj2]] = [widest_box[2], widest_box[3]]
+                            self.datagen_conf["prior"] = tmp_prior
+                        else:
+                            print(f"Warning: No widest_box found for marginal {marginal_key}")
                     out_idx += 1
 
-            print(f"Updated prior after round {i}:\nlog10Mchirp: {self.datagen_conf['prior']['logMchirp']},\nq: {self.datagen_conf['prior']['q']}")
+            print(f"Updated prior after round {i}: {self.datagen_conf['prior']}")
             self._plot_updated_prior_bounds(self.datagen_conf["prior"])
 
             if self.train_conf["device"] == "cuda":
@@ -349,6 +368,6 @@ if __name__ == "__main__":
     
     # run with low noise: 
     # trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path=os.path.join(ROOT_DIR, "/data/gpuleo/mbhb/observation_low_noise.h5"))
-    trainer.run(n_rounds=2)
+    trainer.run(n_rounds=4)
 
     #round(conf, sampler_init_kwargs={'low': 0.5, 'high': 1.0} , lr=conf["training"]["learning_rate"], idx=0)

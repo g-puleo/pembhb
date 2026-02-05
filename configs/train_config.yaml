@@ -12,7 +12,7 @@ scheduler_patience: 10
 keep_ckpt: True
 marginals: 
   #  f: [[0]]
-  f: [[0,1]]
+  f: [[0,1],[7,8]]
 
 
 device: "cuda"
