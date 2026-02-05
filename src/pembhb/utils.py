@@ -150,8 +150,11 @@ def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'Infer
         flattened_x = grid_x.flatten() # values of param_0 to test
         flattened_y = grid_y.flatten() # values of param_1 to test
         grid = torch.stack((flattened_x, flattened_y), dim=1).to("cuda")  # Shape: [ngrid_points^2, 2]
-        padder = torch.zeros(ngrid_points**2, 9).to("cuda") # pass zero as other parameters
-        grid_padded_input = torch.cat((grid, padder), dim=1)  # Shape: [ngrid_points^2, 11]
+        
+        # Create the padded input with parameters at correct positions
+        grid_padded_input = torch.zeros(ngrid_points**2, 11).to("cuda")
+        grid_padded_input[:, in_param_idx[0]] = grid[:, 0]
+        grid_padded_input[:, in_param_idx[1]] = grid[:, 1]
 
         for batch in tqdm(dataloader):
             data_fd = (batch["wave_fd"] + batch["noise_fd"]).to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
@@ -896,13 +899,14 @@ def posterior_contours_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, 
         # make a colormesh on the ax_buffer
         c = ax_buffer.pcolormesh(grid_x, grid_y, ratios, shading='auto', cmap="inferno", **plot_kwargs)
         # add contour lines
-        try:
-            boxes, cs = contour_boxes(grid_x, grid_y, ratios, levels, ax=ax_buffer)
-            fmt = {lev: f"{p:.3f}" for lev, p in zip(levels, levels_labels)}
-            ax_buffer.clabel(cs, fmt=fmt, fontsize=8)
-        except Exception as e:
-            print(f"Error in contour_boxes: {e}")
-            boxes, cs = None, None
+        # try:
+            # breakpoint()
+        boxes, cs = contour_boxes(grid_x, grid_y, ratios, levels, ax=ax_buffer)
+        fmt = {lev: f"{p:.3f}" for lev, p in zip(levels, levels_labels)}
+        ax_buffer.clabel(cs, fmt=fmt, fontsize=8)
+        # except Exception as e:
+        #     print(f"Error in contour_boxes: {e}")
+        #     boxes, cs = None, None
         ax_buffer.axvline(x=true_values[0], color='r', linestyle='--', label='True Value')
         ax_buffer.axhline(y=true_values[1], color='r', linestyle='--')
         fig = ax_buffer.get_figure()
