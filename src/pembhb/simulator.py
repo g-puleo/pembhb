@@ -292,10 +292,12 @@ class MBHBSimulatorFD_TD:
         :return: SNR values with shape (n_samples,)
         :rtype: np.array
         """
-    
-        prod = signal * signal.conj()
+        
         high_pass_idx =  (self.freqs_pos >= 5e-5)
-        weighted = prod[..., high_pass_idx] * self.df / self.asd[...,high_pass_idx]
+        data_over_asd = signal[..., high_pass_idx] / self.asd[..., high_pass_idx]
+        data_over_asd_conj = data_over_asd.conj()
+        prod = data_over_asd * data_over_asd_conj
+        weighted = prod * self.df 
         summed = np.sum(weighted, axis=(1, 2))
         real_part = summed.real
         SNR2 = real_part * 4.0
