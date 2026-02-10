@@ -146,7 +146,7 @@ def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'Infer
         grid_0 = torch.linspace(lows[0], highs[0], ngrid_points).reshape(-1)
         grid_1 = torch.linspace(lows[1], highs[1], ngrid_points).reshape(-1)
 
-        grid_x, grid_y = torch.meshgrid(grid_0, grid_1)# grid_x and grid_y have shape (ngrid_points, ngrid_points)
+        grid_x, grid_y = torch.meshgrid(grid_0, grid_1, indexing="xy")# grid_x and grid_y have shape (ngrid_points, ngrid_points)
         flattened_x = grid_x.flatten() # values of param_0 to test
         flattened_y = grid_y.flatten() # values of param_1 to test
         grid = torch.stack((flattened_x, flattened_y), dim=1).to("cuda")  # Shape: [ngrid_points^2, 2]
