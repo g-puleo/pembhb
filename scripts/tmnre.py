@@ -65,7 +65,7 @@ class PlotPosteriorCallback(Callback):
                 logratios, inj_params, gx, gy = utils.get_logratios_grid_2d(
                     self.obs_loader,
                     pl_module,
-                    ngrid_points=100,
+                    ngrid_points=500,
                     in_param_idx=in_param_idx,
                     out_param_idx=out_param_idx
                 )
@@ -99,7 +99,7 @@ class PlotPosteriorCallback(Callback):
                     if not hasattr(pl_module, 'widest_boxes'):
                         pl_module.widest_boxes = {}
                     marginal_key = tuple(in_param_idx)
-                    pl_module.widest_boxes[marginal_key] = boxes[-1]
+                    pl_module.widest_boxes[marginal_key] = boxes[0]
                     out = os.path.join( ROOT_DIR,"plots",self.timestamp,f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]}.pdf")
                     fig.savefig(out, bbox_inches="tight")
                     plt.close(fig)
@@ -163,7 +163,7 @@ class SequentialTrainer:
         boxes = utils.posterior_contours_2d(gx, gy, norm2d[0],
                                             inj_params[0], ax_buffer=None, parameter_names=[utils._ORDERED_PRIOR_KEYS[in_param_idx[0]], utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]],
                                             levels=levels, levels_labels=labels)
-        widest_box = boxes[-1]
+        widest_box = boxes[0]
         return widest_box
     
     def _setup_plot(self):
@@ -259,7 +259,7 @@ class SequentialTrainer:
             input_idx_list=self.model.marginals_list,
             output_idx_list=list(range(len(self.model.marginals_list))),
             round_idx=round_idx,
-            call_every_n_epochs=1)
+            call_every_n_epochs=5)
 
         trainer = Trainer(
             logger=logger,
@@ -314,7 +314,7 @@ class SequentialTrainer:
         self.fig.savefig(os.path.join(ROOT_DIR, "plots", TIME_OF_EXECUTION, f"prior_bounds_iteration_{len(self.logMchirp_lower)-1}.png"))
 
     def run(self, n_rounds=1):
-        for i in range(n_rounds):
+        for i in range(1,n_rounds+1):
             print(f"Running round {i}...")
             self.round(
                 idx=i,

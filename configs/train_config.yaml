@@ -47,5 +47,6 @@ architecture:
       device: "cuda"
   
 baseline_model:
-  use: False
-  filename: "/data/gpuleo/mbhb/logs/20251205_100028_round_0/version_0/checkpoints/epoch=474-step=133000.ckpt"
+  use: True
+  #filename: "/data/gpuleo/mbhb/logs/20251205_100028_round_0/version_0/checkpoints/epoch=474-step=133000.ckpt"
+  filename: "/data/gpuleo/mbhb/logs/20260205withsky_v1_round_0/version_7/checkpoints/epoch=475-step=66640.ckpt"

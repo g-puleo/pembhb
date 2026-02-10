@@ -59,7 +59,7 @@ counts = []
 #     counts.append(cnt)
 #     print(f"i={j}: {cnt} frequencies where |wave| > |noise|")
 
-indices = [19790]
+indices = [0]
 for i in indices:
     print(f"Plotting sample {i+1}/{args.n_samples}")
     print(f"chirp mass: {parameters[i,0]:.8e} Msun,\nq: {parameters[i,1]:.8e} Mpc")
@@ -107,3 +107,4 @@ for i in indices:
         # ax_fd.grid(True)
     fig_fd.tight_layout()
     fig_fd.savefig(f'plots/{filename_only}/data_fd_event_{i}.png', dpi=600)
+    print(f"Saved plot for sample {i+1} to plots/{filename_only}/data_fd_event_{i}.png")
