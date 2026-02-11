@@ -25,6 +25,89 @@ def get_timestamp():
     return datetime.now().strftime("%Y%m%d")
 TIME_OF_EXECUTION = get_timestamp()+"fullsky_narrowmc_v0"
 
+def validate_marginals(marginals_config: dict):
+    """Validate that no parameter index appears in multiple marginals.
+    
+    :param marginals_config: dictionary containing marginal lists from train_config
+    :raises ValueError: if a parameter index is repeated across marginals
+    """
+    all_indices = []
+    for key, marginal_list in marginals_config.items():
+        for marginal in marginal_list:
+            for idx in marginal:
+                if idx in all_indices:
+                    raise ValueError(
+                        f"Parameter index {idx} ({utils._ORDERED_PRIOR_KEYS[idx]}) appears in multiple marginals. "
+                        f"Each parameter index can only appear in one marginal for prior truncation."
+                    )
+                all_indices.append(idx)
+
+def get_widest_interval_1d(model, dataloader, in_param_idx, out_param_idx, eps=0.003):
+    """Get the widest credible interval for a 1D marginal posterior.
+    
+    :param model: trained inference model
+    :param dataloader: dataloader containing the observation
+    :param in_param_idx: index of the input parameter
+    :param out_param_idx: index of the output (logratio)
+    :param eps: credible level (default 0.003 for 99.7% interval)
+    :return: (widest_interval, norm1d, grid, inj_params) where widest_interval is [low, high]
+    """
+    logratios, inj_params, grid = utils.get_logratios_grid(
+        dataloader,
+        model,
+        ngrid_points=1000,
+        in_param_idx=in_param_idx,
+        out_param_idx=out_param_idx,
+    )
+    
+    ratios = np.exp(logratios[0])  # Take first (only) observation
+    dp = grid[1, 0] - grid[0, 0]
+    norm1d = ratios / np.sum(ratios * dp)
+    
+    # Find credible interval using cumulative sum
+    cumsum = np.cumsum(norm1d * dp)
+    idx_low = np.searchsorted(cumsum, eps / 2)
+    idx_high = np.searchsorted(cumsum, 1 - eps / 2)
+    
+    widest_interval = [float(grid[idx_low, 0]), float(grid[idx_high, 0])]
+    return widest_interval, norm1d, grid, inj_params
+
+def get_widest_box_2d(model, dataloader, in_param_idx, out_param_idx, ax_buffer=None, do_plot=False):
+    """Get the widest credible box for a 2D marginal posterior.
+    
+    :param model: trained inference model
+    :param dataloader: dataloader containing the observation
+    :param in_param_idx: tuple of indices for the two input parameters
+    :param out_param_idx: index of the output (logratio)
+    :param ax_buffer: matplotlib axis to plot on (optional)
+    :param do_plot: whether to create the contour plot
+    :return: (widest_box, inj_params) where widest_box is [x_low, x_high, y_low, y_high]
+    """
+    logratios, inj_params, gx, gy = utils.get_logratios_grid_2d(
+        dataloader,
+        model,
+        ngrid_points=100,
+        in_param_idx=in_param_idx,
+        out_param_idx=out_param_idx,
+    )
+
+    ratios = np.exp(logratios)
+    dp1 = gx[1, 0] - gx[0, 0]
+    dp2 = gy[0, 1] - gy[0, 0]
+    norm2d = ratios / np.sum(ratios * dp1 * dp2, axis=(1, 2), keepdims=True)
+    levels, labels = utils.contour_levels(norm2d)
+    boxes = utils.posterior_contours_2d(
+        gx, gy, norm2d[0],
+        inj_params[0], 
+        ax_buffer=ax_buffer, 
+        parameter_names=[utils._ORDERED_PRIOR_KEYS[in_param_idx[0]], utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]],
+        levels=levels, 
+        levels_labels=labels,
+        do_plot=do_plot
+    )
+    widest_box = boxes[-1]
+    return widest_box, inj_params
+
 class PlotPosteriorCallback(Callback):
     def __init__(self, timestamp: str, obs_loader: DataLoader, input_idx_list: list, output_idx_list: list, round_idx: int , call_every_n_epochs=1): 
         self.epochs_elapsed = 0
@@ -142,17 +225,79 @@ class PlotPosteriorCallback(Callback):
                 in_param_idx = self.input_idx_list[i]
                 out_param_idx = self.output_idx_list[i]
 
-                # if pure 1D, skip (unchanged)
+                # Initialize widest_boxes dict if not present
+                if not hasattr(pl_module, 'widest_boxes'):
+                    pl_module.widest_boxes = {}
+                marginal_key = tuple(in_param_idx)
+
                 if len(in_param_idx) == 1:
-                    continue
+                    # Handle 1D marginals
+                    param_idx = in_param_idx[0]
+                    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+                    fig.suptitle(
+                        f"Round {self.round_idx} - Epoch {trainer.current_epoch} - {title_plot}",
+                        fontsize=10,
+                    )
+                    
+                    try:
+                        widest_interval, norm1d, grid, inj_params = get_widest_interval_1d(
+                            pl_module,
+                            self.obs_loader,
+                            in_param_idx=param_idx,
+                            out_param_idx=out_param_idx
+                        )
+                        
+                        # Plot
+                        ax.plot(grid.flatten(), norm1d, 'b-', linewidth=1.5)
+                        ax.axvline(inj_params[0], color='r', linestyle='--', label='Injection')
+                        ax.axvline(widest_interval[0], color='g', linestyle=':', label='99.7% CI')
+                        ax.axvline(widest_interval[1], color='g', linestyle=':')
+                        ax.fill_between(grid.flatten(), 0, norm1d, 
+                                       where=(grid.flatten() >= widest_interval[0]) & (grid.flatten() <= widest_interval[1]),
+                                       alpha=0.3, color='green')
+                        ax.set_xlabel(utils._ORDERED_PRIOR_KEYS[param_idx])
+                        ax.set_ylabel('Posterior density')
+                        ax.legend()
+                        
+                        # Store the widest interval
+                        pl_module.widest_boxes[marginal_key] = widest_interval
+                        
+                        out = os.path.join(ROOT_DIR, "plots", self.timestamp, 
+                                          f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{utils._ORDERED_PRIOR_KEYS[param_idx]}.pdf")
+                        fig.savefig(out, bbox_inches="tight")
+                    except Exception as e:
+                        print(f"Error plotting 1D marginal for {utils._ORDERED_PRIOR_KEYS[param_idx]}: {e}")
+                    finally:
+                        plt.close(fig)
 
-                fig, ax = plt.subplots(1, 1, figsize=(4, 4))
-                fig.tight_layout()
-                fig.suptitle(
-                    f"Round {self.round_idx} - Epoch {trainer.current_epoch} - {title_plot}",
-                    fontsize=10,
-                )
+                elif len(in_param_idx) == 2:
+                    # Handle 2D marginals
+                    fig, ax = plt.subplots(1, 1, figsize=(4, 4))
+                    fig.tight_layout()
+                    fig.suptitle(
+                        f"Round {self.round_idx} - Epoch {trainer.current_epoch} - {title_plot}",
+                        fontsize=10,
+                    )
 
+                    try:
+                        widest_box, inj_params = get_widest_box_2d(
+                            pl_module,
+                            self.obs_loader,
+                            in_param_idx=in_param_idx,
+                            out_param_idx=out_param_idx,
+                            ax_buffer=ax,
+                            do_plot=True
+                        )
+
+                        # Store widest_box keyed by the marginal (tuple of input parameter indices)
+                        pl_module.widest_boxes[marginal_key] = widest_box
+                        out = os.path.join(ROOT_DIR, "plots", self.timestamp,
+                                          f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]}.pdf")
+                        fig.savefig(out, bbox_inches="tight")
+                    except ValueError:
+                        print("caught ValueError during contour plotting, skipping this plot")
+                    finally:
+                        plt.close(fig)
                 logratios, inj_params, gx, gy = utils.get_logratios_grid_2d(
                     self.obs_loader,
                     pl_module,
@@ -237,6 +382,10 @@ class SequentialTrainer:
         self.train_conf = train_conf
         self.datagen_conf = datagen_conf
         self.dataset_obs_path = dataset_obs_path
+        
+        # Validate that no parameter index appears in multiple marginals
+        validate_marginals(train_conf["marginals"])
+        
         # Subset is there because utils.mbhb_collate_fn expects a Subset, it will access its dataset attribute
         self.dataset_observation = Subset(MBHBDataset(dataset_obs_path, cache_in_memory=True), indices=[0])
         #self.dataset_observation = Subset(MBHBDataset(dataset_obs_path, cache_in_memory=True),indices =[0])
@@ -251,17 +400,29 @@ class SequentialTrainer:
         if self.train_conf["baseline_model"]["use"]:
             self.model = InferenceNetwork.load_from_checkpoint(self.train_conf["baseline_model"]["filename"])
             
-            # update prior based on model performance for all 2D marginals
+            # update prior based on model performance for all marginals (1D and 2D)
             out_idx = 0
             for key, marginal_list in self.train_conf["marginals"].items():
                 for marginal in marginal_list:
-                    if len(marginal) == 2:
-                        widest_box = self._get_widest_box(self.model, self.dataloader_obs, 
-                                                          in_param_idx=tuple(marginal), out_param_idx=out_idx)
+                    if len(marginal) == 1:
+                        # 1D marginal
+                        widest_interval, _, _, _ = get_widest_interval_1d(
+                            self.model, self.dataloader_obs,
+                            in_param_idx=marginal[0], out_param_idx=out_idx
+                        )
+                        param_name = utils._ORDERED_PRIOR_KEYS[marginal[0]]
+                        self.datagen_conf["prior"][param_name] = widest_interval
+                        print(f"Updated prior based on baseline model for 1D marginal ({param_name})")
+                    elif len(marginal) == 2:
+                        # 2D marginal
+                        widest_box, _ = get_widest_box_2d(
+                            self.model, self.dataloader_obs, 
+                            in_param_idx=tuple(marginal), out_param_idx=out_idx
+                        )
                         inj1, inj2 = marginal
                         self.datagen_conf["prior"][utils._ORDERED_PRIOR_KEYS[inj1]] = [widest_box[0], widest_box[1]]
                         self.datagen_conf["prior"][utils._ORDERED_PRIOR_KEYS[inj2]] = [widest_box[2], widest_box[3]]
-                        print(f"Updated prior based on baseline model for marginal ({utils._ORDERED_PRIOR_KEYS[inj1]}, {utils._ORDERED_PRIOR_KEYS[inj2]})")
+                        print(f"Updated prior based on baseline model for 2D marginal ({utils._ORDERED_PRIOR_KEYS[inj1]}, {utils._ORDERED_PRIOR_KEYS[inj2]})")
                     out_idx += 1
             print(f"Updated prior after baseline model: {self.datagen_conf['prior']}")
     
@@ -448,20 +609,30 @@ class SequentialTrainer:
             out_idx = 0
             for key, marginal_list in self.train_conf["marginals"].items():
                 for marginal in marginal_list:
+                    marginal_key = tuple(marginal)
+                    
                     if len(marginal) == 1:
+                        # 1D marginal
                         inj_idx = marginal[0]
+                        param_name = utils._ORDERED_PRIOR_KEYS[inj_idx]
                         utils.pp_plot(self.test_dataloader, self.model, in_param_idx=inj_idx, name=f"round_{i}_{key}", out_param_idx=out_idx)
-                        # updated_prior = utils.update_bounds(
-                        #     self.model, self.dataloader_obs, updated_prior,
-                        #     in_param_idx=inj_idx, n_gridpoints=10000, out_param_idx=out_idx
-                        # )
+                        
+                        # Update prior bounds from widest_boxes
+                        if hasattr(self.model, 'widest_boxes') and marginal_key in self.model.widest_boxes:
+                            widest_interval = self.model.widest_boxes[marginal_key]
+                            tmp_prior = copy.deepcopy(self.datagen_conf["prior"])
+                            tmp_prior[param_name] = [widest_interval[0], widest_interval[1]]
+                            self.datagen_conf["prior"] = tmp_prior
+                        else:
+                            print(f"Warning: No widest_interval found for 1D marginal {marginal_key} ({param_name})")
+                            
                     elif len(marginal) == 2:
+                        # 2D marginal
                         inj1, inj2 = marginal
                         #utils.pp_plot_2d(self.test_dataloader, self.model, in_param_idx=marginal, out_idx=out_idx,
                         #           name=f"{ROOT_DIR}/plots/{TIME_OF_EXECUTION}/round_{i}_{utils._ORDERED_PRIOR_KEYS[inj1]}_{utils._ORDERED_PRIOR_KEYS[inj2]}")
             
                         # Get widest_box for this specific marginal from the dictionary
-                        marginal_key = tuple(marginal)
                         if hasattr(self.model, 'widest_boxes') and marginal_key in self.model.widest_boxes:
                             widest_box = self.model.widest_boxes[marginal_key]
                             tmp_prior = copy.deepcopy(self.datagen_conf["prior"])
@@ -469,7 +640,7 @@ class SequentialTrainer:
                             tmp_prior[utils._ORDERED_PRIOR_KEYS[inj2]] = [widest_box[2], widest_box[3]]
                             self.datagen_conf["prior"] = tmp_prior
                         else:
-                            print(f"Warning: No widest_box found for marginal {marginal_key}")
+                            print(f"Warning: No widest_box found for 2D marginal {marginal_key}")
                     out_idx += 1
 
             print(f"Updated prior after round {i}: {self.datagen_conf['prior']}")
