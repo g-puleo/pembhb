@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 torch.set_float32_matmul_precision("medium")
 def get_timestamp():
     return datetime.now().strftime("%Y%m%d")
-TIME_OF_EXECUTION = get_timestamp()+"withsky_v1"
+TIME_OF_EXECUTION = get_timestamp()+"fullsky_v0"
 
 class PlotPosteriorCallback(Callback):
     def __init__(self, timestamp: str, obs_loader: DataLoader, input_idx_list: list, output_idx_list: list, round_idx: int , call_every_n_epochs=1): 
@@ -71,8 +71,8 @@ class PlotPosteriorCallback(Callback):
                 )
 
                 ratios = np.exp(logratios)
-                dp1 = gx[1, 0] - gx[0, 0]
-                dp2 = gy[0, 1] - gy[0, 0]
+                dp1 = gx[0, 1] - gx[0, 0]  # param_0 spacing (x varies along columns with xy indexing)
+                dp2 = gy[1, 0] - gy[0, 0]  # param_1 spacing (y varies along rows with xy indexing)
                 norm2d = ratios / np.sum(ratios * dp1 * dp2, axis=(1, 2), keepdims=True)
 
                 # only 2D → ax is a single axis
@@ -156,8 +156,8 @@ class SequentialTrainer:
         )
 
         ratios = np.exp(logratios)
-        dp1 = gx[1, 0] - gx[0, 0]
-        dp2 = gy[0, 1] - gy[0, 0]
+        dp1 = gx[0, 1] - gx[0, 0]  # param_0 spacing (x varies along columns with xy indexing)
+        dp2 = gy[1, 0] - gy[0, 0]  # param_1 spacing (y varies along rows with xy indexing)
         norm2d = ratios / np.sum(ratios * dp1 * dp2)
         levels, labels = utils.contour_levels(norm2d)
         boxes = utils.posterior_contours_2d(gx, gy, norm2d[0],

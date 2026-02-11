@@ -850,14 +850,38 @@ def contour_levels(ratios, targets=(0.6827, 0.9545, 0.9973, 0.9999)):
     sorted_targets = np.array(targets)[np.argsort(thresh)]
     return sorted_levels, sorted_targets
 
-def contour_boxes(grid_x, grid_y, ratios, levels, ax=None):
+def contour_boxes(grid_x, grid_y, ratios, levels, ax=None, colors=None, linestyles=None, linewidths=None, alpha=None):
+    """
+    Compute contour boxes and optionally plot contours with custom styling.
+    
+    Parameters:
+    -----------
+    colors : str or list, optional
+        Color(s) for contour lines
+    linestyles : str or list, optional
+        Linestyle(s) for contour lines
+    linewidths : float or list, optional
+        Linewidth(s) for contour lines
+    alpha : float or list, optional
+        Alpha value(s) for contour lines
+    """
+    contour_kwargs = {}
+    if colors is not None:
+        contour_kwargs['colors'] = colors
+    if linestyles is not None:
+        contour_kwargs['linestyles'] = linestyles
+    if linewidths is not None:
+        contour_kwargs['linewidths'] = linewidths
+    if alpha is not None:
+        contour_kwargs['alpha'] = alpha
+    
     if ax:
         #print(f"using provided ax for contour boxes")
-        cs = ax.contour(grid_x, grid_y, ratios, levels=levels) 
+        cs = ax.contour(grid_x, grid_y, ratios, levels=levels, **contour_kwargs) 
     else:
         #print(f"creating new fig for contour boxes")
         fig, ax = plt.subplots()
-        cs = ax.contour(grid_x, grid_y, ratios, levels=levels)
+        cs = ax.contour(grid_x, grid_y, ratios, levels=levels, **contour_kwargs)
 
     boxes = []
     for lvl_segs in cs.allsegs:
@@ -868,7 +892,7 @@ def contour_boxes(grid_x, grid_y, ratios, levels, ax=None):
         plt.close(fig)
     return boxes, cs
 
-def posterior_contours_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, true_values: list, ax_buffer: plt.Axes, parameter_names: list, levels: np.array, levels_labels: list[str], title: str=None, do_plot=False, **plot_kwargs):
+def posterior_contours_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, true_values: list, ax_buffer: plt.Axes, parameter_names: list, levels: np.array, levels_labels: list[str], title: str=None, do_plot=False, show_colormap=True, contour_colors=None, contour_linestyles=None, contour_linewidths=None, contour_alpha=None, **plot_kwargs):
     """
     Find the bounding box of the contour levels specified in levels. 
 
@@ -892,25 +916,34 @@ def posterior_contours_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, 
     :type title: str, optional
     :param do_plot: if True, make also a plot of the contour on the axis defined by ax_buffer, defaults to False
     :type do_plot: bool, optional
+    :param show_colormap: if True (default), show pcolormesh and colorbar. Set to False for contour-only plots
+    :type show_colormap: bool, optional
+    :param contour_colors: color(s) for contour lines
+    :param contour_linestyles: linestyle(s) for contour lines
+    :param contour_linewidths: linewidth(s) for contour lines
+    :param contour_alpha: alpha value(s) for contour lines
     :return: the bounding box of the contour levels
     :rtype: tuple
     """
     if do_plot: 
-        # make a colormesh on the ax_buffer
-        c = ax_buffer.pcolormesh(grid_x, grid_y, ratios, shading='auto', cmap="inferno", **plot_kwargs)
+        # make a colormesh on the ax_buffer (optional, for debugging)
+        if show_colormap:
+            c = ax_buffer.pcolormesh(grid_x, grid_y, ratios, shading='auto', cmap="inferno", **plot_kwargs)
+        
         # add contour lines
-        # try:
-            # breakpoint()
-        boxes, cs = contour_boxes(grid_x, grid_y, ratios, levels, ax=ax_buffer)
+        boxes, cs = contour_boxes(grid_x, grid_y, ratios, levels, ax=ax_buffer,
+                                  colors=contour_colors, linestyles=contour_linestyles,
+                                  linewidths=contour_linewidths, alpha=contour_alpha)
         fmt = {lev: f"{p:.3f}" for lev, p in zip(levels, levels_labels)}
         ax_buffer.clabel(cs, fmt=fmt, fontsize=8)
-        # except Exception as e:
-        #     print(f"Error in contour_boxes: {e}")
-        #     boxes, cs = None, None
+        
         ax_buffer.axvline(x=true_values[0], color='r', linestyle='--', label='True Value')
         ax_buffer.axhline(y=true_values[1], color='r', linestyle='--')
-        fig = ax_buffer.get_figure()
-        cbar = fig.colorbar(c, ax=ax_buffer)
+        
+        if show_colormap:
+            fig = ax_buffer.get_figure()
+            cbar = fig.colorbar(c, ax=ax_buffer)
+        
         if title is not None:
             ax_buffer.set_title(title)
         ax_buffer.set_xlabel(parameter_names[0])
