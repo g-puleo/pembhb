@@ -811,17 +811,34 @@ class ReducedOrderModel:
         return
 
     @profile
-    def train(self, train_dataloader: torch.utils.data.DataLoader):
+    def train(self, train_dataloader: torch.utils.data.DataLoader, use_pinned_memory: bool = True, prefetch_batches: int = 1):
         """Train the reduced order model
 
         Args:
             train_dataloader (torch.utils.data.DataLoader): the training dataloader, that has the training Subset as attribute
+            use_pinned_memory (bool): If True, uses pinned memory + non-blocking transfers (low GPU memory, fast).
+                                      If False, moves entire dataset to GPU (high GPU memory, fastest).
+            prefetch_batches (int): Number of DataLoader batches to concatenate before processing.
+                                    Larger values reduce Python overhead but use more memory.
         """
         print(f"[ROM] training with tolerance={self.tolerance:.1e} on device={self.device}")
         train_subset = train_dataloader.dataset
         if not isinstance(train_dataloader.dataset, torch.utils.data.Subset):
             raise ValueError("[ROM] train_dataloader.dataset must be a torch.utils.data.Subset")
-        train_subset.dataset.to(self.device) # move the (full) dataset to the right device.
+        
+        self._use_pinned_memory = use_pinned_memory
+        self._prefetch_batches = max(1, int(prefetch_batches))
+        if use_pinned_memory:
+            # Keep data on CPU, use pinned memory for fast async transfers
+            print("[ROM] Using pinned memory mode (low GPU memory usage)")
+            # Ensure dataset is on CPU and tensors are pinned
+            if hasattr(train_subset.dataset, 'cache_in_memory') and train_subset.dataset.cache_in_memory:
+                self._pin_dataset_tensors(train_subset.dataset)
+        else:
+            # Original behavior: move entire dataset to GPU
+            print("[ROM] Moving entire dataset to GPU (high memory usage)")
+            train_subset.dataset.to(self.device)
+        
         self.n_freq = train_subset[0]['wave_fd'].shape[1]
         self.n_channels = train_subset[0]['wave_fd'].shape[0]
         self.global_scale_factor, self.mean_vec = self._compute_global_scale(train_dataloader)
@@ -838,7 +855,8 @@ class ReducedOrderModel:
         seed = torch.randint(0, n, (1,)).item()
                 
 
-        first = self._normalize(train_subset[seed]['wave_fd'].unsqueeze(0).to(self.device)).squeeze(0)
+        first_data = self._to_device_async(train_subset[seed]['wave_fd'].unsqueeze(0))
+        first = self._normalize(first_data).squeeze(0)
         first = first / first.norm()
         self.basis = first.unsqueeze(0)
         self.basis_indices = [seed]
@@ -880,7 +898,9 @@ class ReducedOrderModel:
             sigma_last_data = torch.tensor(float("inf"), device=self.device)
             while sigma > self.tolerance:
                 self.epoch += 1 # epoch 1 --> N_basis = 1
-                sigma, idx , sigma_unnorm, sigma_data, idx_data = self._max_residual_index(train_dataloader, picked_set)
+                sigma, idx , sigma_unnorm, sigma_data, idx_data = self._max_residual_index(
+                    train_dataloader, picked_set, prefetch_batches=self._prefetch_batches
+                )
                 if sigma_data >= sigma_last_data: 
                     print(f"\ntraining stopped early at iteration {self.epoch} because sigma did not decrease (sigma={sigma_data:.3e}, last sigma={sigma_last_data:.3e})")
                     break
@@ -894,7 +914,8 @@ class ReducedOrderModel:
                 sigmas.append(sigma)
                 sigmas_unnorm.append(sigma_unnorm)
                 sigmas_data.append(sigma_data)
-                v = self._normalize(train_subset[idx]['wave_fd'].unsqueeze(0)).squeeze(0)
+                v_data = self._to_device_async(train_subset[idx]['wave_fd'].unsqueeze(0))
+                v = self._normalize(v_data).squeeze(0)
                 v = self._gram_schmidt_reorthogonalize(v)
                 self.basis = torch.cat([self.basis, v.unsqueeze(0)], dim=0)
                 elapsed = time.time() - t0
@@ -922,7 +943,7 @@ class ReducedOrderModel:
         return proj
 
     @profile
-    def _max_residual_index(self, train_dataloader, picked_set):
+    def _max_residual_index(self, train_dataloader, picked_set, prefetch_batches: int = 1):
         max_seen = -1.0
         max_seen_unnorm = -1.0
         max_seen_data = -1.0
@@ -931,12 +952,31 @@ class ReducedOrderModel:
         seen_points = 0
         max_relerr_re = 0
         max_relerr_im = 0
-        for idx, batch in enumerate(train_dataloader):
+        dataloader_iter = iter(train_dataloader)
+        batch_group_idx = 0
+        while True:
+            batches = []
+            for _ in range(prefetch_batches):
+                try:
+                    batches.append(next(dataloader_iter))
+                except StopIteration:
+                    break
+            if not batches:
+                break
+
+            if len(batches) == 1:
+                batch = batches[0]
+            else:
+                keys = batches[0].keys()
+                batch = {k: torch.cat([b[k] for b in batches], dim=0) for k in keys}
+
             bsize = batch['wave_fd'].shape[0]
             
-            original_wave_batch = batch['wave_fd'].reshape(bsize, -1).to(self.device)
+            # Use async transfer for better overlap with computation
+            wave_fd_gpu = self._to_device_async(batch['wave_fd'])
+            original_wave_batch = wave_fd_gpu.reshape(bsize, -1)
             # centered and scaled waveforms
-            wave_fd_batch = self._normalize(batch['wave_fd'].to(self.device))  # shape (B_size, N_dim)
+            wave_fd_batch = self._normalize(wave_fd_gpu)  # shape (B_size, N_dim)
             # project onto basis (aka : compute coefficients and then reconstruct)
             proj = self._project_batch(wave_fd_batch)
             # back to original space
@@ -958,12 +998,13 @@ class ReducedOrderModel:
             norms_unnorm = (r_unnorm.abs() ** 2).sum(dim=1)
 
 
-            original_data_batch = (batch['wave_fd'] + batch['noise_fd']).reshape(bsize, -1).to(self.device)
+            noise_fd_gpu = self._to_device_async(batch['noise_fd'])
+            original_data_batch = (wave_fd_gpu + noise_fd_gpu).reshape(bsize, -1)
             normalised_data_batch = self._normalize(original_data_batch)
             data_proj = self._project_batch(normalised_data_batch)
             #data_reconstruction_original_space = self._denormalize(data_proj)
             norms_residual_data = ((wave_fd_batch - data_proj).abs() ** 2).sum(dim=1)
-            if self.debugging and idx == 0 and self.epoch <= 10:
+            if self.debugging and batch_group_idx == 0 and self.epoch <= 10:
                 # plot the residuals as function of frequency
                 for jj in range(min(3, bsize)):
                     plt.figure(figsize=(12,6))
@@ -991,7 +1032,7 @@ class ReducedOrderModel:
                     plt.xscale("log")
                     plt.yscale("log")
                     plt.legend()
-                    plt.savefig(os.path.join(self.plot_dir_debug, f"residuals_epoch{self.epoch}_batch{idx}_event{jj}.png"))
+                    plt.savefig(os.path.join(self.plot_dir_debug, f"residuals_epoch{self.epoch}_batch{batch_group_idx}_event{jj}.png"))
 
                     plt.close()
 
@@ -1018,7 +1059,7 @@ class ReducedOrderModel:
                     plt.yscale("log")
                     plt.title("Channel 2")
                     plt.legend()
-                    plt.savefig(os.path.join(self.plot_dir_debug, f"{self.epoch}_batch{idx}_event{jj}.png"))
+                    plt.savefig(os.path.join(self.plot_dir_debug, f"{self.epoch}_batch{batch_group_idx}_event{jj}.png"))
                     plt.close()
             # mask picked dataset indices
             batch_ids = torch.arange(bsize) + seen_points
@@ -1030,6 +1071,7 @@ class ReducedOrderModel:
 
             if not mask.any():
                 seen_points += bsize
+                batch_group_idx += 1
                 continue 
             masked_norms = norms.clone()
             # set already picked indices to -1 so they are ignored in max search
@@ -1046,16 +1088,33 @@ class ReducedOrderModel:
                 max_seen_data = current_max_data.item()
                 max_index_data = (current_idx_data + seen_points).item()
             seen_points += bsize
+            batch_group_idx += 1
 
         self.training_diagnostics["max_pointwise_relerrors_real"].append(max_relerr_re)
         self.training_diagnostics["max_pointwise_relerrors_imag"].append(max_relerr_im)
         return max_seen, max_index, max_seen_unnorm, max_seen_data, max_index_data
     
+    def _pin_dataset_tensors(self, dataset):
+        """Pin dataset tensors in CPU memory for faster GPU transfers."""
+        for k in ["wave_fd", "wave_td", "source_parameters", "noise_fd", "noise_td"]:
+            if hasattr(dataset, k):
+                tensor = getattr(dataset, k)
+                if tensor is not None and not tensor.is_pinned():
+                    setattr(dataset, k, tensor.pin_memory())
+        print("[ROM] Dataset tensors pinned to memory")
+
+    def _to_device_async(self, tensor):
+        """Move tensor to device with non-blocking transfer if using pinned memory."""
+        if self._use_pinned_memory:
+            return tensor.to(self.device, non_blocking=True)
+        else:
+            return tensor.to(self.device)
+
     def _compute_global_scale(self, dataloader):
         max_val = 0.0
         mean_vec = torch.zeros(self.n_channels * self.n_freq, device=self.device)
         for batch in dataloader:
-            v = batch['wave_fd'].to(self.device)
+            v = self._to_device_async(batch['wave_fd'])
             max_val = max(max_val, v.abs().max().item())
             mean_vec = mean_vec + v.reshape(v.shape[0], -1).sum(dim=0)
         mean_vec = mean_vec / len(dataloader.dataset)

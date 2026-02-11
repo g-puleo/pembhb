@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 torch.set_float32_matmul_precision("medium")
 def get_timestamp():
     return datetime.now().strftime("%Y%m%d")
-TIME_OF_EXECUTION = get_timestamp()+"fullsky_v0"
+TIME_OF_EXECUTION = get_timestamp()+"fullsky_narrowmc_v0"
 
 class PlotPosteriorCallback(Callback):
     def __init__(self, timestamp: str, obs_loader: DataLoader, input_idx_list: list, output_idx_list: list, round_idx: int , call_every_n_epochs=1): 
@@ -36,6 +36,97 @@ class PlotPosteriorCallback(Callback):
         self.n_marginals = len(input_idx_list)
         self.init_time = datetime.now()
         self.round_idx = round_idx
+        # Storage for volume ratio diagnostics
+        self.volume_ratios = {}
+    
+    def _compute_posterior_volume_2d(self, widest_box):
+        """
+        Compute the area/volume of the posterior from the widest contour box.
+        
+        Parameters:
+        -----------
+        widest_box : tuple
+            The bounding box of the 99.99% contour.
+            Currently: (x_min, x_max, y_min, y_max) for axis-aligned boxes.
+            
+        Returns:
+        --------
+        float
+            Area enclosed by the posterior contour.
+            
+        Notes:
+        ------
+        FUTURE EXTENSION FOR TILTED BOXES:
+        - If posterior contours become non-axis-aligned, widest_box format may change
+          to a list of vertices [(x1,y1), (x2,y2), ...]
+        - In that case, use Shoelace formula or similar for polygon area:
+          area = 0.5 * abs(sum(x[i]*y[i+1] - x[i+1]*y[i] for i in range(n)))
+        - Consider using shapely.geometry.Polygon for robust area calculation
+        """
+        # Current implementation: axis-aligned box
+        # widest_box = (x_min, x_max, y_min, y_max)
+        posterior_area = (widest_box[1] - widest_box[0]) * (widest_box[3] - widest_box[2])
+        return posterior_area
+    
+    def _compute_prior_volume_2d(self, pl_module, in_param_idx):
+        """
+        Compute the area/volume of the prior for a 2D marginal.
+        
+        Parameters:
+        -----------
+        pl_module : LightningModule
+            The model containing prior information in hparams.
+        in_param_idx : tuple
+            Indices of the two parameters defining the 2D marginal.
+            
+        Returns:
+        --------
+        float
+            Area of the prior region.
+            
+        Notes:
+        ------
+        **MODIFY THIS METHOD WHEN SWITCHING TO TILTED BOUNDING BOXES**
+        
+        Current implementation assumes axis-aligned rectangular priors.
+        Prior bounds are stored as:
+            prior_dict[param_name] = [min_value, max_value]
+        
+        For tilted/rotated bounding boxes:
+        1. Prior specification will change (e.g., vertices, rotation matrix, etc.)
+        2. Access prior from: pl_module.hparams["dataset_info"]["conf"]["prior"]
+        3. Compute area based on new representation:
+           - If vertices: use Shoelace formula or shapely.geometry.Polygon
+           - If rotation + bounds: compute area of rotated rectangle
+           - Example with vertices:
+             ```python
+             vertices = prior_dict[marginal_key]  # [(x1,y1), (x2,y2), ...]
+             from shapely.geometry import Polygon
+             prior_area = Polygon(vertices).area
+             ```
+        4. Ensure consistency with sampler_init_kwargs format in sampler.py
+        
+        Potential issues to address:
+        - Normalization: If grid evaluation doesn't align with tilted prior,
+          posterior normalization may be affected
+        - Grid coverage: Axis-aligned grids may inefficiently cover tilted regions
+        - Coordinate transforms: May need to transform between rotated and
+          canonical coordinate systems
+        """
+        # Current implementation: axis-aligned rectangular prior
+        prior_dict = pl_module.hparams["dataset_info"]["conf"]["prior"]
+        
+        # Get bounds for each parameter
+        param_name_0 = utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]
+        param_name_1 = utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]
+        
+        prior_bounds_0 = prior_dict[param_name_0]
+        prior_bounds_1 = prior_dict[param_name_1]
+        
+        # Compute area as product of widths
+        prior_area = (prior_bounds_0[1] - prior_bounds_0[0]) * (prior_bounds_1[1] - prior_bounds_1[0])
+        
+        return prior_area
     def on_validation_epoch_end(self, trainer, pl_module):
         if self.epochs_elapsed == 0: 
             os.makedirs(os.path.join(ROOT_DIR, "plots", TIME_OF_EXECUTION), exist_ok=True)
@@ -100,6 +191,34 @@ class PlotPosteriorCallback(Callback):
                         pl_module.widest_boxes = {}
                     marginal_key = tuple(in_param_idx)
                     pl_module.widest_boxes[marginal_key] = boxes[0]
+                    
+                    # Compute posterior-to-prior volume ratio using modular methods
+                    # boxes[0] is the widest box (99.99% contour)
+                    posterior_area = self._compute_posterior_volume_2d(boxes[0])
+                    prior_area = self._compute_prior_volume_2d(pl_module, in_param_idx)
+                    volume_ratio = posterior_area / prior_area
+                    
+                    # Store and log the volume ratio
+                    if marginal_key not in self.volume_ratios:
+                        self.volume_ratios[marginal_key] = []
+                    self.volume_ratios[marginal_key].append({
+                        'epoch': trainer.current_epoch,
+                        'ratio': volume_ratio,
+                        'posterior_area': posterior_area,
+                        'prior_area': prior_area
+                    })
+                    
+                    # Log metric to tensorboard if logger exists
+                    if trainer.logger is not None:
+                        metric_name = f"volume_ratio/{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]}"
+                        trainer.logger.log_metrics({metric_name: volume_ratio}, step=trainer.current_epoch)
+                    
+                    # Print diagnostic
+                    param_names = f"{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}-{utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]}"
+                    print(f"Round {self.round_idx}, Epoch {trainer.current_epoch}, {param_names}: "
+                          f"Volume ratio (posterior/prior) = {volume_ratio:.6f} "
+                          f"(posterior area: {posterior_area:.6e}, prior area: {prior_area:.6e})")
+                    
                     out = os.path.join( ROOT_DIR,"plots",self.timestamp,f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]}.pdf")
                     fig.savefig(out, bbox_inches="tight")
                     plt.close(fig)
@@ -209,7 +328,10 @@ class SequentialTrainer:
         rom = ReducedOrderModel(tolerance=1e-9, device="cuda", batch_size=5000)
         filename = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION, f"rom_round_{round_idx}.pt")
         if not os.path.exists(filename):
-            rom.train(self.data_module.train_dataloader(num_workers=0))
+            # Use pinned memory mode for low GPU memory usage
+            train_dl = self.data_module.train_dataloader(num_workers=0, pin_memory=True)
+            prefetch_batches = self.train_conf.get("rom_prefetch_batches", 1)
+            rom.train(train_dl, use_pinned_memory=True, prefetch_batches=prefetch_batches)
             rom.to_file(filename)
         else: 
             # existing ROM file found: ask whether to retrain or reuse
@@ -220,7 +342,9 @@ class SequentialTrainer:
                 # non-interactive environment, default to not retrain
                 resp = "n"
             if resp in ("y", "yes"):
-                rom.train(self.data_module.train_dataloader(num_workers=0))
+                train_dl = self.data_module.train_dataloader(num_workers=0, pin_memory=True)
+                prefetch_batches = self.train_conf.get("rom_prefetch_batches", 1)
+                rom.train(train_dl, use_pinned_memory=True, prefetch_batches=prefetch_batches)
                 rom.to_file(filename)
                 print(f"Retrained ROM and saved to {filename}")
             else:
