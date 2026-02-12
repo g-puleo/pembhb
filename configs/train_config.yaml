@@ -12,7 +12,7 @@ scheduler_patience: 10
 keep_ckpt: True
 marginals: 
   #  f: [[0]]
-  f: [[0,1],[7,8]]
+  f: [[0,1],[7,8], [10]]
 
 
 device: "cuda"
@@ -50,3 +50,7 @@ baseline_model:
   use: False
   #filename: "/data/gpuleo/mbhb/logs/20251205_100028_round_0/version_0/checkpoints/epoch=474-step=133000.ckpt"
   filename: "/data/gpuleo/mbhb/logs/20260205withsky_v1_round_0/version_7/checkpoints/epoch=475-step=66640.ckpt"
+
+
+rom_use_pinned_memory: false  # Only set true for single-session usage
+rom_prefetch_batches: 4       # Increase to reduce Python overhead

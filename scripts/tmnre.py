@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 torch.set_float32_matmul_precision("medium")
 def get_timestamp():
     return datetime.now().strftime("%Y%m%d")
-TIME_OF_EXECUTION = get_timestamp()+"fullsky_narrowmc_v0"
+TIME_OF_EXECUTION = get_timestamp()+"fullsky_narrowmc_tc_v0"
 
 def validate_marginals(marginals_config: dict):
     """Validate that no parameter index appears in multiple marginals.
@@ -105,7 +105,7 @@ def get_widest_box_2d(model, dataloader, in_param_idx, out_param_idx, ax_buffer=
         levels_labels=labels,
         do_plot=do_plot
     )
-    widest_box = boxes[-1]
+    widest_box = boxes[0]
     return widest_box, inj_params
 
 class PlotPosteriorCallback(Callback):
@@ -210,6 +210,42 @@ class PlotPosteriorCallback(Callback):
         prior_area = (prior_bounds_0[1] - prior_bounds_0[0]) * (prior_bounds_1[1] - prior_bounds_1[0])
         
         return prior_area
+
+    def _compute_posterior_volume_1d(self, widest_interval):
+        """Compute the width of the posterior credible interval for a 1D marginal.
+        
+        Parameters:
+        -----------
+        widest_interval : list
+            [low, high] bounds of the credible interval.
+            
+        Returns:
+        --------
+        float
+            Width of the posterior interval.
+        """
+        return widest_interval[1] - widest_interval[0]
+    
+    def _compute_prior_volume_1d(self, pl_module, in_param_idx):
+        """Compute the width of the prior for a 1D marginal.
+        
+        Parameters:
+        -----------
+        pl_module : LightningModule
+            The model containing prior information in hparams.
+        in_param_idx : int
+            Index of the parameter.
+            
+        Returns:
+        --------
+        float
+            Width of the prior range.
+        """
+        prior_dict = pl_module.hparams["dataset_info"]["conf"]["prior"]
+        param_name = utils._ORDERED_PRIOR_KEYS[in_param_idx]
+        prior_bounds = prior_dict[param_name]
+        return prior_bounds[1] - prior_bounds[0]
+
     def on_validation_epoch_end(self, trainer, pl_module):
         if self.epochs_elapsed == 0: 
             os.makedirs(os.path.join(ROOT_DIR, "plots", TIME_OF_EXECUTION), exist_ok=True)
@@ -262,6 +298,32 @@ class PlotPosteriorCallback(Callback):
                         # Store the widest interval
                         pl_module.widest_boxes[marginal_key] = widest_interval
                         
+                        # Compute posterior-to-prior volume (width) ratio for 1D marginal
+                        posterior_width = self._compute_posterior_volume_1d(widest_interval)
+                        prior_width = self._compute_prior_volume_1d(pl_module, param_idx)
+                        volume_ratio = posterior_width / prior_width
+                        
+                        # Store and log the volume ratio
+                        if marginal_key not in self.volume_ratios:
+                            self.volume_ratios[marginal_key] = []
+                        self.volume_ratios[marginal_key].append({
+                            'epoch': trainer.current_epoch,
+                            'ratio': volume_ratio,
+                            'posterior_width': posterior_width,
+                            'prior_width': prior_width
+                        })
+                        
+                        # Log metric to tensorboard if logger exists
+                        if trainer.logger is not None:
+                            metric_name = f"volume_ratio/{utils._ORDERED_PRIOR_KEYS[param_idx]}"
+                            trainer.logger.log_metrics({metric_name: volume_ratio}, step=trainer.current_epoch)
+                        
+                        # Print diagnostic
+                        param_name = utils._ORDERED_PRIOR_KEYS[param_idx]
+                        print(f"Round {self.round_idx}, Epoch {trainer.current_epoch}, {param_name}: "
+                              f"Volume ratio (posterior/prior) = {volume_ratio:.6f} "
+                              f"(posterior width: {posterior_width:.6e}, prior width: {prior_width:.6e})")
+                        
                         out = os.path.join(ROOT_DIR, "plots", self.timestamp, 
                                           f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{utils._ORDERED_PRIOR_KEYS[param_idx]}.pdf")
                         fig.savefig(out, bbox_inches="tight")
@@ -291,88 +353,40 @@ class PlotPosteriorCallback(Callback):
 
                         # Store widest_box keyed by the marginal (tuple of input parameter indices)
                         pl_module.widest_boxes[marginal_key] = widest_box
+                        
+                        # Compute posterior-to-prior volume ratio for 2D marginal
+                        posterior_area = self._compute_posterior_volume_2d(widest_box)
+                        prior_area = self._compute_prior_volume_2d(pl_module, in_param_idx)
+                        volume_ratio = posterior_area / prior_area
+                        
+                        # Store and log the volume ratio
+                        if marginal_key not in self.volume_ratios:
+                            self.volume_ratios[marginal_key] = []
+                        self.volume_ratios[marginal_key].append({
+                            'epoch': trainer.current_epoch,
+                            'ratio': volume_ratio,
+                            'posterior_area': posterior_area,
+                            'prior_area': prior_area
+                        })
+                        
+                        # Log metric to tensorboard if logger exists
+                        if trainer.logger is not None:
+                            metric_name = f"volume_ratio/{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]}"
+                            trainer.logger.log_metrics({metric_name: volume_ratio}, step=trainer.current_epoch)
+                        
+                        # Print diagnostic
+                        param_names = f"{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}-{utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]}"
+                        print(f"Round {self.round_idx}, Epoch {trainer.current_epoch}, {param_names}: "
+                              f"Volume ratio (posterior/prior) = {volume_ratio:.6f} "
+                              f"(posterior area: {posterior_area:.6e}, prior area: {prior_area:.6e})")
+                        
                         out = os.path.join(ROOT_DIR, "plots", self.timestamp,
                                           f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]}.pdf")
                         fig.savefig(out, bbox_inches="tight")
-                    except ValueError:
-                        print("caught ValueError during contour plotting, skipping this plot")
+                    except ValueError as ve:
+                        print(f"caught ValueError: {ve} during contour plotting, skipping this plot")
                     finally:
                         plt.close(fig)
-                logratios, inj_params, gx, gy = utils.get_logratios_grid_2d(
-                    self.obs_loader,
-                    pl_module,
-                    ngrid_points=500,
-                    in_param_idx=in_param_idx,
-                    out_param_idx=out_param_idx
-                )
-
-                ratios = np.exp(logratios)
-                dp1 = gx[0, 1] - gx[0, 0]  # param_0 spacing (x varies along columns with xy indexing)
-                dp2 = gy[1, 0] - gy[0, 0]  # param_1 spacing (y varies along rows with xy indexing)
-                norm2d = ratios / np.sum(ratios * dp1 * dp2, axis=(1, 2), keepdims=True)
-
-                # only 2D → ax is a single axis
-                ax_2d = ax
-                levels, labels = utils.contour_levels(norm2d)
-                # find the levels corresponding to 68%, 95%, 99.7, %
-                try: 
-                    boxes = utils.posterior_contours_2d(
-                        gx,
-                        gy,
-                        norm2d[0],
-                        inj_params[0],
-                        ax_buffer=ax_2d,
-                        parameter_names=[
-                            utils._ORDERED_PRIOR_KEYS[in_param_idx[0]],
-                            utils._ORDERED_PRIOR_KEYS[in_param_idx[1]],
-                        ],
-                        title="",
-                        levels=levels,
-                        levels_labels=labels,
-                        do_plot=True
-                    )
-                    # Store widest_box keyed by the marginal (tuple of input parameter indices)
-                    if not hasattr(pl_module, 'widest_boxes'):
-                        pl_module.widest_boxes = {}
-                    marginal_key = tuple(in_param_idx)
-                    pl_module.widest_boxes[marginal_key] = boxes[0]
-                    
-                    # Compute posterior-to-prior volume ratio using modular methods
-                    # boxes[0] is the widest box (99.99% contour)
-                    posterior_area = self._compute_posterior_volume_2d(boxes[0])
-                    prior_area = self._compute_prior_volume_2d(pl_module, in_param_idx)
-                    volume_ratio = posterior_area / prior_area
-                    
-                    # Store and log the volume ratio
-                    if marginal_key not in self.volume_ratios:
-                        self.volume_ratios[marginal_key] = []
-                    self.volume_ratios[marginal_key].append({
-                        'epoch': trainer.current_epoch,
-                        'ratio': volume_ratio,
-                        'posterior_area': posterior_area,
-                        'prior_area': prior_area
-                    })
-                    
-                    # Log metric to tensorboard if logger exists
-                    if trainer.logger is not None:
-                        metric_name = f"volume_ratio/{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]}"
-                        trainer.logger.log_metrics({metric_name: volume_ratio}, step=trainer.current_epoch)
-                    
-                    # Print diagnostic
-                    param_names = f"{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}-{utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]}"
-                    print(f"Round {self.round_idx}, Epoch {trainer.current_epoch}, {param_names}: "
-                          f"Volume ratio (posterior/prior) = {volume_ratio:.6f} "
-                          f"(posterior area: {posterior_area:.6e}, prior area: {prior_area:.6e})")
-                    
-                    out = os.path.join( ROOT_DIR,"plots",self.timestamp,f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]}.pdf")
-                    fig.savefig(out, bbox_inches="tight")
-                    plt.close(fig)
-
-                except ValueError as ve: 
-                    print(f"caught ValueError: {ve} during contour plotting, skipping this plot")
-                    continue
-
-            #print("done plotting posteriors")
 
     def on_train_end(self, trainer, pl_module):
         self.on_validation_epoch_end(trainer, pl_module)
@@ -426,26 +440,6 @@ class SequentialTrainer:
                     out_idx += 1
             print(f"Updated prior after baseline model: {self.datagen_conf['prior']}")
     
-    def _get_widest_box(self, model, dataloader, in_param_idx, out_param_idx):
-        logratios, inj_params, gx, gy = utils.get_logratios_grid_2d(
-            dataloader,
-            model,
-            ngrid_points=100,
-            in_param_idx=in_param_idx,
-            out_param_idx=out_param_idx,
-        )
-
-        ratios = np.exp(logratios)
-        dp1 = gx[0, 1] - gx[0, 0]  # param_0 spacing (x varies along columns with xy indexing)
-        dp2 = gy[1, 0] - gy[0, 0]  # param_1 spacing (y varies along rows with xy indexing)
-        norm2d = ratios / np.sum(ratios * dp1 * dp2)
-        levels, labels = utils.contour_levels(norm2d)
-        boxes = utils.posterior_contours_2d(gx, gy, norm2d[0],
-                                            inj_params[0], ax_buffer=None, parameter_names=[utils._ORDERED_PRIOR_KEYS[in_param_idx[0]], utils._ORDERED_PRIOR_KEYS[in_param_idx[1]]],
-                                            levels=levels, levels_labels=labels)
-        widest_box = boxes[0]
-        return widest_box
-    
     def _setup_plot(self):
         self.fig, self.axes = plt.subplots(1, 2, figsize=(12, 6))
         for ax, title, ylabel in zip(
@@ -480,7 +474,7 @@ class SequentialTrainer:
                 print(f"Using existing dataset at {fname_h5}")
         self.data_fname_yaml = fname_h5.replace(".h5", ".yaml")
         self.datagen_info = utils.read_config(self.data_fname_yaml)
-        self.data_module = MBHBDataModule(fname_h5, train_config["batch_size"], cache_in_memory=True, noise_factor=self.train_conf["noise_factor"])
+        self.data_module = MBHBDataModule(fname_h5, train_config["batch_size"], num_workers=4, cache_in_memory=True, noise_factor=self.train_conf["noise_factor"])
         self.data_module.setup(stage="fit")
         self.test_dataloader = self.data_module.test_dataloader()
 
@@ -488,11 +482,14 @@ class SequentialTrainer:
         print("Training ROM...")
         rom = ReducedOrderModel(tolerance=1e-9, device="cuda", batch_size=5000)
         filename = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION, f"rom_round_{round_idx}.pt")
+        
+        # Get ROM training options from config (defaults optimize for multi-session usage)
+        use_pinned_memory = self.train_conf.get("rom_use_pinned_memory", False)
+        prefetch_batches = self.train_conf.get("rom_prefetch_batches", 1)
+        
         if not os.path.exists(filename):
-            # Use pinned memory mode for low GPU memory usage
-            train_dl = self.data_module.train_dataloader(num_workers=0, pin_memory=True)
-            prefetch_batches = self.train_conf.get("rom_prefetch_batches", 1)
-            rom.train(train_dl, use_pinned_memory=True, prefetch_batches=prefetch_batches)
+            train_dl = self.data_module.train_dataloader(num_workers=0, pin_memory=use_pinned_memory)
+            rom.train(train_dl, use_pinned_memory=use_pinned_memory, prefetch_batches=prefetch_batches)
             rom.to_file(filename)
         else: 
             # existing ROM file found: ask whether to retrain or reuse
@@ -503,16 +500,17 @@ class SequentialTrainer:
                 # non-interactive environment, default to not retrain
                 resp = "n"
             if resp in ("y", "yes"):
-                train_dl = self.data_module.train_dataloader(num_workers=0, pin_memory=True)
-                prefetch_batches = self.train_conf.get("rom_prefetch_batches", 1)
-                rom.train(train_dl, use_pinned_memory=True, prefetch_batches=prefetch_batches)
+                train_dl = self.data_module.train_dataloader(num_workers=0, pin_memory=use_pinned_memory)
+                rom.train(train_dl, use_pinned_memory=use_pinned_memory, prefetch_batches=prefetch_batches)
                 rom.to_file(filename)
                 print(f"Retrained ROM and saved to {filename}")
             else:
                 print(f"Using existing ROM at {filename}")
 
         self.data_summary = ROMWrapper(filename=filename, device=self.train_conf["device"])
-        self.data_module.full_dataset.to("cpu") # go back to loading from cpu
+        
+        # Free cached data and switch to disk-based loading to reduce memory
+        self.data_module.full_dataset.clear_cache()
 
     def _train_inference_network ( self, round_idx, data_summary=None) :
         #  initialise data summarizer (ROM) 

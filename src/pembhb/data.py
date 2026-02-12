@@ -72,12 +72,21 @@ class MBHBDataset(Dataset):
         else: 
             print("Dataset not cached in memory; cannot move to device.")
             return
-    # def clear_cache(self): 
-    #     if self.cache_in_memory:
-    #         del self.wave_fd, self.wave_td, self.source_parameters, self.noise_fd, self.noise_td
-    #         gc.collect()
-    #         torch.cuda.empty_cache()
-    #     else: 
+
+    def clear_cache(self): 
+        """Free cached tensors and switch to disk-based loading."""
+        if self.cache_in_memory:
+            for k in ["wave_fd", "wave_td", "source_parameters", "noise_fd", "noise_td"]:
+                if hasattr(self, k) and getattr(self, k) is not None:
+                    delattr(self, k)
+            self.wave_fd = self.wave_td = self.source_parameters = self.noise_fd = self.noise_td = None
+            self.cache_in_memory = False
+            self._load = self._load_from_disk
+            gc.collect()
+            torch.cuda.empty_cache()
+            print("[Dataset] Cache cleared, switched to disk-based loading.")
+        else: 
+            print("[Dataset] Not cached in memory; nothing to clear.")
     #         print("Dataset not cached in memory; nothing to clear.")
     #         return
     #     self.cache_in_memory = False
