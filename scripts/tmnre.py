@@ -2,6 +2,7 @@ import os, shutil
 import torch
 from pembhb.simulator import MBHBSimulatorFD_TD, DummySimulator
 from pembhb.model import InferenceNetwork, PeregrineModel, ReducedOrderModel, ROMWrapper
+from pembhb.autoencoder import DenoisingAutoencoder, AutoencoderWrapper
 from pembhb.data import MBHBDataModule, MBHBDataset, mbhb_collate_fn
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch import Trainer
@@ -23,7 +24,7 @@ import matplotlib.pyplot as plt
 torch.set_float32_matmul_precision("medium")
 def get_timestamp():
     return datetime.now().strftime("%Y%m%d")
-TIME_OF_EXECUTION = get_timestamp()+"fullsky_narrowmc_tc_v0"
+TIME_OF_EXECUTION = get_timestamp()+"autoenc_fullsky_narrowmc_tc_v0"
 
 def validate_marginals(marginals_config: dict):
     """Validate that no parameter index appears in multiple marginals.
@@ -512,6 +513,34 @@ class SequentialTrainer:
         # Free cached data and switch to disk-based loading to reduce memory
         self.data_module.full_dataset.clear_cache()
 
+    def _load_autoencoder(self, round_idx):
+        """Load a trained autoencoder from checkpoint and wrap it for use as data_summary."""
+        print("Loading trained Autoencoder...")
+        ae_config = self.train_conf["architecture"]["data_summary"]["Autoencoder"]
+        ckpt_path = ae_config["filename"]
+        device = ae_config.get("device", self.train_conf["device"])
+        
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(
+                f"Autoencoder checkpoint not found at {ckpt_path}. "
+                "Please train an autoencoder first using scripts/train_autoencoder.py"
+            )
+        
+        # Load the trained autoencoder
+        autoencoder = DenoisingAutoencoder.load_from_checkpoint(ckpt_path)
+        autoencoder.to(device)
+        autoencoder.eval()
+        
+        # Wrap it for use as data_summarizer
+        self.data_summary = AutoencoderWrapper(autoencoder, freeze=True)
+        self.data_summary.to(device)
+        
+        print(f"Loaded autoencoder from {ckpt_path}")
+        print(f"Bottleneck dimensionality: {self.data_summary.get_n_features()}")
+        
+        # Free cached data and switch to disk-based loading to reduce memory
+        self.data_module.full_dataset.clear_cache()
+
     def _train_inference_network ( self, round_idx, data_summary=None) :
         #  initialise data summarizer (ROM) 
         mean, std = self.data_module.get_params_mean_std()
@@ -566,10 +595,16 @@ class SequentialTrainer:
 
     def round(self, idx, sampler_init_kwargs):
         self._generate_data(round_idx=idx, sampler_init_kwargs=sampler_init_kwargs)
-        if self.train_conf["architecture"]["data_summary"]["type"] == "ROM":
+        data_summary_type = self.train_conf["architecture"]["data_summary"]["type"]
+        
+        if data_summary_type == "ROM":
             self._train_rom(round_idx=idx)
             self._train_inference_network(round_idx=idx, data_summary=self.data_summary)
+        elif data_summary_type == "Autoencoder":
+            self._load_autoencoder(round_idx=idx)
+            self._train_inference_network(round_idx=idx, data_summary=self.data_summary)
         else:
+            # No data summary (direct inference on raw data)
             self._train_inference_network(round_idx=idx, data_summary=None)
     def _plot_updated_prior_bounds(self, updated_prior):
         self.logMchirp_lower.append(updated_prior["logMchirp"][0])

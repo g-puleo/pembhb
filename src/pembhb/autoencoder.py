@@ -280,7 +280,7 @@ class DenoisingAutoencoder(LightningModule):
 
     def training_step(self, batch, batch_idx):
         noisy = batch["wave_fd"] + batch["noise_fd"]
-        clean = batch["wave_fd"]
+        clean = batch["noise_fd"]
 
         # normalise
         noisy_norm = self.preprocess(noisy)
@@ -299,7 +299,7 @@ class DenoisingAutoencoder(LightningModule):
 
     def validation_step(self, batch, batch_idx):
         noisy = batch["wave_fd"] + batch["noise_fd"]
-        clean = batch["wave_fd"]
+        clean = batch["noise_fd"]
 
         noisy_norm = self.preprocess(noisy)
         clean_norm = self.preprocess(clean)
@@ -346,9 +346,10 @@ class AutoencoderWrapper(nn.Module):
     The encoder weights are frozen by default (``freeze=True``).
     """
 
-    def __init__(self, autoencoder: DenoisingAutoencoder, freeze: bool = True):
+    def __init__(self, autoencoder: DenoisingAutoencoder, freeze: bool = True, device: str = "cuda"):
         super().__init__()
         self.autoencoder = autoencoder
+        self.device = device
 
         if freeze:
             for p in self.autoencoder.parameters():
@@ -364,6 +365,7 @@ class AutoencoderWrapper(nn.Module):
         n_real_ch = self.autoencoder.n_channels * 2
         dummy = torch.zeros(1, n_real_ch, self.autoencoder.n_freqs)
         with torch.no_grad():
+            dummy = dummy.to(self.device)
             bottleneck, _ = self.autoencoder.encoder(dummy)
         return bottleneck.numel()  # sizes[-1] * L_bottleneck
 
