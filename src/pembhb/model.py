@@ -901,9 +901,9 @@ class ReducedOrderModel:
                 sigma, idx , sigma_unnorm, sigma_data, idx_data = self._max_residual_index(
                     train_dataloader, picked_set, prefetch_batches=self._prefetch_batches
                 )
-                if sigma_data >= sigma_last_data: 
-                    print(f"\ntraining stopped early at iteration {self.epoch} because sigma did not decrease (sigma={sigma_data:.3e}, last sigma={sigma_last_data:.3e})")
-                    break
+                # if sigma_data >= sigma_last_data: 
+                #     print(f"\ntraining stopped early at iteration {self.epoch} because sigma did not decrease (sigma={sigma_data:.3e}, last sigma={sigma_last_data:.3e})")
+                #     break
 
                 sigma_last_data = sigma_data
                 picked_set.add(idx)
@@ -921,8 +921,11 @@ class ReducedOrderModel:
                 elapsed = time.time() - t0
                 pbar.set_postfix({f"N_basis_elems":self.basis.shape[0], "iter":self.epoch, "sigma":f"{sigma:.3e}", "elapsed":f"{elapsed:.1f}s", "rate":f"{self.epoch/elapsed:.1f} it/s"})
                 pbar.update(0)  # just refresh the display
-        except KeyboardInterrupt:
+        except KeyboardInterrupt: 
             print("\n[ROM] training interrupted by user.")
+        except Exception as e:
+            print(f"\n[ROM] training stopped due to error: {e}")
+            
         total = time.time() - t0
         print(f"[ROM] done. basis={len(self.basis)}, time={total:.1f}s")
 
