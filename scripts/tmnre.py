@@ -1,14 +1,14 @@
 import os, shutil
 import torch
 from pembhb.simulator import MBHBSimulatorFD_TD, DummySimulator
-from pembhb.model import InferenceNetwork, PeregrineModel, ReducedOrderModel, ROMWrapper
+from pembhb.model import InferenceNetwork, PeregrineModel
+from pembhb.rom import ReducedOrderModel, ROMWrapper
 from pembhb.autoencoder import DenoisingAutoencoder, AutoencoderWrapper
 from pembhb.data import MBHBDataModule, MBHBDataset, mbhb_collate_fn
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.callbacks import ModelCheckpoint, Callback
-from lightning.pytorch.tuner import Tuner
 from torch.utils.data import DataLoader , random_split, Subset
 import numpy as np
 from pembhb import ROOT_DIR, DATA_ROOT_DIR

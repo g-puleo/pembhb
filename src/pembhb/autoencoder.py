@@ -280,7 +280,7 @@ class DenoisingAutoencoder(LightningModule):
 
     def training_step(self, batch, batch_idx):
         noisy = batch["wave_fd"] + batch["noise_fd"]
-        clean = batch["noise_fd"]
+        clean = batch["wave_fd"]
 
         # normalise
         noisy_norm = self.preprocess(noisy)
@@ -299,7 +299,7 @@ class DenoisingAutoencoder(LightningModule):
 
     def validation_step(self, batch, batch_idx):
         noisy = batch["wave_fd"] + batch["noise_fd"]
-        clean = batch["noise_fd"]
+        clean = batch["wave_fd"]
 
         noisy_norm = self.preprocess(noisy)
         clean_norm = self.preprocess(clean)
