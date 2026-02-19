@@ -105,11 +105,11 @@ class BBHXLikelihood(bilby.Likelihood):
 def main():
     # Configuration
     event_idx = 0  # Which event to analyze
-    observation_file = "/data/gpuleo/mbhb/observation_skyloc.h5"
+    observation_file = "/data/gpuleo/mbhb/observation_skyloc_tc_mass.h5"
     config_file = os.path.join(ROOT_DIR, "configs", "datagen_config.yaml")
     
     # Output settings
-    label = f"bbhx_event_{event_idx}_bilbymcmc"
+    label = f"skyloc_tc_m_bilbymcmc"
     outdir = os.path.join(ROOT_DIR, "mc_results")
     os.makedirs(outdir, exist_ok=True)
     
@@ -119,17 +119,17 @@ def main():
     # Override priors with hardcoded bounds
     # NOTE: dist is in Gpc (will be cubed in UniformSampler.__init__)
     prior_bounds = {
-        "logMchirp": [5.25-3e-5, 5.25+3e-5],
-        "q": [4.678, 4.683],
+        "logMchirp": [5.25-3e-4, 5.25+3e-4],
+        "q": [4.6777, 4.683],
         "chi1": [0.0, 0.0],
         "chi2": [0.0, 0.0],
         "dist": [10, 10],  # 10 Gpc 
         "phi": [0.0, 0.0],
         "inc": [0.5, 0.5],
         "lambda": [3.13, 3.15],
-        "beta": [0.498, 0.5025],
+        "beta": [-0.01, 0.01],
         "psi": [1.0, 1.0],
-        "Deltat": [-2.0, -2.0],
+        "Deltat": [-2.6, -2.4],
     }
     loaded_dataset = load_observation(observation_file)
     
@@ -213,39 +213,39 @@ def main():
     true_logl = likelihood.log_likelihood(test_params_base)
     print(f"Log-likelihood at TRUE parameters: {true_logl:.1f}")
     
-    best_logl = true_logl
-    best_params = {}
+    # best_logl = true_logl
+    # best_params = {}
     
-    for key in ['logMchirp', 'q', 'lambda', 'beta']:
-        if key not in test_params_base:
-            continue
-        print(f"\nScanning {key}:")
-        bounds = prior_bounds[key]
-        grid = np.linspace(bounds[0], bounds[1], 11)
+    # for key in ['logMchirp', 'q', 'lambda', 'beta']:
+    #     if key not in test_params_base:
+    #         continue
+    #     print(f"\nScanning {key}:")
+    #     bounds = prior_bounds[key]
+    #     grid = np.linspace(bounds[0], bounds[1], 11)
         
-        test_params = test_params_base.copy()
-        logls = []
-        for val in grid:
-            test_params[key] = val
-            logl = likelihood.log_likelihood(test_params)
-            logls.append(logl)
-            marker = " <-- TRUE" if abs(val - test_params_base[key]) < 1e-10 else ""
-            if logl > best_logl:
-                marker += " *** NEW MAX ***"
-                best_logl = logl
-                best_params[key] = val
-            print(f"  {key}={val:.6f}: log_L = {logl:.1f}{marker}")
+    #     test_params = test_params_base.copy()
+    #     logls = []
+    #     for val in grid:
+    #         test_params[key] = val
+    #         logl = likelihood.log_likelihood(test_params)
+    #         logls.append(logl)
+    #         marker = " <-- TRUE" if abs(val - test_params_base[key]) < 1e-10 else ""
+    #         if logl > best_logl:
+    #             marker += " *** NEW MAX ***"
+    #             best_logl = logl
+    #             best_params[key] = val
+    #         print(f"  {key}={val:.6f}: log_L = {logl:.1f}{marker}")
         
-        max_idx = np.argmax(logls)
-        print(f"  --> Max at grid point {max_idx}: {key}={grid[max_idx]:.6f}, log_L={logls[max_idx]:.1f}")
+    #     max_idx = np.argmax(logls)
+    #     print(f"  --> Max at grid point {max_idx}: {key}={grid[max_idx]:.6f}, log_L={logls[max_idx]:.1f}")
     
-    if best_params:
-        print(f"\n=== Best found in grid search ===")
-        print(f"Best log_L = {best_logl:.1f} (improvement: {best_logl - true_logl:.1f})")
-        for key, val in best_params.items():
-            diff = val - test_params_base[key]
-            print(f"  {key}: {val:.6f} (shift: {diff:+.6f})")
-    print("="*50)
+    # if best_params:
+    #     print(f"\n=== Best found in grid search ===")
+    #     print(f"Best log_L = {best_logl:.1f} (improvement: {best_logl - true_logl:.1f})")
+    #     for key, val in best_params.items():
+    #         diff = val - test_params_base[key]
+    #         print(f"  {key}: {val:.6f} (shift: {diff:+.6f})")
+    # print("="*50)
     
     # Run sampler
     print("\n=== Starting MCMC Sampler ===")
@@ -261,6 +261,7 @@ def main():
         diagnostic=True,
         resume=False,
         nsamples=1000,
+        nensemble=10,
         burn_in_nact=100,
         fixed_discard=0,
         thin_by_nact=0.2,

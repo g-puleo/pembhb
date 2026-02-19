@@ -71,24 +71,19 @@ for i in indices:
     fig_fd, ax_fd = plt.subplots(1, 2, figsize=(8, 4))
 
     for c in range(2): 
-        ax_td[c].plot(times/DAY_SI, wave_td[i,0], label='A (wave)')
-        #ax_td.plot(times/DAY_SI, wave_td[0,1], label='E (wave)')
-        ax_td[c].plot(times/DAY_SI, noise_td[i,0], label='A (noise)', linestyle='--', alpha=0.7)
-        #ax_td.plot(times/DAY_SI, noise_td[0,1], label='E (noise)', linestyle='--', alpha=0.7)
-        ax_td[c].plot(times/DAY_SI, wave_td[i,0] + noise_td[i,0], label='A (wave+noise)', linestyle='-.', color='C3')
-        #ax_td.plot(times/DAY_SI, wave_td[0,1] + noise_td[0,1], label='E (wave+noise)', linestyle='-.', color='C4')
+        ax_td[c].plot(times/DAY_SI, wave_td[i,c], label='A (wave)' if c==0 else 'E (wave)')
+        ax_td[c].plot(times/DAY_SI, noise_td[i,c], label='A (noise)' if c==0 else 'E (noise)', linestyle='--', alpha=0.7)
+        ax_td[c].plot(times/DAY_SI, wave_td[i,c] + noise_td[i,c], label='A (wave+noise)' if c==0 else 'E (wave+noise)', linestyle='-.', color='C3')
         
-        # ax_td.set_xlim(1,1.2)
+        ax_td[c].set_xlim(4.4,4.6)
         # ax_td.set_ylim(-2e-21, 2e-21)
 
-        #ax_td.set_title('data_td Example 1')
+        ax_td[c].set_title('data_td Example 1')
         ax_td[c].set_xlabel('Time (days)')
         ax_td[c].set_ylabel('Amplitude')
         ax_td[c].legend()
         ax_td[c].grid(True)
 
-        fig_td.tight_layout()
-        fig_td.savefig('data_td_example_presentation.png')
 
 
 
@@ -105,6 +100,10 @@ for i in indices:
         ax_fd[c].set_xscale('log')
         # ax_fd.legend()
         # ax_fd.grid(True)
+
+    fig_td.savefig(f'plots/{filename_only}/data_td_event_{i}.png', dpi=600)
+    fig_td.tight_layout()
     fig_fd.tight_layout()
     fig_fd.savefig(f'plots/{filename_only}/data_fd_event_{i}.png', dpi=600)
     print(f"Saved plot for sample {i+1} to plots/{filename_only}/data_fd_event_{i}.png")
+    print(f"Saved plot for sample {i+1} to plots/{filename_only}/data_td_event_{i}.png")

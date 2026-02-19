@@ -154,6 +154,12 @@ class MBHBDataModule( L.LightningDataModule ):
         with h5py.File(self.filename, "r") as f:
             freqs = f["frequencies"][()]
         return freqs
+    
+    def get_times(self):
+        """Get the time bins from the dataset. Times are in SI units (seconds)."""
+        with h5py.File(self.filename, "r") as f:
+            times = f["times_SI"][()]
+        return times
 
     def train_dataloader(self, shuffle=True, num_workers=None, pin_memory=False):
         if num_workers is None:

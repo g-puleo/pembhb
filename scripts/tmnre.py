@@ -22,9 +22,11 @@ from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 
 torch.set_float32_matmul_precision("medium")
+
 def get_timestamp():
     return datetime.now().strftime("%Y%m%d")
-TIME_OF_EXECUTION = get_timestamp()+"autoenc_fullsky_narrowmc_tc_v0"
+
+TIME_OF_EXECUTION = get_timestamp()+"rom_1000_fullsky_narrowmc_tc_v0"
 
 def validate_marginals(marginals_config: dict):
     """Validate that no parameter index appears in multiple marginals.
@@ -43,14 +45,14 @@ def validate_marginals(marginals_config: dict):
                     )
                 all_indices.append(idx)
 
-def get_widest_interval_1d(model, dataloader, in_param_idx, out_param_idx, eps=0.003):
+def get_widest_interval_1d(model, dataloader, in_param_idx, out_param_idx, eps=0.0001):
     """Get the widest credible interval for a 1D marginal posterior.
     
     :param model: trained inference model
     :param dataloader: dataloader containing the observation
     :param in_param_idx: index of the input parameter
     :param out_param_idx: index of the output (logratio)
-    :param eps: credible level (default 0.003 for 99.7% interval)
+    :param eps: credible level (default 0.0001 for 99.99% interval)
     :return: (widest_interval, norm1d, grid, inj_params) where widest_interval is [low, high]
     """
     logratios, inj_params, grid = utils.get_logratios_grid(
@@ -93,8 +95,8 @@ def get_widest_box_2d(model, dataloader, in_param_idx, out_param_idx, ax_buffer=
     )
 
     ratios = np.exp(logratios)
-    dp1 = gx[1, 0] - gx[0, 0]
-    dp2 = gy[0, 1] - gy[0, 0]
+    dp1 = gx[0, 1] - gx[0, 0]  # param_0 spacing (x varies along columns with xy indexing)
+    dp2 = gy[1, 0] - gy[0, 0]  # param_1 spacing (y varies along rows with xy indexing)
     norm2d = ratios / np.sum(ratios * dp1 * dp2, axis=(1, 2), keepdims=True)
     levels, labels = utils.contour_levels(norm2d)
     boxes = utils.posterior_contours_2d(
@@ -281,7 +283,8 @@ class PlotPosteriorCallback(Callback):
                             pl_module,
                             self.obs_loader,
                             in_param_idx=param_idx,
-                            out_param_idx=out_param_idx
+                            out_param_idx=out_param_idx,
+                            eps=1e-4
                         )
                         
                         # Plot
@@ -423,7 +426,7 @@ class SequentialTrainer:
                         # 1D marginal
                         widest_interval, _, _, _ = get_widest_interval_1d(
                             self.model, self.dataloader_obs,
-                            in_param_idx=marginal[0], out_param_idx=out_idx
+                            in_param_idx=marginal[0], out_param_idx=out_idx, eps=1e-4
                         )
                         param_name = utils._ORDERED_PRIOR_KEYS[marginal[0]]
                         self.datagen_conf["prior"][param_name] = widest_interval
@@ -512,6 +515,12 @@ class SequentialTrainer:
         
         # Free cached data and switch to disk-based loading to reduce memory
         self.data_module.full_dataset.clear_cache()
+    def _load_rom(self, round_idx):
+        assert round_idx == 1, "Are you sure this is the ROM for this round?"
+        filename = self.train_conf["architecture"]["data_summary"]["ROM"]["filename"]
+        print(f"Loading ROM from {filename}...")
+        self.data_summary = ROMWrapper(filename=filename, device=self.train_conf["device"], compress="fd")
+    
 
     def _load_autoencoder(self, round_idx):
         """Load a trained autoencoder from checkpoint and wrap it for use as data_summary."""
@@ -596,10 +605,19 @@ class SequentialTrainer:
     def round(self, idx, sampler_init_kwargs):
         self._generate_data(round_idx=idx, sampler_init_kwargs=sampler_init_kwargs)
         data_summary_type = self.train_conf["architecture"]["data_summary"]["type"]
-        
+        data_summary_load = self.train_conf["architecture"]["data_summary"][data_summary_type]["load"]
         if data_summary_type == "ROM":
-            self._train_rom(round_idx=idx)
-            self._train_inference_network(round_idx=idx, data_summary=self.data_summary)
+            if data_summary_load:
+                #load the rom from file specified in train_config.yaml
+
+                self._load_rom(round_idx=idx)
+            else:
+                self._train_rom(round_idx=idx)
+            if idx ==1: 
+                self.model = InferenceNetwork.load_from_checkpoint("/data/gpuleo/mbhb/logs/20260217rom_1000_fullsky_narrowmc_tc_v0_round_1/version_1/checkpoints/epoch=26-step=3780.ckpt")
+                print("warning: using pretrained inference network for round 1, skipping training for this round")
+            else: 
+                self._train_inference_network(round_idx=idx, data_summary=self.data_summary)
         elif data_summary_type == "Autoencoder":
             self._load_autoencoder(round_idx=idx)
             self._train_inference_network(round_idx=idx, data_summary=self.data_summary)
@@ -692,7 +710,7 @@ if __name__ == "__main__":
     train_config   = utils.read_config(os.path.join(ROOT_DIR, "configs", train_config_filename))
     datagen_config = utils.read_config(os.path.join(ROOT_DIR, "configs", datagen_config_filename))
                                
-    trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path="/data/gpuleo/mbhb/observation_skyloc.h5")
+    trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path="/data/gpuleo/mbhb/observation_skyloc_tc_mass.h5")
     
     # run with low noise: 
     # trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path=os.path.join(ROOT_DIR, "/data/gpuleo/mbhb/observation_low_noise.h5"))
