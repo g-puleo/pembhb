@@ -12,8 +12,7 @@ scheduler_patience: 10
 keep_ckpt: True
 marginals: 
   #  f: [[0]]
-  f: [[0,1],[7,8], [10]]
-
+  f: [[0,1]] #,[7,8], [10]]
 
 device: "cuda"
 
@@ -28,7 +27,7 @@ architecture:
 
   data_summary:
 
-    type: "ROM"  # Options: "ROM", "Autoencoder"
+    type: "Autoencoder"  # Options: "ROM", "Autoencoder"
     BrutalCompression:
       Nfreqs: 1000
       lowdim: 16
@@ -48,7 +47,7 @@ architecture:
       device: "cuda"
     Autoencoder:
       load: True 
-      filename: "/data/gpuleo/mbhb/logs/autoencoder/version_11/checkpoints/ae-epoch=497-val_loss=1.3618e-03.ckpt"  # Path to trained DenoisingAutoencoder checkpoint
+      filename: "/data/gpuleo/mbhb/logs/autoencoder/version_12/checkpoints/ae-epoch=261-val_loss=5.7389e-09.ckpt"  # Path to trained DenoisingAutoencoder checkpoint
       device: "cuda"
   
 baseline_model:

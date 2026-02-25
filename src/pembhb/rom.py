@@ -23,7 +23,7 @@ class ReducedOrderModel:
 
     def __init__(self, batch_size=1000, tolerance=1e-3, device="cpu",
                  filename=None, debugging=False, domain='fd', patience=10,
-                 freq_cutoff_idx=None):
+                 freq_cutoff_idx=None, df=None, dt=None):
         if filename is not None: 
             print(f"[ROM] initializing from file {filename}.\n Other arguments will be ignored.")
             self.device = device
@@ -40,6 +40,8 @@ class ReducedOrderModel:
             self.patience = patience
             self.max_epochs = 1000  # safety cap to prevent infinite loops in case of non-convergence
             self.freq_cutoff_idx = freq_cutoff_idx  # discard fd bins below this index
+            self.df = df  # frequency bin width(s): scalar (uniform) or 1-D array (non-uniform / logspaced)
+            self.dt = dt  # time bin width(s): scalar (uniform) or 1-D array (non-uniform)
 
             # Per-domain attributes initialised to None; filled during train()
             for dom in self._active_domains:
@@ -48,6 +50,10 @@ class ReducedOrderModel:
                 setattr(self, f'n_dim_{dom}', None)      # n_freq or n_time
                 setattr(self, f'global_scale_factor_{dom}', None)
                 setattr(self, f'mean_vec_{dom}', None)
+                setattr(self, f'valid_bins_mask_{dom}', None)  # boolean mask for non-zero ASD bins
+                setattr(self, f'inner_weights_{dom}', None)    # inner-product weights (4*df or dt)
+
+            self.asd = None  # ASD tensor, shape (n_channels, n_freq_full); stored for inference-time whitening
 
 
             # Keep legacy aliases when only fd is used
@@ -74,9 +80,43 @@ class ReducedOrderModel:
     def _is_complex(dom):
         return dom == 'fd'
 
-    def _conj(self, t, dom):
-        """Conjugate for complex (fd) data, identity for real (td)."""
-        return t.conj() if self._is_complex(dom) else t
+    def _inner(self, A, B, dom):
+        """Compute the weighted inner product ⟨A|B⟩ between two sets of vectors.
+
+        For FD (complex) data this implements the GW-standard real inner
+        product including the frequency-bin width factor:
+
+            ⟨a|b⟩ = Re[∑_k a_k* b_k w_k]
+
+        where ``w_k = 4 Δf_k``.  When the data has been pre-whitened
+        (divided by ASD), the noise weighting 1/S_n(f) is already
+        absorbed into the vectors.
+
+        For TD (real) data the weight is ``Δt_k``.
+
+        If no bin-width was supplied at construction time the weight
+        defaults to 1 (unweighted dot product, backward-compatible).
+
+        Parameters
+        ----------
+        A : torch.Tensor
+            Shape ``(M, D)`` — *M* row-vectors of dimension *D*.
+        B : torch.Tensor
+            Shape ``(N, D)`` — *N* row-vectors of dimension *D*.
+        dom : str
+            Domain tag (``'fd'`` or ``'td'``).
+
+        Returns
+        -------
+        torch.Tensor
+            Real tensor of shape ``(M, N)`` with entries ``⟨A_i | B_j⟩``.
+        """
+        w = getattr(self, f'inner_weights_{dom}', None)
+        if self._is_complex(dom):
+            Aw = A.conj() * w if w is not None else A.conj()
+            return (Aw @ B.mT).real
+        Aw = A * w if w is not None else A
+        return Aw @ B.mT
 
     def _apply_freq_cutoff(self, data, dom):
         """Slice off low-frequency bins when *freq_cutoff_idx* is set (fd only).
@@ -102,6 +142,32 @@ class ReducedOrderModel:
             return data[:, idx:]
         return data
 
+    def _whiten_fd(self, data):
+        """Whiten FD data by dividing by the stored ASD.
+
+        Applies the standard pre-whitening ``data / ASD``, with zero-ASD
+        bins guarded (0 → inf so that whitened value → 0).
+        No-op if ``self.asd`` is ``None``.
+
+        Parameters
+        ----------
+        data : torch.Tensor
+            2-D ``(C, F)`` or 3-D ``(B, C, F)`` tensor (complex or real).
+
+        Returns
+        -------
+        torch.Tensor
+            Whitened tensor, same shape and dtype as input.
+        """
+        if self.asd is None:
+            return data
+        asd = self.asd.to(data.device)
+        safe_asd = asd.clone()
+        safe_asd[safe_asd == 0] = float('inf')
+        if data.ndim == 3:
+            return data / safe_asd.unsqueeze(0)
+        return data / safe_asd
+
     def from_file(self, filename):
         s = torch.load(filename, map_location=self.device)
         print("Keys in the saved file:", list(s.keys()))
@@ -116,6 +182,16 @@ class ReducedOrderModel:
         # Frequency cutoff (None for legacy / uncropped models)
         self.freq_cutoff_idx = s.get('freq_cutoff_idx', None)
 
+        # Bin widths for inner-product weighting
+        self.df = s.get('df', None)
+        self.dt = s.get('dt', None)
+
+        # ASD (for inference-time whitening)
+        self.asd = s.get('asd', None)
+        if self.asd is not None:
+            self.asd = self.asd.to(self.device)
+            print(f"[ROM] ASD loaded, shape={tuple(self.asd.shape)}")
+
         for dom in self._active_domains:
             if f'basis_{dom}' in s:
                 setattr(self, f'basis_{dom}', s[f'basis_{dom}'].to(self.device))
@@ -123,6 +199,22 @@ class ReducedOrderModel:
                 setattr(self, f'n_dim_{dom}', s[f'n_dim_{dom}'])
                 setattr(self, f'global_scale_factor_{dom}', s[f'global_scale_factor_{dom}'])
                 setattr(self, f'mean_vec_{dom}', s[f'mean_vec_{dom}'].to(self.device))
+                # Valid-bins mask (Option B: boolean mask for non-zero ASD bins)
+                vbm = s.get(f'valid_bins_mask_{dom}', None)
+                if vbm is not None:
+                    setattr(self, f'valid_bins_mask_{dom}', vbm.to(self.device))
+                    n_valid = vbm.sum().item()
+                    n_total = vbm.numel()
+                    print(f"[ROM] {dom} valid_bins_mask loaded: {n_valid}/{n_total} bins active")
+                else:
+                    setattr(self, f'valid_bins_mask_{dom}', None)
+                # Inner-product weights (4*df or dt)
+                iw = s.get(f'inner_weights_{dom}', None)
+                if iw is not None:
+                    setattr(self, f'inner_weights_{dom}', iw.to(self.device))
+                    print(f"[ROM] {dom} inner_weights loaded (min={iw.min().item():.4e}, max={iw.max().item():.4e})")
+                else:
+                    setattr(self, f'inner_weights_{dom}', None)
                 basis = getattr(self, f'basis_{dom}')
                 print(f"[ROM] {dom} basis loaded. n_dim={getattr(self, f'n_dim_{dom}')}, "
                       f"n_channels={getattr(self, f'n_channels_{dom}')}, n_basis={len(basis)}")
@@ -163,13 +255,25 @@ class ReducedOrderModel:
             "tolerance": self.tolerance,
             "device": self.device,
             "freq_cutoff_idx": self.freq_cutoff_idx,
+            "df": self.df if not isinstance(self.df, torch.Tensor) else self.df.cpu(),
+            "dt": self.dt if not isinstance(self.dt, torch.Tensor) else self.dt.cpu(),
         }
+        # Store ASD for inference-time whitening
+        if self.asd is not None:
+            state['asd'] = self.asd.cpu() if isinstance(self.asd, torch.Tensor) else self.asd
+
         for dom in self._active_domains:
             state[f'basis_{dom}'] = getattr(self, f'basis_{dom}').cpu()
             state[f'n_channels_{dom}'] = getattr(self, f'n_channels_{dom}')
             state[f'n_dim_{dom}'] = getattr(self, f'n_dim_{dom}')
             state[f'global_scale_factor_{dom}'] = getattr(self, f'global_scale_factor_{dom}')
             state[f'mean_vec_{dom}'] = getattr(self, f'mean_vec_{dom}').cpu()
+            vbm = getattr(self, f'valid_bins_mask_{dom}', None)
+            if vbm is not None:
+                state[f'valid_bins_mask_{dom}'] = vbm.cpu() if isinstance(vbm, torch.Tensor) else vbm
+            iw = getattr(self, f'inner_weights_{dom}', None)
+            if iw is not None:
+                state[f'inner_weights_{dom}'] = iw.cpu() if isinstance(iw, torch.Tensor) else iw
 
 
         # Legacy keys for backward compatibility when fd-only
@@ -242,7 +346,9 @@ class ReducedOrderModel:
 
         return is_stagnant
     def _train_single_domain(self, dom, train_dataloader, convergence_on):
-        """Train a reduced basis for a single domain ('fd' or 'td')."""
+        """Train a reduced basis for a single domain ('fd' or 'td').
+        
+        """
         wave_key = f'wave_{dom}'
         noise_key = f'noise_{dom}'
         train_subset = train_dataloader.dataset
@@ -260,20 +366,28 @@ class ReducedOrderModel:
             print(f"[ROM][{dom}] frequency cutoff at index {self.freq_cutoff_idx}: "
                   f"keeping {n_dim} of {n_dim + self.freq_cutoff_idx} bins")
 
+        # Build valid-bins mask from ASD (Option B)
+        if dom == 'fd':
+            self._build_valid_bins_mask(train_subset, dom, n_channels, n_dim)
+
+        # Build inner-product weights (4*df for fd, dt for td)
+        self._build_inner_weights(dom)
+
         # Compute global scale & mean for this domain
-        scale, mean = self._compute_global_scale(train_dataloader, wave_key, n_channels * n_dim, dom=dom)
+        mean, scale = self._compute_global_scale(train_dataloader, wave_key, n_channels * n_dim, dom=dom)
         mean = mean.to(self.device)
         setattr(self, f'global_scale_factor_{dom}', scale)
         setattr(self, f'mean_vec_{dom}', mean)
-        print(f"[ROM][{dom}] global scale factor: {scale:.3e}")
 
         n = len(train_subset)
         seed = torch.randint(0, n, (1,)).item()
 
         first_data = self._to_device_async(train_subset[seed][wave_key].unsqueeze(0))
+        if dom == 'fd':
+            first_data = self._whiten_fd(first_data)
         first_data = self._apply_freq_cutoff(first_data, dom)
         first = self._normalize_dom(first_data, dom).squeeze(0)
-        first = first / first.norm()
+        first = first / self._wnorm(first, dom)
         basis = first.unsqueeze(0)
 
         sigma = float("inf")
@@ -323,7 +437,6 @@ class ReducedOrderModel:
                     prefetch_batches=self._prefetch_batches
                 )
                 # Choose convergence metric
-                convergence_value = sigma_data if convergence_on == 'sigma_data' else sigma
 
                 if convergence_on == 'sigma_data':
                     convergence_value = sigma_data
@@ -344,9 +457,11 @@ class ReducedOrderModel:
                 sigmas_unnorm.append(sigma_unnorm)
                 sigmas_data.append(sigma_data)
 
-                v_data = self._to_device_async(train_subset[idx][wave_key].unsqueeze(0))
-                v_data = self._apply_freq_cutoff(v_data, dom)
-                v = self._normalize_dom(v_data, dom).squeeze(0)
+                v_wave = self._to_device_async(train_subset[idx][wave_key].unsqueeze(0))
+                if dom == 'fd':
+                    v_wave = self._whiten_fd(v_wave)
+                v_wave = self._apply_freq_cutoff(v_wave, dom)
+                v = self._normalize_dom(v_wave, dom).squeeze(0)
                 v = self._gram_schmidt_reorthogonalize_dom(v, dom)
                 basis = getattr(self, f'basis_{dom}')
                 setattr(self, f'basis_{dom}', torch.cat([basis, v.unsqueeze(0)], dim=0))
@@ -371,9 +486,8 @@ class ReducedOrderModel:
 
         except KeyboardInterrupt:
             print(f"\n[ROM][{dom}] training interrupted by user.")
-        except Exception as e:
-            print(f"\n[ROM][{dom}] training stopped due to error: {e}")
-            raise
+        # except Exception as e:
+        #     print(f"\n[ROM][{dom}] training stopped due to error: {e}")
 
         basis = getattr(self, f'basis_{dom}')
         total = time.time() - t0
@@ -444,18 +558,29 @@ class ReducedOrderModel:
             bsize = batch[wave_key].shape[0]
 
             wave_gpu = self._to_device_async(batch[wave_key])
+            if dom == 'fd':
+                wave_gpu = self._whiten_fd(wave_gpu)
             wave_gpu = self._apply_freq_cutoff(wave_gpu, dom)
-            original_wave_batch = wave_gpu.reshape(bsize, -1)
+            flattened_wave_batch = wave_gpu.reshape(bsize, -1)# flattened on freq, channel dim
+            # here wave_batch is the whitened waveform, minus the mean divided by abs(max)
             wave_batch = self._normalize_dom(wave_gpu, dom)
+            # the normalised wave_batch is projected onto the basis (made by normalised whitened waves)
             proj = self._project_batch_dom(wave_batch, dom)
 
-            reconstruction_original_space = self._denormalize_dom(proj, dom)
-            residual_original_space = original_wave_batch - reconstruction_original_space
 
-            # Normalised residual
-            r = (wave_batch - proj) / wave_batch.norm(dim=1, keepdim=True)
+            # and is denormalised to get a comparison with the original waveform
+            reconstruction_denormalised = self._denormalize_dom(proj, dom)
+            # the difference between the flattened wave (clean) and the denormalised reconstruction is assessed
+            residual_original_space = flattened_wave_batch - reconstruction_denormalised
 
-            # Per-channel max pointwise relative error
+            # Weighted residual norms
+            r_unnorm = wave_batch - proj
+            wnorm_wave = self._wnorm(wave_batch, dom)       # (bsize,)
+            wnorm_resid = self._wnorm(r_unnorm, dom)        # (bsize,)
+            norms = (wnorm_resid / wnorm_wave) ** 2         # squared relative residual
+            norms_unnorm = wnorm_resid ** 2                 # squared absolute residual
+
+            # Per-channel max pointwise relative error (element-wise, no inner-product weight)
             if is_complex:
                 scale_ch1 = wave_batch.real.abs().amax(dim=1, keepdim=True)
                 scale_ch2 = wave_batch.imag.abs().amax(dim=1, keepdim=True)
@@ -475,17 +600,15 @@ class ReducedOrderModel:
             max_relerr_ch1 = max(max_relerr_ch1, err_ch1.item())
             max_relerr_ch2 = max(max_relerr_ch2, err_ch2.item())
 
-            r_unnorm = wave_batch - proj
-            norms = (r.abs() ** 2).sum(dim=1)
-            norms_unnorm = (r_unnorm.abs() ** 2).sum(dim=1)
-
             # Noisy-data residual  (sigma_data)
             noise_gpu = self._to_device_async(batch[noise_key])
+            if dom == 'fd':
+                noise_gpu = self._whiten_fd(noise_gpu)
             noise_gpu = self._apply_freq_cutoff(noise_gpu, dom)
             original_data_batch = (wave_gpu + noise_gpu).reshape(bsize, -1)
             normalised_data_batch = self._normalize_dom(original_data_batch, dom)
             data_proj = self._project_batch_dom(normalised_data_batch, dom)
-            rel_err_data = ((wave_batch - data_proj).norm(dim=1) / wave_batch.norm(dim=1))
+            rel_err_data = self._wnorm(wave_batch - data_proj, dom) / wnorm_wave
             # Mask already-picked indices
             batch_ids = torch.arange(bsize) + seen_points
             mask = torch.tensor(
@@ -547,127 +670,229 @@ class ReducedOrderModel:
         mean_vec = torch.zeros(flat_dim, device=self.device, dtype=vec_dtype)
         for batch in dataloader:
             v = self._to_device_async(batch[wave_key])
+            if dom == 'fd':
+                v = self._whiten_fd(v)
             v = self._apply_freq_cutoff(v, dom)
             max_val = max(max_val, v.abs().max().item())
             mean_vec = mean_vec + v.reshape(v.shape[0], -1).sum(dim=0)
         mean_vec = mean_vec / len(dataloader.dataset)
-        return max_val, mean_vec
-    
+        print(f"[ROM][{dom}] global scale factor: {max_val:.3e}")
+        return mean_vec, max_val
 
-    def _gram_schmidt_reorthogonalize(self, v):
-        """Legacy fd-only wrapper."""
-        return self._gram_schmidt_reorthogonalize_dom(v, 'fd')
+    def _build_valid_bins_mask(self, train_subset, dom, n_channels, n_dim):
+        """Build a boolean mask identifying frequency bins with non-zero ASD.
 
-    def _gram_schmidt_reorthogonalize_dom(self, v, dom): 
-        """Gram-Schmidt with reorthogonalization, domain-aware (handles conjugation for complex data)."""
-        B = getattr(self, f'basis_{dom}')
-        Bc = self._conj(B, dom)
-        coeff = Bc @ v
-        projection = coeff @ B
-        v_trunc = v - projection
+        The mask has shape ``(n_channels * n_dim,)`` (flattened) so it can
+        be applied directly to the flattened normalised vectors used in
+        inner products.  Bins where ASD == 0 are ``False``.
 
-        # reorthogonalisation step 
-        coeff2 = Bc @ v_trunc
-        projection2 = coeff2 @ B
-        v_trunc = v_trunc - projection2
-        normalised = v_trunc / v_trunc.norm()
-        scalar_products = Bc @ v_trunc
-        cosines_vtrunc = scalar_products / (B.norm(dim=1) * v_trunc.norm())
-        scalar_products_v_normalised = Bc @ normalised
-        cosines_vnormalised = scalar_products_v_normalised / (B.norm(dim=1) * normalised.norm())
-        self.gs_diagnose["max_cosine_angle_unnormalised"].append(cosines_vtrunc.abs().max().item())
-        self.gs_diagnose["max_cosine_angle_normalised"].append(cosines_vnormalised.abs().max().item())
+        The ASD is read once from the underlying HDF5 dataset and stored
+        on ``self.asd`` for later serialisation.
+        """
+        import h5py
+        dataset = train_subset.dataset if hasattr(train_subset, 'dataset') else train_subset
+        filename = dataset.filename
+        with h5py.File(filename, 'r') as f:
+            asd_np = f['asd'][()]                    # (n_channels, n_freq_full)
+        asd_full = torch.tensor(asd_np, dtype=torch.float32)
+        self.asd = asd_full.to(self.device)          # store for inference-time whitening
 
-        norm_projection = projection.norm()
-        norm_v_trunc = v_trunc.norm()
-        norm_v_original = v.norm()
-        self.gs_diagnose["norm_v_original"].append(norm_v_original.item())
-        self.gs_diagnose["norm_projection"].append(norm_projection.item())
-        self.gs_diagnose["norm_v_trunc"].append(norm_v_trunc.item())
+        # Apply freq_cutoff if set
+        asd_trimmed = self._apply_freq_cutoff(asd_full, dom)  # (n_channels, n_dim)
+        # Flatten to (n_channels * n_dim,) — same layout as normalised vectors
+        asd_flat = asd_trimmed.reshape(-1)
+        valid = asd_flat > 0
+        n_valid = valid.sum().item()
+        n_total = valid.numel()
+        print(f"[ROM][{dom}] valid_bins_mask: {n_valid}/{n_total} bins have non-zero ASD")
+        if n_valid < n_total:
+            print(f"[ROM][{dom}] WARNING: {n_total - n_valid} zero-ASD bins detected. "
+                  f"These will be excluded from inner products.")
+        setattr(self, f'valid_bins_mask_{dom}', valid.to(self.device))
 
-        assert norm_v_original <= norm_v_trunc + norm_projection, "Triangular inequality violated"
-        assert norm_v_trunc <= norm_v_original + norm_projection, "Triangular inequality violated"
-        assert norm_projection <= norm_v_original + norm_v_trunc, "Triangular inequality violated"
-        
-        return normalised
+    # ------------------------------------------------------------------
+    # Inner-product weights & weighted norm
+    # ------------------------------------------------------------------
+    def _build_inner_weights(self, dom):
+        """Build the inner-product weight vector for a given domain.
 
-    def _modified_gram_schmidt(self, v) : 
-        B = self.basis
-        v_trunc = v.clone()
-        for i in range(B.shape[0]):
-            bi = B[i]
-            coeff = (bi.conj() @ v_trunc) / (bi.conj() @ bi)
-            v_trunc = v_trunc - coeff * bi
-        normalised = v_trunc / v_trunc.norm()
+        For FD the weight per frequency bin is ``4 * Δf``  (the standard
+        GW inner-product prefactor).  For TD it is ``Δt``.
 
-        scalar_products = B.conj() @ v_trunc  # shape (N_basis, )
-        cosines_vtrunc = scalar_products / (B.norm(dim=1) * v_trunc.norm())
-        scalar_products_v_normalised = B.conj() @ normalised
-        cosines_vnormalised = scalar_products_v_normalised / (B.norm(dim=1) * normalised.norm())
-        self.gs_diagnose["max_cosine_angle_unnormalised"].append(cosines_vtrunc.abs().max().item())
-        self.gs_diagnose["max_cosine_angle_normalised"].append(cosines_vnormalised.abs().max().item())
-        #max_abs_scalar_product = scalar_products.abs().max().item()
+        The per-bin weight is tiled across channels to match the flattened
+        vector layout ``(n_channels * n_dim,)``.
 
-        self.gs_diagnose["norm_v_original"].append(v.norm().item())
-        self.gs_diagnose["norm_v_trunc"].append(v_trunc.norm().item())
-        self.gs_diagnose["norm_projection"].append( (v - v_trunc).norm().item())
+        If no ``df`` / ``dt`` was supplied at construction time the weight
+        defaults to all ones (backward-compatible, unweighted inner product).
+        """
+        n_channels = getattr(self, f'n_channels_{dom}')
+        n_dim = getattr(self, f'n_dim_{dom}')
 
-        return normalised
+        if dom == 'fd':
+            raw = self.df
+            prefactor = 4.0
+        else:  # td
+            raw = self.dt
+            prefactor = 1.0
+
+        if raw is None:
+            w_per_dim = torch.ones(n_dim, device=self.device)
+        elif isinstance(raw, (int, float)):
+            w_per_dim = prefactor * float(raw) * torch.ones(n_dim, device=self.device)
+        else:
+            # raw is a tensor / array — non-uniform bin widths
+            w_per_dim = prefactor * torch.as_tensor(raw, device=self.device, dtype=torch.float32)
+            # Apply freq cutoff if set (only the retained bins matter)
+            if dom == 'fd' and self.freq_cutoff_idx:
+                w_per_dim = w_per_dim[self.freq_cutoff_idx:]
+            assert w_per_dim.shape[0] == n_dim, (
+                f"bin-width array for '{dom}' has {w_per_dim.shape[0]} elements "
+                f"after cutoff, but n_dim={n_dim}"
+            )
+
+        # Tile across channels: [w_0, …, w_{D-1}, w_0, …, w_{D-1}, …]
+        w = w_per_dim.repeat(n_channels)
+        setattr(self, f'inner_weights_{dom}', w)
+        print(f"[ROM][{dom}] inner-product weights built "
+              f"(prefactor={prefactor}, n_dim={n_dim}, n_channels={n_channels}, "
+              f"w_min={w.min().item():.4e}, w_max={w.max().item():.4e})")
+
+    def _wnorm(self, x, dom):
+        """Weighted norm consistent with :meth:`_inner`.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            1-D ``(D,)`` or 2-D ``(B, D)`` tensor.
+        dom : str
+            Domain tag.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar (1-D input) or shape ``(B,)`` (2-D input).
+        """
+        w = getattr(self, f'inner_weights_{dom}', None)
+        if x.ndim == 1:
+            if w is None:
+                return x.norm()
+            return ((x.conj() * x).real * w).sum().sqrt()
+        else:
+            if w is None:
+                return x.norm(dim=-1)
+            return ((x.conj() * x).real * w).sum(dim=-1).sqrt()
+
+    # ------------------------------------------------------------------
+    # Gram-Schmidt orthogonalization (unified)
+    # ------------------------------------------------------------------
+    def _project_onto_basis_single(self, v, dom):
+        """Project a single vector onto the current basis (compress → reconstruct).
+
+        Parameters
+        ----------
+        v : torch.Tensor
+            1-D vector of shape ``(N_dim,)``.
+        dom : str
+            Domain tag.
+
+        Returns
+        -------
+        projection : torch.Tensor
+            Component of *v* lying in the span of the basis, shape ``(N_dim,)``.
+        """
+        coeff = self._compress_normalized_dom(v.unsqueeze(0), dom)   # (1, N_basis)
+        projection = self._reconstruct_normalized_dom(coeff, dom)    # (1, N_dim)
+        return projection.squeeze(0)
 
     @profile
-    def _gram_schmidt(self, v):
-        B = self.basis
-        coeff = B.conj() @ v # shape (N_basis, N_dim) @ (N_dim, )  #/ torch.einsum("ik,ik->i", B.conj(), B)
-        projection = coeff @ B # shape (N_basis) @ (N_basis, N_dim) = > (N_dim, )
-        v_trunc = v - projection# now v is orthogonal to the basis
-        normalised = v_trunc / v_trunc.norm()# normalise before adding to the reduced basis. 
-        scalar_products = B.conj() @ v_trunc  # shape (N_basis, )
-        cosines_vtrunc = scalar_products / (B.norm(dim=1) * v_trunc.norm())
-        scalar_products_v_normalised = B.conj() @ normalised
-        cosines_vnormalised = scalar_products_v_normalised / (B.norm(dim=1) * normalised.norm())
+    def _gram_schmidt_dom(self, v, dom, n_passes=2):
+        """Gram-Schmidt orthogonalization, domain-aware.
+
+        Each pass projects *v* onto the current basis via
+        compress → reconstruct and subtracts the result.
+        Setting ``n_passes=2`` (default) gives the classical
+        *Gram-Schmidt with one reorthogonalization step*.
+
+        Parameters
+        ----------
+        v : torch.Tensor
+            1-D vector to orthogonalize against the current basis.
+        dom : str
+            Domain tag (``'fd'`` or ``'td'``).
+        n_passes : int
+            Number of orthogonalization passes.
+            Use 1 for classical GS, 2 for GS + reorthogonalization.
+
+        Returns
+        -------
+        normalised : torch.Tensor
+            Unit vector orthogonal to the basis.
+        """
+        norm_v_original = self._wnorm(v, dom)
+        first_projection_norm = None
+
+        for i in range(n_passes):
+            projection = self._project_onto_basis_single(v, dom)
+            v = v - projection
+
+            if i == 0:
+                first_projection_norm = self._wnorm(projection, dom)
+                # Triangle inequality checks (first pass only)
+                _vo = norm_v_original.item()
+                _vt = self._wnorm(v, dom).item()
+                _pr = first_projection_norm.item()
+                assert _vo <= _vt + _pr, (
+                    f"Triangular inequality violated: "
+                    f"v_norm={_vo:.6e} > v_trunc_norm + projection_norm = "
+                    f"{_vt:.6e} + {_pr:.6e} = {_vt + _pr:.6e} "
+                    f"(excess={_vo - (_vt + _pr):.6e})"
+                )
+                assert _vt <= _vo + _pr, (
+                    f"Triangular inequality violated: "
+                    f"v_trunc_norm={_vt:.6e} > v_norm + projection_norm = "
+                    f"{_vo:.6e} + {_pr:.6e} = {_vo + _pr:.6e} "
+                    f"(excess={_vt - (_vo + _pr):.6e})"
+                )
+                assert _pr <= _vo + _vt, (
+                    f"Triangular inequality violated: "
+                    f"projection_norm={_pr:.6e} > v_norm + v_trunc_norm = "
+                    f"{_vo:.6e} + {_vt:.6e} = {_vo + _vt:.6e} "
+                    f"(excess={_pr - (_vo + _vt):.6e})"
+                )
+
+        v_trunc = v
+        normalised = v_trunc / self._wnorm(v_trunc, dom)
+
+        # Orthogonality diagnostics (using the same weighted inner product)
+        B = getattr(self, f'basis_{dom}')
+        B_wnorms = self._wnorm(B, dom)           # (N_basis,)
+        v_trunc_wnorm = self._wnorm(v_trunc, dom)
+        normalised_wnorm = self._wnorm(normalised, dom)
+        # _inner(B, v.unsqueeze(0), dom) → (N_basis, 1); squeeze to (N_basis,)
+        scalar_products = self._inner(B, v_trunc.unsqueeze(0), dom).squeeze(1)
+        cosines_vtrunc = scalar_products / (B_wnorms * v_trunc_wnorm)
+        scalar_products_v_normalised = self._inner(B, normalised.unsqueeze(0), dom).squeeze(1)
+        cosines_vnormalised = scalar_products_v_normalised / (B_wnorms * normalised_wnorm)
         self.gs_diagnose["max_cosine_angle_unnormalised"].append(cosines_vtrunc.abs().max().item())
         self.gs_diagnose["max_cosine_angle_normalised"].append(cosines_vnormalised.abs().max().item())
-        max_abs_scalar_product = scalar_products.abs().max().item()
 
-        if self.debugging and self.epoch <= 10: 
-            # check orthogonality between v_trunc and basis B
-
-            print(f"[ROM][debug] max abs scalar product between v_trunc and basis elements: {max_abs_scalar_product:.3e}")
-            # plot the difference between cosines and cosines after normalisation (should be zero)
-            cosine_residual = (cosines_vtrunc - cosines_vnormalised).abs()
-            max_cosine_residual = cosine_residual.max().item()
-            print(f"[ROM][debug] max abs difference between cosines before and after normalisation: {max_cosine_residual:.3e}")
-            plt.plot(cosine_residual.cpu().numpy())
-            plt.yscale("log")
-            plt.xlabel("Basis element index")
-            plt.title("Difference between cosines before and after normalisation")
-            plt.savefig(os.path.join(self.plot_dir_debug, f"cosine_residual_epoch{self.epoch}.png"))
-            plt.close()
-
-        # compute max abs of removed part 
-
-        norm_projection = projection.norm()
-        norm_v_trunc = v_trunc.norm()
-        norm_v_original = v.norm()
         self.gs_diagnose["norm_v_original"].append(norm_v_original.item())
-        self.gs_diagnose["norm_projection"].append(norm_projection.item())
-        self.gs_diagnose["norm_v_trunc"].append(norm_v_trunc.item())
+        self.gs_diagnose["norm_projection"].append(first_projection_norm.item())
+        self.gs_diagnose["norm_v_trunc"].append(v_trunc_wnorm.item())
 
-        # triangular inequality checks
-        assert norm_v_original <= norm_v_trunc + norm_projection, "Triangular inequality violated"
-        assert norm_v_trunc <= norm_v_original + norm_projection, "Triangular inequality violated"
-        assert norm_projection <= norm_v_original + norm_v_trunc, "Triangular inequality violated"
-        ### debug line:  check orthogonality
-        # try:
-        #     assert torch.allclose((B.conj() @ v), torch.zeros_like(coeff), atol=1e-6), "Gram-Schmidt failed to produce orthogonal vector."
-        # except AssertionError as e:
-        #     print(e)
-        #     print("if divide coefficients by norm of basis elements:")
-        #     coeff_normed = coeff / torch.einsum("ik,ik->i", B.conj(), B)
-        #     new_v = v - coeff_normed @ B
-        #     assert torch.allclose((B.conj() @ new_v), torch.zeros_like(coeff), atol=1e-6), "Gram-Schmidt failed to produce orthogonal vector even after normalizing coefficients by basis element norms."
-        
         return normalised
+
+    def _gram_schmidt_reorthogonalize(self, v):
+        """Legacy fd-only wrapper (2-pass Gram-Schmidt)."""
+        return self._gram_schmidt_dom(v, 'fd', n_passes=2)
+
+    def _gram_schmidt_reorthogonalize_dom(self, v, dom):
+        """Gram-Schmidt with reorthogonalization (2-pass), domain-aware."""
+        return self._gram_schmidt_dom(v, dom, n_passes=2)
+
+    def _gram_schmidt(self, v):
+        """Legacy fd-only wrapper (single-pass Gram-Schmidt)."""
+        return self._gram_schmidt_dom(v, 'fd', n_passes=1)
 
     # ------------------------------------------------------------------
     # normalize / denormalize  (domain-aware + legacy wrappers)
@@ -685,7 +910,7 @@ class ReducedOrderModel:
         mean = getattr(self, f'mean_vec_{dom}')
         scale = getattr(self, f'global_scale_factor_{dom}')
         return (d - mean) / scale
-
+    
     def _denormalize(self, data):
         """Legacy fd-only wrapper."""
         return self._denormalize_dom(data, 'fd')
@@ -704,10 +929,16 @@ class ReducedOrderModel:
         return self._compress_normalized_dom(normalized_data, 'fd')
 
     def _compress_normalized_dom(self, normalized_data, dom):
-        """Compress normalized data into reduced basis coefficients for a given domain."""
+        """Compress normalized data into reduced basis coefficients for a given domain.
+
+        Uses the unified ``_inner`` helper so that FD coefficients are
+        real-valued (consistent with the GW inner product
+        ⟨a|b⟩ = Re[∑ a* b]) and only valid (non-zero-ASD) bins
+        contribute to the sum.
+        """
         B = getattr(self, f'basis_{dom}')
-        Bc = self._conj(B, dom)
-        coeff = (Bc @ normalized_data.T).T  # shape (B_size, N_basis)
+        # _inner returns (N_basis, B_size); transpose to (B_size, N_basis)
+        coeff = self._inner(B, normalized_data, dom).T
         return coeff
 
     def _reconstruct_normalized(self, coeff):
@@ -717,6 +948,10 @@ class ReducedOrderModel:
     def _reconstruct_normalized_dom(self, coeff, dom):
         """Reconstruct normalized data from reduced basis coefficients for a given domain."""
         B = getattr(self, f'basis_{dom}')
+        # coeff is real (from the Re[] inner product); promote to complex
+        # when the basis is complex so that @ doesn't raise a dtype error.
+        if B.is_complex() and not coeff.is_complex():
+            coeff = coeff.to(B.dtype)
         return coeff @ B  # shape (B_size, N_dim)
 
     # ------------------------------------------------------------------
@@ -815,14 +1050,15 @@ class ROMWrapper(nn.Module):
                 )
 
     def get_n_features(self):
-        """Return the total number of scalar features produced by forward()."""
+        """Return the total number of scalar features produced by forward().
+
+        With the noise-weighted real inner product, FD coefficients are
+        real-valued, so each basis vector contributes 1 feature (not 2).
+        """
         n = 0
         for dom in self._compress_domains:
             basis = getattr(self.rom, f'basis_{dom}')
-            if self.rom._is_complex(dom):
-                n += 2 * basis.shape[0]  # real + imag
-            else:
-                n += basis.shape[0]      # already real
+            n += basis.shape[0]   # real coefficients for both fd and td
         return n
 
     def forward(self, d_f, d_t): 
@@ -841,10 +1077,19 @@ class ROMWrapper(nn.Module):
 
         # --- frequency domain ---
         if 'fd' in self._compress_domains:
+            # Whiten incoming raw data using the stored ASD before compression.
+            # The ROM was trained on pre-whitened waveforms, so inference data
+            # must be whitened identically.
+            if self.rom.asd is not None:
+                asd = self.rom.asd.to(d_f.device)          # (C, F_full)
+                # Guard against zero-ASD bins: replace 0 → inf so whitened value → 0
+                safe_asd = asd.clone()
+                safe_asd[safe_asd == 0] = float('inf')
+                d_f = d_f / safe_asd.unsqueeze(0)          # (B, C, F)
+
             compressed_fd = self.rom.compress(d_f, dom='fd')
-            # Split complex coefficients into real and imaginary channels
-            compressed_reim = torch.cat([compressed_fd.real, compressed_fd.imag], dim=1)
-            parts.append(compressed_reim)
+            # Coefficients are real-valued under the Re[] inner product
+            parts.append(compressed_fd)
         else:
             passthrough['fd'] = d_f  # pass through uncompressed
 

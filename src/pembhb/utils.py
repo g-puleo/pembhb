@@ -1007,6 +1007,7 @@ def posterior_contours_2d_imshow(grid_x: np.array, grid_y: np.array, ratios: np.
 
 
 
+
 def mbhb_collate_fn(batch, subset: torch.utils.data.Subset, noise_factor, noise_shuffling=True):
     B = len(batch)
     wave_fd = torch.stack([b["wave_fd"] for b in batch])

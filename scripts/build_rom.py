@@ -6,8 +6,8 @@ from pembhb.utils import read_config, ROOT_DIR
 import os
 
 def build_rom(dataloader, outfile, tolerance, domain='fd', convergence_on='sigma_data',
-              use_pinned_memory=False, prefetch_batches=1, freq_cutoff_idx=None):
-    rom = ReducedOrderModel(tolerance=tolerance, device="cuda", debugging=False, domain=domain, freq_cutoff_idx=freq_cutoff_idx)
+              use_pinned_memory=False, prefetch_batches=1, freq_cutoff_idx=None, df=None):
+    rom = ReducedOrderModel(tolerance=tolerance, device="cuda", debugging=False, domain=domain, freq_cutoff_idx=freq_cutoff_idx, df=df)
     rom.train(dataloader, use_pinned_memory=use_pinned_memory, prefetch_batches=prefetch_batches,
               convergence_on=convergence_on)
     rom.to_file(outfile)
@@ -38,15 +38,20 @@ if __name__ == "__main__":
     train_conf = read_config(os.path.join(ROOT_DIR, "configs", "train_config.yaml"))
     batch_size = train_conf["batch_size"]
     dmodule = MBHBDataModule(args.data, batch_size, num_workers=0, cache_in_memory=True, noise_factor=args.noise_factor)
+    freqs = dmodule.get_freqs()
+    df = (freqs[1] - freqs[0]).item()
     dmodule.setup("fit")
     
     # --pin-memory enables pinned memory; --gpu-data moves all to GPU (mutually exclusive in effect)
     use_pinned_memory = args.pin_memory and not args.gpu_data
-    ds = dmodule.train_dataloader(pin_memory=use_pinned_memory)
+    ds = dmodule.train_dataloader(shuffle=False, pin_memory=use_pinned_memory)
     
     if args.gpu_data:
         ds.dataset.dataset.to("cuda")
     
     build_rom(ds, args.out, tolerance=args.tol, domain=args.domain,
               convergence_on=args.convergence_on,
-              use_pinned_memory=use_pinned_memory, prefetch_batches=args.prefetch_batches, freq_cutoff_idx=args.freq_cutoff_idx)
+              use_pinned_memory=use_pinned_memory, 
+              prefetch_batches=args.prefetch_batches, 
+              freq_cutoff_idx=args.freq_cutoff_idx,
+              df=df)

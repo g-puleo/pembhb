@@ -20,6 +20,13 @@ class MBHBDataset(Dataset):
         with h5py.File(self.filename, "r") as f:
             self.len = f["wave_fd"].shape[0]
 
+            # Load ASD (Amplitude Spectral Density) for noise-weighting.
+            # Shape: (n_channels, n_freq).  This is the same for all samples.
+            if "asd" in f:
+                self.asd = torch.tensor(f["asd"][()], device="cpu", dtype=torch.float32)
+            else:
+                self.asd = None
+
             if cache_in_memory:
                 self.wave_fd = torch.tensor(f["wave_fd"][()], device="cpu", dtype=torch.complex64)
                 self.wave_td = torch.tensor(f["wave_td"][()], device="cpu", dtype=torch.float32)
@@ -101,8 +108,6 @@ class MBHBDataModule( L.LightningDataModule ):
         :type filename: str
         :param batch_size: Batch size for data loading.
         :type batch_size: int
-        :param transform_fd: Transformation to apply to the frequency domain data.
-        :type transform_fd: str
         """
         super().__init__()
         self.batch_size = batch_size
@@ -149,6 +154,15 @@ class MBHBDataModule( L.LightningDataModule ):
     #     params = self.train.dataset[self.train_indices]["params"]
     #     return params.std(dim=0)
     
+    def get_asd(self):
+        """Return the ASD tensor of shape (n_channels, n_freq) from the dataset."""
+        if hasattr(self, 'full_dataset') and self.full_dataset.asd is not None:
+            return self.full_dataset.asd
+        with h5py.File(self.filename, "r") as f:
+            if "asd" in f:
+                return torch.tensor(f["asd"][()], dtype=torch.float32)
+        return None
+
     def get_freqs(self):
         """Get the frequency bins from the dataset."""
         with h5py.File(self.filename, "r") as f:
