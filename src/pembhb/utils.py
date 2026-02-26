@@ -1034,3 +1034,115 @@ def mbhb_collate_fn(batch, subset: torch.utils.data.Subset, noise_factor, noise_
         "noise_td": noise_td,
         "noise_index": pick,
     }
+
+def whiten_fd(data, asd):
+    """Whiten FD data by dividing by the ASD (amplitude spectral density).
+
+    Zero-ASD bins are guarded: ``0 → inf`` so that whitened values → 0
+    rather than inf/nan.
+
+    Parameters
+    ----------
+    data : torch.Tensor
+        Complex tensor of shape ``(B, C, F)`` or ``(C, F)``.
+    asd : torch.Tensor
+        Real tensor of shape ``(C, F)``.
+
+    Returns
+    -------
+    torch.Tensor
+        Whitened tensor, same shape and dtype as *data*.
+    """
+    safe_asd = asd.clone().to(data.device)
+    safe_asd[safe_asd == 0] = float('inf')
+    if data.ndim == 3:
+        return data / safe_asd.unsqueeze(0)
+    return data / safe_asd
+
+
+def fd_inner(a, b, df):
+    r"""Noise-weighted FD inner product (Gram matrix) on pre-whitened data.
+
+    Computes the GW inner product
+
+    .. math::
+
+        G_{ij} = \langle a_i \mid b_j \rangle
+        = 4 \, \operatorname{Re} \sum_c \sum_k
+          \bar{a}_{i,c,k} \, b_{j,c,k} \, \Delta f_k
+
+    where *a* and *b* have already been divided by the ASD.  The sum
+    runs over channels *c* and frequency bins *k*.
+
+    Always returns an ``(M, N)`` Gram matrix — use :func:`fd_norm` for
+    efficient diagonal-only computation.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Pre-whitened complex tensor of shape ``(M, C, F)``.
+    b : torch.Tensor
+        Pre-whitened complex tensor of shape ``(N, C, F)``.
+    df : float or torch.Tensor
+        Frequency bin width(s).  Scalar for uniform spacing, or a 1-D
+        tensor of shape ``(F,)`` for non-uniform spacing.
+
+    Returns
+    -------
+    torch.Tensor
+        Real tensor of shape ``(M, N)`` with entry ``G_{ij} = ⟨a_i | b_j⟩``.
+    """
+    M, N = a.shape[0], b.shape[0]
+    C, F = a.shape[-2], a.shape[-1]
+
+    # Build per-bin weight
+    if isinstance(df, (int, float)):
+        w = 4.0 * df
+    else:
+        w = 4.0 * df.to(a.device)  # (F,)
+
+    # Flatten (C, F) → D = C*F, tile weight across channels
+    a_flat = a.reshape(M, C * F)          # (M, D)
+    b_flat = b.reshape(N, C * F)          # (N, D)
+    if isinstance(w, float):
+        aw = a_flat.conj() * w
+    else:
+        w_tiled = w.repeat(C)             # (D,)
+        aw = a_flat.conj() * w_tiled
+    return (aw @ b_flat.mT).real          # (M, N)
+
+
+def fd_norm(a, df):
+    r"""Norm induced by :func:`fd_inner`: :math:`\|a\| = \sqrt{\langle a \mid a \rangle}`.
+
+    Computes the diagonal elements only — never allocates an ``(M, M)``
+    matrix.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Pre-whitened complex tensor of shape ``(B, C, F)`` or ``(C, F)``.
+    df : float or torch.Tensor
+        Frequency bin width(s).  Same convention as :func:`fd_inner`.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(B,)`` or scalar.
+    """
+    squeeze = a.ndim == 2
+    if squeeze:
+        a = a.unsqueeze(0)
+
+    if isinstance(df, (int, float)):
+        w = 4.0 * df
+    else:
+        w = 4.0 * df.to(a.device)  # (F,)
+
+    power = (a.conj() * a).real  # (B, C, F)
+    if isinstance(w, float):
+        result = (w * power).sum(dim=(-2, -1)).sqrt()
+    else:
+        result = (power * w).sum(dim=(-2, -1)).sqrt()
+
+    return result.squeeze(0) if squeeze else result

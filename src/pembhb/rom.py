@@ -38,7 +38,7 @@ class ReducedOrderModel:
             self.device = device
             self.tolerance = tolerance
             self.patience = patience
-            self.max_epochs = 1000  # safety cap to prevent infinite loops in case of non-convergence
+            self.max_epochs = 4000  # safety cap to prevent infinite loops in case of non-convergence
             self.freq_cutoff_idx = freq_cutoff_idx  # discard fd bins below this index
             self.df = df  # frequency bin width(s): scalar (uniform) or 1-D array (non-uniform / logspaced)
             self.dt = dt  # time bin width(s): scalar (uniform) or 1-D array (non-uniform)
@@ -571,7 +571,7 @@ class ReducedOrderModel:
             # and is denormalised to get a comparison with the original waveform
             reconstruction_denormalised = self._denormalize_dom(proj, dom)
             # the difference between the flattened wave (clean) and the denormalised reconstruction is assessed
-            residual_original_space = flattened_wave_batch - reconstruction_denormalised
+            #residual_original_space = flattened_wave_batch - reconstruction_denormalised
 
             # Weighted residual norms
             r_unnorm = wave_batch - proj
@@ -968,12 +968,17 @@ class ReducedOrderModel:
         :param dom: Domain tag ('fd' or 'td').
         :return: Coefficients of shape (Batch_size, N_basis).
         """
-        data = self._apply_freq_cutoff(data, dom)
-        normalized_data = self._normalize_dom(data, dom)
+        data_white = self._whiten_fd(data) if dom == 'fd' else data
+        data_white_cutoff = self._apply_freq_cutoff(data_white, dom)
+        normalized_data = self._normalize_dom(data_white_cutoff, dom)
         return self._compress_normalized_dom(normalized_data, dom)
 
     def reconstruct(self, coeff, dom='fd'):
-        """Reconstruct data from reduced basis coefficients.
+        """Reconstruct raw data from reduced basis coefficients.
+
+        Inverse of :meth:`compress`: returns data in the same space as the
+        original input (i.e. raw, un-whitened).  For FD the whitened
+        reconstruction is multiplied back by the ASD.
 
         If the ROM was trained with a frequency cutoff, the returned
         tensor contains only the retained (high-frequency) bins, i.e.
@@ -981,13 +986,19 @@ class ReducedOrderModel:
 
         :param coeff: Coefficients with shape (Batch_size, N_basis).
         :param dom: Domain tag ('fd' or 'td').
-        :return: Reconstructed data with shape (Batch_size, Channels, Dim).
+        :return: Reconstructed raw data with shape (Batch_size, Channels, Dim).
         """
         normalized_data = self._reconstruct_normalized_dom(coeff, dom)
         denormalized_data = self._denormalize_dom(normalized_data, dom)
         n_channels = getattr(self, f'n_channels_{dom}')
         n_dim = getattr(self, f'n_dim_{dom}')
-        return denormalized_data.reshape(denormalized_data.shape[0], n_channels, n_dim)
+        whitened = denormalized_data.reshape(denormalized_data.shape[0], n_channels, n_dim)
+        if dom == 'fd' and self.asd is not None:
+            # de-whiten: multiply back by ASD to return to raw-data space
+            asd = self.asd.to(whitened.device)   # (C, F_full) — may be wider than n_dim
+            asd_trimmed = self._apply_freq_cutoff(asd, dom)  # (C, n_dim)
+            whitened = whitened * asd_trimmed.unsqueeze(0)
+        return whitened
     
 
 class ROMWrapper(nn.Module): 
@@ -1077,16 +1088,7 @@ class ROMWrapper(nn.Module):
 
         # --- frequency domain ---
         if 'fd' in self._compress_domains:
-            # Whiten incoming raw data using the stored ASD before compression.
-            # The ROM was trained on pre-whitened waveforms, so inference data
-            # must be whitened identically.
-            if self.rom.asd is not None:
-                asd = self.rom.asd.to(d_f.device)          # (C, F_full)
-                # Guard against zero-ASD bins: replace 0 → inf so whitened value → 0
-                safe_asd = asd.clone()
-                safe_asd[safe_asd == 0] = float('inf')
-                d_f = d_f / safe_asd.unsqueeze(0)          # (B, C, F)
-
+            # compress() handles whitening internally.
             compressed_fd = self.rom.compress(d_f, dom='fd')
             # Coefficients are real-valued under the Re[] inner product
             parts.append(compressed_fd)

@@ -100,6 +100,176 @@ class BBHXLikelihood(bilby.Likelihood):
         # Evaluate likelihood
         log_l = self.bbhx_likelihood.get_ll(bbhx_params, **waveform_kwargs)
         return float(log_l[0])
+    
+    def log_likelihood_vectorized(self, parameters_list):
+        """
+        Compute log likelihood for multiple parameter sets at once (vectorized)
+        
+        This method enables parallel evaluation of multiple walkers by batching
+        the likelihood calls. bbhx.Likelihood.get_ll is vectorizable and can
+        evaluate multiple parameter sets simultaneously, which is much faster
+        than calling log_likelihood sequentially for each walker.
+        
+        Parameters
+        ----------
+        parameters_list : list of dict
+            List of parameter dictionaries, one per walker
+            Each dict has parameter names as keys (following _ORDERED_PRIOR_KEYS)
+            
+        Returns
+        -------
+        np.ndarray
+            Array of log likelihood values, shape (n_walkers,)
+        """
+        n_walkers = len(parameters_list)
+        
+        # Convert all parameters to tmnre space and stack
+        tmnre_params_list = []
+        for parameters in parameters_list:
+            tmnre_params = np.array(
+                [parameters[key] if key in parameters else self.fixed_params[key] 
+                 for key in _ORDERED_PRIOR_KEYS],
+                             dtype=np.float64
+            )
+            tmnre_params_list.append(tmnre_params)
+        
+        # Stack into (11, n_walkers) array
+        tmnre_params_batch = np.stack(tmnre_params_list, axis=1)  # shape (11, n_walkers)
+        
+        # Transform all to bbhx input space at once
+        bbhx_params_batch = self.sampler.samples_to_bbhx_input(
+            tmnre_params_batch, 
+            t_obs_end=self.simulator.t_obs_end_SI
+        )  # shape (12, n_walkers)
+        
+        # Get waveform kwargs (copy because get_ll mutates the dict in-place)
+        waveform_kwargs = self.simulator.waveform_kwargs.copy()
+        
+        # Evaluate likelihood for all walkers at once - THIS IS THE KEY OPTIMIZATION!
+        log_l_batch = self.bbhx_likelihood.get_ll(bbhx_params_batch, **waveform_kwargs)
+        # log_l_batch has shape (n_walkers,)
+        
+        return log_l_batch
+
+
+def compute_fisher_information_matrix(likelihood, true_params_dict, param_names, delta_frac=1e-4):
+    """
+    Compute Fisher Information Matrix using numerical derivatives
+    
+    The Fisher Information Matrix (FIM) is computed as:
+    F_ij = -E[∂²log L / ∂θ_i ∂θ_j]
+    
+    For a single data realization, we approximate:
+    F_ij ≈ -∂²log L / ∂θ_i ∂θ_j
+    
+    This is computed numerically using finite differences.
+    The FIM inverse gives the Cramér-Rao lower bound on parameter uncertainties.
+    
+    Parameters
+    ----------
+    likelihood : BBHXLikelihood
+        The likelihood object
+    true_params_dict : dict
+        Dictionary with true parameter values
+    param_names : list
+        List of parameter names to include in FIM (only varying params)
+    delta_frac : float, optional
+        Fractional step size for finite differences (default: 1e-4)
+        
+    Returns
+    -------
+    fisher_matrix : np.ndarray
+        Fisher Information Matrix, shape (n_params, n_params)
+    param_uncertainties : np.ndarray  
+        Square root of diagonal of inverse FIM (parameter standard deviations)
+    """
+    n_params = len(param_names)
+    fisher = np.zeros((n_params, n_params))
+    
+    # Compute log-likelihood at true parameters
+    logl_0 = likelihood.log_likelihood(true_params_dict)
+    print(f"Log-likelihood at true parameters: {logl_0:.2f}")
+    
+    # Compute numerical second derivatives
+    print("Computing Fisher Information Matrix...")
+    for i, param_i in enumerate(param_names):
+        for j, param_j in enumerate(param_names):
+            if j < i:
+                # Use symmetry
+                fisher[i, j] = fisher[j, i]
+                continue
+                
+            # Compute step sizes
+            val_i = true_params_dict[param_i]
+            val_j = true_params_dict[param_j]
+            delta_i = abs(val_i) * delta_frac if val_i != 0 else delta_frac
+            delta_j = abs(val_j) * delta_frac if val_j != 0 else delta_frac
+            
+            if i == j:
+                # Diagonal: second derivative ∂²L/∂θ²
+                params_plus = true_params_dict.copy()
+                params_minus = true_params_dict.copy()
+                params_plus[param_i] = val_i + delta_i
+                params_minus[param_i] = val_i - delta_i
+                
+                logl_plus = likelihood.log_likelihood(params_plus)
+                logl_minus = likelihood.log_likelihood(params_minus)
+                
+                # Second derivative: (f(x+h) - 2f(x) + f(x-h)) / h²
+                d2logl = (logl_plus - 2*logl_0 + logl_minus) / (delta_i**2)
+            else:
+                # Off-diagonal: mixed derivative ∂²L/∂θ_i∂θ_j
+                params_pp = true_params_dict.copy()
+                params_pm = true_params_dict.copy()
+                params_mp = true_params_dict.copy()
+                params_mm = true_params_dict.copy()
+                
+                params_pp[param_i] = val_i + delta_i
+                params_pp[param_j] = val_j + delta_j
+                
+                params_pm[param_i] = val_i + delta_i
+                params_pm[param_j] = val_j - delta_j
+                
+                params_mp[param_i] = val_i - delta_i
+                params_mp[param_j] = val_j + delta_j
+                
+                params_mm[param_i] = val_i - delta_i
+                params_mm[param_j] = val_j - delta_j
+                
+                logl_pp = likelihood.log_likelihood(params_pp)
+                logl_pm = likelihood.log_likelihood(params_pm)
+                logl_mp = likelihood.log_likelihood(params_mp)
+                logl_mm = likelihood.log_likelihood(params_mm)
+                
+                # Mixed derivative: (f(x+h,y+k) - f(x+h,y-k) - f(x-h,y+k) + f(x-h,y-k)) / (4hk)
+                d2logl = (logl_pp - logl_pm - logl_mp + logl_mm) / (4 * delta_i * delta_j)
+            
+            # Fisher matrix is negative of second derivative
+            fisher[i, j] = -d2logl
+            print(f"  F[{param_i}, {param_j}] = {fisher[i, j]:.3e}")
+    
+    # Compute parameter uncertainties from inverse FIM
+    print("\nFisher Information Matrix:")
+    print(fisher)
+    
+    try:
+        fisher_inv = np.linalg.inv(fisher)
+        param_uncertainties = np.sqrt(np.diag(fisher_inv))
+        
+        print("\nParameter uncertainties (sqrt of diagonal of FIM^-1):")
+        for i, param in enumerate(param_names):
+            print(f"  σ({param}) = {param_uncertainties[i]:.6e}")
+            
+        # Compute correlation matrix
+        correlation = fisher_inv / np.outer(param_uncertainties, param_uncertainties)
+        print("\nCorrelation matrix:")
+        print(correlation)
+        
+    except np.linalg.LinAlgError:
+        print("WARNING: Fisher matrix is singular! Cannot invert.")
+        param_uncertainties = np.full(n_params, np.nan)
+    
+    return fisher, param_uncertainties
 
 
 def main():
@@ -205,13 +375,34 @@ def main():
         fixed_params=fixed_params
     )
     
-    # DIAGNOSTIC: Grid search to verify likelihood peak
-    print("\n=== DIAGNOSTIC: Grid Search Around True Parameters ===")
+    # COMPUTE FISHER INFORMATION MATRIX
+    print("\n=== Computing Fisher Information Matrix ===")
     test_params_base = {key: true_tmnre_params[i] for i, key in enumerate(_ORDERED_PRIOR_KEYS) if key not in fixed_params}
+    varying_params = [key for key in _ORDERED_PRIOR_KEYS if key not in fixed_params]
     
     # Evaluate at true params first
     true_logl = likelihood.log_likelihood(test_params_base)
     print(f"Log-likelihood at TRUE parameters: {true_logl:.1f}")
+    
+    # Compute Fisher matrix to get parameter uncertainties
+    fisher_matrix, param_uncertainties = compute_fisher_information_matrix(
+        likelihood, 
+        test_params_base, 
+        varying_params,
+        delta_frac=1e-5  # Use smaller step for narrow priors
+    )
+    
+    print("\n=== Suggested Prior Widths Based on FIM ===")
+    print("Parameter uncertainties from Cramér-Rao bound:")
+    for param, sigma in zip(varying_params, param_uncertainties):
+        if not np.isnan(sigma):
+            # Suggest prior width as 3-5 sigma (covers ~99.7% - 99.99%)
+            suggested_width = 5 * sigma
+            current_width = prior_bounds[param][1] - prior_bounds[param][0]
+            print(f"  {param}: σ = {sigma:.6e}, suggested width = {suggested_width:.6e} (current: {current_width:.6e})")
+    
+    # DIAGNOSTIC: Grid search to verify likelihood peak
+    print("\n=== DIAGNOSTIC: Grid Search Around True Parameters ===")
     
     # best_logl = true_logl
     # best_params = {}

@@ -46,9 +46,30 @@ architecture:
       filename: "/u/g/gpuleo/pembhb/rom_td_fd.pt"
       device: "cuda"
     Autoencoder:
-      load: True 
+      load: False 
       filename: "/data/gpuleo/mbhb/logs/autoencoder/version_12/checkpoints/ae-epoch=261-val_loss=5.7389e-09.ckpt"  # Path to trained DenoisingAutoencoder checkpoint
       device: "cuda"
+      # --- Training hyperparameters (used when load: False) ---
+      architecture: "conv"        # "conv" or "unet"
+      representation: "real_imag"  # "amp_phase" or "real_imag"
+      n_channels: 2                # TDI channels (AE→2, AET→3)
+      n_freqs: 4096
+      bottleneck_dim: 128
+      hidden_channels: [32, 64, 128, 256, 256]
+      kernel_size: 4
+      stride: 2
+      dropout: 0.0
+      high_freq_only: True
+      freq_split_idx: 2048
+      # Training
+      lr: 0.001
+      weight_decay: 0.00001
+      epochs: 500
+      scheduler_patience: 10
+      scheduler_factor: 0.3
+      early_stop_patience: 50
+      gradient_clip_val: null
+      log_name: "autoencoder"
   
 baseline_model:
   use: False
