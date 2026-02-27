@@ -12,7 +12,7 @@ scheduler_patience: 10
 keep_ckpt: True
 marginals: 
   #  f: [[0]]
-  f: [[0,1]] #,[7,8], [10]]
+  f: [[0,1],[7,8], [10]]
 
 device: "cuda"
 
@@ -27,7 +27,7 @@ architecture:
 
   data_summary:
 
-    type: "Autoencoder"  # Options: "ROM", "Autoencoder"
+    type: "ROM"  # Options: "ROM", "Autoencoder"
     BrutalCompression:
       Nfreqs: 1000
       lowdim: 16
@@ -43,6 +43,7 @@ architecture:
       # cnn_channels: [32, 64]
     ROM:
       load: False
+      max_basis_elements: 2400
       filename: "/u/g/gpuleo/pembhb/rom_td_fd.pt"
       device: "cuda"
     Autoencoder:

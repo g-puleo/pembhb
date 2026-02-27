@@ -274,8 +274,11 @@ def compute_fisher_information_matrix(likelihood, true_params_dict, param_names,
 
 def main():
     # Configuration
-    event_idx = 0  # Which event to analyze
-    observation_file = "/data/gpuleo/mbhb/observation_skyloc_tc_mass.h5"
+    event_idx = 2  # Which event to analyze
+    # 5d
+    #observation_file = "/data/gpuleo/mbhb/observation_skyloc_tc_mass.h5"
+    # 2d 
+    observation_file = os.path.join(ROOT_DIR, "data", "testes_newdata_fixall_notmcq.h5")
     config_file = os.path.join(ROOT_DIR, "configs", "datagen_config.yaml")
     
     # Output settings

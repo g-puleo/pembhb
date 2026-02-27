@@ -1027,10 +1027,10 @@ class ROMWrapper(nn.Module):
 
     _VALID_COMPRESS = ('fd', 'td', 'both')
 
-    def __init__(self, filename: str, device: str = "cuda", compress=None):
+    def __init__(self, filename: str, device: str = "cuda", compress=None, max_basis_elems=None):
         super().__init__()
         self.rom = ReducedOrderModel(filename=filename, device=device)
-
+        self.rom.basis = self.rom.basis[:max_basis_elems] if max_basis_elems is not None else self.rom.basis
         # Resolve which domains to compress
         if compress is None:
             # Auto: compress every domain that has a basis
@@ -1054,11 +1054,17 @@ class ROMWrapper(nn.Module):
 
         # Validate that the ROM actually has a basis for every requested domain
         for dom in self._compress_domains:
-            if getattr(self.rom, f'basis_{dom}', None) is None:
+            basis_dom = getattr(self.rom, f'basis_{dom}', None)
+            if basis_dom is None:
                 raise ValueError(
                     f"compress='{compress}' requests domain '{dom}', but the ROM "
                     f"loaded from '{filename}' has no trained basis for it."
                 )
+            # and retain at most max_basis_elems if specified
+            n_basis_elems = basis_dom.shape[0]
+            
+            if max_basis_elems is not None and n_basis_elems > max_basis_elems:
+                setattr(self.rom, f'basis_{dom}', basis_dom[:max_basis_elems])
 
     def get_n_features(self):
         """Return the total number of scalar features produced by forward().
