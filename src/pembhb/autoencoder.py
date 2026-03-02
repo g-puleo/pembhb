@@ -635,13 +635,20 @@ class AutoencoderWrapper(nn.Module):
         self._device = device
 
         if freeze:
-            for p in self.autoencoder.parameters():
-                p.requires_grad = False
+            self._freeze_parameters()
 
         # Pre-compute the number of bottleneck features so
         # InferenceNetwork can query it via get_n_features().
         self._n_features = self._compute_n_features()
 
+    def _freeze_parameters(self):
+        """Freeze the autoencoder parameters."""
+        for p in self.autoencoder.parameters():
+            p.requires_grad = False
+    def unfreeze_parameters(self):
+        """Unfreeze the autoencoder parameters."""
+        for p in self.autoencoder.parameters():
+            p.requires_grad = True
     def _compute_n_features(self) -> int:
         """Compute the bottleneck dimensionality."""
         if self.autoencoder.architecture == "conv":

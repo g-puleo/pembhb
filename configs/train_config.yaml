@@ -27,7 +27,7 @@ architecture:
 
   data_summary:
 
-    type: "ROM"  # Options: "ROM", "Autoencoder"
+    type: "Autoencoder"  # Options: "ROM", "Autoencoder"
     BrutalCompression:
       Nfreqs: 1000
       lowdim: 16
@@ -47,7 +47,8 @@ architecture:
       filename: "/u/g/gpuleo/pembhb/rom_td_fd.pt"
       device: "cuda"
     Autoencoder:
-      load: False 
+      load: False
+      finetune_previous: True 
       filename: "/data/gpuleo/mbhb/logs/autoencoder/version_12/checkpoints/ae-epoch=261-val_loss=5.7389e-09.ckpt"  # Path to trained DenoisingAutoencoder checkpoint
       device: "cuda"
       # --- Training hyperparameters (used when load: False) ---
