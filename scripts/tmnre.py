@@ -26,7 +26,7 @@ torch.set_float32_matmul_precision("medium")
 def get_timestamp():
     return datetime.now().strftime("%Y%m%d")
 
-TIME_OF_EXECUTION = get_timestamp()+"autoenc_5d_narrow"
+TIME_OF_EXECUTION = get_timestamp()+"autoenc_narrow_fisher_5d"
 
 def validate_marginals(marginals_config: dict):
     """Validate that no parameter index appears in multiple marginals.
@@ -279,18 +279,19 @@ class PlotPosteriorCallback(Callback):
                     )
                     
                     try:
+                        epsilon_value = 1e-4
                         widest_interval, norm1d, grid, inj_params = get_widest_interval_1d(
                             pl_module,
                             self.obs_loader,
                             in_param_idx=param_idx,
                             out_param_idx=out_param_idx,
-                            eps=1e-4
+                            eps=epsilon_value
                         )
                         
                         # Plot
                         ax.plot(grid.flatten(), norm1d, 'b-', linewidth=1.5)
                         ax.axvline(inj_params[0], color='r', linestyle='--', label='Injection')
-                        ax.axvline(widest_interval[0], color='g', linestyle=':', label='99.7% CI')
+                        ax.axvline(widest_interval[0], color='g', linestyle=':', label=f'{100*epsilon_value}% CI')
                         ax.axvline(widest_interval[1], color='g', linestyle=':')
                         ax.fill_between(grid.flatten(), 0, norm1d, 
                                        where=(grid.flatten() >= widest_interval[0]) & (grid.flatten() <= widest_interval[1]),
@@ -443,7 +444,25 @@ class SequentialTrainer:
                         print(f"Updated prior based on baseline model for 2D marginal ({utils._ORDERED_PRIOR_KEYS[inj1]}, {utils._ORDERED_PRIOR_KEYS[inj2]})")
                     out_idx += 1
             print(f"Updated prior after baseline model: {self.datagen_conf['prior']}")
-    
+
+        # Optionally compute Fisher-matrix-based prior bounds for round 1.
+        # When train_conf["fisher_prior"]["enabled"] is True the bounds are
+        # derived from the FIM at the target event; otherwise this is None and
+        # datagen_conf["prior"] is used as usual.
+        self.fisher_prior_bounds = None
+        fp_conf = self.train_conf.get("fisher_prior", {})
+        if fp_conf.get("enabled", False):
+            print("[Fisher] Computing Fisher Information Matrix for prior initialisation ...")
+            self.fisher_prior_bounds = utils.compute_fisher_prior_bounds(
+                datagen_config=self.datagen_conf,
+                observation_file=fp_conf["observation_file"],
+                event_idx=fp_conf["event_idx"],
+                varying_params=fp_conf["varying_params"],
+                fixed_params=fp_conf["fixed_params"],
+                n_sigma=fp_conf.get("n_sigma", 5.0),
+                delta_frac=fp_conf.get("delta_frac", 1e-4),
+            )
+
     def _setup_plot(self):
         self.fig, self.axes = plt.subplots(1, 2, figsize=(12, 6))
         for ax, title, ylabel in zip(
@@ -793,9 +812,20 @@ class SequentialTrainer:
     def run(self, n_rounds=1):
         for i in range(1,n_rounds+1):
             print(f"Running round {i}...")
+            if i == 1 and self.fisher_prior_bounds is not None:
+                sampler_kwargs = {"prior_bounds": self.fisher_prior_bounds}
+                print("[Fisher] Using Fisher-based prior for round 1.")
+                import yaml as _yaml
+                _out = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION, "fisher_prior_round_1.yaml")
+                os.makedirs(os.path.dirname(_out), exist_ok=True)
+                with open(_out, "w") as _f:
+                    _yaml.safe_dump({"fisher_prior_bounds": self.fisher_prior_bounds}, _f)
+                print(f"[Fisher] Saved Fisher prior bounds to {_out}")
+            else:
+                sampler_kwargs = {"prior_bounds": self.datagen_conf["prior"]}
             self.round(
                 idx=i,
-                sampler_init_kwargs={"prior_bounds": self.datagen_conf["prior"]},
+                sampler_init_kwargs=sampler_kwargs,
             )
             # model = InferenceNetwork.load_from_checkpoint("/u/g/gpuleo/pembhb/logs/20251111_100948_round_0/version_0/checkpoints/epoch=13-step=2380.ckpt")
             out_idx = 0

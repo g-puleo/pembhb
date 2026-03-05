@@ -64,7 +64,7 @@ def parse_args():
     )
     p.add_argument("--batch_size", type=int, default=250)
     p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--noise_factor", type=float, default=1.0)
+    p.add_argument("--noise_f actor", type=float, default=1.0)
     p.add_argument("--cache_in_memory", action="store_true", default=True)
 
     # ---------- architecture -------------------------------------------------

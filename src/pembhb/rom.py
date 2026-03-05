@@ -22,7 +22,7 @@ class ReducedOrderModel:
     _VALID_DOMAINS = ('fd', 'td', 'both')
 
     def __init__(self, batch_size=1000, tolerance=1e-3, device="cpu",
-                 filename=None, debugging=False, domain='fd', patience=10,
+                 filename=None, debugging=False, domain='fd', patience=1,
                  freq_cutoff_idx=None, df=None, dt=None):
         if filename is not None: 
             print(f"[ROM] initializing from file {filename}.\n Other arguments will be ignored.")
@@ -49,7 +49,7 @@ class ReducedOrderModel:
                 setattr(self, f'n_channels_{dom}', None)
                 setattr(self, f'n_dim_{dom}', None)      # n_freq or n_time
                 setattr(self, f'global_scale_factor_{dom}', None)
-                setattr(self, f'mean_vec_{dom}', None)
+                #setattr(self, f'mean_vec_{dom}', None)
                 setattr(self, f'valid_bins_mask_{dom}', None)  # boolean mask for non-zero ASD bins
                 setattr(self, f'inner_weights_{dom}', None)    # inner-product weights (4*df or dt)
 
@@ -198,7 +198,7 @@ class ReducedOrderModel:
                 setattr(self, f'n_channels_{dom}', s[f'n_channels_{dom}'])
                 setattr(self, f'n_dim_{dom}', s[f'n_dim_{dom}'])
                 setattr(self, f'global_scale_factor_{dom}', s[f'global_scale_factor_{dom}'])
-                setattr(self, f'mean_vec_{dom}', s[f'mean_vec_{dom}'].to(self.device))
+                #setattr(self, f'mean_vec_{dom}', s[f'mean_vec_{dom}'].to(self.device))
                 # Valid-bins mask (Option B: boolean mask for non-zero ASD bins)
                 vbm = s.get(f'valid_bins_mask_{dom}', None)
                 if vbm is not None:
@@ -224,7 +224,7 @@ class ReducedOrderModel:
                 self.n_channels_fd = s['n_channels']
                 self.n_dim_fd = s['n_freq']
                 self.global_scale_factor_fd = s['global_scale_factor']
-                self.mean_vec_fd = s['mean_vec'].to(self.device)
+                #self.mean_vec_fd = s['mean_vec'].to(self.device)
                 print(f"[ROM] fd basis loaded (legacy). n_freq={self.n_dim_fd}, "
                       f"n_channels={self.n_channels_fd}, n_basis={len(self.basis_fd)}")
 
@@ -234,7 +234,7 @@ class ReducedOrderModel:
             self.n_channels = self.n_channels_fd
             self.n_freq = self.n_dim_fd
             self.global_scale_factor = self.global_scale_factor_fd
-            self.mean_vec = self.mean_vec_fd
+            #self.mean_vec = self.mean_vec_fd
         return 
 
     def load_diagnostics(self, filename):
@@ -267,7 +267,7 @@ class ReducedOrderModel:
             state[f'n_channels_{dom}'] = getattr(self, f'n_channels_{dom}')
             state[f'n_dim_{dom}'] = getattr(self, f'n_dim_{dom}')
             state[f'global_scale_factor_{dom}'] = getattr(self, f'global_scale_factor_{dom}')
-            state[f'mean_vec_{dom}'] = getattr(self, f'mean_vec_{dom}').cpu()
+            #state[f'mean_vec_{dom}'] = getattr(self, f'mean_vec_{dom}').cpu()
             vbm = getattr(self, f'valid_bins_mask_{dom}', None)
             if vbm is not None:
                 state[f'valid_bins_mask_{dom}'] = vbm.cpu() if isinstance(vbm, torch.Tensor) else vbm
@@ -282,7 +282,7 @@ class ReducedOrderModel:
             state['n_channels'] = state['n_channels_fd']
             state['n_freq'] = state['n_dim_fd']
             state['global_scale_factor'] = state['global_scale_factor_fd']
-            state['mean_vec'] = state['mean_vec_fd']
+            #state['mean_vec'] = state['mean_vec_fd']
 
         torch.save(state, filename)
         filename_diagnostics = filename.replace(".pt", "_diagnostics.pt")
@@ -333,7 +333,7 @@ class ReducedOrderModel:
             self.n_channels = self.n_channels_fd
             self.n_freq = self.n_dim_fd
             self.global_scale_factor = self.global_scale_factor_fd
-            self.mean_vec = self.mean_vec_fd
+            #self.mean_vec = self.mean_vec_fd
 
 
     def _is_convergence_stagnant(self, convergence_value, last_values):
@@ -374,10 +374,11 @@ class ReducedOrderModel:
         self._build_inner_weights(dom)
 
         # Compute global scale & mean for this domain
-        mean, scale = self._compute_global_scale(train_dataloader, wave_key, n_channels * n_dim, dom=dom)
-        mean = mean.to(self.device)
+        #mean, 
+        scale = self._compute_global_scale(train_dataloader, wave_key, n_channels * n_dim, dom=dom)
+        #mean = mean.to(self.device)
         setattr(self, f'global_scale_factor_{dom}', scale)
-        setattr(self, f'mean_vec_{dom}', mean)
+        #setattr(self, f'mean_vec_{dom}', mean)
 
         n = len(train_subset)
         seed = torch.randint(0, n, (1,)).item()
@@ -440,15 +441,15 @@ class ReducedOrderModel:
 
                 if convergence_on == 'sigma_data':
                     convergence_value = sigma_data
-                    last_10_values = diagnostics['sigmas_data'][-self.patience:] if len(diagnostics['sigmas_data']) >= self.patience else diagnostics['sigmas_data']
+                    last_N_values = diagnostics['sigmas_data'][-self.patience:] if len(diagnostics['sigmas_data']) >= self.patience else diagnostics['sigmas_data']
                 
                 elif convergence_on == 'sigma':
                     convergence_value = sigma
-                    last_10_values = diagnostics['sigmas'][-self.patience:] if len(diagnostics['sigmas']) >= self.patience else diagnostics['sigmas']
+                    last_N_values = diagnostics['sigmas'][-self.patience:] if len(diagnostics['sigmas']) >= self.patience else diagnostics['sigmas']
                 # early stop training if the convergence_value does not decrease after a certain number of epochs (e.g. 10)
-                # if self._is_convergence_stagnant(convergence_value, last_10_values):
-                #     print(f"\n[ROM][{dom}] convergence stagnation detected (no improvement in {self.patience} epochs). Stopping training.")
-                #     break
+                if self._is_convergence_stagnant(convergence_value, last_N_values):
+                    print(f"\n[ROM][{dom}] convergence stagnation detected (no improvement in {self.patience} epochs). Stopping training.")
+                    break
                 picked_set.add(idx)
                 picked.append(idx)
                 log10mc_values.append(train_subset[idx]["params"][0])
@@ -667,17 +668,17 @@ class ReducedOrderModel:
         # Peek at first batch to determine dtype
         peek = self._apply_freq_cutoff(next(iter(dataloader))[wave_key], dom)
         vec_dtype = torch.complex64 if peek.is_complex() else torch.float32
-        mean_vec = torch.zeros(flat_dim, device=self.device, dtype=vec_dtype)
+        #mean_vec = torch.zeros(flat_dim, device=self.device, dtype=vec_dtype)
         for batch in dataloader:
             v = self._to_device_async(batch[wave_key])
             if dom == 'fd':
                 v = self._whiten_fd(v)
             v = self._apply_freq_cutoff(v, dom)
             max_val = max(max_val, v.abs().max().item())
-            mean_vec = mean_vec + v.reshape(v.shape[0], -1).sum(dim=0)
-        mean_vec = mean_vec / len(dataloader.dataset)
+            #mean_vec = mean_vec + v.reshape(v.shape[0], -1).sum(dim=0)
+        #mean_vec = mean_vec / len(dataloader.dataset)
         print(f"[ROM][{dom}] global scale factor: {max_val:.3e}")
-        return mean_vec, max_val
+        return  max_val
 
     def _build_valid_bins_mask(self, train_subset, dom, n_channels, n_dim):
         """Build a boolean mask identifying frequency bins with non-zero ASD.
@@ -907,9 +908,9 @@ class ReducedOrderModel:
             d = data.reshape(data.shape[0], -1)
         else:
             d = data
-        mean = getattr(self, f'mean_vec_{dom}')
+        #mean = getattr(self, f'mean_vec_{dom}')
         scale = getattr(self, f'global_scale_factor_{dom}')
-        return (d - mean) / scale
+        return d / scale
     
     def _denormalize(self, data):
         """Legacy fd-only wrapper."""
@@ -917,9 +918,9 @@ class ReducedOrderModel:
 
     def _denormalize_dom(self, data, dom):
         """Unscale and uncenter data from normalized space for a given domain."""
-        mean = getattr(self, f'mean_vec_{dom}')
+        #mean = getattr(self, f'mean_vec_{dom}')
         scale = getattr(self, f'global_scale_factor_{dom}')
-        return data * scale + mean
+        return data * scale #+ mean
 
     # ------------------------------------------------------------------
     # compress / reconstruct  (domain-aware + legacy wrappers)

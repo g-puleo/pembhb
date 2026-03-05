@@ -1,4 +1,5 @@
 import yaml
+import copy
 import torch
 import os 
 from pembhb import ROOT_DIR
@@ -1146,3 +1147,244 @@ def fd_norm(a, df):
         result = (power * w).sum(dim=(-2, -1)).sqrt()
 
     return result.squeeze(0) if squeeze else result
+
+
+# ---------------------------------------------------------------------------
+# Fisher Information Matrix utilities
+# ---------------------------------------------------------------------------
+
+def compute_fisher_information_matrix(
+    likelihood_fn,
+    true_params_dict: dict,
+    param_names: list,
+    delta_frac: float = 1e-4,
+):
+    """Compute the Fisher Information Matrix via numerical second derivatives.
+
+    Uses finite differences of the log-likelihood at *true_params_dict* to fill
+    the FIM, then returns the Cramér-Rao lower bounds on parameter
+    uncertainties as ``sqrt(diag(FIM^{-1}))``.
+
+    Parameters
+    ----------
+    likelihood_fn : callable
+        Function ``(dict) -> float`` returning the log-likelihood for a dict of
+        ``{param_name: value}`` covering at least *param_names*.
+    true_params_dict : dict
+        Expansion-point parameter values (typically the injected / true values).
+    param_names : list of str
+        Names of the parameters to include in the FIM.
+    delta_frac : float
+        Fractional step size for finite differences
+        (``delta_i = |val_i| * delta_frac`` if ``val_i != 0``, else
+        ``delta_frac`` directly).
+
+    Returns
+    -------
+    fisher : np.ndarray, shape (n, n)
+        Fisher Information Matrix.
+    param_uncertainties : np.ndarray, shape (n,)
+        1-sigma uncertainties from the Cramér-Rao bound
+        (``NaN`` if the FIM is singular).
+    """
+    n = len(param_names)
+    fisher = np.zeros((n, n))
+
+    logl_0 = likelihood_fn(true_params_dict)
+    print(f"[FIM] Log-likelihood at expansion point: {logl_0:.4f}")
+    print("[FIM] Computing Fisher Information Matrix ...")
+
+    for i, pi in enumerate(param_names):
+        for j, pj in enumerate(param_names):
+            if j < i:
+                fisher[i, j] = fisher[j, i]
+                continue
+
+            vi = true_params_dict[pi]
+            vj = true_params_dict[pj]
+            di = abs(vi) * delta_frac if vi != 0 else delta_frac
+            dj = abs(vj) * delta_frac if vj != 0 else delta_frac
+
+            if i == j:
+                p_plus  = {**true_params_dict, pi: vi + di}
+                p_minus = {**true_params_dict, pi: vi - di}
+                d2 = (likelihood_fn(p_plus) - 2.0 * logl_0 + likelihood_fn(p_minus)) / di ** 2
+            else:
+                p_pp = {**true_params_dict, pi: vi + di, pj: vj + dj}
+                p_pm = {**true_params_dict, pi: vi + di, pj: vj - dj}
+                p_mp = {**true_params_dict, pi: vi - di, pj: vj + dj}
+                p_mm = {**true_params_dict, pi: vi - di, pj: vj - dj}
+                d2 = (
+                    likelihood_fn(p_pp) - likelihood_fn(p_pm)
+                    - likelihood_fn(p_mp) + likelihood_fn(p_mm)
+                ) / (4.0 * di * dj)
+
+            fisher[i, j] = -d2
+            print(f"  F[{pi}, {pj}] = {fisher[i, j]:.3e}")
+
+    print("[FIM] Fisher Information Matrix:")
+    print(fisher)
+
+    try:
+        fisher_inv = np.linalg.inv(fisher)
+        param_uncertainties = np.sqrt(np.diag(fisher_inv))
+        print("[FIM] Parameter uncertainties (Cramér-Rao lower bound):")
+        for name, sigma in zip(param_names, param_uncertainties):
+            print(f"  σ({name}) = {sigma:.6e}")
+    except np.linalg.LinAlgError:
+        print("[FIM] WARNING: Fisher matrix is singular – cannot invert.")
+        param_uncertainties = np.full(n, np.nan)
+
+    return fisher, param_uncertainties
+
+
+def compute_fisher_prior_bounds(
+    datagen_config: dict,
+    observation_file: str,
+    event_idx: int,
+    varying_params: list,
+    fixed_params: list,
+    n_sigma: float = 5.0,
+    delta_frac: float = 1e-4,
+) -> dict:
+    """Build prior bounds for data generation using the Fisher Information Matrix.
+
+    For each parameter in *varying_params* the bounds are set to
+    ``[true_val ± n_sigma * σ_FIM]`` where *σ_FIM* is the Cramér-Rao
+    1-sigma uncertainty.  Parameters in *fixed_params* are pinned to their
+    **true value read from the observation file** (zero-width prior).  All
+    other parameters keep the ``datagen_config["prior"]`` bounds unchanged.
+
+    Parameters
+    ----------
+    datagen_config : dict
+        Datagen configuration (as returned by :func:`read_config`).
+    observation_file : str
+        Path to the HDF5 observation file.
+    event_idx : int
+        Index of the event to use as the FIM expansion point.
+    varying_params : list of str
+        Parameter names for which FIM-based bounds are computed.
+    fixed_params : list of str
+        Names of parameters to hold fixed.  Their values are read from the
+        observation file (``source_parameters[event_idx]``), **not** from the
+        YAML config.
+    n_sigma : float
+        Half-width of the generated prior in units of the FIM σ.
+    delta_frac : float
+        Fractional step size passed to :func:`compute_fisher_information_matrix`.
+
+    Returns
+    -------
+    dict
+        Complete prior-bounds dict compatible with
+        ``sampler_init_kwargs={"prior_bounds": ...}``.
+    """
+    import h5py  # h5py is already a project dependency
+    # Lazy imports to avoid circular dependency with pembhb.simulator
+    from pembhb.simulator import MBHBSimulatorFD_TD
+    from bbhx.likelihood import Likelihood as BBHXLikelihoodFn
+
+    # Load observation first so we can use true values for fixed params.
+    print(f"[Fisher] Loading event {event_idx} from {observation_file} ...")
+    import h5py as _h5
+    with _h5.File(observation_file, "r") as f:
+        freqs_obs       = f["frequencies"][:]
+        true_params_arr = f["source_parameters"][event_idx]  # shape (11,)
+        wave_fd         = f["wave_fd"][event_idx]            # shape (n_ch, n_freqs)
+        noise_fd        = f["noise_fd"][event_idx]           # shape (n_ch, n_freqs)
+
+    # Build fixed_values dict from the observation file.
+    fixed_values = {
+        key: float(true_params_arr[_ORDERED_PRIOR_KEYS.index(key)])
+        for key in fixed_params
+    }
+    print("[Fisher] Fixed parameter values read from observation file:")
+    for k, v in fixed_values.items():
+        print(f"  {k} = {v:.6e}")
+
+    # Build simulator-friendly dummy prior (correct shape, no crash).
+    # We only need the simulator for its waveform generator and frequency array.
+    dummy_prior = copy.deepcopy(datagen_config["prior"])
+    for key, val in fixed_values.items():
+        dummy_prior[key] = [val, val]
+
+    print("[Fisher] Initializing simulator for FIM evaluation ...")
+    simulator = MBHBSimulatorFD_TD(
+        datagen_config,
+        sampler_init_kwargs={"prior_bounds": dummy_prior},
+        seed=42,
+    )
+    frequencies = simulator.freqs_pos
+
+    assert np.allclose(freqs_obs, frequencies), (
+        "[Fisher] Frequency mismatch between observation file and simulator!"
+    )
+
+    # Build AET data and PSD.
+    data_fd_complex = wave_fd + noise_fd
+    psd_AE  = simulator.asd ** 2
+    psd_T   = np.ones((1, psd_AE.shape[1]))
+    psd_AET = np.concatenate([psd_AE, psd_T], axis=0)
+    data_T  = np.zeros((1, data_fd_complex.shape[1]), dtype=np.complex128)
+    data_fd = np.concatenate([data_fd_complex, data_T], axis=0)
+
+    print("[Fisher] Creating BBHX likelihood ...")
+    bbhx_ll = BBHXLikelihoodFn(
+        simulator.wfd,
+        frequencies,
+        data_fd,
+        psd_AET,
+        force_backend="cpu",
+    )
+
+    # All parameters not in varying_params are fixed to the true observed value.
+    all_fixed = {
+        key: float(true_params_arr[_ORDERED_PRIOR_KEYS.index(key)])
+        for key in _ORDERED_PRIOR_KEYS
+        if key not in varying_params
+    }
+
+    def _log_likelihood(params_dict: dict) -> float:
+        """Evaluate BBHX log-likelihood for the varying parameters only."""
+        tmnre = np.array(
+            [params_dict[k] if k in params_dict else all_fixed[k]
+             for k in _ORDERED_PRIOR_KEYS],
+            dtype=np.float64,
+        ).reshape(-1, 1)
+        bbhx_p = simulator.sampler.samples_to_bbhx_input(
+            tmnre, t_obs_end=simulator.t_obs_end_SI
+        )
+        wf_kw = simulator.waveform_kwargs.copy()
+        return float(bbhx_ll.get_ll(bbhx_p, **wf_kw)[0])
+
+    # FIM computation.
+    true_varying = {
+        k: float(true_params_arr[_ORDERED_PRIOR_KEYS.index(k)])
+        for k in varying_params
+    }
+    _, param_uncertainties = compute_fisher_information_matrix(
+        _log_likelihood, true_varying, varying_params, delta_frac=delta_frac
+    )
+
+    # Assemble final prior bounds.
+    prior_bounds = copy.deepcopy(datagen_config["prior"])
+
+    # Pin fixed parameters to the true values from the observation file.
+    for key, val in fixed_values.items():
+        prior_bounds[key] = [val, val]
+
+    # FIM-based bounds for varying parameters.
+    for key, sigma in zip(varying_params, param_uncertainties):
+        true_val = float(true_params_arr[_ORDERED_PRIOR_KEYS.index(key)])
+        if np.isfinite(sigma):
+            lo = float(true_val - n_sigma * sigma)
+            hi = float(true_val + n_sigma * sigma)
+        else:
+            print(f"[Fisher] WARNING: σ({key}) is NaN – keeping datagen_config bounds.")
+            lo, hi = datagen_config["prior"][key]
+        prior_bounds[key] = [lo, hi]
+        print(f"[Fisher] {key}: true={true_val:.6e}, σ={sigma:.3e} → [{lo:.6e}, {hi:.6e}]")
+
+    print(f"[Fisher] Final prior bounds: {prior_bounds}")
+    return prior_bounds
