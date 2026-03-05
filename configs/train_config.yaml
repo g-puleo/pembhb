@@ -27,7 +27,7 @@ architecture:
 
   data_summary:
 
-    type: "ROM"  # Options: "ROM", "Autoencoder"
+    type: "Autoencoder"  # Options: "ROM", "Autoencoder"
     BrutalCompression:
       Nfreqs: 1000
       lowdim: 16

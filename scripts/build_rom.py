@@ -5,9 +5,18 @@ from pembhb.rom import ReducedOrderModel
 from pembhb.utils import read_config, ROOT_DIR
 import os
 
-def build_rom(dataloader, outfile, tolerance, domain='fd', convergence_on='sigma_data',
-              use_pinned_memory=False, prefetch_batches=1, freq_cutoff_idx=None, df=None):
-    rom = ReducedOrderModel(tolerance=tolerance, device="cuda", debugging=False, domain=domain, freq_cutoff_idx=freq_cutoff_idx, df=df)
+def build_rom(dataloader, outfile, tolerance, convergence_on='sigma_data',
+              use_pinned_memory=False, prefetch_batches=1, freq_cutoff_idx=None,
+              df=None, patience=1, normalize_by_max=True):
+    rom = ReducedOrderModel(
+        tolerance=tolerance,
+        device="cuda",
+        debugging=False,
+        patience=patience,
+        freq_cutoff_idx=freq_cutoff_idx,
+        df=df,
+        normalize_by_max=normalize_by_max,
+    )
     rom.train(dataloader, use_pinned_memory=use_pinned_memory, prefetch_batches=prefetch_batches,
               convergence_on=convergence_on)
     rom.to_file(outfile)
@@ -20,19 +29,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, required=True)
     parser.add_argument("--out", type=str, required=True)
-    parser.add_argument("--tol", type=float)
+    parser.add_argument("--tol", type=float, required=True, help="Convergence tolerance")
     parser.add_argument("--noise-factor", type=float, default=1.0)
-    parser.add_argument("--bs", type=int, default=1000)
-    parser.add_argument("--domain", type=str, default="fd", choices=["fd", "td", "both"],
-                        help="Which representation(s) to build a basis for: fd, td, or both")
+    parser.add_argument("--bs", type=int, default=1000, help="DataLoader batch size")
     parser.add_argument("--convergence-on", type=str, default="sigma_data",
                         choices=["sigma", "sigma_data"],
                         help="Convergence criterion: 'sigma' (normalised waveform) or 'sigma_data' (noisy data)")
     parser.add_argument("--gpu-data", action="store_true", help="Move entire dataset to GPU (faster but uses more VRAM)")
     parser.add_argument("--pin-memory", action="store_true", help="Use pinned CPU memory (faster transfers but locks RAM)")
     parser.add_argument("--prefetch-batches", type=int, default=1, help="Concatenate this many batches before processing")
-    parser.add_argument("--patience", type=int, default=10, help="Number of epochs to wait for improvement before early stopping")
+    parser.add_argument("--patience", type=int, default=1, help="Number of epochs without improvement before early stopping")
     parser.add_argument("--freq-cutoff-idx", type=int, default=None, help="Discard fd bins below this index")
+    parser.add_argument("--no-normalize-by-max", action="store_true",
+                        help="Disable division by global max abs value (basis built on raw whitened data)")
     args = parser.parse_args()
     
     train_conf = read_config(os.path.join(ROOT_DIR, "configs", "train_config.yaml"))
@@ -49,9 +58,14 @@ if __name__ == "__main__":
     if args.gpu_data:
         ds.dataset.dataset.to("cuda")
     
-    build_rom(ds, args.out, tolerance=args.tol, domain=args.domain,
-              convergence_on=args.convergence_on,
-              use_pinned_memory=use_pinned_memory, 
-              prefetch_batches=args.prefetch_batches, 
-              freq_cutoff_idx=args.freq_cutoff_idx,
-              df=df)
+    build_rom(
+        ds, args.out,
+        tolerance=args.tol,
+        convergence_on=args.convergence_on,
+        use_pinned_memory=use_pinned_memory,
+        prefetch_batches=args.prefetch_batches,
+        freq_cutoff_idx=args.freq_cutoff_idx,
+        df=df,
+        patience=args.patience,
+        normalize_by_max=not args.no_normalize_by_max,
+    )

@@ -503,16 +503,29 @@ class SequentialTrainer:
 
     def _train_rom ( self, round_idx) : 
         print("Training ROM...")
-        rom = ReducedOrderModel(tolerance=1e-9, device="cuda", batch_size=5000)
+        rom_training_config = self.train_conf["architecture"]["data_summary"]["ROM"]
+        freqs = self.data_module.get_freqs()
+        df = (freqs[1] - freqs[0]).item()
+        rom = ReducedOrderModel(
+            tolerance=rom_training_config.get("tolerance", 1e-3),
+            device="cuda",
+            batch_size=rom_training_config.get("batch_train", 1000),
+            patience=rom_training_config.get("patience", 1),
+            freq_cutoff_idx=rom_training_config.get("freq_cutoff_idx", None),
+            df=df,
+            normalize_by_max=rom_training_config.get("normalize_by_max", True),
+            debugging=rom_training_config.get("debugging", False),
+        )
         filename = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION, f"rom_round_{round_idx}.pt")
         
-        # Get ROM training options from config (defaults optimize for multi-session usage)
-        use_pinned_memory = self.train_conf.get("rom_use_pinned_memory", False)
-        prefetch_batches = self.train_conf.get("rom_prefetch_batches", 1)
+        use_pinned_memory = rom_training_config.get("use_pinned_memory", False)
+        prefetch_batches = rom_training_config.get("prefetch_batches", 1)
+        convergence_on = rom_training_config.get("convergence_on", "sigma_data")
         
         if not os.path.exists(filename):
             train_dl = self.data_module.train_dataloader(num_workers=0, pin_memory=use_pinned_memory)
-            rom.train(train_dl, use_pinned_memory=use_pinned_memory, prefetch_batches=prefetch_batches)
+            rom.train(train_dl, use_pinned_memory=use_pinned_memory, prefetch_batches=prefetch_batches,
+                      convergence_on=convergence_on)
             rom.to_file(filename)
         else: 
             # existing ROM file found: ask whether to retrain or reuse
@@ -524,21 +537,31 @@ class SequentialTrainer:
                 resp = "n"
             if resp in ("y", "yes"):
                 train_dl = self.data_module.train_dataloader(num_workers=0, pin_memory=use_pinned_memory)
-                rom.train(train_dl, use_pinned_memory=use_pinned_memory, prefetch_batches=prefetch_batches)
+                rom.train(train_dl, use_pinned_memory=use_pinned_memory, prefetch_batches=prefetch_batches,
+                          convergence_on=convergence_on)
                 rom.to_file(filename)
                 print(f"Retrained ROM and saved to {filename}")
             else:
                 print(f"Using existing ROM at {filename}")
 
-        self.data_summary = ROMWrapper(filename=filename, device=self.train_conf["device"])
+        self.data_summary = ROMWrapper(
+            filename=filename,
+            device=self.train_conf["device"],
+            max_basis_elems=rom_training_config.get("max_basis_elems", None),
+        )
         
         # Free cached data and switch to disk-based loading to reduce memory
         self.data_module.full_dataset.clear_cache()
     def _load_rom(self, round_idx):
         assert round_idx == 1, "Are you sure this is the ROM for this round?"
-        filename = self.train_conf["architecture"]["data_summary"]["ROM"]["filename"]
+        rom_config = self.train_conf["architecture"]["data_summary"]["ROM"]
+        filename = rom_config["filename"]
         print(f"Loading ROM from {filename}...")
-        self.data_summary = ROMWrapper(filename=filename, device=self.train_conf["device"], compress="fd", max_basis_elems=self.train_conf["architecture"]["data_summary"]["ROM"].get("max_basis_elems", None))
+        self.data_summary = ROMWrapper(
+            filename=filename,
+            device=self.train_conf["device"],
+            max_basis_elems=rom_config.get("max_basis_elems", None),
+        )
     
 
     def _load_autoencoder(self, round_idx):
