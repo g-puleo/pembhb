@@ -234,7 +234,14 @@ class InferenceNetwork(LightningModule):
         self.marginals_dict = train_conf["marginals"]
         self.loss = nn.BCEWithLogitsLoss(reduction='none')
         self.lr = train_conf["learning_rate"]
-        self.bounds_trained = dataset_info["conf"]["prior"]
+        # Use the actual sampling prior (sampler_init_kwargs) as the
+        # authoritative source.  Fall back to conf["prior"] for backward
+        # compatibility with old YAML sidecars that may lack the key.
+        _sik = dataset_info.get("sampler_init_kwargs", {})
+        if "prior_bounds" in _sik:
+            self.bounds_trained = _sik["prior_bounds"]
+        else:
+            self.bounds_trained = dataset_info["conf"]["prior"]
         self.scheduler_patience = train_conf["scheduler_patience"]
         self.scheduler_factor = train_conf["scheduler_factor"]
         self.output_names = []

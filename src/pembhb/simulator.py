@@ -1,6 +1,7 @@
 import numpy as np 
 import os
 import h5py
+import copy
 import yaml
 from scipy.signal.windows import tukey
 from tqdm import tqdm
@@ -268,10 +269,20 @@ class MBHBSimulatorFD_TD:
             # fallback to string for unsupported objects
             return obj if isinstance(obj, (str, int, float, bool, type(None))) else str(obj)
 
+        # Reconcile: ensure conf["prior"] always reflects the actual
+        # sampling bounds used to generate the data.  The authoritative
+        # source is sampler_init_kwargs["prior_bounds"].
+        sik = self.info.get("sampler_init_kwargs", {})
+        if "prior_bounds" in sik:
+            conf_copy = copy.deepcopy(self.info.get("conf", {}))
+            conf_copy["prior"] = copy.deepcopy(sik["prior_bounds"])
+        else:
+            conf_copy = self.info.get("conf", {})
+
         # Extract the two fields requested and convert
         payload = {
-            "conf": _convert(self.info.get("conf", {})),
-            "sampler_init_kwargs": _convert(self.info.get("sampler_init_kwargs", {})),
+            "conf": _convert(conf_copy),
+            "sampler_init_kwargs": _convert(sik),
             "td_max": _convert(self.info.get("td_max", None))
         }
 

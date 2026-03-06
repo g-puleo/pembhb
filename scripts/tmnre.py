@@ -26,7 +26,7 @@ torch.set_float32_matmul_precision("medium")
 def get_timestamp():
     return datetime.now().strftime("%Y%m%d")
 
-TIME_OF_EXECUTION = get_timestamp()+"autoenc_narrow_fisher_5d"
+TIME_OF_EXECUTION = get_timestamp()+"autoenc_test5d"
 
 def validate_marginals(marginals_config: dict):
     """Validate that no parameter index appears in multiple marginals.
@@ -200,7 +200,13 @@ class PlotPosteriorCallback(Callback):
           canonical coordinate systems
         """
         # Current implementation: axis-aligned rectangular prior
-        prior_dict = pl_module.hparams["dataset_info"]["conf"]["prior"]
+        # Use the actual sampling prior (sampler_init_kwargs) as the
+        # authoritative source.  Fall back to conf["prior"] for backward compat.
+        _sik = pl_module.hparams["dataset_info"].get("sampler_init_kwargs", {})
+        if "prior_bounds" in _sik:
+            prior_dict = _sik["prior_bounds"]
+        else:
+            prior_dict = pl_module.hparams["dataset_info"]["conf"]["prior"]
         
         # Get bounds for each parameter
         param_name_0 = utils._ORDERED_PRIOR_KEYS[in_param_idx[0]]
@@ -244,7 +250,13 @@ class PlotPosteriorCallback(Callback):
         float
             Width of the prior range.
         """
-        prior_dict = pl_module.hparams["dataset_info"]["conf"]["prior"]
+        # Use the actual sampling prior (sampler_init_kwargs) as the
+        # authoritative source.  Fall back to conf["prior"] for backward compat.
+        _sik = pl_module.hparams["dataset_info"].get("sampler_init_kwargs", {})
+        if "prior_bounds" in _sik:
+            prior_dict = _sik["prior_bounds"]
+        else:
+            prior_dict = pl_module.hparams["dataset_info"]["conf"]["prior"]
         param_name = utils._ORDERED_PRIOR_KEYS[in_param_idx]
         prior_bounds = prior_dict[param_name]
         return prior_bounds[1] - prior_bounds[0]
@@ -291,7 +303,7 @@ class PlotPosteriorCallback(Callback):
                         # Plot
                         ax.plot(grid.flatten(), norm1d, 'b-', linewidth=1.5)
                         ax.axvline(inj_params[0], color='r', linestyle='--', label='Injection')
-                        ax.axvline(widest_interval[0], color='g', linestyle=':', label=f'{100*epsilon_value}% CI')
+                        ax.axvline(widest_interval[0], color='g', linestyle=':', label=f'{100*(1-epsilon_value):.2f}% CI')
                         ax.axvline(widest_interval[1], color='g', linestyle=':')
                         ax.fill_between(grid.flatten(), 0, norm1d, 
                                        where=(grid.flatten() >= widest_interval[0]) & (grid.flatten() <= widest_interval[1]),
@@ -455,7 +467,7 @@ class SequentialTrainer:
             print("[Fisher] Computing Fisher Information Matrix for prior initialisation ...")
             self.fisher_prior_bounds = utils.compute_fisher_prior_bounds(
                 datagen_config=self.datagen_conf,
-                observation_file=fp_conf["observation_file"],
+                observation_file=dataset_obs_path,
                 event_idx=fp_conf["event_idx"],
                 varying_params=fp_conf["varying_params"],
                 fixed_params=fp_conf["fixed_params"],
@@ -498,6 +510,7 @@ class SequentialTrainer:
         self.data_fname_yaml = fname_h5.replace(".h5", ".yaml")
         self.datagen_info = utils.read_config(self.data_fname_yaml)
         self.data_module = MBHBDataModule(fname_h5, train_config["batch_size"], num_workers=4, cache_in_memory=True, noise_factor=self.train_conf["noise_factor"])
+        assert self.data_module.median_snr > 8, f"Median SNR lower than 8. Please make sure this is what you want. "
         self.data_module.setup(stage="fit")
         self.test_dataloader = self.data_module.test_dataloader()
 
@@ -836,6 +849,9 @@ class SequentialTrainer:
         for i in range(1,n_rounds+1):
             print(f"Running round {i}...")
             if i == 1 and self.fisher_prior_bounds is not None:
+                # Update datagen_conf["prior"] so that conf and
+                # sampler_init_kwargs stay consistent in the YAML sidecar.
+                self.datagen_conf["prior"].update(copy.deepcopy(self.fisher_prior_bounds))
                 sampler_kwargs = {"prior_bounds": self.fisher_prior_bounds}
                 print("[Fisher] Using Fisher-based prior for round 1.")
                 import yaml as _yaml
@@ -904,7 +920,7 @@ if __name__ == "__main__":
     train_config   = utils.read_config(os.path.join(ROOT_DIR, "configs", train_config_filename))
     datagen_config = utils.read_config(os.path.join(ROOT_DIR, "configs", datagen_config_filename))
                                
-    trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path="/data/gpuleo/mbhb/observation_skyloc_tc_mass.h5")
+    trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path="/data/gpuleo/mbhb/observation_skyloc_distGpc_tc.h5")
     #trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path="/u/g/gpuleo/pembhb/data/testes_newdata_fixall_notmcq.h5")
 
     # run with low noise: 

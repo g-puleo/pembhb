@@ -43,7 +43,7 @@ architecture:
       # cnn_channels: [32, 64]
     ROM:
       load: False
-      max_basis_elements: 500
+      max_basis_elements: 50
       filename: "/u/g/gpuleo/pembhb/rom_td_fd.pt"
       device: "cuda"
       batch_train: 1000
@@ -60,11 +60,11 @@ architecture:
       representation: "real_imag"  # "amp_phase" or "real_imag"
       n_channels: 2                # TDI channels (AE→2, AET→3)
       n_freqs: 4096
-      bottleneck_dim: 256
+      bottleneck_dim: 128
       # input_channels is 4, hidden_channels determines the progressive increase in the channel dimension
-      hidden_channels: [3, 5, 11, 24, 53, 116, 256]
-      kernel_size: 5
-      stride: 3 # determines downsampling along the frequency dimension (start from 4096=2^12)
+      hidden_channels: [32, 64, 128, 256, 256]
+      kernel_size: 3
+      stride: 2 # determines downsampling along the frequency dimension (start from 4096=2^12)
       dropout: 0.0
       high_freq_only: True
       freq_split_idx: 2048
@@ -96,7 +96,6 @@ rom_prefetch_batches: 4       # Increase to reduce Python overhead
 # -------------------------------------------------------------------------
 fisher_prior:
   enabled: true
-  observation_file: "/data/gpuleo/mbhb/observation_skyloc_tc_mass.h5"
   event_idx: 0           # which event in the HDF5 file to use as expansion point
   varying_params:        # FIM-based bounds are computed for these parameters
     - "logMchirp"
@@ -111,5 +110,5 @@ fisher_prior:
     - "phi"
     - "inc"
     - "psi"
-  n_sigma: 5.0           # prior half-width in units of FIM sigma
+  n_sigma: 15.0           # prior half-width in units of FIM sigma
   delta_frac: 1.0e-4     # fractional step size for numerical derivatives

@@ -824,7 +824,7 @@ round_dirs = [
     f"/data/gpuleo/mbhb/logs/{name}_round_1/version_0",
     f"/data/gpuleo/mbhb/logs/{name}_round_2/version_0",
     f"/data/gpuleo/mbhb/logs/{name}_round_3/version_0",
-    #f"/data/gpuleo/mbhb/logs/{name}_round_4/version_0",
+    f"/data/gpuleo/mbhb/logs/{name}_round_4/version_0",
 ]
 
 data_path = "/data/gpuleo/mbhb/observation_skyloc_tc_mass.h5"

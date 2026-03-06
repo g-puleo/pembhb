@@ -60,7 +60,14 @@ def get_logratios_grid(dataloader: torch.utils.data.DataLoader, model: 'Inferenc
 
     model.eval()
     model = model.to("cuda")
-    prior_trained_dict = model.hparams["dataset_info"]["conf"]["prior"]
+    # Use the actual sampling prior (sampler_init_kwargs) as the
+    # authoritative source for the grid range.  Fall back to conf["prior"]
+    # for backward compatibility with old YAML sidecars.
+    _sik = model.hparams["dataset_info"].get("sampler_init_kwargs", {})
+    if "prior_bounds" in _sik:
+        prior_trained_dict = _sik["prior_bounds"]
+    else:
+        prior_trained_dict = model.hparams["dataset_info"]["conf"]["prior"]
     prior_bounds = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx]]
     low = prior_bounds[0]
     high = prior_bounds[1]
@@ -133,10 +140,14 @@ def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'Infer
     with torch.no_grad():
         model.eval()
         model = model.to("cuda")
-        prior_trained_dict = model.hparams["dataset_info"]["conf"]["prior"]
-        # print("calling get_logratios_grid_2d with in_param_idx:", in_param_idx)
-        # print("prior trained dict:")
-        # print(prior_trained_dict)
+        # Use the actual sampling prior (sampler_init_kwargs) as the
+        # authoritative source for the grid range.  Fall back to conf["prior"]
+        # for backward compatibility with old YAML sidecars.
+        _sik = model.hparams["dataset_info"].get("sampler_init_kwargs", {})
+        if "prior_bounds" in _sik:
+            prior_trained_dict = _sik["prior_bounds"]
+        else:
+            prior_trained_dict = model.hparams["dataset_info"]["conf"]["prior"]
         if bounds_0 is None:
             bounds_0 = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx[0]]]
         if bounds_1 is None:

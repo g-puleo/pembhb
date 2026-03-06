@@ -117,6 +117,12 @@ class MBHBDataModule( L.LightningDataModule ):
         self.cache_in_memory = cache_in_memory
         self.shuffle_data = shuffle_data 
         self.noise_factor = noise_factor
+
+        # read median snr from the dataset for safety checks: 
+        with h5py.File(self.filename, "r") as f:
+            snr = f["snr"][()]
+            self.median_snr = np.median(snr)
+            
     def prepare_data(self):
 
         pass

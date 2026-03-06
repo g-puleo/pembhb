@@ -31,6 +31,7 @@ class UniformSampler ():
         :param prior_bounds: dict of prior bounds
         :type prior_bounds: dict
         """
+        print("init of uniform sampler")
         self.prior_bounds = copy.deepcopy(prior_bounds)
         ## value is in Gpc^3
         self.prior_bounds["dist"][0]   = self.prior_bounds["dist"][0]**3
@@ -53,6 +54,8 @@ class UniformSampler ():
 
         unif_samples = np.random.uniform(0, 1, size=(self.n_params, n_samples))
         tmnre_input = unif_samples * (self.upper_bounds - self.lower_bounds) + self.lower_bounds
+        # take cube root of tmnre input for distance to get back to Gpc units
+        tmnre_input[4] = np.cbrt(tmnre_input[4])
         #NB IT IS VERY IMPORTANT TO USE .copy() OTHERWISE THE OPERATIONS WILL BE PERFORMED IN-PLACE
         bbhx_input = self.samples_to_bbhx_input(tmnre_input.copy(), t_obs_end)
         ## insert f_ref=0
@@ -71,7 +74,7 @@ class UniformSampler ():
         n_samples = samples.shape[1]
         samples_ = samples.copy()
         samples_[0:2] = lMcq_m1m2(samples_[0:2]) # log(Mc), q --> m1, m2
-        samples_[4] = np.cbrt(samples_[4]) * 1e9 * PC_SI # d^3 -->distance
+        samples_[4] = samples_[4]* 1e9 * PC_SI # d^3 -->distance
         # 5: phase is already in 0,2pi
         samples_[6] = np.arccos(samples_[6]) # cos(inclination)-->inclination in [0,pi]
         # 7: lambda is already in 0,2pi
