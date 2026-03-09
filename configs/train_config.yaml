@@ -83,6 +83,18 @@ baseline_model:
   #filename: "/data/gpuleo/mbhb/logs/20251205_100028_round_0/version_0/checkpoints/epoch=474-step=133000.ckpt"
   filename: "/data/gpuleo/mbhb/logs/20260205withsky_v1_round_0/version_7/checkpoints/epoch=475-step=66640.ckpt"
 
+# -------------------------------------------------------------------------
+# Joint AE + NRE training  (used by scripts/tmnre_joint.py)
+# These settings are IGNORED by scripts/tmnre.py (sequential pipeline).
+# -------------------------------------------------------------------------
+joint_training:
+  ae_warmup_epochs: 50        # epochs of AE-only training before NRE kicks in (round 1 only)
+  lr_ae: 0.001                # learning rate for autoencoder (encoder + decoder)
+  lr_nre: 0.0001              # learning rate for NRE classifier heads
+  ae_weight_decay: 0.00001    # weight decay for autoencoder param group
+  ae_scheduler_patience: 10   # ReduceLROnPlateau patience
+  ae_scheduler_factor: 0.3    # ReduceLROnPlateau factor
+
 
 rom_use_pinned_memory: false  # Only set true for single-session usage
 rom_prefetch_batches: 4       # Increase to reduce Python overhead

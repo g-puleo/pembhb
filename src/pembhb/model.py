@@ -763,3 +763,379 @@ class LinearCompression(nn.Module):
 from pembhb.rom import ROMWrapper
 
 DATA_SUMMARY_REGISTRY = { "BrutalCompression": BrutalCompression, "PeregrineModel": PeregrineModel, "ROM": ROMWrapper}
+
+
+# ---------------------------------------------------------------------------
+# Joint Autoencoder + InferenceNetwork
+# ---------------------------------------------------------------------------
+
+class JointAEInferenceNetwork(LightningModule):
+    """Joint training of a DenoisingAutoencoder and NRE classifier heads.
+
+    The autoencoder encoder+decoder are trained with the standard MSE
+    reconstruction loss.  The NRE classifier heads receive the encoder's
+    bottleneck representation **detached** from the computational graph so
+    that the BCE contrastive loss never back-propagates through the encoder.
+
+    This means:
+    * Encoder gradients come **only** from the AE reconstruction loss.
+    * NRE gradients come **only** from the BCE contrastive loss.
+    * No conflicting gradient signals on the shared encoder weights.
+
+    An optional warm-up phase trains only the autoencoder for the first
+    ``ae_warmup_epochs`` epochs; the NRE loss is zero during that phase.
+
+    After training, the encoder can be extracted and wrapped in
+    :class:`AutoencoderWrapper` for standalone inference exactly like in
+    the sequential pipeline.
+
+    Parameters
+    ----------
+    train_conf : dict
+        Full training configuration (same as for ``InferenceNetwork``).
+    dataset_info : dict
+        YAML sidecar information for the dataset.
+    normalisation : dict
+        Contains ``td_normalisation``, ``param_mean``, ``param_std``.
+    autoencoder : DenoisingAutoencoder
+        An initialised (and normalisation-fitted) ``DenoisingAutoencoder``.
+        It will be owned by this module.  Its encoder is used as the data
+        summarizer; its decoder provides the reconstruction loss.
+    ae_warmup_epochs : int
+        Number of epochs during which only the AE loss is active (NRE loss
+        is switched off).  Set to 0 to train both from the start, e.g.
+        when fine-tuning from a previous round.
+    lr_ae : float
+        Learning rate for the autoencoder (encoder + decoder) parameter group.
+    lr_nre : float
+        Learning rate for the NRE classifier heads parameter group.
+    ae_weight_decay : float
+        Weight decay for the autoencoder parameter group.
+    ae_scheduler_patience : int
+        Patience for the autoencoder learning-rate scheduler.
+    ae_scheduler_factor : float
+        Factor for the autoencoder learning-rate scheduler.
+    """
+
+    def __init__(
+        self,
+        train_conf: dict,
+        dataset_info: dict,
+        normalisation: dict,
+        autoencoder: 'DenoisingAutoencoder',
+        ae_warmup_epochs: int = 50,
+        lr_ae: float = 1e-3,
+        lr_nre: float = 1e-4,
+        ae_weight_decay: float = 1e-5,
+        ae_scheduler_patience: int = 10,
+        ae_scheduler_factor: float = 0.3,
+    ):
+        super().__init__()
+
+        # ---- Autoencoder (encoder + decoder) ----------------------------
+        self.autoencoder = autoencoder
+
+        # ---- Marginals / NRE setup (mirrors InferenceNetwork) -----------
+        self.marginals_dict = train_conf["marginals"]
+        self.loss = nn.BCEWithLogitsLoss(reduction="none")
+        self.lr_nre = lr_nre
+        self.lr_ae = lr_ae
+        self.ae_weight_decay = ae_weight_decay
+        self.ae_scheduler_patience = ae_scheduler_patience
+        self.ae_scheduler_factor = ae_scheduler_factor
+        self.ae_warmup_epochs = ae_warmup_epochs
+
+        # Use the actual sampling prior as authoritative source
+        _sik = dataset_info.get("sampler_init_kwargs", {})
+        if "prior_bounds" in _sik:
+            self.bounds_trained = _sik["prior_bounds"]
+        else:
+            self.bounds_trained = dataset_info["conf"]["prior"]
+
+        self.scheduler_patience = train_conf["scheduler_patience"]
+        self.scheduler_factor = train_conf["scheduler_factor"]
+
+        self.output_names = []
+        self.marginals_list = []
+        for domain in self.marginals_dict:
+            for marginal in self.marginals_dict[domain]:
+                name_output = "_".join(_ORDERED_PRIOR_KEYS[idx] for idx in marginal)
+                self.output_names.append(name_output)
+                self.marginals_list.append(marginal)
+
+        # ---- Normalisation buffers (same as InferenceNetwork) -----------
+        self.td_normalisation = normalisation["td_normalisation"].item()
+        self.register_buffer(
+            "param_mean",
+            torch.tensor(normalisation["param_mean"], dtype=torch.float32),
+        )
+        self.register_buffer(
+            "param_std",
+            torch.tensor(normalisation["param_std"], dtype=torch.float32),
+        )
+
+        # ---- Data summary dimensionality (from encoder) -----------------
+        if self.autoencoder.architecture == "conv":
+            self.n_features_summary = self.autoencoder.bottleneck_dim
+        else:
+            # UNet: need a dummy forward to get bottleneck size
+            n_real_ch = self.autoencoder.n_channels * 2
+            with torch.no_grad():
+                dummy = torch.zeros(1, n_real_ch, self.autoencoder.n_freqs)
+                b, _ = self.autoencoder.encoder(dummy)
+            self.n_features_summary = b.numel()
+
+        # ---- NRE classifier heads (same as InferenceNetwork) ------------
+        self.logratios_model_dict = nn.ModuleDict()
+        for key in self.marginals_dict.keys():
+            self.logratios_model_dict[key] = MarginalClassifierHead(
+                n_data_features=self.n_features_summary * len(key),
+                marginals=self.marginals_dict[key],
+                hlayersizes=(64, 32, 16, 8),
+            )
+
+        # ---- Save hyper-parameters for checkpoint / utils compat --------
+        self.save_hyperparameters(
+            {
+                "train_conf": train_conf,
+                "dataset_info": dataset_info,
+                "normalisation": {
+                    k: v.tolist() if hasattr(v, "tolist") else v
+                    for k, v in normalisation.items()
+                },
+                "ae_warmup_epochs": ae_warmup_epochs,
+                "lr_ae": lr_ae,
+                "lr_nre": lr_nre,
+                "ae_weight_decay": ae_weight_decay,
+                "ae_scheduler_patience": ae_scheduler_patience,
+                "ae_scheduler_factor": ae_scheduler_factor,
+            },
+            logger=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Forward  (NRE path — used at inference / posterior evaluation time)
+    # ------------------------------------------------------------------
+
+    def _encode_detached(self, d_f: torch.Tensor) -> torch.Tensor:
+        """Encode FD data through the autoencoder encoder and detach.
+
+        The detach ensures no NRE gradients flow into the encoder.
+        """
+        x_norm = self.autoencoder.preprocess(d_f)
+        bottleneck = self.autoencoder.encode(x_norm)
+        if self.autoencoder.architecture != "conv":
+            bottleneck, _ = bottleneck
+            bottleneck = bottleneck.reshape(bottleneck.shape[0], -1)
+        return bottleneck.detach()
+
+    def _encode(self, d_f: torch.Tensor) -> torch.Tensor:
+        """Encode FD data through the autoencoder encoder (with grad)."""
+        x_norm = self.autoencoder.preprocess(d_f)
+        bottleneck = self.autoencoder.encode(x_norm)
+        if self.autoencoder.architecture != "conv":
+            bottleneck, _ = bottleneck
+            bottleneck = bottleneck.reshape(bottleneck.shape[0], -1)
+        return bottleneck
+
+    def forward(self, d_f, d_t, parameters):
+        """NRE forward pass (same signature as InferenceNetwork.forward).
+
+        Used by ``utils.get_logratios_grid`` and posterior evaluation.
+        The bottleneck is **detached** so this is safe even if called
+        inside a training loop.
+        """
+        bottleneck = self._encode_detached(d_f)
+
+        features_dict = {"ft": None, "f": bottleneck, "t": d_t}
+        normalised_parameters = (parameters - self.param_mean) / self.param_std
+
+        logratios_list = []
+        for key in self.logratios_model_dict.keys():
+            logratios_list.append(
+                self.logratios_model_dict[key](features_dict[key], normalised_parameters)
+            )
+        return torch.cat(logratios_list, dim=-1)
+
+    # ------------------------------------------------------------------
+    # NRE loss (contrastive BCE — mirrors InferenceNetwork)
+    # ------------------------------------------------------------------
+
+    def _calc_nre_loss(self, batch):
+        """Compute the contrastive NRE loss and logits."""
+        data_f = batch["wave_fd"] + batch["noise_fd"]
+        data_t = batch["wave_td"] + batch["noise_td"]
+        parameters = batch["source_parameters"]
+
+        all_data_f = torch.cat((data_f, data_f), dim=0)
+        all_data_t = torch.cat((data_t, data_t), dim=0)
+        scrambled_params = torch.roll(parameters, shifts=1, dims=0)
+        all_params = torch.cat((parameters, scrambled_params), dim=0)
+
+        all_logits = self(all_data_f, all_data_t, all_params)
+
+        shape_half = (all_logits.shape[0] // 2, all_logits.shape[1])
+        labels = torch.cat(
+            (
+                torch.ones(shape_half, device=self.device),
+                torch.zeros(shape_half, device=self.device),
+            ),
+            dim=0,
+        )
+        all_loss = self.loss(all_logits, labels)
+        task_losses = torch.mean(all_loss, dim=0)
+        nre_loss = torch.mean(task_losses)
+        return all_logits, task_losses, nre_loss
+
+    # ------------------------------------------------------------------
+    # AE loss (reconstruction MSE — mirrors DenoisingAutoencoder)
+    # ------------------------------------------------------------------
+
+    def _calc_ae_loss(self, batch):
+        """Compute the autoencoder reconstruction loss."""
+        noisy = batch["wave_fd"] + batch["noise_fd"]
+        clean = batch["wave_fd"]
+
+        noisy_norm = self.autoencoder.preprocess(noisy)
+        clean_norm = self.autoencoder.preprocess(clean)
+
+        reconstructed = self.autoencoder(noisy_norm)
+        target = self.autoencoder._get_target(clean_norm)
+
+        ae_loss = F.mse_loss(reconstructed, target)
+        return ae_loss
+
+    # ------------------------------------------------------------------
+    # Accuracy (same as InferenceNetwork)
+    # ------------------------------------------------------------------
+
+    def _calc_accuracies(self, all_logits):
+        shape_half = (all_logits.shape[0] // 2, all_logits.shape[1])
+        joint_preds = (all_logits[: shape_half[0]] > 0).float()
+        scrambled_preds = (all_logits[shape_half[0] :] > 0).float()
+        joint_accurate = (joint_preds == 1).float()
+        scrambled_accurate = (scrambled_preds == 0).float()
+        joint_accuracy = torch.mean(joint_accurate, dim=0)
+        scrambled_accuracy = torch.mean(scrambled_accurate, dim=0)
+        accuracy_params = (joint_accuracy + scrambled_accuracy) / 2
+        accuracy = torch.mean(accuracy_params)
+        return accuracy_params, accuracy
+
+    # ------------------------------------------------------------------
+    # Lightning training / validation steps
+    # ------------------------------------------------------------------
+
+    def training_step(self, batch, batch_idx):
+        # AE reconstruction loss (gradients flow through encoder+decoder)
+        ae_loss = self._calc_ae_loss(batch)
+
+        # NRE loss (bottleneck detached — no encoder gradients)
+        in_warmup = self.current_epoch < self.ae_warmup_epochs
+        if in_warmup:
+            nre_loss = torch.tensor(0.0, device=self.device)
+            all_logits = None
+            task_losses = None
+        else:
+            all_logits, task_losses, nre_loss = self._calc_nre_loss(batch)
+
+        total_loss = ae_loss + nre_loss
+
+        # ---- Logging ----------------------------------------------------
+        self.log("train_ae_loss", ae_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log("train_nre_loss", nre_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log("train_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+
+        if in_warmup:
+            # Log dummy accuracy so EarlyStopping / callbacks never miss the metric
+            self.log("train_accuracy", 0.5, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        else:
+            accuracy_params, accuracy = self._calc_accuracies(all_logits)
+            self.log("train_accuracy", accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            overall_idx = 0
+            for domain in self.marginals_dict:
+                for i, marginal in enumerate(self.marginals_dict[domain]):
+                    name = self.output_names[overall_idx]
+                    self.log(f"train_accuracy_{name}", accuracy_params[overall_idx], on_step=True, on_epoch=True, logger=True)
+                    self.log(f"train_loss_{name}", task_losses[overall_idx], on_step=True, on_epoch=True, logger=True)
+                    overall_idx += 1
+
+        return total_loss
+
+    def validation_step(self, batch, batch_idx):
+        ae_loss = self._calc_ae_loss(batch)
+
+        in_warmup = self.current_epoch < self.ae_warmup_epochs
+        if in_warmup:
+            nre_loss = torch.tensor(0.0, device=self.device)
+            all_logits = None
+            task_losses = None
+        else:
+            all_logits, task_losses, nre_loss = self._calc_nre_loss(batch)
+
+        total_loss = ae_loss + nre_loss
+
+        self.log("val_ae_loss", ae_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log("val_nre_loss", nre_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log("val_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+
+        if in_warmup:
+            self.log("val_accuracy", 0.5, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        else:
+            accuracy_params, accuracy = self._calc_accuracies(all_logits)
+            self.log("val_accuracy", accuracy, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            overall_idx = 0
+            for domain in self.marginals_dict:
+                for marginal in self.marginals_dict[domain]:
+                    name = self.output_names[overall_idx]
+                    self.log(f"val_accuracy_{name}", accuracy_params[overall_idx], on_step=False, on_epoch=True, logger=True)
+                    self.log(f"val_loss_{name}", task_losses[overall_idx], on_step=False, on_epoch=True, logger=True)
+                    overall_idx += 1
+
+        return total_loss
+
+    # ------------------------------------------------------------------
+    # Optimizers (two parameter groups, single optimizer)
+    # ------------------------------------------------------------------
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(
+            [
+                {
+                    "params": self.autoencoder.parameters(),
+                    "lr": self.lr_ae,
+                    "weight_decay": self.ae_weight_decay,
+                },
+                {
+                    "params": self.logratios_model_dict.parameters(),
+                    "lr": self.lr_nre,
+                },
+            ],
+        )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=self.ae_scheduler_factor,
+            patience=self.ae_scheduler_patience,
+            min_lr=1e-7,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # Helpers (for compatibility with existing utils / callbacks)
+    # ------------------------------------------------------------------
+
+    def get_autoencoder_wrapper(self, freeze: bool = True) -> 'AutoencoderWrapper':
+        """Build an ``AutoencoderWrapper`` from the trained encoder.
+
+        Useful for extracting the data summarizer after joint training,
+        e.g. for use in a standalone ``InferenceNetwork`` or for the next
+        TMNRE round.
+        """
+        from pembhb.autoencoder import AutoencoderWrapper
+        return AutoencoderWrapper(self.autoencoder, freeze=freeze)

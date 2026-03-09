@@ -58,7 +58,7 @@ def get_widest_interval_1d(model, dataloader, in_param_idx, out_param_idx, eps=0
     logratios, inj_params, grid = utils.get_logratios_grid(
         dataloader,
         model,
-        ngrid_points=1000,
+        ngrid_points=100,
         in_param_idx=in_param_idx,
         out_param_idx=out_param_idx,
     )
@@ -263,7 +263,7 @@ class PlotPosteriorCallback(Callback):
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if self.epochs_elapsed == 0: 
-            os.makedirs(os.path.join(ROOT_DIR, "plots", TIME_OF_EXECUTION), exist_ok=True)
+            os.makedirs(os.path.join(ROOT_DIR, "plots", self.timestamp), exist_ok=True)
 
         self.epochs_elapsed += 1
         if (self.epochs_elapsed-2) % self.call_every_n_epochs == 0:
