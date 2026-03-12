@@ -1,6 +1,7 @@
 from torch.utils.data import Dataset, random_split, DataLoader, Subset 
 import lightning as L
 from pembhb.utils import mbhb_collate_fn
+from pembhb import get_torch_dtype, get_torch_complex_dtype
 import torch
 import numpy as np
 import h5py
@@ -23,16 +24,16 @@ class MBHBDataset(Dataset):
             # Load ASD (Amplitude Spectral Density) for noise-weighting.
             # Shape: (n_channels, n_freq).  This is the same for all samples.
             if "asd" in f:
-                self.asd = torch.tensor(f["asd"][()], device="cpu", dtype=torch.float32)
+                self.asd = torch.tensor(f["asd"][()], device="cpu", dtype=get_torch_dtype())
             else:
                 self.asd = None
 
             if cache_in_memory:
-                self.wave_fd = torch.tensor(f["wave_fd"][()], device="cpu", dtype=torch.complex64)
-                self.wave_td = torch.tensor(f["wave_td"][()], device="cpu", dtype=torch.float32)
-                self.noise_fd = torch.tensor(f["noise_fd"][()], device="cpu", dtype=torch.complex64)
-                self.noise_td = torch.tensor(f["noise_td"][()], device="cpu", dtype=torch.float32)
-                self.source_parameters = torch.tensor(f["source_parameters"][()], device="cpu", dtype=torch.float32)
+                self.wave_fd = torch.tensor(f["wave_fd"][()], device="cpu", dtype=get_torch_complex_dtype())
+                self.wave_td = torch.tensor(f["wave_td"][()], device="cpu", dtype=get_torch_dtype())
+                self.noise_fd = torch.tensor(f["noise_fd"][()], device="cpu", dtype=get_torch_complex_dtype())
+                self.noise_td = torch.tensor(f["noise_td"][()], device="cpu", dtype=get_torch_dtype())
+                self.source_parameters = torch.tensor(f["source_parameters"][()], device="cpu", dtype=get_torch_dtype())
             else:
                 self.wave_fd = self.wave_td = self.parameters = None
                 # noise_fd / noise_td not loaded; collate_fn will handle sampling
@@ -166,7 +167,7 @@ class MBHBDataModule( L.LightningDataModule ):
             return self.full_dataset.asd
         with h5py.File(self.filename, "r") as f:
             if "asd" in f:
-                return torch.tensor(f["asd"][()], dtype=torch.float32)
+                return torch.tensor(f["asd"][()], dtype=get_torch_dtype())
         return None
 
     def get_freqs(self):

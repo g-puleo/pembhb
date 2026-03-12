@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from line_profiler import profile
 import torch.nn as nn
 from torch import nn
-from pembhb import ROOT_DIR
+from pembhb import ROOT_DIR, get_torch_dtype
 
 class ReducedOrderModel:
     """Reduced-order model for frequency-domain (complex) waveform data.
@@ -592,7 +592,7 @@ class ReducedOrderModel:
         filename = dataset.filename
         with h5py.File(filename, 'r') as f:
             asd_np = f['asd'][()]
-        asd_full = torch.tensor(asd_np, dtype=torch.float32)
+        asd_full = torch.tensor(asd_np, dtype=get_torch_dtype())
         self.asd = asd_full.to(self.device)
 
         asd_trimmed = self._apply_freq_cutoff(asd_full)
@@ -619,7 +619,7 @@ class ReducedOrderModel:
         elif isinstance(self.df, (int, float)):
             w_per_dim = prefactor * float(self.df) * torch.ones(n_freq, device=self.device)
         else:
-            w_per_dim = prefactor * torch.as_tensor(self.df, device=self.device, dtype=torch.float32)
+            w_per_dim = prefactor * torch.as_tensor(self.df, device=self.device, dtype=get_torch_dtype())
             if self.freq_cutoff_idx:
                 w_per_dim = w_per_dim[self.freq_cutoff_idx:]
             assert w_per_dim.shape[0] == n_freq, (

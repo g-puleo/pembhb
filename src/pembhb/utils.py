@@ -7,6 +7,10 @@ import numpy as np
 # from pembhb.data import MBHBDataset, mbhb_collate_fn
 from glob import glob
 from torch.utils.data import DataLoader, TensorDataset
+from lightning.pytorch.callbacks import  Callback
+
+from datetime import datetime, timedelta
+
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from bbhx import waveformbuild as wfb
@@ -34,7 +38,7 @@ def read_config(fname: str):
         conf = yaml.safe_load(file)
     return conf
 
-def get_logratios_grid(dataloader: torch.utils.data.DataLoader, model: 'InferenceNetwork', ngrid_points: int, in_param_idx : int, out_param_idx: int):
+def get_logratios_grid(dataloader: torch.utils.data.DataLoader, model: 'InferenceNetwork', ngrid_points: int, in_param_idx : int, out_param_idx: int, low: float=None , high: float=None):
     """Generate a grid of logratios for a given observation and model.
     This is useful for plotting the posterior and to make pp plots
     
@@ -69,8 +73,8 @@ def get_logratios_grid(dataloader: torch.utils.data.DataLoader, model: 'Inferenc
     else:
         prior_trained_dict = model.hparams["dataset_info"]["conf"]["prior"]
     prior_bounds = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx]]
-    low = prior_bounds[0]
-    high = prior_bounds[1]
+    low = low if low is not None else prior_bounds[0]
+    high = high if high is not None else prior_bounds[1]
     grid = torch.linspace(low, high, ngrid_points).to("cuda").reshape(-1, 1)
     zero_pad1d = torch.zeros(ngrid_points, 10).to("cuda")
     grid_padded = torch.cat((zero_pad1d[:, :in_param_idx], grid, zero_pad1d[:, in_param_idx:]), dim=1)  # Shape: [ngrid_points, 11]
@@ -1004,7 +1008,6 @@ def posterior_contours_2d_imshow(grid_x: np.array, grid_y: np.array, ratios: np.
         ax_buffer.axvline(x=true_values[0], color='r', linestyle='--', label='True Value')
         ax_buffer.axhline(y=true_values[1], color='r', linestyle='--')
         fig = ax_buffer.get_figure()
-        cbar = fig.colorbar(c, ax=ax_buffer)
         if title is not None:
             ax_buffer.set_title(title)
         ax_buffer.set_xlabel(parameter_names[0])
@@ -1399,3 +1402,385 @@ def compute_fisher_prior_bounds(
 
     print(f"[Fisher] Final prior bounds: {prior_bounds}")
     return prior_bounds
+
+
+def validate_marginals(marginals_config: dict):
+    """Validate that no parameter index appears in multiple marginals.
+    
+    :param marginals_config: dictionary containing marginal lists from train_config
+    :raises ValueError: if a parameter index is repeated across marginals
+    """
+    all_indices = []
+    for key, marginal_list in marginals_config.items():
+        for marginal in marginal_list:
+            for idx in marginal:
+                if idx in all_indices:
+                    raise ValueError(
+                        f"Parameter index {idx} ({_ORDERED_PRIOR_KEYS[idx]}) appears in multiple marginals. "
+                        f"Each parameter index can only appear in one marginal for prior truncation."
+                    )
+                all_indices.append(idx)
+
+def get_widest_interval_1d(model, dataloader, in_param_idx, out_param_idx, eps=0.0001):
+    """Get the widest credible interval for a 1D marginal posterior.
+    
+    :param model: trained inference model
+    :param dataloader: dataloader containing the observation
+    :param in_param_idx: index of the input parameter
+    :param out_param_idx: index of the output (logratio)
+    :param eps: credible level (default 0.0001 for 99.99% interval)
+    :return: (widest_interval, norm1d, grid, inj_params) where widest_interval is [low, high]
+    """
+    logratios, inj_params, grid = get_logratios_grid(
+        dataloader,
+        model,
+        ngrid_points=100,
+        in_param_idx=in_param_idx,
+        out_param_idx=out_param_idx,
+    )
+    
+    ratios = np.exp(logratios[0])  # Take first (only) observation
+    dp = grid[1, 0] - grid[0, 0]
+    norm1d = ratios / np.sum(ratios * dp)
+    
+    # Find credible interval using cumulative sum
+    cumsum = np.cumsum(norm1d * dp)
+    idx_low = np.searchsorted(cumsum, eps / 2)
+    idx_high = np.searchsorted(cumsum, 1 - eps / 2)
+    
+    widest_interval = [float(grid[idx_low, 0]), float(grid[idx_high, 0])]
+    return widest_interval, norm1d, grid, inj_params
+
+def get_widest_box_2d(model, dataloader, in_param_idx, out_param_idx, ax_buffer=None, do_plot=False):
+    """Get the widest credible box for a 2D marginal posterior.
+    
+    :param model: trained inference model
+    :param dataloader: dataloader containing the observation
+    :param in_param_idx: tuple of indices for the two input parameters
+    :param out_param_idx: index of the output (logratio)
+    :param ax_buffer: matplotlib axis to plot on (optional)
+    :param do_plot: whether to create the contour plot
+    :return: (widest_box, inj_params) where widest_box is [x_low, x_high, y_low, y_high]
+    """
+    logratios, inj_params, gx, gy = get_logratios_grid_2d(
+        dataloader,
+        model,
+        ngrid_points=100,
+        in_param_idx=in_param_idx,
+        out_param_idx=out_param_idx,
+    )
+
+    ratios = np.exp(logratios)
+    dp1 = gx[0, 1] - gx[0, 0]  # param_0 spacing (x varies along columns with xy indexing)
+    dp2 = gy[1, 0] - gy[0, 0]  # param_1 spacing (y varies along rows with xy indexing)
+    norm2d = ratios / np.sum(ratios * dp1 * dp2, axis=(1, 2), keepdims=True)
+    levels, labels = contour_levels(norm2d)
+    boxes = posterior_contours_2d(
+        gx, gy, norm2d[0],
+        inj_params[0], 
+        ax_buffer=ax_buffer, 
+        parameter_names=[_ORDERED_PRIOR_KEYS[in_param_idx[0]], _ORDERED_PRIOR_KEYS[in_param_idx[1]]],
+        levels=levels, 
+        levels_labels=labels,
+        do_plot=do_plot
+    )
+    widest_box = boxes[0]
+    return widest_box, inj_params
+
+class PlotPosteriorCallback(Callback):
+    def __init__(self, timestamp: str, obs_loader: DataLoader, input_idx_list: list, output_idx_list: list, round_idx: int , call_every_n_epochs=1): 
+        self.epochs_elapsed = 0
+        self.call_every_n_epochs = call_every_n_epochs
+        self.timestamp = timestamp
+        self.obs_loader = obs_loader
+        self.input_idx_list = input_idx_list
+        self.output_idx_list = output_idx_list
+        self.n_marginals = len(input_idx_list)
+        self.init_time = datetime.now()
+        self.round_idx = round_idx
+        # Storage for volume ratio diagnostics
+        self.volume_ratios = {}
+    
+    def _compute_posterior_volume_2d(self, widest_box):
+        """
+        Compute the area/volume of the posterior from the widest contour box.
+        
+        Parameters:
+        -----------
+        widest_box : tuple
+            The bounding box of the 99.99% contour.
+            Currently: (x_min, x_max, y_min, y_max) for axis-aligned boxes.
+            
+        Returns:
+        --------
+        float
+            Area enclosed by the posterior contour.
+            
+        Notes:
+        ------
+        FUTURE EXTENSION FOR TILTED BOXES:
+        - If posterior contours become non-axis-aligned, widest_box format may change
+          to a list of vertices [(x1,y1), (x2,y2), ...]
+        - In that case, use Shoelace formula or similar for polygon area:
+          area = 0.5 * abs(sum(x[i]*y[i+1] - x[i+1]*y[i] for i in range(n)))
+        - Consider using shapely.geometry.Polygon for robust area calculation
+        """
+        # Current implementation: axis-aligned box
+        # widest_box = (x_min, x_max, y_min, y_max)
+        posterior_area = (widest_box[1] - widest_box[0]) * (widest_box[3] - widest_box[2])
+        return posterior_area
+    
+    def _compute_prior_volume_2d(self, pl_module, in_param_idx):
+        """
+        Compute the area/volume of the prior for a 2D marginal.
+        
+        Parameters:
+        -----------
+        pl_module : LightningModule
+            The model containing prior information in hparams.
+        in_param_idx : tuple
+            Indices of the two parameters defining the 2D marginal.
+            
+        Returns:
+        --------
+        float
+            Area of the prior region.
+            
+        Notes:
+        ------
+        **MODIFY THIS METHOD WHEN SWITCHING TO TILTED BOUNDING BOXES**
+        
+        Current implementation assumes axis-aligned rectangular priors.
+        Prior bounds are stored as:
+            prior_dict[param_name] = [min_value, max_value]
+        
+        For tilted/rotated bounding boxes:
+        1. Prior specification will change (e.g., vertices, rotation matrix, etc.)
+        2. Access prior from: pl_module.hparams["dataset_info"]["conf"]["prior"]
+        3. Compute area based on new representation:
+           - If vertices: use Shoelace formula or shapely.geometry.Polygon
+           - If rotation + bounds: compute area of rotated rectangle
+           - Example with vertices:
+             ```python
+             vertices = prior_dict[marginal_key]  # [(x1,y1), (x2,y2), ...]
+             from shapely.geometry import Polygon
+             prior_area = Polygon(vertices).area
+             ```
+        4. Ensure consistency with sampler_init_kwargs format in sampler.py
+        
+        Potential issues to address:
+        - Normalization: If grid evaluation doesn't align with tilted prior,
+          posterior normalization may be affected
+        - Grid coverage: Axis-aligned grids may inefficiently cover tilted regions
+        - Coordinate transforms: May need to transform between rotated and
+          canonical coordinate systems
+        """
+        # Current implementation: axis-aligned rectangular prior
+        # Use the actual sampling prior (sampler_init_kwargs) as the
+        # authoritative source.  Fall back to conf["prior"] for backward compat.
+        _sik = pl_module.hparams["dataset_info"].get("sampler_init_kwargs", {})
+        if "prior_bounds" in _sik:
+            prior_dict = _sik["prior_bounds"]
+        else:
+            prior_dict = pl_module.hparams["dataset_info"]["conf"]["prior"]
+        
+        # Get bounds for each parameter
+        param_name_0 = _ORDERED_PRIOR_KEYS[in_param_idx[0]]
+        param_name_1 = _ORDERED_PRIOR_KEYS[in_param_idx[1]]
+        
+        prior_bounds_0 = prior_dict[param_name_0]
+        prior_bounds_1 = prior_dict[param_name_1]
+        
+        # Compute area as product of widths
+        prior_area = (prior_bounds_0[1] - prior_bounds_0[0]) * (prior_bounds_1[1] - prior_bounds_1[0])
+        
+        return prior_area
+
+    def _compute_posterior_volume_1d(self, widest_interval):
+        """Compute the width of the posterior credible interval for a 1D marginal.
+        
+        Parameters:
+        -----------
+        widest_interval : list
+            [low, high] bounds of the credible interval.
+            
+        Returns:
+        --------
+        float
+            Width of the posterior interval.
+        """
+        return widest_interval[1] - widest_interval[0]
+    
+    def _compute_prior_volume_1d(self, pl_module, in_param_idx):
+        """Compute the width of the prior for a 1D marginal.
+        
+        Parameters:
+        -----------
+        pl_module : LightningModule
+            The model containing prior information in hparams.
+        in_param_idx : int
+            Index of the parameter.
+            
+        Returns:
+        --------
+        float
+            Width of the prior range.
+        """
+        # Use the actual sampling prior (sampler_init_kwargs) as the
+        # authoritative source.  Fall back to conf["prior"] for backward compat.
+        _sik = pl_module.hparams["dataset_info"].get("sampler_init_kwargs", {})
+        if "prior_bounds" in _sik:
+            prior_dict = _sik["prior_bounds"]
+        else:
+            prior_dict = pl_module.hparams["dataset_info"]["conf"]["prior"]
+        param_name = _ORDERED_PRIOR_KEYS[in_param_idx]
+        prior_bounds = prior_dict[param_name]
+        return prior_bounds[1] - prior_bounds[0]
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if self.epochs_elapsed == 0: 
+            os.makedirs(os.path.join(ROOT_DIR, "plots", self.timestamp), exist_ok=True)
+
+        self.epochs_elapsed += 1
+        if (self.epochs_elapsed-2) % self.call_every_n_epochs == 0:
+            #print("plotting posteriors on observed data")
+            train_time = datetime.now() - self.init_time
+            td_trunc = train_time - timedelta(microseconds=train_time.microseconds)
+            title_plot = f"training time={td_trunc}s"
+            # plot the posterior on the observed data , using the current model
+            for i in range(self.n_marginals):
+                in_param_idx = self.input_idx_list[i]
+                out_param_idx = self.output_idx_list[i]
+
+                # Initialize widest_boxes dict if not present
+                if not hasattr(pl_module, 'widest_boxes'):
+                    pl_module.widest_boxes = {}
+                marginal_key = tuple(in_param_idx)
+
+                if len(in_param_idx) == 1:
+                    # Handle 1D marginals
+                    param_idx = in_param_idx[0]
+                    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+                    fig.suptitle(
+                        f"Round {self.round_idx} - Epoch {trainer.current_epoch} - {title_plot}",
+                        fontsize=10,
+                    )
+                    
+                    try:
+                        epsilon_value = 1e-4
+                        widest_interval, norm1d, grid, inj_params = get_widest_interval_1d(
+                            pl_module,
+                            self.obs_loader,
+                            in_param_idx=param_idx,
+                            out_param_idx=out_param_idx,
+                            eps=epsilon_value
+                        )
+                        
+                        # Plot
+                        ax.plot(grid.flatten(), norm1d, 'b-', linewidth=1.5)
+                        ax.axvline(inj_params[0], color='r', linestyle='--', label='Injection')
+                        ax.axvline(widest_interval[0], color='g', linestyle=':', label=f'{100*(1-epsilon_value):.2f}% CI')
+                        ax.axvline(widest_interval[1], color='g', linestyle=':')
+                        ax.fill_between(grid.flatten(), 0, norm1d, 
+                                       where=(grid.flatten() >= widest_interval[0]) & (grid.flatten() <= widest_interval[1]),
+                                       alpha=0.3, color='green')
+                        ax.set_xlabel(_ORDERED_PRIOR_KEYS[param_idx])
+                        ax.set_ylabel('Posterior density')
+                        ax.legend()
+                        
+                        # Store the widest interval
+                        pl_module.widest_boxes[marginal_key] = widest_interval
+                        
+                        # Compute posterior-to-prior volume (width) ratio for 1D marginal
+                        posterior_width = self._compute_posterior_volume_1d(widest_interval)
+                        prior_width = self._compute_prior_volume_1d(pl_module, param_idx)
+                        volume_ratio = posterior_width / prior_width
+                        
+                        # Store and log the volume ratio
+                        if marginal_key not in self.volume_ratios:
+                            self.volume_ratios[marginal_key] = []
+                        self.volume_ratios[marginal_key].append({
+                            'epoch': trainer.current_epoch,
+                            'ratio': volume_ratio,
+                            'posterior_width': posterior_width,
+                            'prior_width': prior_width
+                        })
+                        
+                        # Log metric to tensorboard if logger exists
+                        if trainer.logger is not None:
+                            metric_name = f"volume_ratio/{_ORDERED_PRIOR_KEYS[param_idx]}"
+                            trainer.logger.log_metrics({metric_name: volume_ratio}, step=trainer.current_epoch)
+                        
+                        # Print diagnostic
+                        param_name = _ORDERED_PRIOR_KEYS[param_idx]
+                        print(f"Round {self.round_idx}, Epoch {trainer.current_epoch}, {param_name}: "
+                              f"Volume ratio (posterior/prior) = {volume_ratio:.6f} "
+                              f"(posterior width: {posterior_width:.6e}, prior width: {prior_width:.6e})")
+                        
+                        out = os.path.join(ROOT_DIR, "plots", self.timestamp, 
+                                          f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{_ORDERED_PRIOR_KEYS[param_idx]}.pdf")
+                        fig.savefig(out, bbox_inches="tight")
+                    except Exception as e:
+                        print(f"Error plotting 1D marginal for {_ORDERED_PRIOR_KEYS[param_idx]}: {e}")
+                    finally:
+                        plt.close(fig)
+
+                elif len(in_param_idx) == 2:
+                    # Handle 2D marginals
+                    fig, ax = plt.subplots(1, 1, figsize=(4, 4))
+                    fig.tight_layout()
+                    fig.suptitle(
+                        f"Round {self.round_idx} - Epoch {trainer.current_epoch} - {title_plot}",
+                        fontsize=10,
+                    )
+
+                    try:
+                        widest_box, inj_params = get_widest_box_2d(
+                            pl_module,
+                            self.obs_loader,
+                            in_param_idx=in_param_idx,
+                            out_param_idx=out_param_idx,
+                            ax_buffer=ax,
+                            do_plot=True
+                        )
+
+                        # Store widest_box keyed by the marginal (tuple of input parameter indices)
+                        pl_module.widest_boxes[marginal_key] = widest_box
+                        
+                        # Compute posterior-to-prior volume ratio for 2D marginal
+                        posterior_area = self._compute_posterior_volume_2d(widest_box)
+                        prior_area = self._compute_prior_volume_2d(pl_module, in_param_idx)
+                        volume_ratio = posterior_area / prior_area
+                        
+                        # Store and log the volume ratio
+                        if marginal_key not in self.volume_ratios:
+                            self.volume_ratios[marginal_key] = []
+                        self.volume_ratios[marginal_key].append({
+                            'epoch': trainer.current_epoch,
+                            'ratio': volume_ratio,
+                            'posterior_area': posterior_area,
+                            'prior_area': prior_area
+                        })
+                        
+                        # Log metric to tensorboard if logger exists
+                        if trainer.logger is not None:
+                            metric_name = f"volume_ratio/{_ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{_ORDERED_PRIOR_KEYS[in_param_idx[1]]}"
+                            trainer.logger.log_metrics({metric_name: volume_ratio}, step=trainer.current_epoch)
+                        
+                        # Print diagnostic
+                        param_names = f"{_ORDERED_PRIOR_KEYS[in_param_idx[0]]}-{_ORDERED_PRIOR_KEYS[in_param_idx[1]]}"
+                        print(f"Round {self.round_idx}, Epoch {trainer.current_epoch}, {param_names}: "
+                              f"Volume ratio (posterior/prior) = {volume_ratio:.6f} "
+                              f"(posterior area: {posterior_area:.6e}, prior area: {prior_area:.6e})")
+                        
+                        out = os.path.join(ROOT_DIR, "plots", self.timestamp,
+                                          f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{_ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{_ORDERED_PRIOR_KEYS[in_param_idx[1]]}.pdf")
+                        fig.savefig(out, bbox_inches="tight")
+                    except ValueError as ve:
+                        print(f"caught ValueError: {ve} during contour plotting, skipping this plot")
+                    finally:
+                        plt.close(fig)
+
+    def on_train_end(self, trainer, pl_module):
+        self.on_validation_epoch_end(trainer, pl_module)
+        print(f"Total training time: {datetime.now() - self.init_time}")

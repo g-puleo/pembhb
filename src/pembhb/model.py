@@ -13,7 +13,7 @@ from pembhb.data import MBHBDataset
 from torch.utils.data import DataLoader
 
 from pembhb.utils import _ORDERED_PRIOR_KEYS, mbhb_collate_fn
-from pembhb import ROOT_DIR
+from pembhb import ROOT_DIR, get_torch_dtype
 import numpy as np
 # class GWTransformer(LightningModule):
 #     def __init__(self, n_chunks=100, embed_dim=512, num_heads=8, num_layers=4):
@@ -256,8 +256,8 @@ class InferenceNetwork(LightningModule):
                 self.output_names.append(name_output)
                 self.marginals_list.append(marginal)
         self.td_normalisation = normalisation["td_normalisation"].item()
-        self.param_mean = torch.Tensor(normalisation["param_mean"]).to(train_conf["device"])
-        self.param_std = torch.Tensor(normalisation["param_std"]).to(train_conf["device"])
+        self.param_mean = torch.tensor(normalisation["param_mean"], dtype=get_torch_dtype()).to(train_conf["device"])
+        self.param_std = torch.tensor(normalisation["param_std"], dtype=get_torch_dtype()).to(train_conf["device"])
         print("Parameter mean:", self.param_mean.shape)
         print("Parameter std:", self.param_std.shape)
         self.save_hyperparameters(logger=True)    
@@ -343,7 +343,7 @@ class InferenceNetwork(LightningModule):
         all_logits = self(all_data_f, all_data_t, all_params)
         shape_half = (all_logits.shape[0] // 2, all_logits.shape[1])
         labels = torch.cat(
-            (torch.ones(shape_half, device=self.device), torch.zeros(shape_half, device=self.device)),
+            (torch.ones(shape_half, device=self.device, dtype=get_torch_dtype()), torch.zeros(shape_half, device=self.device, dtype=get_torch_dtype())),
             dim=0,
         )
         all_loss = self.loss(all_logits, labels)
@@ -864,14 +864,14 @@ class JointAEInferenceNetwork(LightningModule):
                 self.marginals_list.append(marginal)
 
         # ---- Normalisation buffers (same as InferenceNetwork) -----------
-        self.td_normalisation = normalisation["td_normalisation"].item()
+        self.td_normalisation = normalisation["td_normalisation"]
         self.register_buffer(
             "param_mean",
-            torch.tensor(normalisation["param_mean"], dtype=torch.float32),
+            torch.tensor(normalisation["param_mean"], dtype=get_torch_dtype()),
         )
         self.register_buffer(
             "param_std",
-            torch.tensor(normalisation["param_std"], dtype=torch.float32),
+            torch.tensor(normalisation["param_std"], dtype=get_torch_dtype()),
         )
 
         # ---- Data summary dimensionality (from encoder) -----------------
@@ -977,8 +977,8 @@ class JointAEInferenceNetwork(LightningModule):
         shape_half = (all_logits.shape[0] // 2, all_logits.shape[1])
         labels = torch.cat(
             (
-                torch.ones(shape_half, device=self.device),
-                torch.zeros(shape_half, device=self.device),
+                torch.ones(shape_half, device=self.device, dtype=get_torch_dtype()),
+                torch.zeros(shape_half, device=self.device, dtype=get_torch_dtype()),
             ),
             dim=0,
         )

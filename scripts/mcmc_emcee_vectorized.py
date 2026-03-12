@@ -20,11 +20,11 @@ from mcmc import BBHXLikelihood, load_observation, compute_fisher_information_ma
 
 def main():
     # Configuration
-    event_idx = 2  # Which event to analyze
+    event_idx = 0  # Which event to analyze
     # 5d
     #observation_file = "/data/gpuleo/mbhb/observation_skyloc_tc_mass.h5"
     # 2d 
-    observation_file = os.path.join(ROOT_DIR, "data", "testes_newdata_fixall_notmcq.h5")
+    observation_file = "/data/gpuleo/mbhb/observation_skyloc_distGpc_tc.h5"
     config_file = os.path.join(ROOT_DIR, "configs", "datagen_config.yaml")
     
     # Load configuration and data
@@ -104,7 +104,10 @@ def main():
     print("\\nSetting up parameters...")
     varying_params = [ #declare explicitly which ones : 
         "logMchirp",
-        "q"
+        "q", 
+        "Deltat",
+        "lambda",
+        "beta"
     ]
     # Save varying_params to a file for reproducibility
 
@@ -142,8 +145,8 @@ def main():
     
     
     # Define prior bounds for varying params
-    prior_mins = np.array([true_tmnre_params[i]-5*param_uncertainties[j] for j, i in enumerate(varying_indices)])
-    prior_maxs = np.array([true_tmnre_params[i]+5*param_uncertainties[j] for j, i in enumerate(varying_indices)])
+    prior_mins = np.array([true_tmnre_params[i]-15*param_uncertainties[j] for j, i in enumerate(varying_indices)])
+    prior_maxs = np.array([true_tmnre_params[i]+15*param_uncertainties[j] for j, i in enumerate(varying_indices)])
     prior_widths = prior_maxs - prior_mins
     for i, param in enumerate(varying_params):
         print(f"{param}: [{prior_mins[i]:.3e}, {prior_maxs[i]:.3e}] (width: {prior_widths[i]:.3e})")
@@ -224,8 +227,8 @@ def main():
 
     # Run MCMC
     nsteps = 1000
+    exit(1)
     print(f"\\n=== Running MCMC for {nsteps} steps ===")
-    print("This will use VECTORIZED likelihood evaluation for speedup!")
     state = sampler_emcee.run_mcmc(pos, nsteps, progress=True)
     
     # Get samples
@@ -264,7 +267,7 @@ def main():
         show_titles=True,
         title_kwargs={"fontsize": 12}
     )
-    name="2d_masses"
+    name="5d_new"
     outdir = os.path.join(ROOT_DIR, "mc_results_emcee_vec", name)
     os.makedirs(outdir, exist_ok=True)
     output_file = os.path.join(outdir, "flat_samples.npy")

@@ -6,17 +6,17 @@ waveform_params:
   dt: 100 # seconds
   t_max: 5 # days
 prior:
-  "logMchirp": [5.25, 5.25]
-  "q":         [4.7, 4.7]          # mass ratio
+  "logMchirp": [5.2, 5.3]
+  "q":         [4.6, 4.8]          # mass ratio
   "chi1":       [0.0,0.0]
   "chi2":       [0.0,0.0]
   "dist":       [10,10]            # dist in Gpc (note that we shall sample uniformly dist^3)
   "phi":        [0.0, 0.0]
   "inc":        [0.5 ,0.5]         # cos inclination
-  "lambda":     [3.14,3.14]       # ecliptic longitude
+  "lambda":     [0,6.28]       # ecliptic longitude
   "beta":       [-1,1]             # sin ecliptic latitude
   "psi":        [1.0, 1.0]
-  "Deltat":     [-2.5, -2.5]         # t_merger from end of observation in days
+  "Deltat":     [-2.55, -2.45]         # t_merger from end of observation in days
 
 backend: "cpu"
 

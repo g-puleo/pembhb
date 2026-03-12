@@ -1,14 +1,15 @@
 batch_size: 250
 epochs: 500
 learning_rate: 0.0001
+precision: "float32"  # "float32" (default) or "float64"
 #transform_td: "normalise_max" # options: "none", "logwhiten", "log", "whiten"
 transform_fd: "log" # options: "none", "logwhiten", "log", "whiten", "normalise_max"
 noise_factor: 1.0
-early_stop_patience: 90
+early_stop_patience: 75
 early_stop_min_delta: 0.001
 early_stop_threshold: 0.999
 scheduler_factor: 0.3
-scheduler_patience: 10
+scheduler_patience: 50
 keep_ckpt: True
 marginals: 
   #  f: [[0]]
@@ -60,11 +61,11 @@ architecture:
       representation: "real_imag"  # "amp_phase" or "real_imag"
       n_channels: 2                # TDI channels (AE→2, AET→3)
       n_freqs: 4096
-      bottleneck_dim: 128
+      bottleneck_dim: 256
       # input_channels is 4, hidden_channels determines the progressive increase in the channel dimension
-      hidden_channels: [32, 64, 128, 256, 256]
-      kernel_size: 3
-      stride: 2 # determines downsampling along the frequency dimension (start from 4096=2^12)
+      hidden_channels: [3, 5, 11, 24, 53, 116, 256]
+      kernel_size: 7
+      stride: 3 # determines downsampling along the frequency dimension (start from 4096=2^12)
       dropout: 0.0
       high_freq_only: True
       freq_split_idx: 2048
@@ -92,7 +93,7 @@ joint_training:
   lr_ae: 0.001                # learning rate for autoencoder (encoder + decoder)
   lr_nre: 0.0001              # learning rate for NRE classifier heads
   ae_weight_decay: 0.00001    # weight decay for autoencoder param group
-  ae_scheduler_patience: 10   # ReduceLROnPlateau patience
+  ae_scheduler_patience: 50   # ReduceLROnPlateau patience
   ae_scheduler_factor: 0.3    # ReduceLROnPlateau factor
 
 
@@ -122,5 +123,5 @@ fisher_prior:
     - "phi"
     - "inc"
     - "psi"
-  n_sigma: 15.0           # prior half-width in units of FIM sigma
+  n_sigma: 25.0           # prior half-width in units of FIM sigma
   delta_frac: 1.0e-4     # fractional step size for numerical derivatives

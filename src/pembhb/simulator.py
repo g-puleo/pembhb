@@ -13,13 +13,10 @@ from lisatools.detector import EqualArmlengthOrbits
 
 
 from pembhb import ROOT_DIR
+from pembhb import get_numpy_dtype, get_numpy_complex_dtype
 from pembhb.sampler import UniformSampler
 import sys
-gpu_available = False ### True does not work on coglians, needs nvcc
-if gpu_available: 
-    backend='cuda12x'
-else:
-    backend='cpu'
+
 WEEK_SI = 7 * 24 * 3600  # seconds in a week
 DAY_SI = 24 * 3600  # seconds in a dayYRSID_SI = wfb.YRSID_SI
 
@@ -62,7 +59,7 @@ class MBHBSimulatorFD_TD:
         self.filtered_asd[:, self.freqs_pos < 5e-5] = 0
 
         self.window = tukey(self.n_time, alpha=0.0005)
-        orbits = EqualArmlengthOrbits(force_backend=backend)
+        orbits = EqualArmlengthOrbits(force_backend=conf["backend"])
         orbits.configure(linear_interp_setup=True)
 
         resp_kwargs = {
@@ -78,7 +75,7 @@ class MBHBSimulatorFD_TD:
         )
         self.xp = self.wfd.xp
         self.info = {
-            "backend": backend,
+            "backend": conf["backend"],
             "seed": seed,
             "conf": conf,
             "sampler_init_kwargs": sampler_init_kwargs,
@@ -91,10 +88,12 @@ class MBHBSimulatorFD_TD:
         }
         t0 = self.t_obs_start_SI / YRSID_SI
         t1 = self.t_obs_end_SI / YRSID_SI
+        # Convert freqs to appropriate backend (important for GPU)
+        freqs_backend = self.xp.asarray(self.freqs_pos)
         self.waveform_kwargs = {
             "t_obs_start": t0,
             "t_obs_end": t1,
-            "freqs": self.freqs_pos,
+            "freqs": freqs_backend,
             "modes": self.modes,
             "direct": False,
             "fill": True,
@@ -131,6 +130,8 @@ class MBHBSimulatorFD_TD:
 
     # -----------------------------------------
     def _waveform_fd(self, inj):
+        # Pass NumPy arrays — BBHx internally handles GPU conversion.
+        # Pre-converting to CuPy breaks its isinstance(Tobs, np.ndarray) check.
         return self.wfd(*inj, **self.waveform_kwargs)
 
     # -----------------------------------------
@@ -141,9 +142,13 @@ class MBHBSimulatorFD_TD:
         # insert f_ref=0
         #inj = np.insert(inj, 6, np.zeros(n_obs), axis=0)
 
-        wave_pos = self._waveform_fd(inj).astype(np.complex64)
+        wave_pos = self._waveform_fd(inj)
+        # Convert back to NumPy if needed (GPU backend returns CuPy arrays)
+        if self.xp.__name__ == 'cupy':
+            wave_pos = wave_pos.get()
+        wave_pos = wave_pos.astype(get_numpy_complex_dtype())
         wave_pos = wave_pos[:, self.channels_idx,:]
-        noise_pos = self._noise_pos(n_obs).astype(np.complex64)
+        noise_pos = self._noise_pos(n_obs).astype(get_numpy_complex_dtype())
 
         wave_two = self._two_sided(wave_pos)
         noise_two = self._two_sided(noise_pos)
@@ -159,6 +164,7 @@ class MBHBSimulatorFD_TD:
     # -----------------------------------------
     def sample(self, N):
         z, inj = self.sampler.sample(N, self.t_obs_end_SI)
+
         noise_fd, wave_fd, noise_td, wave_td = self.generate(z)
         return {
             "parameters": inj,
@@ -184,16 +190,18 @@ class MBHBSimulatorFD_TD:
             batch_size = max(1,int(N/10.0))
         
         with h5py.File(filename, "a") as f:
-            source_params = f.create_dataset("source_parameters", shape=(N, 11), dtype=np.float32)
-            bbhx_params = f.create_dataset("bbhx_parameters", shape=(N, 12), dtype=np.float32)
-            sample_frequencies = f.create_dataset("frequencies", data=self.freqs_pos, dtype=np.float32)
-            sample_times_SI = f.create_dataset("times_SI", data=np.arange(0, self.n_time)*self.dt, dtype=np.float32)
-            wave_fd = f.create_dataset("wave_fd", shape=(N, self.n_channels, self.n_freqs_pos), dtype=np.complex64)
-            wave_td = f.create_dataset("wave_td", shape=(N, self.n_channels, self.n_time), dtype=np.float32)
-            noise_fd = f.create_dataset("noise_fd", shape=(N, self.n_channels, self.n_freqs_pos), dtype=np.complex64)
-            noise_td = f.create_dataset("noise_td", shape=(N, self.n_channels, self.n_time), dtype=np.float32)
-            snr = f.create_dataset("snr", shape = (N,), dtype=np.float32)
-            asd_dataset = f.create_dataset("asd", data=self.asd, dtype=np.float32)
+            _np_real = get_numpy_dtype()
+            _np_complex = get_numpy_complex_dtype()
+            source_params = f.create_dataset("source_parameters", shape=(N, 11), dtype=_np_real)
+            bbhx_params = f.create_dataset("bbhx_parameters", shape=(N, 12), dtype=_np_real)
+            sample_frequencies = f.create_dataset("frequencies", data=self.freqs_pos, dtype=_np_real)
+            sample_times_SI = f.create_dataset("times_SI", data=np.arange(0, self.n_time)*self.dt, dtype=_np_real)
+            wave_fd = f.create_dataset("wave_fd", shape=(N, self.n_channels, self.n_freqs_pos), dtype=_np_complex)
+            wave_td = f.create_dataset("wave_td", shape=(N, self.n_channels, self.n_time), dtype=_np_real)
+            noise_fd = f.create_dataset("noise_fd", shape=(N, self.n_channels, self.n_freqs_pos), dtype=_np_complex)
+            noise_td = f.create_dataset("noise_td", shape=(N, self.n_channels, self.n_time), dtype=_np_real)
+            snr = f.create_dataset("snr", shape = (N,), dtype=_np_real)
+            asd_dataset = f.create_dataset("asd", data=self.asd, dtype=_np_real)
             print("Sampling and storing simulations to ", filename)
             maximum_timedomain = 0
             

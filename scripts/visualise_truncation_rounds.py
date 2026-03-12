@@ -6,10 +6,13 @@ marginal output of the trained model and produces:
 
 * **2-D marginals** – one figure with N columns (one per round), each showing
   posterior contours (no colorscale), a dashed rectangle for the next round's
-  prior window, and connecting lines to the next panel's frame.
+  prior window, and connecting lines to the next panel's frame.  The final
+  round additionally displays inset 1-D marginal distributions (top and
+  right) with optional MCMC overlay.
 
 * **1-D marginals** – one figure showing how the truncated prior window
-  (lower and upper bound) evolves across rounds (x-axis = round index).
+  (lower and upper bound) evolves across rounds (x-axis = round index),
+  plus a final-round 1-D posterior density with optional MCMC overlay.
 
 Usage
 -----
@@ -224,6 +227,8 @@ def plot_1d_prior_evolution(
     hpd_levels: tuple = (0.50, 0.90, 0.9999),
     band_colors: tuple = ("#4393c3", "#92c5de", "#d1e5f0"),
     ngrid_points: int = 1000,
+    mcmc_samples_dir: str = None,
+    ngrid_points_1d: int = 500,
 ):
     """Plot how the 1-D posterior HPD intervals evolve across rounds.
 
@@ -232,6 +237,10 @@ def plot_1d_prior_evolution(
     defined by *hpd_levels* are shown as filled bands.  The prior window
     itself (99.99 % HPD bound, matching the truncation logic in tmnre.py)
     is shown as dashed lines.
+
+    Additionally, the final-round 1-D posterior density is plotted on a
+    secondary axes (right-hand panel) with an optional MCMC KDE overlay
+    when *mcmc_samples_dir* is provided.
 
     Reuses ``get_logratios_grid`` from pembhb.utils (the same function called
     by ``get_widest_interval_1d`` in tmnre.py).
@@ -249,18 +258,26 @@ def plot_1d_prior_evolution(
     dataloader : DataLoader
         Observation data loader.
     figsize : tuple
-        Figure size in inches.
+        Figure size in inches for the HPD evolution panel.
     hpd_levels : tuple of float
         Credibility levels to show as bands, from narrowest (innermost) to
         widest (outermost).  Default: 50 %, 90 %, 99.99 %.
     band_colors : tuple of str
         Fill colours for each band, matched by position to *hpd_levels*.
     ngrid_points : int
-        Grid resolution for posterior evaluation.
+        Grid resolution for posterior evaluation (HPD panel).
+    mcmc_samples_dir : str, optional
+        Directory containing ``flat_samples.npy`` and
+        ``varying_params.txt``.  When provided, the MCMC marginal KDE is
+        overlaid on the final-round density panel.
+    ngrid_points_1d : int
+        Grid resolution for the final-round 1-D density panel.
 
     Returns
     -------
-    fig, ax
+    fig, axes : tuple
+        ``fig`` is the figure; ``axes`` is a dict with keys ``"hpd"`` and
+        ``"density"`` pointing to the two axes.
     """
     n_rounds = len(round_dirs)
     round_indices = np.arange(1, n_rounds + 1)
@@ -277,55 +294,115 @@ def plot_1d_prior_evolution(
     hpd_lows  = {lvl: [] for lvl in hpd_levels}
     hpd_highs = {lvl: [] for lvl in hpd_levels}
 
+    # Store final-round density for the secondary panel
+    final_norm1d = None
+    final_grid_1d = None
+    final_inj = None
+
     for i, round_dir in enumerate(round_dirs):
         print(f"  [1-D {param_key}] Round {i + 1}: evaluating posterior...")
         model = load_model(os.path.join(round_dir, "checkpoints"))
+
+        # Use higher resolution for the final round if requested
+        _ngrid = ngrid_points_1d if (i == n_rounds - 1) else ngrid_points
+        if in_param_idx == 10: 
+            low = -2.5-3e-5
+            high = -2.5+3e-5
+        else:
+            low = None
+            high = None
+        
         logratios, inj_params, grid = get_logratios_grid(
             dataloader,
             model,
-            ngrid_points=ngrid_points,
+            ngrid_points=_ngrid,
             in_param_idx=in_param_idx,
             out_param_idx=out_param_idx,
+            low=low, 
+            high=high
         )
         del model
         ratios = np.exp(logratios[0])
         dp = grid[1, 0] - grid[0, 0]
         norm1d = ratios / np.sum(ratios * dp)
         grid_1d = grid[:, 0]
+
+        # HPD intervals (use the ngrid_points resolution for consistency
+        # when this is not the final round; for the final round the higher
+        # resolution only helps)
         for lvl in hpd_levels:
             lo, hi = _hpd_interval_1d(norm1d, grid_1d, lvl)
             hpd_lows[lvl].append(lo)
             hpd_highs[lvl].append(hi)
 
-    fig, ax = plt.subplots(figsize=figsize)
+        # Keep final round data
+        if i == n_rounds - 1:
+            final_norm1d = norm1d
+            final_grid_1d = grid_1d
+            final_inj = float(inj_params[0])
 
+    # ---- Create figure with two panels: HPD evolution + final-round density ----
+    fig, (ax_hpd, ax_dens) = plt.subplots(
+        1, 2, figsize=(figsize[0] * 2 + 1, figsize[1]),
+        gridspec_kw={"width_ratios": [1, 1], "wspace": 0.35},
+    )
+
+    # --- Left panel: HPD band evolution (unchanged logic) ---
     # Filled HPD bands (widest first so narrower ones paint on top)
     for lvl, color in zip(reversed(hpd_levels), reversed(band_colors)):
         lows_arr  = np.array(hpd_lows[lvl])
         highs_arr = np.array(hpd_highs[lvl])
         pct = int(round(lvl * 100))
-        ax.fill_between(
+        ax_hpd.fill_between(
             round_indices, lows_arr, highs_arr,
             color=color, alpha=0.85,
             label=f"{pct} % HPD",
         )
         # Draw the bounding lines explicitly
-        ax.plot(round_indices, lows_arr,  color=color, linewidth=1.5)
-        ax.plot(round_indices, highs_arr, color=color, linewidth=1.5)
+        ax_hpd.plot(round_indices, lows_arr,  color=color, linewidth=1.5)
+        ax_hpd.plot(round_indices, highs_arr, color=color, linewidth=1.5)
 
     # Prior window as dashed reference
-    ax.plot(round_indices, prior_lows,  color="black",
-            linestyle="--", linewidth=1.2, label="prior window")
-    ax.plot(round_indices, prior_highs, color="black",
-            linestyle="--", linewidth=1.2)
+    ax_hpd.plot(round_indices, prior_lows,  color="black",
+                linestyle="--", linewidth=1.2, label="prior window")
+    ax_hpd.plot(round_indices, prior_highs, color="black",
+                linestyle="--", linewidth=1.2)
 
-    ax.set_xlabel("Round")
-    ax.set_ylabel(param_key)
-    ax.set_title(f"1-D posterior HPD evolution: {param_key}")
-    ax.set_xticks(round_indices)
-    ax.legend(loc="best", fontsize=9)
-    ax.grid(True, linestyle="--", alpha=0.4)
-    return fig, ax
+    ax_hpd.set_xlabel("Round")
+    ax_hpd.set_ylabel(param_key)
+    ax_hpd.set_title(f"1-D posterior HPD evolution: {param_key}")
+    ax_hpd.set_xticks(round_indices)
+    ax_hpd.legend(loc="best", fontsize=9)
+    ax_hpd.grid(True, linestyle="--", alpha=0.4)
+
+    # --- Right panel: final-round 1-D posterior density ---
+    ax_dens.plot(final_grid_1d, final_norm1d, "b-", linewidth=2, label="NRE")
+    ax_dens.fill_between(final_grid_1d, 0, final_norm1d, alpha=0.3, color="b")
+    ax_dens.axvline(x=final_inj, color="r", linestyle="--", linewidth=2, label="Injection")
+
+    # MCMC overlay
+    if mcmc_samples_dir is not None:
+        flat_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_dir)
+        if param_key in mcmc_param_names:
+            idx_mc = mcmc_param_names.index(param_key)
+            mcmc_samp = flat_samples[:, idx_mc]
+            kde = gaussian_kde(mcmc_samp)
+            mcmc_marginal = kde(final_grid_1d)
+            dp = final_grid_1d[1] - final_grid_1d[0]
+            mcmc_marginal = mcmc_marginal / np.sum(mcmc_marginal * dp)
+            ax_dens.plot(final_grid_1d, mcmc_marginal, color="orange",
+                         linewidth=2, label="MCMC")
+            ax_dens.fill_between(final_grid_1d, 0, mcmc_marginal,
+                                 alpha=0.3, color="orange")
+
+    ax_dens.set_xlabel(param_key)
+    ax_dens.set_ylabel("Posterior Density")
+    ax_dens.set_title(f"Final-round 1-D posterior: {param_key}")
+    ax_dens.legend(loc="best", fontsize=9)
+    ax_dens.grid(True, linestyle="--", alpha=0.4)
+
+    axes_dict = {"hpd": ax_hpd, "density": ax_dens}
+    return fig, axes_dict
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +437,7 @@ def overlay_mcmc_contours(
     alpha: float = 0.9,
     label: str = "MCMC",
     is_sky: bool = False,
+    use_mollweide: bool = True,
 ):
     """Overlay Gaussian-KDE credibility contours from MCMC flat samples on *ax*.
 
@@ -368,10 +446,10 @@ def overlay_mcmc_contours(
     (68.27 %, 95.45 %, 99.73 %, 99.99 %) computed via ``contour_levels``.
 
     When *is_sky* is ``True`` the parameter pair is assumed to be
-    ``(lambda, beta)`` and the samples are reprojected to Mollweide
-    (lon, lat) coordinates before KDE evaluation.  The evaluation grid
-    spans the full sky ([-π, π] × [-π/2, π/2]) rather than the current
-    axis limits.
+    ``(lambda, beta)`` and the samples are reprojected to
+    (lon, lat) coordinates before KDE evaluation.  If *use_mollweide* is
+    ``True`` the grid spans the full sky in radians; otherwise it spans
+    the current axis limits in degrees.
     """
     idx0 = mcmc_param_names.index(p0_key)
     idx1 = mcmc_param_names.index(p1_key)
@@ -379,14 +457,39 @@ def overlay_mcmc_contours(
     samples_y = flat_samples[:, idx1]
 
     if is_sky:
-        # Transform MCMC samples to Mollweide (lon, lat) — same reparametrisation
-        # as the posterior grid: lon = lambda - pi, lat = arcsin(beta).
+        # Transform MCMC samples to (lon, lat)
         lam_col = samples_x if p0_key == "lambda" else samples_y
         bet_col = samples_y if p1_key == "beta" else samples_x
-        samples_x = lam_col - np.pi                          # lon in [-π, π]
-        samples_y = np.arcsin(np.clip(bet_col, -1.0, 1.0))  # lat in [-π/2, π/2]
-        gx_1d = np.linspace(-np.pi, np.pi, ngrid_points)
-        gy_1d = np.linspace(-np.pi / 2.0, np.pi / 2.0, ngrid_points)
+        lon_rad = lam_col - np.pi
+        lat_rad = np.arcsin(np.clip(bet_col, -1.0, 1.0))
+
+        if use_mollweide:
+            # Full-sky in radians
+            samples_x = lon_rad
+            samples_y = lat_rad
+            gx_1d = np.linspace(-np.pi, np.pi, ngrid_points)
+            gy_1d = np.linspace(-np.pi / 2.0, np.pi / 2.0, ngrid_points)
+        else:
+            # Restricted sky in degrees — grid matches current axes
+            samples_x = np.degrees(lon_rad)
+            samples_y = np.degrees(lat_rad)
+            xl = ax.get_xlim()
+            yl = ax.get_ylim()
+            # Clip samples to the axis range so outliers don't inflate the
+            # KDE bandwidth and push all density off the evaluation grid.
+            mask = (
+                (samples_x >= xl[0]) & (samples_x <= xl[1])
+                & (samples_y >= yl[0]) & (samples_y <= yl[1])
+            )
+            samples_x = samples_x[mask]
+            samples_y = samples_y[mask]
+            print(f"    MCMC samples clipped away: {np.sum(~mask)} / {len(mask)}")
+            if len(samples_x) < 10:
+                print("    WARNING: fewer than 10 MCMC samples inside axes "
+                      "— skipping MCMC contour overlay.")
+                return None
+            gx_1d = np.linspace(xl[0], xl[1], ngrid_points)
+            gy_1d = np.linspace(yl[0], yl[1], ngrid_points)
     else:
         # Evaluate on a regular grid matching the current axis limits
         xl = ax.get_xlim()
@@ -403,7 +506,11 @@ def overlay_mcmc_contours(
     # Normalise (matches the convention used by contour_levels)
     dp0 = gx_1d[1] - gx_1d[0]
     dp1 = gy_1d[1] - gy_1d[0]
-    kde_norm = kde_vals / (np.sum(kde_vals) * dp0 * dp1)
+    kde_sum = np.sum(kde_vals)
+    if kde_sum == 0:
+        print("    WARNING: KDE evaluated to zero on grid — skipping MCMC overlay.")
+        return None
+    kde_norm = kde_vals / (kde_sum * dp0 * dp1)
 
     # Compute credibility-level thresholds on the KDE density
     levels, level_labels = contour_levels(kde_norm, targets=[0.6827, 0.9545, 0.9973])
@@ -430,8 +537,194 @@ def overlay_mcmc_contours(
 
 
 # ---------------------------------------------------------------------------
-# Sky-localisation coordinate transform
+# 1-D marginal insets for the final-round 2-D panel
 # ---------------------------------------------------------------------------
+
+def _add_1d_marginal_insets(
+    ax,
+    norm2d,
+    gx,
+    gy,
+    inj_params,
+    p0_key: str,
+    p1_key: str,
+    mcmc_samples_dir: str = None,
+    _sky_deg: bool = False,
+    _p0_key_raw: str = None,
+    _p1_key_raw: str = None,
+):
+    """Add top and right inset axes to *ax* showing 1-D marginals.
+
+    The 1-D marginals are obtained by numerically integrating the 2-D
+    posterior over the complementary axis, matching the convention in
+    ``plot_corner_with_marginals`` from the interactive notebook:
+
+    * ``marginal_0 = sum(norm2d * dp1, axis=0)``  →  p(param_0)
+    * ``marginal_1 = sum(norm2d * dp0, axis=1)``  →  p(param_1)
+
+    When *mcmc_samples_dir* is provided, a Gaussian-KDE marginal from the
+    MCMC flat samples is overlaid in orange.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        The 2-D contour axes (last-round panel).
+    norm2d : ndarray, shape (ngrid, ngrid)
+        Normalised 2-D posterior (single observation, no batch dim).
+    gx, gy : ndarray, shape (ngrid, ngrid)
+        Meshgrids (xy indexing).  May be in degree coordinates when
+        ``_sky_deg`` is True.
+    inj_params : 1-D array of length 2
+        True parameter values ``[p0_true, p1_true]``.
+    p0_key, p1_key : str
+        Parameter names for labelling.
+    mcmc_samples_dir : str, optional
+        Path to MCMC samples directory.
+    _sky_deg : bool
+        If True, grids are in (lon, lat) degrees; MCMC samples must be
+        converted from native (lambda, beta) to degrees before KDE.
+    _p0_key_raw, _p1_key_raw : str, optional
+        Original parameter keys ("lambda"/"beta") used to look up MCMC
+        columns when ``_sky_deg`` is True.
+
+    Returns
+    -------
+    ax_top, ax_right : Axes
+        The two inset axes.
+    """
+    # Grid vectors and spacings
+    grid_0 = gx[0, :]   # param_0 values (columns)
+    grid_1 = gy[:, 0]   # param_1 values (rows)
+    dp0 = grid_0[1] - grid_0[0]
+    dp1 = grid_1[1] - grid_1[0]
+
+    if _sky_deg:
+        # norm2d is a density in native (λ, β) space but the grids are in
+        # degrees.  Apply the inverse Jacobian so that the marginals
+        # integrate correctly in degree-space:
+        #   p(lon°, lat°) = p(λ, β) · (π/180)² · cos(lat)
+        # where cos(lat) = sqrt(1 − β²).  grid_1 is lat_deg (rows).
+        lat_rad = np.radians(grid_1)                   # shape (ngrid,)
+        cos_lat = np.cos(lat_rad)                       # = sqrt(1 - β²)
+        jac_inv = (np.pi / 180.0) ** 2 * cos_lat        # shape (ngrid,)
+        norm2d = norm2d * jac_inv[:, np.newaxis]         # broadcast over columns
+
+    # Marginalise: norm2d[i, j] → axis 0 = param_1, axis 1 = param_0
+    marginal_0 = np.sum(norm2d * dp1, axis=0)  # p(param_0), shape (ngrid,)
+    marginal_1 = np.sum(norm2d * dp0, axis=1)  # p(param_1), shape (ngrid,)
+
+    # --- Top inset: marginal for param_0 (x-axis of the 2-D plot) ---
+    ax_top = ax.inset_axes([0.0, 1.02, 1.0, 0.25])  # [x0, y0, width, height] in axes fraction
+    ax_top.plot(grid_0, marginal_0, "b-", linewidth=1.5, label="NRE")
+    ax_top.fill_between(grid_0, 0, marginal_0, alpha=0.3, color="b")
+    ax_top.axvline(x=float(inj_params[0]), color="r", linestyle="--", linewidth=1.5)
+    ax_top.set_xlim(ax.get_xlim())
+    ax_top.tick_params(labelbottom=False, labelleft=False, left=False, bottom=True)
+    ax_top.set_ylabel("p", fontsize=8)
+    ax_top.grid(alpha=0.3)
+
+    # --- Right inset: marginal for param_1 (y-axis of the 2-D plot) ---
+    ax_right = ax.inset_axes([1.02, 0.0, 0.25, 1.0])
+    ax_right.plot(marginal_1, grid_1, "b-", linewidth=1.5, label="NRE")
+    ax_right.fill_betweenx(grid_1, 0, marginal_1, alpha=0.3, color="b")
+    ax_right.axhline(y=float(inj_params[1]), color="r", linestyle="--", linewidth=1.5)
+    ax_right.set_ylim(ax.get_ylim())
+    ax_right.tick_params(labelbottom=False, labelleft=False, left=False, bottom=True)
+    ax_right.set_xlabel("p", fontsize=8)
+    ax_right.grid(alpha=0.3)
+
+    # --- MCMC KDE overlay ---
+    if mcmc_samples_dir is not None:
+        flat_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_dir)
+
+        if _sky_deg:
+            # Axes are in (lon_deg, lat_deg); MCMC columns are (lambda, beta)
+            _lk = _p0_key_raw if _p0_key_raw == "lambda" else _p1_key_raw
+            _bk = _p0_key_raw if _p0_key_raw == "beta"   else _p1_key_raw
+            _has_lon = _lk in mcmc_param_names
+            _has_lat = _bk in mcmc_param_names
+            if _has_lon:
+                lam_samp = flat_samples[:, mcmc_param_names.index(_lk)]
+                lon_deg_samp = np.degrees(lam_samp - np.pi)
+                kde_0 = gaussian_kde(lon_deg_samp)
+                mcmc_m0 = kde_0(grid_0)
+                mcmc_m0 = mcmc_m0 / np.sum(mcmc_m0 * dp0)
+                ax_top.plot(grid_0, mcmc_m0, color="orange", linewidth=1.5, label="MCMC")
+                ax_top.fill_between(grid_0, 0, mcmc_m0, alpha=0.3, color="orange")
+            if _has_lat:
+                bet_samp = flat_samples[:, mcmc_param_names.index(_bk)]
+                lat_deg_samp = np.degrees(np.arcsin(np.clip(bet_samp, -1, 1)))
+                kde_1 = gaussian_kde(lat_deg_samp)
+                mcmc_m1 = kde_1(grid_1)
+                mcmc_m1 = mcmc_m1 / np.sum(mcmc_m1 * dp1)
+                ax_right.plot(mcmc_m1, grid_1, color="orange", linewidth=1.5, label="MCMC")
+                ax_right.fill_betweenx(grid_1, 0, mcmc_m1, alpha=0.3, color="orange")
+        else:
+            _has_p0 = p0_key in mcmc_param_names
+            _has_p1 = p1_key in mcmc_param_names
+
+            if _has_p0:
+                mcmc_samp_0 = flat_samples[:, mcmc_param_names.index(p0_key)]
+                kde_0 = gaussian_kde(mcmc_samp_0)
+                mcmc_m0 = kde_0(grid_0)
+                mcmc_m0 = mcmc_m0 / np.sum(mcmc_m0 * dp0)
+                ax_top.plot(grid_0, mcmc_m0, color="orange", linewidth=1.5, label="MCMC")
+                ax_top.fill_between(grid_0, 0, mcmc_m0, alpha=0.3, color="orange")
+
+            if _has_p1:
+                mcmc_samp_1 = flat_samples[:, mcmc_param_names.index(p1_key)]
+                kde_1 = gaussian_kde(mcmc_samp_1)
+                mcmc_m1 = kde_1(grid_1)
+                mcmc_m1 = mcmc_m1 / np.sum(mcmc_m1 * dp1)
+                ax_right.plot(mcmc_m1, grid_1, color="orange", linewidth=1.5, label="MCMC")
+                ax_right.fill_betweenx(grid_1, 0, mcmc_m1, alpha=0.3, color="orange")
+
+    # Compact legend on the top inset only
+    ax_top.legend(loc="upper right", fontsize=7, framealpha=0.8)
+
+    return ax_top, ax_right
+
+
+# ---------------------------------------------------------------------------
+# Sky-localisation helpers
+# ---------------------------------------------------------------------------
+
+# Full-sky bounds in the model's native parametrisation
+_FULL_SKY_LAMBDA = (0.0, 2.0 * np.pi)   # ecliptic longitude
+_FULL_SKY_BETA   = (-1.0, 1.0)          # sin(ecliptic latitude)
+_SR_TO_SQDEG     = (180.0 / np.pi) ** 2  # steradians → square degrees
+
+
+def _is_full_sky(bounds_lambda: tuple, bounds_beta: tuple, rtol: float = 0.02) -> bool:
+    """Return ``True`` if the prior window covers (nearly) the full sky.
+
+    Compares the lambda and beta bounds against the canonical full-sky
+    ranges with relative tolerance *rtol*.
+    """
+    lam_range = bounds_lambda[1] - bounds_lambda[0]
+    bet_range = bounds_beta[1] - bounds_beta[0]
+    full_lam  = _FULL_SKY_LAMBDA[1] - _FULL_SKY_LAMBDA[0]
+    full_bet  = _FULL_SKY_BETA[1]  - _FULL_SKY_BETA[0]
+    return (abs(lam_range - full_lam) / full_lam < rtol and
+            abs(bet_range - full_bet) / full_bet < rtol)
+
+
+def _compute_sky_area(density_2d: np.ndarray, threshold: float,
+                      dp_lambda: float, dp_beta: float) -> float:
+    """Compute the sky area enclosed by the iso-density contour at *threshold*.
+
+    The grid lives in (lambda, beta) space where beta = sin(ecliptic
+    latitude).  The solid-angle element is
+    ``dΩ = dλ × d(sin lat) = dp_lambda × dp_beta``, so the area in
+    steradians is simply the number of cells above the threshold
+    multiplied by the cell area.
+
+    Returns the area in **square degrees**.
+    """
+    n_cells = np.sum(density_2d >= threshold)
+    area_sr = float(n_cells) * dp_lambda * dp_beta
+    return area_sr * _SR_TO_SQDEG
+
 
 def _to_mollweide_coords(gx: np.ndarray, gy: np.ndarray, p0_key: str, p1_key: str):
     """Convert a model-space meshgrid to Mollweide (lon, lat) coordinates.
@@ -470,6 +763,16 @@ def _to_mollweide_coords(gx: np.ndarray, gy: np.ndarray, p0_key: str, p1_key: st
     return lon, lat
 
 
+def _to_lonlat_deg(gx: np.ndarray, gy: np.ndarray, p0_key: str, p1_key: str):
+    """Convert a model-space meshgrid to (longitude, latitude) in **degrees**.
+
+    Uses the same mapping as ``_to_mollweide_coords`` but outputs degrees
+    instead of radians, suitable for a Cartesian axes.
+    """
+    lon_rad, lat_rad = _to_mollweide_coords(gx, gy, p0_key, p1_key)
+    return np.degrees(lon_rad), np.degrees(lat_rad)
+
+
 # ---------------------------------------------------------------------------
 # Main plotting function
 # ---------------------------------------------------------------------------
@@ -487,6 +790,11 @@ def plot_truncation_rounds(
     mcmc_samples_dir: str = None,
 ):
     """Plot posterior-contour evolution across successive truncation rounds.
+
+    The final-round panel additionally includes inset axes showing
+    1-D marginal distributions (top: param_0, right: param_1) obtained
+    by integrating the 2-D posterior over the complementary axis.  When
+    *mcmc_samples_dir* is given, MCMC KDE marginals are overlaid.
 
     Parameters
     ----------
@@ -518,13 +826,14 @@ def plot_truncation_rounds(
         Directory containing ``flat_samples.npy`` and
         ``varying_params.txt`` from a previous MCMC run.  When provided,
         Gaussian-KDE credibility contours from those samples are
-        superimposed on the **last** round's panel.  The two parameter
-        columns are selected automatically based on the marginal pair
-        being plotted.
+        superimposed on the **last** round's panel, and 1-D MCMC
+        marginals are overlaid on the inset axes.
 
     Returns
     -------
-    fig, axes
+    fig, axes, sky_areas
+        ``sky_areas`` is a dict mapping round index → ``{"nre": area, "mcmc": area}``
+        in square degrees (only populated for sky-localisation marginals).
     """
     n_rounds = len(round_dirs)
 
@@ -551,19 +860,31 @@ def plot_truncation_rounds(
         )
     marginal_label, in_param_idx_fixed, out_param_idx_fixed = marginals_2d[marginal_pair_idx]
 
-    # Detect sky-localisation marginal (lambda vs beta) → Mollweide projection
+    # Detect sky-localisation marginal (lambda vs beta)
     p0_key_fixed = _ORDERED_PRIOR_KEYS[in_param_idx_fixed[0]]
     p1_key_fixed = _ORDERED_PRIOR_KEYS[in_param_idx_fixed[1]]
     is_sky = {p0_key_fixed, p1_key_fixed} == {"lambda", "beta"}
 
-    # Create figure — Mollweide axes for the sky-location pair, standard otherwise
+    # For sky marginals decide Mollweide vs Cartesian *per round*.
+    # Determine the projection for each round once; the first round that
+    # has a restricted prior triggers Cartesian for that round onward.
     if is_sky:
+        sky_use_mollweide = []
+        for i_r in range(n_rounds):
+            box_r = prior_boxes[i_r]
+            lam_key = "lambda"
+            bet_key = "beta"
+            sky_use_mollweide.append(
+                _is_full_sky(box_r[lam_key], box_r[bet_key])
+            )
+        # Create figure with per-panel projection
         fig = plt.figure(figsize=(figsize_per_panel[0] * n_rounds, figsize_per_panel[1]))
-        axes = [
-            fig.add_subplot(1, n_rounds, k + 1, projection="mollweide")
-            for k in range(n_rounds)
-        ]
+        axes = []
+        for k in range(n_rounds):
+            proj = "mollweide" if sky_use_mollweide[k] else None
+            axes.append(fig.add_subplot(1, n_rounds, k + 1, projection=proj))
     else:
+        sky_use_mollweide = [False] * n_rounds   # unused, keeps indexing safe
         fig, axes = plt.subplots(
             1,
             n_rounds,
@@ -573,6 +894,9 @@ def plot_truncation_rounds(
         )
         if n_rounds == 1:
             axes = [axes]
+
+    # Collect sky-area measurements (populated in the sky branch)
+    sky_areas = {}  # round_idx → {"nre": area_sqdeg, "mcmc": area_sqdeg}
 
     # Collect (rect_patch, ax) for each round that has a following round
     rectangles = []
@@ -608,39 +932,148 @@ def plot_truncation_rounds(
 
         if is_sky:
             # ------------------------------------------------------------------
-            # Mollweide path: reparametrise (lambda, beta) → (lon, lat) and
-            # plot directly on the Mollweide-projected axes.
+            # Sky path: Mollweide for full-sky priors, Cartesian for
+            # restricted priors.  Both use (lon, lat) coordinates.
             # ------------------------------------------------------------------
-            lon_grid, lat_grid = _to_mollweide_coords(gx, gy, p0_key, p1_key)
+            use_mollweide = sky_use_mollweide[i]
 
-            # Injection point in Mollweide coordinates
+            # Injection point in (lon, lat)
             lam_inj = float(inj_params[0, 0]) if p0_key == "lambda" else float(inj_params[0, 1])
             bet_inj = float(inj_params[0, 1]) if p1_key == "beta"   else float(inj_params[0, 0])
-            lon_inj = lam_inj - np.pi
-            lat_inj = np.arcsin(np.clip(bet_inj, -1.0, 1.0))
+            lon_inj_rad = lam_inj - np.pi
+            lat_inj_rad = np.arcsin(np.clip(bet_inj, -1.0, 1.0))
 
-            ax.contourf(lon_grid, lat_grid, norm2d[0], levels=20, cmap="viridis", alpha=0.85)
-            cs = ax.contour(
-                lon_grid, lat_grid, norm2d[0],
-                levels=levels,
-                colors=["white"] * len(levels),
-                linewidths=1.5,
-                zorder=4,
-            )
-            fmt = {lev: f"{p:.3f}" for lev, p in zip(levels, level_labels)}
-            ax.clabel(cs, fmt=fmt, fontsize=8)
-            ax.plot(lon_inj, lat_inj, "r+", markersize=10, markeredgewidth=2, zorder=5)
+            if use_mollweide:
+                # --- Full-sky Mollweide (radians) ---
+                lon_grid, lat_grid = _to_mollweide_coords(gx, gy, p0_key, p1_key)
+                cs = ax.contour(
+                    lon_grid, lat_grid, norm2d[0], levels=levels,
+                    colors=["blue"] * len(levels), linewidths=1.5, zorder=4,
+                )
+                fmt = {lev: f"{p:.3f}" for lev, p in zip(levels, level_labels)}
+                ax.clabel(cs, fmt=fmt, fontsize=8)
+                ax.plot(lon_inj_rad, lat_inj_rad, "r+", markersize=10,
+                        markeredgewidth=2, zorder=5)
+            else:
+                # --- Restricted-sky Cartesian (degrees) ---
+                lon_deg, lat_deg = _to_lonlat_deg(gx, gy, p0_key, p1_key)
+                lon_inj_deg = np.degrees(lon_inj_rad)
+                lat_inj_deg = np.degrees(lat_inj_rad)
+
+                cs = ax.contour(
+                    lon_deg, lat_deg, norm2d[0], levels=levels,
+                    colors=["blue"] * len(levels), linewidths=1.5, zorder=4,
+                )
+                fmt = {lev: f"{p:.3f}" for lev, p in zip(levels, level_labels)}
+                ax.clabel(cs, fmt=fmt, fontsize=8)
+                ax.plot(lon_inj_deg, lat_inj_deg, "r+", markersize=10,
+                        markeredgewidth=2, zorder=5)
+                ax.set_xlabel("Longitude [deg]")
+                ax.set_ylabel("Latitude [deg]")
+                ax.set_xlim(lon_deg.min(), lon_deg.max())
+                ax.set_ylim(lat_deg.min(), lat_deg.max())
+                ax.grid(True, linestyle="--", alpha=0.4)
+                ax.set_aspect("equal", adjustable="box")
+
             ax.set_title(f"Round {i + 1}")
 
-            # Overlay MCMC contours on last panel (Mollweide-aware)
+            # --- NRE sky area (widest contour = levels[-1], the lowest threshold) ---
+            dp_lam = gx[0, 1] - gx[0, 0]  if p0_key == "lambda" else gy[0, 1] - gy[0, 0]
+            dp_bet = gy[1, 0] - gy[0, 0]  if p1_key == "beta"   else gx[1, 0] - gx[0, 0]
+            nre_area = _compute_sky_area(norm2d[0], levels[0], dp_lam, dp_bet)
+            sky_areas[i] = {"nre": nre_area}
+            print(f"    NRE sky area ({level_labels[0]*100:.1f}% CR): "
+                  f"{nre_area:.2f} sq deg")
+
+            # --- Overlay MCMC contours + area on last panel ---
             if mcmc_samples_dir is not None and i == n_rounds - 1:
-                print("    Overlaying MCMC contours (Mollweide)...")
+                print("    Overlaying MCMC contours...")
                 flat_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_dir)
-                overlay_mcmc_contours(
-                    ax, flat_samples, mcmc_param_names, p0_key, p1_key, is_sky=True
+                mcmc_cs = overlay_mcmc_contours(
+                    ax, flat_samples, mcmc_param_names, p0_key, p1_key,
+                    is_sky=True, use_mollweide=use_mollweide,
+                )
+                # Compute MCMC sky area from the KDE on the *model* grid
+                idx0 = mcmc_param_names.index(p0_key)
+                idx1 = mcmc_param_names.index(p1_key)
+                _lam_samp = flat_samples[:, idx0] if p0_key == "lambda" else flat_samples[:, idx1]
+                _bet_samp = flat_samples[:, idx1] if p1_key == "beta"   else flat_samples[:, idx0]
+                # Evaluate on the same (lambda, beta) grid as NRE
+                if p0_key == "lambda":
+                    lam_1d, bet_1d = gx[0, :], gy[:, 0]
+                else:
+                    lam_1d, bet_1d = gy[0, :], gx[:, 0]
+                # Clip MCMC samples to the grid range to avoid KDE bandwidth
+                # inflation from outliers that fall far outside the prior window.
+                lam_lo, lam_hi = float(lam_1d.min()), float(lam_1d.max())
+                bet_lo, bet_hi = float(bet_1d.min()), float(bet_1d.max())
+                mask = (
+                    (_lam_samp >= lam_lo) & (_lam_samp <= lam_hi)
+                    & (_bet_samp >= bet_lo) & (_bet_samp <= bet_hi)
+                )
+                _lam_clip = _lam_samp[mask]
+                _bet_clip = _bet_samp[mask]
+                if len(_lam_clip) < 10:
+                    print("    WARNING: fewer than 10 MCMC samples fall inside "
+                          "the grid — skipping MCMC sky area computation.")
+                else:
+                    kde_sky = gaussian_kde(np.vstack([_lam_clip, _bet_clip]))
+                    LG, BG = np.meshgrid(lam_1d, bet_1d)
+                    kde_vals = kde_sky(np.vstack([LG.ravel(), BG.ravel()])).reshape(LG.shape)
+                    kde_sum = np.sum(kde_vals)
+                    if kde_sum > 0:
+                        kde_norm = kde_vals / (kde_sum * dp_lam * dp_bet)
+                    else:
+                        print("    WARNING: KDE evaluated to zero on the grid "
+                              "— skipping MCMC sky area.")
+                        kde_norm = None
+                    if kde_norm is not None:
+                        mcmc_levels, mcmc_labels = contour_levels(
+                            kde_norm, targets=[0.6827, 0.9545, 0.9973]
+                        )
+                        mcmc_area = _compute_sky_area(kde_norm, mcmc_levels[0],
+                                                      dp_lam, dp_bet)
+                        sky_areas[i]["mcmc"] = mcmc_area
+                        print(f"    MCMC sky area ({mcmc_labels[0]*100:.1f}% CR): "
+                              f"{mcmc_area:.2f} sq deg")
+
+            # --- 1-D marginal insets on the final-round panel ---
+            if i == n_rounds - 1 and not use_mollweide:
+                print("    Adding 1-D marginal insets (sky, Cartesian)...")
+                # Grids need to be in the same coordinates as the axes (degrees)
+                lon_deg_grid, lat_deg_grid = _to_lonlat_deg(gx, gy, p0_key, p1_key)
+                _add_1d_marginal_insets(
+                    ax, norm2d[0], lon_deg_grid, lat_deg_grid,
+                    np.array([np.degrees(lon_inj_rad), np.degrees(lat_inj_rad)]),
+                    "lon [deg]", "lat [deg]",
+                    mcmc_samples_dir=mcmc_samples_dir,
+                    _sky_deg=True, _p0_key_raw=p0_key, _p1_key_raw=p1_key,
                 )
 
-            rectangles.append(None)  # no prior rectangles or connecting lines
+            # Prior-window rectangle for restricted-sky Cartesian panels
+            if not use_mollweide and i + 1 < n_rounds:
+                nb = prior_boxes[i + 1]
+                # Convert next-round bounds to (lon, lat) degrees
+                nb_lam = nb["lambda"]
+                nb_bet = nb["beta"]
+                nb_lon0 = np.degrees(nb_lam[0] - np.pi)
+                nb_lon1 = np.degrees(nb_lam[1] - np.pi)
+                nb_lat0 = np.degrees(np.arcsin(np.clip(nb_bet[0], -1, 1)))
+                nb_lat1 = np.degrees(np.arcsin(np.clip(nb_bet[1], -1, 1)))
+                rect = Rectangle(
+                    (nb_lon0, nb_lat0),
+                    nb_lon1 - nb_lon0,
+                    nb_lat1 - nb_lat0,
+                    linewidth=rect_lw,
+                    edgecolor=rect_color,
+                    facecolor="none",
+                    linestyle="--",
+                    zorder=10,
+                )
+                ax.add_patch(rect)
+                rectangles.append((rect, ax))
+            else:
+                rectangles.append(None)
 
         else:
             # ------------------------------------------------------------------
@@ -674,6 +1107,20 @@ def plot_truncation_rounds(
                     mcmc_param_names,
                     p0_key,
                     p1_key,
+                )
+
+            # Add 1-D marginal insets on the final-round panel
+            if i == n_rounds - 1:
+                print("    Adding 1-D marginal insets...")
+                _add_1d_marginal_insets(
+                    ax,
+                    norm2d[0],
+                    gx,
+                    gy,
+                    inj_params[0],
+                    p0_key,
+                    p1_key,
+                    mcmc_samples_dir=mcmc_samples_dir,
                 )
 
             # Draw a dashed rectangle marking the *next* round's prior bounds
@@ -720,7 +1167,7 @@ def plot_truncation_rounds(
                 linestyle="-",
             )
 
-    return fig, axes
+    return fig, axes, sky_areas
 
 
 # ---------------------------------------------------------------------------
@@ -731,6 +1178,7 @@ def plot_all_marginals(
     round_dirs: list,
     dataloader,
     ngrid_points: int = 100,
+    ngrid_points_1d: int = 500,
     figsize_per_panel: tuple = (5, 5),
     figsize_1d: tuple = (7, 4),
     connect_boxes: bool = True,
@@ -745,9 +1193,11 @@ def plot_all_marginals(
     produces:
 
     * **2-D marginals** → ``plot_truncation_rounds``: posterior-contour
-      evolution across rounds, one panel per round.
+      evolution across rounds, one panel per round.  The final-round panel
+      includes inset 1-D marginal distributions with optional MCMC overlay.
     * **1-D marginals** → ``plot_1d_prior_evolution``: HPD interval bands
-      (50 %, 90 %, 99.99 %) as a function of round index.
+      (50 %, 90 %, 99.99 %) as a function of round index, plus a
+      final-round density panel with optional MCMC overlay.
 
     Parameters
     ----------
@@ -756,13 +1206,17 @@ def plot_all_marginals(
     dataloader : DataLoader
         Observation data loader.
     ngrid_points : int
-        Grid resolution for posterior evaluation (both 1-D and 2-D).
+        Grid resolution for 2-D posterior evaluation.
+    ngrid_points_1d : int
+        Grid resolution for standalone 1-D posterior evaluation
+        (final-round density panel).  Default 500.
     figsize_per_panel : tuple
         ``(width, height)`` per 2-D subplot panel.
     figsize_1d : tuple
-        Figure size for 1-D HPD plots.
+        Figure size for 1-D HPD + density plots.
     connect_boxes, rect_color, rect_lw, wspace, mcmc_samples_dir
-        Forwarded to ``plot_truncation_rounds`` for 2-D marginals.
+        Forwarded to ``plot_truncation_rounds`` for 2-D marginals, and
+        *mcmc_samples_dir* also to ``plot_1d_prior_evolution``.
 
     Returns
     -------
@@ -785,7 +1239,7 @@ def plot_all_marginals(
     for label, ndim, in_param_idx, out_param_idx in all_marginals:
         if ndim == 2:
             print(f"\n=== 2-D marginal [{pair_idx}]: {label} ===")
-            fig, axes = plot_truncation_rounds(
+            fig, axes, sky_areas = plot_truncation_rounds(
                 round_dirs=round_dirs,
                 dataloader=dataloader,
                 marginal_pair_idx=pair_idx,
@@ -797,12 +1251,12 @@ def plot_all_marginals(
                 wspace=wspace,
                 mcmc_samples_dir=mcmc_samples_dir,
             )
-            results[label] = (fig, axes)
+            results[label] = (fig, axes, sky_areas)
             pair_idx += 1
 
         elif ndim == 1:
             print(f"\n=== 1-D marginal: {label} ===")
-            fig, ax = plot_1d_prior_evolution(
+            fig, axes_dict = plot_1d_prior_evolution(
                 round_dirs=round_dirs,
                 param_key=label,
                 in_param_idx=in_param_idx,
@@ -810,8 +1264,10 @@ def plot_all_marginals(
                 dataloader=dataloader,
                 figsize=figsize_1d,
                 ngrid_points=ngrid_points,
+                mcmc_samples_dir=mcmc_samples_dir,
+                ngrid_points_1d=ngrid_points_1d,
             )
-            results[label] = (fig, ax)
+            results[label] = (fig, axes_dict, {})
 
     return results
 
@@ -819,15 +1275,15 @@ def plot_all_marginals(
 # ---------------------------------------------------------------------------
 # Configuration — edit these to match your setup
 # ---------------------------------------------------------------------------
-name = "20260304autoenc_5d_fixdim_v2"
+name = "20260306autoenc_test5d"
 round_dirs = [
     f"/data/gpuleo/mbhb/logs/{name}_round_1/version_0",
-    f"/data/gpuleo/mbhb/logs/{name}_round_2/version_0",
-    f"/data/gpuleo/mbhb/logs/{name}_round_3/version_0",
-    f"/data/gpuleo/mbhb/logs/{name}_round_4/version_0",
+    # "/data/gpuleo/mbhb/logs/{name}_round_2/version_0",
+    # f"/data/gpuleo/mbhb/logs/{name}_round_3/version_0",
+    # f"/data/gpuleo/mbhb/logs/{name}_round_4/version_0",
 ]
 
-data_path = "/data/gpuleo/mbhb/observation_skyloc_tc_mass.h5"
+data_path = "/data/gpuleo/mbhb/observation_skyloc_distGpc_tc.h5"
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -852,13 +1308,20 @@ if __name__ == "__main__":
         round_dirs=round_dirs,
         dataloader=dataloader_obs,
         ngrid_points=100,
-        mcmc_samples_dir=None
+        ngrid_points_1d=100,
+        mcmc_samples_dir="/u/g/gpuleo/pembhb/mc_results_emcee_vec/5d_new"
     )
 
-    for label, (fig, _) in figures.items():
+    for label, (fig, _, sky_areas) in figures.items():
         safe_label = label.replace(" ", "_").replace("/", "_")
         out_path = os.path.join(outdir, f"{safe_label}.png")
         fig.savefig(out_path, dpi=150, bbox_inches="tight")
         print(f"Saved figure to {out_path}")
+        if sky_areas:
+            for rnd, areas in sorted(sky_areas.items()):
+                parts = [f"NRE={areas['nre']:.2f} sq deg"]
+                if "mcmc" in areas:
+                    parts.append(f"MCMC={areas['mcmc']:.2f} sq deg")
+                print(f"    Round {rnd + 1} sky area: {', '.join(parts)}")
 
     plt.show()

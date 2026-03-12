@@ -18,6 +18,7 @@ from lightning import LightningModule
 from torch.utils.data import DataLoader
 
 from pembhb.model import DoubleConv, Down, Up, OutConv
+from pembhb import get_torch_dtype
 
 
 # ---------------------------------------------------------------------------
@@ -379,8 +380,8 @@ class DenoisingAutoencoder(LightningModule):
         # ---- normalisation buffers (computed from training data) -----------
         # These are registered as buffers so they are saved/loaded with the
         # checkpoint and moved to the correct device automatically.
-        self.register_buffer("mean_vec", torch.zeros(n_real_channels, n_freqs))
-        self.register_buffer("global_scale_factor", torch.tensor(1.0))
+        self.register_buffer("mean_vec", torch.zeros(n_real_channels, n_freqs, dtype=get_torch_dtype()))
+        self.register_buffer("global_scale_factor", torch.tensor(1.0, dtype=get_torch_dtype()))
         self._normalisation_fitted = False
 
     # ------------------------------------------------------------------
