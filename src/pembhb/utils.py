@@ -34,7 +34,7 @@ def print_params(params: np.array):
         print(f"{_ORDERED_PRIOR_KEYS[idx]}: {params[param]}")
 
 def read_config(fname: str): 
-    with open(fname, "r") as file:
+    with open(fname, "r", encoding="utf-8") as file:
         conf = yaml.safe_load(file)
     return conf
 

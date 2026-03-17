@@ -10,6 +10,7 @@ parser = argparse.ArgumentParser(
 parser.add_argument("--n", default=1)
 parser.add_argument("--fname", required=True)
 parser.add_argument("-s", "--seed", required=True)
+parser.add_argument("--batch_size", default=None)
 config_path = os.path.join(ROOT_DIR, "configs/datagen_config.yaml")
 with open(config_path, "r") as file:
     conf = yaml.safe_load(file) 
@@ -17,4 +18,4 @@ args = parser.parse_args()
 print(type(args.n))
 sampler_init_kwargs={'prior_bounds': conf["prior"]}
 sim = MBHBSimulatorFD_TD(conf, sampler_init_kwargs=sampler_init_kwargs, seed=int(args.seed))
-sim.sample_and_store(filename=args.fname, N=int(args.n))
+sim.sample_and_store(filename=args.fname, N=int(args.n), batch_size=int(args.batch_size) if args.batch_size is not None else None)

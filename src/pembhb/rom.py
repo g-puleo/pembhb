@@ -3,7 +3,7 @@ import os
 import time
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from line_profiler import profile
+#from line_profiler import profile
 import torch.nn as nn
 from torch import nn
 from pembhb import ROOT_DIR, get_torch_dtype
@@ -264,7 +264,6 @@ class ReducedOrderModel:
     # training
     # ------------------------------------------------------------------
 
-    @profile
     def train(self, train_dataloader: torch.utils.data.DataLoader,
               use_pinned_memory: bool = True, prefetch_batches: int = 1,
               convergence_on: str = 'sigma_data'):
@@ -664,7 +663,6 @@ class ReducedOrderModel:
         projection = self._reconstruct_normalized(coeff)
         return projection.squeeze(0)
 
-    @profile
     def _gram_schmidt(self, v, n_passes=2):
         """Gram-Schmidt orthogonalisation with optional reorthogonalisation.
 

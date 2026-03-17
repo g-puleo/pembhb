@@ -15,6 +15,7 @@ marginals:
   #  f: [[0]]
   f: [[0,],[7,8], [10]]
 
+periodic_bc_params: [ 7, ]
 device: "cuda"
 
 
@@ -72,10 +73,10 @@ architecture:
       # Training
       lr: 0.001
       weight_decay: 0.00001
-      epochs: 500
-      scheduler_patience: 10
+      epochs: 1
+      scheduler_patience: 30
       scheduler_factor: 0.3
-      early_stop_patience: 20
+      early_stop_patience: 60
       gradient_clip_val: null
       log_name: "autoencoder"
   
@@ -108,7 +109,7 @@ rom_prefetch_batches: 4       # Increase to reduce Python overhead
 # the bounds in datagen_config.yaml.
 # -------------------------------------------------------------------------
 fisher_prior:
-  enabled: true
+  enabled: false
   event_idx: 0           # which event in the HDF5 file to use as expansion point
   varying_params:        # FIM-based bounds are computed for these parameters
     - "logMchirp"

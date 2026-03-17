@@ -1,3 +1,9 @@
 [submodule "BBHx"]
 	path = BBHx
 	url = https://github.com/mikekatz04/BBHx.git
+[submodule "LISAanalysistools"]
+	path = LISAanalysistools
+	url = https://github.com/mikekatz04/LISAanalysistools.git
+[submodule "src/RoMAE"]
+	path = src/RoMAE
+	url = https://github.com/Chromeilion/RoMAE.git

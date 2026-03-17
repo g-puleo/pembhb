@@ -1,38 +1,34 @@
-import numpy as np 
-import os
-import h5py
 import copy
+import os
+import sys
+
+import h5py
+import numpy as np
 import yaml
 from scipy.signal.windows import tukey
 from tqdm import tqdm
+
 from bbhx.waveformbuild import BBHWaveformFD
+from bbhx.utils.constants import MTSUN_SI, PC_SI, YRSID_SI
 from bbhx.utils.transform import LISA_to_SSB
-from bbhx.utils.constants import YRSID_SI, PC_SI, MTSUN_SI
 import lisatools.sensitivity as lisasens
 from lisatools.detector import EqualArmlengthOrbits
-
+from lisatools.sensitivity import get_sensitivity
 
 from pembhb import ROOT_DIR
 from pembhb import get_numpy_dtype, get_numpy_complex_dtype
 from pembhb.sampler import UniformSampler
-import sys
-
-WEEK_SI = 7 * 24 * 3600  # seconds in a week
-DAY_SI = 24 * 3600  # seconds in a dayYRSID_SI = wfb.YRSID_SI
 
 
-    
-import numpy as np
-from typing import Optional
-from bbhx.waveformbuild import BBHWaveformFD
-import bbhx.waveformbuild as wfb  # for constants and helpers
-from lisatools.sensitivity import get_sensitivity
+WEEK_SI = 7 * 24 * 3600
+DAY_SI = 24 * 3600
 
 class MBHBSimulatorFD_TD:
 
     def __init__(self, conf, sampler_init_kwargs, seed=0):
         self.rng = np.random.default_rng(seed)
         self.sampler = UniformSampler(**sampler_init_kwargs)
+        self.backend_name = conf.get("backend", "cpu")
 
         self.dt = conf["waveform_params"]["dt"] 
         self.channels = conf["waveform_params"]["channels"]
@@ -59,7 +55,7 @@ class MBHBSimulatorFD_TD:
         self.filtered_asd[:, self.freqs_pos < 5e-5] = 0
 
         self.window = tukey(self.n_time, alpha=0.0005)
-        orbits = EqualArmlengthOrbits(force_backend=conf["backend"])
+        orbits = EqualArmlengthOrbits(force_backend=self.backend_name)
         orbits.configure(linear_interp_setup=True)
 
         resp_kwargs = {
@@ -71,11 +67,11 @@ class MBHBSimulatorFD_TD:
         self.wfd = BBHWaveformFD(
             amp_phase_kwargs=dict(run_phenomd=False),
             response_kwargs=resp_kwargs,
-            force_backend=conf["backend"]
+            force_backend=self.backend_name
         )
         self.xp = self.wfd.xp
         self.info = {
-            "backend": conf["backend"],
+            "backend": self.backend_name,
             "seed": seed,
             "conf": conf,
             "sampler_init_kwargs": sampler_init_kwargs,
@@ -143,10 +139,9 @@ class MBHBSimulatorFD_TD:
         #inj = np.insert(inj, 6, np.zeros(n_obs), axis=0)
 
         wave_pos = self._waveform_fd(inj)
-        # Convert back to NumPy if needed (GPU backend returns CuPy arrays)
-        if self.xp.__name__ == 'cupy':
+        if hasattr(wave_pos, "get"):
             wave_pos = wave_pos.get()
-        wave_pos = wave_pos.astype(get_numpy_complex_dtype())
+        wave_pos = wave_pos.astype(np.complex64)
         wave_pos = wave_pos[:, self.channels_idx,:]
         noise_pos = self._noise_pos(n_obs).astype(get_numpy_complex_dtype())
 

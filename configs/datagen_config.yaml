@@ -5,9 +5,10 @@ waveform_params:
   duration: 1 # weeks
   dt: 100 # seconds
   t_max: 5 # days
+
 prior:
   "logMchirp": [5.2, 5.3]
-  "q":         [4.6, 4.8]          # mass ratio
+  "q":         [1.0, 5.0]          # mass ratio
   "chi1":       [0.0,0.0]
   "chi2":       [0.0,0.0]
   "dist":       [10,10]            # dist in Gpc (note that we shall sample uniformly dist^3)
@@ -18,6 +19,6 @@ prior:
   "psi":        [1.0, 1.0]
   "Deltat":     [-2.55, -2.45]         # t_merger from end of observation in days
 
-backend: "cpu"
+backend: "cuda12x"
 
 

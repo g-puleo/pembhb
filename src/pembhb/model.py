@@ -3,7 +3,7 @@ import os
 import time
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from line_profiler import profile
+# from line_profiler import profile
 import torch.nn as nn
 from lightning import LightningModule
 from torch import nn
@@ -184,7 +184,7 @@ class MarginalClassifierHead(nn.Module):
 
         :param n_data_features: the number of features in the data summary
         :type n_data_features: int
-        :param marginals: list of marginals that you want 
+        :param marginals: list of marginals that you want , in the reparametrised index space
         :type marginals: list[list]
         :param hidden_size: sizes of the hidden layers in the classifier
         :type hidden_size: iterable[int]
@@ -211,6 +211,15 @@ class MarginalClassifierHead(nn.Module):
 
 
     def forward(self, features, parameters):
+        """Compute logratios for all marginals 
+
+        Args:
+            features : compressed version of the data
+            parameters : parameters to be used , already reparametrised (expanded number of columns for periodic bc)
+
+        Returns:
+            torch.Tensor: logratios for this marginal
+        """
         outputs = []
         for i, marginal in enumerate(self.marginals_dict):
             indices = marginal
@@ -219,11 +228,37 @@ class MarginalClassifierHead(nn.Module):
             
         return torch.cat(outputs, dim=-1)
 
+
+
+def reparametrise_periodic_bc(parameters, position_indices:list):
+    """
+    for each index in position_indices, replace the column parameters[:,idx] with two columns,
+    one with sin(parameters[:,idx]) and the other with cos(...same...)
+    
+
+    Args:
+        parameters (_type_): array of size 
+        position_indices (list): _description_
+
+    Raises:
+        a: _description_
+        ValueError: _description_
+        NotImplementedError: _description_
+
+    Returns:
+        _type_: _description_
+    """
+    for idx in position_indices:
+        sin_col = torch.sin(parameters[:, idx:idx+1])
+        cos_col = torch.cos(parameters[:, idx:idx+1])
+        parameters_out = torch.cat([parameters[:, :idx], sin_col, cos_col, parameters[:, idx+1:]], dim=-1)
+    return parameters_out
+
 class InferenceNetwork(LightningModule):
     """ 
     Basic FC network for TMNRE of MBHB data. 
     """
-    def __init__(self,  train_conf: dict,  dataset_info: dict, normalisation: dict,  data_summarizer: nn.Module=None):  
+    def __init__(self,  train_conf: dict,  dataset_info: dict, normalisation: dict,  data_summarizer: nn.Module=None, periodic_bc_params: list=None):  
         super().__init__()
         if data_summarizer is not None:
             self.data_summary = data_summarizer
@@ -263,19 +298,60 @@ class InferenceNetwork(LightningModule):
         self.save_hyperparameters(logger=True)    
         
         self.use_gradnorm = train_conf["architecture"]["gradnorm"]["enabled"]
-
         if self.use_gradnorm:
             self.gradnorm = GradnormHandler(self, train_conf["architecture"]["gradnorm"])
             self.weights_loss_logits = torch.nn.Parameter(torch.zeros(len(self.marginals_list)))
             self.lr_gradnorm = train_conf["architecture"]["gradnorm"]["learning_rate"]
-       
-        self.logratios_model_dict = nn.ModuleDict()
+
+
+        # this part of the code builds an index mapping, assuming that a reparametrisation is performed on all 
+        # the parameters specified by the indices in periodic_bc_params. The column specified by such indices 
+        # will be replaced with their sin and cos. 
+        self.periodic_bc_params = periodic_bc_params
+        # do not normalise the bc_params 
+        self.param_mean[periodic_bc_params] = 0
+        self.param_std[periodic_bc_params] = 1
+        # also build a mask for the complementary of periodic_bc_params . 
+        self.non_periodic_params_mask = torch.ones(len(_ORDERED_PRIOR_KEYS), dtype=bool)
+        self.non_periodic_params_mask[periodic_bc_params] = False
+
+        
+        self.param_index_remapping = {}
+        offset = 0
+        for idx in range(len(_ORDERED_PRIOR_KEYS)):
+            # when a parameter is passed 
+            if idx in self.periodic_bc_params:
+                self.param_index_remapping[idx] = [idx + offset, idx + offset + 1]  # map to the two new columns
+                offset += 1
+            else: 
+                self.param_index_remapping[idx] = idx + offset 
+
+        # for each marginal list in the marginal dict, map it to the new indices:
+        self.marginals_dict_remapped = {}
+        
         for key in self.marginals_dict.keys():
+            marginals_remapped = []
+            # remember that self.marginals_dict[key] is a list of marginals
+            for marginal in self.marginals_dict[key]:
+                current_marginal_remapped =  [] 
+                for idx in marginal:
+                    if idx in self.periodic_bc_params:
+                         # add the two new columns, extend is a function that appends multiple elements at once. 
+                        current_marginal_remapped.extend(self.param_index_remapping[idx])
+                    else:
+                        current_marginal_remapped.append(self.param_index_remapping[idx])
+                marginals_remapped.append(current_marginal_remapped)
+            
+            self.marginals_dict_remapped[key] = marginals_remapped
+
+        self.logratios_model_dict = nn.ModuleDict()
+        for key in self.marginals_dict_remapped.keys():
             self.logratios_model_dict[key] = MarginalClassifierHead(
                 n_data_features=self.n_features_summary*len(key),
-                marginals=self.marginals_dict[key], 
+                marginals=self.marginals_dict_remapped[key], 
                 hlayersizes=(64, 32, 16, 8)
             ).to(train_conf["device"])
+
 
 
     def transform_td(self, data_t):
@@ -318,17 +394,15 @@ class InferenceNetwork(LightningModule):
             "f": d_f,
             "t": d_t
         }
-        # print(f"features_t device: {features_t.device}")
-        # print(f"parameters device: {parameters.device}")
-        # print(f"features_f device: {features_f.device}")
-        # print(f"features_ft device: {features_ft.device}")
-        # #print(f"features_f shape: {features_f.shape}")
-        #breakpoint()
+        #  normalise the non angular parameters: 
+        # this line does not touch the parameters in periodic_bc_params because their mean is set to 0 and std to 1
         normalised_parameters = (parameters - self.param_mean) / self.param_std
+        # take sin and cos of the params specified in periodic_bc_params
+        reparametrised_withbc_params = reparametrise_periodic_bc(normalised_parameters, self.periodic_bc_params)
         logratios_1d_list = []
         for key in self.logratios_model_dict.keys():
-            #breakpoint()
-            logratios_1d_list.append(self.logratios_model_dict[key](features_dict[key], normalised_parameters))
+            logratios_output = self.logratios_model_dict[key](features_dict[key], reparametrised_withbc_params)
+            logratios_1d_list.append(logratios_output)
         logratios_1d = torch.cat(logratios_1d_list, dim=-1)        
         return logratios_1d
 
