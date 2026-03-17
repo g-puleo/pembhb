@@ -230,28 +230,27 @@ class MarginalClassifierHead(nn.Module):
 
 
 
-def reparametrise_periodic_bc(parameters, position_indices:list):
-    """
-    for each index in position_indices, replace the column parameters[:,idx] with two columns,
-    one with sin(parameters[:,idx]) and the other with cos(...same...)
-    
+def reparametrise_periodic_bc(parameters, position_indices: list):
+    """Replace each column in position_indices with (sin, cos) pair.
 
     Args:
-        parameters (_type_): array of size 
-        position_indices (list): _description_
-
-    Raises:
-        a: _description_
-        ValueError: _description_
-        NotImplementedError: _description_
+        parameters: Tensor of shape (B, N)
+        position_indices: list of column indices (in the original N-dim space) to reparametrise
 
     Returns:
-        _type_: _description_
+        Tensor of shape (B, N + len(position_indices))
     """
+    parameters_out = parameters
+    offset = 0
     for idx in position_indices:
-        sin_col = torch.sin(parameters[:, idx:idx+1])
-        cos_col = torch.cos(parameters[:, idx:idx+1])
-        parameters_out = torch.cat([parameters[:, :idx], sin_col, cos_col, parameters[:, idx+1:]], dim=-1)
+        shifted_idx = idx + offset
+        sin_col = torch.sin(parameters_out[:, shifted_idx:shifted_idx+1])
+        cos_col = torch.cos(parameters_out[:, shifted_idx:shifted_idx+1])
+        parameters_out = torch.cat(
+            [parameters_out[:, :shifted_idx], sin_col, cos_col, parameters_out[:, shifted_idx+1:]],
+            dim=-1,
+        )
+        offset += 1
     return parameters_out
 
 class InferenceNetwork(LightningModule):
@@ -304,16 +303,14 @@ class InferenceNetwork(LightningModule):
             self.lr_gradnorm = train_conf["architecture"]["gradnorm"]["learning_rate"]
 
 
-        # this part of the code builds an index mapping, assuming that a reparametrisation is performed on all 
-        # the parameters specified by the indices in periodic_bc_params. The column specified by such indices 
-        # will be replaced with their sin and cos. 
+        # Build index remapping for periodic BC reparametrisation.
+        # Each periodic parameter column is replaced by (sin, cos), expanding the tensor by 1 per param.
+        if periodic_bc_params is None:
+            periodic_bc_params = []
         self.periodic_bc_params = periodic_bc_params
-        # do not normalise the bc_params 
+        # Normalization is a no-op for periodic params (they are passed raw to sin/cos).
         self.param_mean[periodic_bc_params] = 0
         self.param_std[periodic_bc_params] = 1
-        # also build a mask for the complementary of periodic_bc_params . 
-        self.non_periodic_params_mask = torch.ones(len(_ORDERED_PRIOR_KEYS), dtype=bool)
-        self.non_periodic_params_mask[periodic_bc_params] = False
 
         
         self.param_index_remapping = {}
@@ -408,10 +405,13 @@ class InferenceNetwork(LightningModule):
 
     def _calc_logits_base(self, batch):
         data_f = batch['wave_fd']+batch["noise_fd"]
-        data_t = batch['wave_td']+batch["noise_td"]
+        if "wave_td" in batch:
+            data_t = batch['wave_td']+batch["noise_td"]
+            all_data_t = torch.cat((data_t, data_t), dim=0)
+        else:
+            all_data_t = None
         parameters = batch['source_parameters']
         all_data_f = torch.cat((data_f, data_f), dim=0)
-        all_data_t = torch.cat((data_t, data_t), dim=0)
         scrambled_params = torch.roll(parameters, shifts=1, dims=0)
         all_params = torch.cat((parameters, scrambled_params), dim=0)
         all_logits = self(all_data_f, all_data_t, all_params)
@@ -903,6 +903,7 @@ class JointAEInferenceNetwork(LightningModule):
         ae_weight_decay: float = 1e-5,
         ae_scheduler_patience: int = 10,
         ae_scheduler_factor: float = 0.3,
+        periodic_bc_params: list = None,
     ):
         super().__init__()
 
@@ -948,6 +949,35 @@ class JointAEInferenceNetwork(LightningModule):
             torch.tensor(normalisation["param_std"], dtype=get_torch_dtype()),
         )
 
+        # ---- Periodic BC reparametrisation (mirrors InferenceNetwork) ---
+        if periodic_bc_params is None:
+            periodic_bc_params = []
+        self.periodic_bc_params = periodic_bc_params
+        self.param_mean[periodic_bc_params] = 0
+        self.param_std[periodic_bc_params] = 1
+
+        self.param_index_remapping = {}
+        offset = 0
+        for idx in range(len(_ORDERED_PRIOR_KEYS)):
+            if idx in self.periodic_bc_params:
+                self.param_index_remapping[idx] = [idx + offset, idx + offset + 1]
+                offset += 1
+            else:
+                self.param_index_remapping[idx] = idx + offset
+
+        self.marginals_dict_remapped = {}
+        for key in self.marginals_dict.keys():
+            marginals_remapped = []
+            for marginal in self.marginals_dict[key]:
+                current_marginal_remapped = []
+                for idx in marginal:
+                    if idx in self.periodic_bc_params:
+                        current_marginal_remapped.extend(self.param_index_remapping[idx])
+                    else:
+                        current_marginal_remapped.append(self.param_index_remapping[idx])
+                marginals_remapped.append(current_marginal_remapped)
+            self.marginals_dict_remapped[key] = marginals_remapped
+
         # ---- Data summary dimensionality (from encoder) -----------------
         if self.autoencoder.architecture == "conv":
             self.n_features_summary = self.autoencoder.bottleneck_dim
@@ -961,10 +991,10 @@ class JointAEInferenceNetwork(LightningModule):
 
         # ---- NRE classifier heads (same as InferenceNetwork) ------------
         self.logratios_model_dict = nn.ModuleDict()
-        for key in self.marginals_dict.keys():
+        for key in self.marginals_dict_remapped.keys():
             self.logratios_model_dict[key] = MarginalClassifierHead(
                 n_data_features=self.n_features_summary * len(key),
-                marginals=self.marginals_dict[key],
+                marginals=self.marginals_dict_remapped[key],
                 hlayersizes=(64, 32, 16, 8),
             )
 
@@ -1023,11 +1053,12 @@ class JointAEInferenceNetwork(LightningModule):
 
         features_dict = {"ft": None, "f": bottleneck, "t": d_t}
         normalised_parameters = (parameters - self.param_mean) / self.param_std
+        reparametrised_withbc_params = reparametrise_periodic_bc(normalised_parameters, self.periodic_bc_params)
 
         logratios_list = []
         for key in self.logratios_model_dict.keys():
             logratios_list.append(
-                self.logratios_model_dict[key](features_dict[key], normalised_parameters)
+                self.logratios_model_dict[key](features_dict[key], reparametrised_withbc_params)
             )
         return torch.cat(logratios_list, dim=-1)
 
@@ -1038,11 +1069,14 @@ class JointAEInferenceNetwork(LightningModule):
     def _calc_nre_loss(self, batch):
         """Compute the contrastive NRE loss and logits."""
         data_f = batch["wave_fd"] + batch["noise_fd"]
-        data_t = batch["wave_td"] + batch["noise_td"]
+        if "wave_td" in batch:
+            data_t = batch["wave_td"] + batch["noise_td"]
+            all_data_t = torch.cat((data_t, data_t), dim=0)
+        else:
+            all_data_t = None
         parameters = batch["source_parameters"]
 
         all_data_f = torch.cat((data_f, data_f), dim=0)
-        all_data_t = torch.cat((data_t, data_t), dim=0)
         scrambled_params = torch.roll(parameters, shifts=1, dims=0)
         all_params = torch.cat((parameters, scrambled_params), dim=0)
 

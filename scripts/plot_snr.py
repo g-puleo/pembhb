@@ -17,25 +17,25 @@ with h5py.File(filename, 'r') as f:
     print(f.keys())
     params = f['source_parameters'][:]
     ### compute the snr manually: 
-    data = f['wave_fd'][:] + f['noise_fd'][:]
-    freqs = f['frequencies'][:]
-    asd = f['asd'][:]
-    df = freqs[1] - freqs[0]
+    # data = f['wave_fd'][:] + f['noise_fd'][:]
+    # freqs = f['frequencies'][:]
+    # asd = f['asd'][:]
+    # df = freqs[1] - freqs[0]
  
-    high_pass_idx =  (freqs >= 5e-5)
-    data_over_asd = data[..., high_pass_idx] / asd[..., high_pass_idx]
-    data_over_asd_conj = data_over_asd.conj()
-    prod = data_over_asd * data_over_asd_conj
-    weighted = prod * df
-    summed = np.sum(weighted, axis=(1, 2))
-    real_part = summed.real
-    SNR2 = real_part * 4.0
-    SNR = np.sqrt(SNR2)
-    print(f"Manually computed SNR mean : {np.mean(SNR):.6e}")
-    print(f"Manually computed SNR median : {np.median(SNR):.6e}")
-    print(f"Manually computed SNR min : {np.min(SNR):.6e}")
-    print(f"Manually computed SNR max : {np.max(SNR):.6e}")
-    print(f"Manually computed snr std : {np.std(SNR):.6e}")
+    # high_pass_idx =  (freqs >= 5e-5)
+    # data_over_asd = data[..., high_pass_idx] / asd[..., high_pass_idx]
+    # data_over_asd_conj = data_over_asd.conj()
+    # prod = data_over_asd * data_over_asd_conj
+    # weighted = prod * df
+    # summed = np.sum(weighted, axis=(1, 2))
+    # real_part = summed.real
+    # SNR2 = real_part * 4.0
+    # SNR = np.sqrt(SNR2)
+    # print(f"Manually computed SNR mean : {np.mean(SNR):.6e}")
+    # print(f"Manually computed SNR median : {np.median(SNR):.6e}")
+    # print(f"Manually computed SNR min : {np.min(SNR):.6e}")
+    # print(f"Manually computed SNR max : {np.max(SNR):.6e}")
+    # print(f"Manually computed snr std : {np.std(SNR):.6e}")
 print(f"SNR mean : {np.mean(snr):.6e}")
 print(f"SNR median : {np.median(snr):.6e}")
 print(f"SNR min : {np.min(snr):.6e}")

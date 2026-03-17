@@ -16,9 +16,9 @@ os.makedirs('plots/'+filename_only, exist_ok=True)
 with h5py.File(filename, 'r') as f:
     wave_fd     = f['wave_fd'][:]
     noise_fd = f['noise_fd'][:]
-    wave_td     = f['wave_td'][:]
-    noise_td = f['noise_td'][:]
-    times       = f['times_SI'][:]
+    # wave_td     = f['wave_td'][:]
+    # noise_td = f['noise_td'][:]
+    #times       = f['times_SI'][:]
     frequencies = f['frequencies'][:]
     parameters = f["source_parameters"][:]
     asd = f['asd'][:]
@@ -59,7 +59,7 @@ counts = []
 #     counts.append(cnt)
 #     print(f"i={j}: {cnt} frequencies where |wave| > |noise|")
 
-indices = [0]
+indices = np.random.choice(wave_fd.shape[0], size=args.n_samples, replace=False)
 for i in indices:
     print(f"Plotting sample {i+1}/{args.n_samples}")
     print(f"chirp mass: {parameters[i,0]:.8e} Msun,\nq: {parameters[i,1]:.8e} Mpc")
@@ -67,22 +67,22 @@ for i in indices:
     print(f"mean over channel E: {np.mean(wave_fd[i,1]):.3e} ± {np.std(wave_fd[i,1]):.3e}")
     print(f"amp: mean over amplitudes of channel A: {np.mean(abs_wave[i,0]):.3e} ± {np.std(abs_wave[i,0]):.3e}")
     print(f"amp: mean over amplitudes of channel E: {np.mean(abs_wave[i,1]):.3e} ± {np.std(abs_wave[i,1]):.3e}")
-    fig_td, ax_td = plt.subplots(1, 2, figsize=(8, 4))
+    #fig_td, ax_td = plt.subplots(1, 2, figsize=(8, 4))
     fig_fd, ax_fd = plt.subplots(1, 2, figsize=(8, 4))
 
     for c in range(2): 
-        ax_td[c].plot(times/DAY_SI, wave_td[i,c], label='A (wave)' if c==0 else 'E (wave)')
-        ax_td[c].plot(times/DAY_SI, noise_td[i,c], label='A (noise)' if c==0 else 'E (noise)', linestyle='--', alpha=0.7)
-        ax_td[c].plot(times/DAY_SI, wave_td[i,c] + noise_td[i,c], label='A (wave+noise)' if c==0 else 'E (wave+noise)', linestyle='-.', color='C3')
+    #     ax_td[c].plot(times/DAY_SI, wave_td[i,c], label='A (wave)' if c==0 else 'E (wave)')
+    #     ax_td[c].plot(times/DAY_SI, noise_td[i,c], label='A (noise)' if c==0 else 'E (noise)', linestyle='--', alpha=0.7)
+    #     ax_td[c].plot(times/DAY_SI, wave_td[i,c] + noise_td[i,c], label='A (wave+noise)' if c==0 else 'E (wave+noise)', linestyle='-.', color='C3')
         
-        ax_td[c].set_xlim(4.4,4.6)
-        # ax_td.set_ylim(-2e-21, 2e-21)
+    #     ax_td[c].set_xlim(4.4,4.6)
+    #     # ax_td.set_ylim(-2e-21, 2e-21)
 
-        ax_td[c].set_title('data_td Example 1')
-        ax_td[c].set_xlabel('Time (days)')
-        ax_td[c].set_ylabel('Amplitude')
-        ax_td[c].legend()
-        ax_td[c].grid(True)
+    #     ax_td[c].set_title('data_td Example 1')
+    #     ax_td[c].set_xlabel('Time (days)')
+    #     ax_td[c].set_ylabel('Amplitude')
+    #     ax_td[c].legend()
+    #     ax_td[c].grid(True)
 
 
 
@@ -101,9 +101,9 @@ for i in indices:
         # ax_fd.legend()
         # ax_fd.grid(True)
 
-    fig_td.savefig(f'plots/{filename_only}/data_td_event_{i}.png', dpi=600)
-    fig_td.tight_layout()
+    # fig_td.savefig(f'plots/{filename_only}/data_td_event_{i}.png', dpi=600)
+    # fig_td.tight_layout()
     fig_fd.tight_layout()
     fig_fd.savefig(f'plots/{filename_only}/data_fd_event_{i}.png', dpi=600)
     print(f"Saved plot for sample {i+1} to plots/{filename_only}/data_fd_event_{i}.png")
-    print(f"Saved plot for sample {i+1} to plots/{filename_only}/data_td_event_{i}.png")
+#print(f"Saved plot for sample {i+1} to plots/{filename_only}/data_td_event_{i}.png")

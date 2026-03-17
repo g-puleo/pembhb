@@ -11,9 +11,24 @@ early_stop_threshold: 0.999
 scheduler_factor: 0.3
 scheduler_patience: 50
 keep_ckpt: True
-marginals: 
+marginals:
   #  f: [[0]]
   f: [[0,],[7,8], [10]]
+
+# -------------------------------------------------------------------------
+# Marginal schedule (optional)
+# Train on different marginal sets depending on the round index.
+# Each entry has "from_round" (inclusive) and the "marginals" dict to use.
+# Entries are evaluated in order; the LAST matching entry wins.
+# If omitted or empty, "marginals" above is used for all rounds.
+# -------------------------------------------------------------------------
+marginal_schedule:
+  - from_round: 1
+    marginals:
+      f: [[0,], [10,]]
+  - from_round: 3
+    marginals:
+      f: [[0,], [10,], [7, 8]]
 
 periodic_bc_params: [ 7, ]
 device: "cuda"
@@ -68,12 +83,12 @@ architecture:
       kernel_size: 7
       stride: 3 # determines downsampling along the frequency dimension (start from 4096=2^12)
       dropout: 0.0
-      high_freq_only: True
+      high_freq_only: False
       freq_split_idx: 2048
       # Training
       lr: 0.001
       weight_decay: 0.00001
-      epochs: 1
+      epochs: 200
       scheduler_patience: 30
       scheduler_factor: 0.3
       early_stop_patience: 60

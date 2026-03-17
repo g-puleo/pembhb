@@ -11,21 +11,21 @@ from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.callbacks import ModelCheckpoint, Callback
 
 
-from pembhb.simulator import MBHBSimulatorFD_TD
+from pembhb.simulator import MBHBSimulatorFD_TD, MBHBSimulatorFD
 from pembhb.model import InferenceNetwork
 from pembhb.rom import ReducedOrderModel, ROMWrapper
 from pembhb.autoencoder import DenoisingAutoencoder, AutoencoderWrapper
 from pembhb.data import MBHBDataModule, MBHBDataset, mbhb_collate_fn
 from pembhb import ROOT_DIR, DATA_ROOT_DIR, set_precision
 from pembhb import utils
-from pembhb.utils import validate_marginals, get_widest_interval_1d, get_widest_box_2d, PlotPosteriorCallback
+from pembhb.utils import validate_marginals, resolve_marginals_for_round, transfer_classifier_weights, get_widest_interval_1d, get_widest_box_2d, PlotPosteriorCallback
 
 
 
 def get_timestamp():
     return datetime.now().strftime("%Y%m%d")
 
-TIME_OF_EXECUTION = get_timestamp()+"reparam_bc_periodic_v1"
+TIME_OF_EXECUTION = get_timestamp()+"periodicbc_logspace_fullfreq_finetune_v2"
 
 def validate_marginals(marginals_config: dict):
     """Validate that no parameter index appears in multiple marginals.
@@ -344,7 +344,7 @@ class PlotPosteriorCallback(Callback):
                                           f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{utils._ORDERED_PRIOR_KEYS[param_idx]}.pdf")
                         fig.savefig(out, bbox_inches="tight")
                     except Exception as e:
-                        print(f"Error plotting 1D marginal for {utils._ORDERED_PRIOR_KEYS[param_idx]}: {e}")
+                        raise e
                     finally:
                         plt.close(fig)
 
@@ -489,7 +489,17 @@ class SequentialTrainer:
         fname_base = f"simulation_round_{round_idx}"
         fname_h5 = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION,  f"{fname_base}.h5")
         os.makedirs(os.path.dirname(fname_h5), exist_ok=True)
-        sim = MBHBSimulatorFD_TD(self.datagen_conf, sampler_init_kwargs=sampler_init_kwargs)
+        domain = self.datagen_conf.get("waveform_params", {}).get("domain", "fd_td")
+        if domain == "fd":
+            wp = self.datagen_conf["waveform_params"]
+            sim = MBHBSimulatorFD(
+                self.datagen_conf,
+                sampler_init_kwargs=sampler_init_kwargs,
+                n_freq_bins=wp.get("n_freq_bins", 4096),
+                freq_spacing=wp.get("freq_spacing", "linear"),
+            )
+        else:
+            sim = MBHBSimulatorFD_TD(self.datagen_conf, sampler_init_kwargs=sampler_init_kwargs)
         N_simulations = 50000
         batch_size_generation = 250
         if not os.path.exists(fname_h5):
@@ -743,12 +753,16 @@ class SequentialTrainer:
         self.data_module.full_dataset.clear_cache()
 
     def _train_inference_network ( self, round_idx, data_summary=None) :
-        #  initialise data summarizer (ROM) 
+        #  initialise data summarizer (ROM)
         mean, std = self.data_module.get_params_mean_std()
-        normalisation = {"td_normalisation": np.array(self.data_module.get_max_td()), 
+        normalisation = {"td_normalisation": np.array(self.data_module.get_max_td()),
                          "param_mean": np.array(mean),
                          "param_std": np.array(std)}
+        old_model = getattr(self, "model", None)
         self.model = InferenceNetwork(train_conf=self.train_conf, dataset_info=self.datagen_info, normalisation=normalisation, data_summarizer=data_summary, periodic_bc_params=self.train_conf["periodic_bc_params"])
+        # Carry over classifier weights from the previous round (finetune)
+        if old_model is not None:
+            transfer_classifier_weights(old_model, self.model)
         self.model.train()
         copy_bounds_file = True
 
@@ -847,6 +861,12 @@ class SequentialTrainer:
     def run(self, n_rounds=1):
         for i in range(1,n_rounds+1):
             print(f"Running round {i}...")
+            # Resolve scheduled marginals for this round
+            active_marginals = resolve_marginals_for_round(self.train_conf, i)
+            self.train_conf["marginals"] = active_marginals
+            validate_marginals(active_marginals)
+            print(f"Active marginals for round {i}: {active_marginals}")
+
             if i == 1 and self.fisher_prior_bounds is not None:
                 # Update datagen_conf["prior"] so that conf and
                 # sampler_init_kwargs stay consistent in the YAML sidecar.
@@ -922,11 +942,11 @@ if __name__ == "__main__":
     # Activate the configured precision (default: float32)
     set_precision(train_config.get("precision", "float32"))
 
-    trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path="/data/gpuleo/mbhb/observation_skyloc_distGpc_tc.h5")
+    trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path="/data/gpuleo/mbhb/obs_logspace_freqonly_q3.h5")
     #trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path="/u/g/gpuleo/pembhb/data/testes_newdata_fixall_notmcq.h5")
 
     # run with low noise: 
     # trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path=os.path.join(ROOT_DIR, "/data/gpuleo/mbhb/observation_low_noise.h5"))
-    trainer.run(n_rounds=1)
+    trainer.run(n_rounds=9)
 
     #round(conf, sampler_init_kwargs={'low': 0.5, 'high': 1.0} , lr=conf["training"]["learning_rate"], idx=0)

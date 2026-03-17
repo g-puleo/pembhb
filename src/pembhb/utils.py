@@ -82,29 +82,28 @@ def get_logratios_grid(dataloader: torch.utils.data.DataLoader, model: 'Inferenc
         for batch in tqdm( dataloader ) :
             
             data_fd = (batch["wave_fd"]+batch["noise_fd"]).to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
-            data_td = (batch["wave_td"]+batch["noise_td"]).to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
+            #data_td = (batch["wave_td"]+batch["noise_td"]).to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
             source_parameters = batch["source_parameters"]  # Shape: [batchsize, 11]
 
 
             batch_size = data_fd.shape[0]
 
-            data_td_expanded = data_td.unsqueeze(1).expand(batch_size, ngrid_points, -1, -1)  # Shape: [batchsize, ngrid_points, n_channels, n_datapoints]
+            #data_td_expanded = data_td.unsqueeze(1).expand(batch_size, ngrid_points, -1, -1)  # Shape: [batchsize, ngrid_points, n_channels, n_datapoints]
             data_fd_expanded = data_fd.unsqueeze(1).expand(batch_size, ngrid_points, -1, -1)  # Shape: [batchsize, ngrid_points, n_channels, n_datapoints]
             grid_expanded = grid_padded.unsqueeze(0).expand(batch_size, -1, -1) # shape is [batchsize, ngrid_points, 11]
 
-            batched_data_td = data_td_expanded.reshape(-1, data_td_expanded.shape[-2], data_td_expanded.shape[-1])  # Flatten batch and ngrid_points
+            #batched_data_td = data_td_expanded.reshape(-1, data_td_expanded.shape[-2], data_td_expanded.shape[-1])  # Flatten batch and ngrid_points
             batched_data_fd = data_fd_expanded.reshape(-1, data_fd_expanded.shape[-2], data_fd_expanded.shape[-1])  # Flatten batch and ngrid_points
             batched_grid = grid_expanded.reshape(-1, grid_expanded.shape[-1])  # Flatten batch and ngrid_points
 
-            batched2dataset = TensorDataset(batched_data_fd, batched_data_td, batched_grid)
+            batched2dataset = TensorDataset(batched_data_fd, batched_grid)
             batched2dataloader = DataLoader(batched2dataset, batch_size=50, shuffle=False)
             logratios_list = []
             for batch2 in batched2dataloader:
-                batched2_data_fd, batched2_data_td, batched2_grid = batch2
+                batched2_data_fd, batched2_grid = batch2
                 batched2_data_fd = batched2_data_fd.to("cuda")
-                batched2_data_td = batched2_data_td.to("cuda")
                 batched2_grid = batched2_grid.to("cuda")
-                logratios= model(batched2_data_fd, batched2_data_td, batched2_grid)[:, out_param_idx]  
+                logratios= model(batched2_data_fd, None, batched2_grid)[:, out_param_idx]  
                 logratios_list.append(logratios)
             logratios = torch.cat(logratios_list, dim=0)            # view them as [batchsize, ngrid_points]
             logratios = logratios.reshape(batch_size, ngrid_points)
@@ -1026,8 +1025,8 @@ def posterior_contours_2d_imshow(grid_x: np.array, grid_y: np.array, ratios: np.
 def mbhb_collate_fn(batch, subset: torch.utils.data.Subset, noise_factor, noise_shuffling=True):
     B = len(batch)
     wave_fd = torch.stack([b["wave_fd"] for b in batch])
-    wave_td = torch.stack([b["wave_td"] for b in batch])
     params  = torch.stack([b["params"] for b in batch])
+    has_td = "wave_td" in batch[0]
 
     # pick noise indices randomly
     if noise_shuffling:
@@ -1036,19 +1035,20 @@ def mbhb_collate_fn(batch, subset: torch.utils.data.Subset, noise_factor, noise_
     else:
         pick = torch.tensor([b["idx"] for b in batch])
 
-
     noise_fd = noise_factor*torch.stack([subset.dataset._load("noise_fd", i) for i in pick])
-    noise_td = noise_factor*torch.stack([subset.dataset._load("noise_td", i) for i in pick])
 
-    # delivers waveform and a random instance of the noise. 
-    return {
+    out = {
         "source_parameters": params,
         "wave_fd": wave_fd,
-        "wave_td": wave_td,
         "noise_fd": noise_fd,
-        "noise_td": noise_td,
         "noise_index": pick,
     }
+
+    if has_td:
+        out["wave_td"] = torch.stack([b["wave_td"] for b in batch])
+        out["noise_td"] = noise_factor*torch.stack([subset.dataset._load("noise_td", i) for i in pick])
+
+    return out
 
 def whiten_fd(data, asd):
     """Whiten FD data by dividing by the ASD (amplitude spectral density).
@@ -1402,6 +1402,72 @@ def compute_fisher_prior_bounds(
 
     print(f"[Fisher] Final prior bounds: {prior_bounds}")
     return prior_bounds
+
+
+def transfer_classifier_weights(old_model, new_model):
+    """Transfer classifier weights from *old_model* to *new_model* for matching marginals.
+
+    Marginals are matched by their parameter-index tuple (e.g. ``(0,)`` or ``(7, 8)``).
+    For every marginal that exists in both models the corresponding classifier
+    weights are copied; new marginals keep their random initialisation.
+
+    Works with both ``InferenceNetwork`` and ``JointAEInferenceNetwork``.
+    """
+    # Build a lookup: marginal_tuple -> (domain_key, position_in_domain) for old model
+    old_lookup = {}
+    for domain, marginal_list in old_model.marginals_dict.items():
+        for pos, marginal in enumerate(marginal_list):
+            old_lookup[tuple(marginal)] = (domain, pos)
+
+    transferred, fresh = [], []
+    for domain, marginal_list in new_model.marginals_dict.items():
+        for pos, marginal in enumerate(marginal_list):
+            key = tuple(marginal)
+            if key in old_lookup:
+                old_domain, old_pos = old_lookup[key]
+                src = old_model.logratios_model_dict[old_domain].classifiers[old_pos]
+                dst = new_model.logratios_model_dict[domain].classifiers[pos]
+                dst.load_state_dict(src.state_dict())
+                transferred.append(key)
+            else:
+                fresh.append(key)
+
+    # Also transfer GradNorm loss weights if both models use them
+    if (hasattr(old_model, "weights_loss_logits") and
+            hasattr(new_model, "weights_loss_logits")):
+        # Map old weight values by marginal index
+        old_marg_list = old_model.marginals_list
+        new_marg_list = new_model.marginals_list
+        for new_idx, marg in enumerate(new_marg_list):
+            key = tuple(marg)
+            if key in old_lookup:
+                old_idx = old_marg_list.index(list(key))
+                new_model.weights_loss_logits.data[new_idx] = (
+                    old_model.weights_loss_logits.data[old_idx]
+                )
+
+    print(f"[transfer] Carried over classifiers for {transferred}")
+    print(f"[transfer] Freshly initialised classifiers for {fresh}")
+
+
+def resolve_marginals_for_round(train_conf: dict, round_idx: int) -> dict:
+    """Return the marginals dict to use for a given round.
+
+    If ``train_conf`` contains a ``marginal_schedule`` list, the last entry
+    whose ``from_round`` is <= *round_idx* wins.  Otherwise falls back to
+    ``train_conf["marginals"]``.
+    """
+    schedule = train_conf.get("marginal_schedule")
+    if not schedule:
+        return train_conf["marginals"]
+
+    # Sort by from_round so the last match is the tightest
+    sorted_schedule = sorted(schedule, key=lambda e: e["from_round"])
+    active = train_conf["marginals"]  # default fallback
+    for entry in sorted_schedule:
+        if round_idx >= entry["from_round"]:
+            active = entry["marginals"]
+    return active
 
 
 def validate_marginals(marginals_config: dict):

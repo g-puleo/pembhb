@@ -20,6 +20,7 @@ class MBHBDataset(Dataset):
 
         with h5py.File(self.filename, "r") as f:
             self.len = f["wave_fd"].shape[0]
+            self.has_td = "wave_td" in f
 
             # Load ASD (Amplitude Spectral Density) for noise-weighting.
             # Shape: (n_channels, n_freq).  This is the same for all samples.
@@ -30,10 +31,14 @@ class MBHBDataset(Dataset):
 
             if cache_in_memory:
                 self.wave_fd = torch.tensor(f["wave_fd"][()], device="cpu", dtype=get_torch_complex_dtype())
-                self.wave_td = torch.tensor(f["wave_td"][()], device="cpu", dtype=get_torch_dtype())
                 self.noise_fd = torch.tensor(f["noise_fd"][()], device="cpu", dtype=get_torch_complex_dtype())
-                self.noise_td = torch.tensor(f["noise_td"][()], device="cpu", dtype=get_torch_dtype())
                 self.source_parameters = torch.tensor(f["source_parameters"][()], device="cpu", dtype=get_torch_dtype())
+                if self.has_td:
+                    self.wave_td = torch.tensor(f["wave_td"][()], device="cpu", dtype=get_torch_dtype())
+                    self.noise_td = torch.tensor(f["noise_td"][()], device="cpu", dtype=get_torch_dtype())
+                else:
+                    self.wave_td = None
+                    self.noise_td = None
             else:
                 self.wave_fd = self.wave_td = self.parameters = None
                 # noise_fd / noise_td not loaded; collate_fn will handle sampling
@@ -58,33 +63,35 @@ class MBHBDataset(Dataset):
 
     def __getitem__(self, idx):
         wave_fd = self._load("wave_fd", idx)
-        wave_td = self._load("wave_td", idx)
         params = self._load("source_parameters", idx)
-        return {
+        out = {
             "idx": idx,
             "wave_fd": wave_fd,
-            "wave_td": wave_td,
             "params": params,
         }
+        if self.has_td:
+            out["wave_td"] = self._load("wave_td", idx)
+        return out
     
     def to(self, device):
         if self.cache_in_memory:
-            for k in ["wave_fd","wave_td","source_parameters","noise_fd","noise_td"]:
-
-                setattr(self, k, getattr(self, k).to(device))
-                # data = torch.tensor(getattr(self, k), device=device)
-                # setattr(self, k, data)
-
+            keys = ["wave_fd", "source_parameters", "noise_fd"]
+            if self.has_td:
+                keys += ["wave_td", "noise_td"]
+            for k in keys:
+                tensor = getattr(self, k, None)
+                if tensor is not None:
+                    setattr(self, k, tensor.to(device))
             self.device = device
-
-        else: 
+        else:
             print("Dataset not cached in memory; cannot move to device.")
             return
 
-    def clear_cache(self): 
+    def clear_cache(self):
         """Free cached tensors and switch to disk-based loading."""
         if self.cache_in_memory:
-            for k in ["wave_fd", "wave_td", "source_parameters", "noise_fd", "noise_td"]:
+            keys = ["wave_fd", "wave_td", "source_parameters", "noise_fd", "noise_td"]
+            for k in keys:
                 if hasattr(self, k) and getattr(self, k) is not None:
                     delattr(self, k)
             self.wave_fd = self.wave_td = self.source_parameters = self.noise_fd = self.noise_td = None
@@ -144,8 +151,10 @@ class MBHBDataModule( L.LightningDataModule ):
             test_dataset = MBHBDataset(self.filename, cache_in_memory=self.cache_in_memory)
             self.test = Subset(test_dataset, indices=range(len(test_dataset)))
 
-    def get_max_td(self): 
+    def get_max_td(self):
         """Get the maximum time-domain value from the training dataset."""
+        if not self.full_dataset.has_td:
+            return None
         maxtd = self.train.dataset[self.train_indices]["wave_td"].abs().max()
         print("Max td:", maxtd)
         return maxtd
@@ -177,8 +186,11 @@ class MBHBDataModule( L.LightningDataModule ):
         return freqs
     
     def get_times(self):
-        """Get the time bins from the dataset. Times are in SI units (seconds)."""
+        """Get the time bins from the dataset. Times are in SI units (seconds).
+        Returns None for FD-only datasets."""
         with h5py.File(self.filename, "r") as f:
+            if "times_SI" not in f:
+                return None
             times = f["times_SI"][()]
         return times
 

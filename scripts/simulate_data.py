@@ -2,7 +2,7 @@ import argparse
 import yaml
 import os
 from pembhb import ROOT_DIR
-from pembhb.simulator import MBHBSimulatorFD_TD
+from pembhb.simulator import MBHBSimulatorFD
 
 parser = argparse.ArgumentParser(
             prog='Simulate N data and store the output into file')
@@ -17,5 +17,5 @@ with open(config_path, "r") as file:
 args = parser.parse_args()
 print(type(args.n))
 sampler_init_kwargs={'prior_bounds': conf["prior"]}
-sim = MBHBSimulatorFD_TD(conf, sampler_init_kwargs=sampler_init_kwargs, seed=int(args.seed))
+sim = MBHBSimulatorFD(conf, sampler_init_kwargs=sampler_init_kwargs, seed=int(args.seed), n_freq_bins=conf["waveform_params"]["n_freq_bins"], freq_spacing=conf["waveform_params"]["freq_spacing"])
 sim.sample_and_store(filename=args.fname, N=int(args.n), batch_size=int(args.batch_size) if args.batch_size is not None else None)
