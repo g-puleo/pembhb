@@ -5,16 +5,15 @@ precision: "float32"  # "float32" (default) or "float64"
 #transform_td: "normalise_max" # options: "none", "logwhiten", "log", "whiten"
 transform_fd: "log" # options: "none", "logwhiten", "log", "whiten", "normalise_max"
 noise_factor: 1.0
-early_stop_patience: 75
+early_stop_patience: 50
 early_stop_min_delta: 0.001
 early_stop_threshold: 0.999
 scheduler_factor: 0.3
-scheduler_patience: 50
+scheduler_patience: 80
 keep_ckpt: True
 marginals:
   #  f: [[0]]
   f: [[0,],[7,8], [10]]
-
 # -------------------------------------------------------------------------
 # Marginal schedule (optional)
 # Train on different marginal sets depending on the round index.
@@ -44,7 +43,7 @@ architecture:
 
   data_summary:
 
-    type: "Autoencoder"  # Options: "ROM", "Autoencoder"
+    type: "Autoencoder"  # Options: "ROM", "Autoencoder", "MarginalEncoder"
     BrutalCompression:
       Nfreqs: 1000
       lowdim: 16
@@ -69,7 +68,7 @@ architecture:
       high_freq_only: True
     Autoencoder:
       load: False
-      finetune_previous: True 
+      finetune_previous: True
       filename: "/data/gpuleo/mbhb/logs/autoencoder/version_12/checkpoints/ae-epoch=261-val_loss=5.7389e-09.ckpt"  # Path to trained DenoisingAutoencoder checkpoint
       device: "cuda"
       # --- Training hyperparameters (used when load: False) ---
@@ -77,24 +76,60 @@ architecture:
       representation: "real_imag"  # "amp_phase" or "real_imag"
       n_channels: 2                # TDI channels (AE→2, AET→3)
       n_freqs: 4096
-      bottleneck_dim: 256
+      bottleneck_dim: 200
       # input_channels is 4, hidden_channels determines the progressive increase in the channel dimension
-      hidden_channels: [3, 5, 11, 24, 53, 116, 256]
-      kernel_size: 7
-      stride: 3 # determines downsampling along the frequency dimension (start from 4096=2^12)
+      # Channels double at each layer (constant capacity heuristic: ch × spatial ≈ const)
+      # With stride=2 and 7 layers: 4096 → 32 spatial bins before FC
+      hidden_channels: [32, 64, 128, 256, 512, 512, 512]
+      kernel_size: 5
+      stride: 2 # determines downsampling along the frequency dimension (start from 4096=2^12)
       dropout: 0.0
-      high_freq_only: False
+      residual: False           # residual shortcut connections in the ConvEncoder
+      high_freq_only: True
       freq_split_idx: 2048
       # Training
       lr: 0.001
-      weight_decay: 0.00001
-      epochs: 200
-      scheduler_patience: 30
+      weight_decay: 0.0001
+      epochs: 150
+      scheduler_patience: 75
       scheduler_factor: 0.3
-      early_stop_patience: 60
-      gradient_clip_val: null
+      early_stop_patience: 3
       log_name: "autoencoder"
   
+    # -----------------------------------------------------------------------
+    # Per-marginal encoder with parameter regression (replaces shared AE).
+    # Each marginal gets its own ConvEncoder trained to regress its param(s).
+    # Activate by setting  data_summary.type: "MarginalEncoder"
+    # -----------------------------------------------------------------------
+    MarginalEncoder:
+      load: False
+      finetune_previous: True
+      filename: ""          # path to MarginalEncoderTrainer checkpoint (load: True only)
+      device: "cuda"
+      # --- ConvEncoder architecture (same hyper-params as Autoencoder.conv) ---
+      representation: "real_imag"   # "real_imag" or "amp_phase"
+      n_channels: 2                 # TDI channels (AE→2, AET→3)
+      n_freqs: 4096
+      bottleneck_dim: 200
+      hidden_channels: [32, 64, 128, 256, 512, 512, 512]
+      kernel_size: 5
+      stride: 2
+      dropout: 0.0
+      residual: True          # residual shortcut connections in the ConvEncoder
+      # --- Regression head (MLP after bottleneck) ---
+      # Predicts the parameter(s) associated with each marginal.
+      # Loss: MSE on normalised parameter values.
+      # Deeper heads help for 2-D marginals; keep small to not dominate capacity.
+      regressor_hidden_sizes: [128, 64]
+      # --- Training ---
+      lr: 0.001
+      weight_decay: 0.0001
+      epochs: 150
+      scheduler_patience: 75
+      scheduler_factor: 0.3
+      early_stop_patience: 3
+      log_name: "marginal_encoder"
+
 baseline_model:
   use: False
   #filename: "/data/gpuleo/mbhb/logs/20251205_100028_round_0/version_0/checkpoints/epoch=474-step=133000.ckpt"
@@ -105,13 +140,25 @@ baseline_model:
 # These settings are IGNORED by scripts/tmnre.py (sequential pipeline).
 # -------------------------------------------------------------------------
 joint_training:
-  ae_warmup_epochs: 50        # epochs of AE-only training before NRE kicks in (round 1 only)
+  ae_warmup_epochs: 80        # epochs of AE-only training before NRE kicks in (round 1 only)
   lr_ae: 0.001                # learning rate for autoencoder (encoder + decoder)
   lr_nre: 0.0001              # learning rate for NRE classifier heads
   ae_weight_decay: 0.00001    # weight decay for autoencoder param group
   ae_scheduler_patience: 50   # ReduceLROnPlateau patience
   ae_scheduler_factor: 0.3    # ReduceLROnPlateau factor
 
+
+# -------------------------------------------------------------------------
+# Volume-ratio early stopping  (used by scripts/tmnre_joint.py & tmnre.py)
+# Stops NRE training when the posterior/prior volume ratio has plateaued.
+# -------------------------------------------------------------------------
+volume_ratio_early_stop:
+  enabled: true
+  warmup_epochs: 50       # ignore first N epochs (posterior is noisy)
+  patience: 15            # consecutive stalled evaluations before stopping
+  rel_tol: 0.02           # relative EMA change threshold for "stalled"
+  ema_alpha: 0.3          # EMA smoothing factor (higher = more reactive)
+  min_ratio_threshold: 0.5  # stop immediately if any marginal ratio drops here
 
 rom_use_pinned_memory: false  # Only set true for single-session usage
 rom_prefetch_batches: 4       # Increase to reduce Python overhead

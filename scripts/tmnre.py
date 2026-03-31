@@ -12,20 +12,22 @@ from lightning.pytorch.callbacks import ModelCheckpoint, Callback
 
 
 from pembhb.simulator import MBHBSimulatorFD_TD, MBHBSimulatorFD
-from pembhb.model import InferenceNetwork
+from pembhb.model import InferenceNetwork, PerMarginalInferenceNetwork
 from pembhb.rom import ReducedOrderModel, ROMWrapper
-from pembhb.autoencoder import DenoisingAutoencoder, AutoencoderWrapper
+from pembhb.autoencoder import (
+    DenoisingAutoencoder, AutoencoderWrapper,
+    MarginalEncoderTrainer, MarginalEncoderWrapper,
+)
 from pembhb.data import MBHBDataModule, MBHBDataset, mbhb_collate_fn
 from pembhb import ROOT_DIR, DATA_ROOT_DIR, set_precision
 from pembhb import utils
-from pembhb.utils import validate_marginals, resolve_marginals_for_round, transfer_classifier_weights, get_widest_interval_1d, get_widest_box_2d, PlotPosteriorCallback
-
-
+from pembhb.utils import validate_marginals, resolve_marginals_for_round, transfer_classifier_weights, get_widest_interval_1d, get_widest_box_2d
+from pembhb.callbacks import PlotPosteriorCallback, VolumeRatioEarlyStopping
 
 def get_timestamp():
     return datetime.now().strftime("%Y%m%d")
 
-TIME_OF_EXECUTION = get_timestamp()+"periodicbc_logspace_fullfreq_finetune_v2"
+TIME_OF_EXECUTION = get_timestamp() + "_sequential_volratio_earlystop"
 
 def validate_marginals(marginals_config: dict):
     """Validate that no parameter index appears in multiple marginals.
@@ -252,7 +254,7 @@ class PlotPosteriorCallback(Callback):
         # Use the actual sampling prior (sampler_init_kwargs) as the
         # authoritative source.  Fall back to conf["prior"] for backward compat.
         _sik = pl_module.hparams["dataset_info"].get("sampler_init_kwargs", {})
-        if "prior_bounds" in _sik:
+        if "prior_bounds" in _sik:    
             prior_dict = _sik["prior_bounds"]
         else:
             prior_dict = pl_module.hparams["dataset_info"]["conf"]["prior"]
@@ -416,10 +418,11 @@ class SequentialTrainer:
         # Validate that no parameter index appears in multiple marginals
         validate_marginals(train_conf["marginals"])
         
-        # Subset is there because utils.mbhb_collate_fn expects a Subset, it will access its dataset attribute
         #self.dataset_observation = Subset(MBHBDataset(dataset_obs_path, cache_in_memory=True), indices=[2])
         self.dataset_observation = Subset(MBHBDataset(dataset_obs_path, cache_in_memory=True),indices =[0])
-        self.dataloader_obs = DataLoader(self.dataset_observation, batch_size=train_conf["batch_size"], shuffle=False, collate_fn=lambda b: mbhb_collate_fn(b, self.dataset_observation, noise_shuffling=False, noise_factor=self.train_conf["noise_factor"]))
+        obs_noise_scale = self.dataset_observation.dataset.noise_scale
+        obs_td_params = self.dataset_observation.dataset.td_params
+        self.dataloader_obs = DataLoader(self.dataset_observation, batch_size=train_conf["batch_size"], shuffle=False, collate_fn=lambda b: mbhb_collate_fn(b, obs_noise_scale, noise_factor=self.train_conf["noise_factor"], noise_shuffling=False, td_params=obs_td_params))
         self.logMchirp_lower = [datagen_conf["prior"]["logMchirp"][0]]
         self.logMchirp_upper = [datagen_conf["prior"]["logMchirp"][1]]
         self.q_lower = [datagen_conf["prior"]["q"][0]]
@@ -677,6 +680,7 @@ class SequentialTrainer:
                 kernel_size=ae_conf.get("kernel_size", 4),
                 stride=ae_conf.get("stride", 2),
                 dropout=ae_conf.get("dropout", 0.0),
+                residual=ae_conf.get("residual", False),
                 lr=ae_conf.get("lr", 1e-3),
                 weight_decay=ae_conf.get("weight_decay", 1e-5),
                 scheduler_patience=ae_conf.get("scheduler_patience", 10),
@@ -693,10 +697,24 @@ class SequentialTrainer:
             norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
             autoencoder.fit_normalisation(norm_loader)
 
-        else: 
+            # --- set noise ASD for noise-weighted reconstruction loss --------
+            asd = self.data_module.get_asd()
+            if asd is not None:
+                autoencoder.set_noise_asd(asd)
+
+        else:
             autoencoder = self.data_summary.autoencoder
             self.data_summary.unfreeze_parameters()
             print(f"Finetuning autoencoder from previous round with bottleneck dim {autoencoder.hparams.bottleneck_dim} and prior bounds {autoencoder.hparams.prior_bounds}")
+
+            # Re-fit normalisation on the new round's data and re-set noise
+            # ASD so the noise-weighted loss is used consistently across rounds.
+            print("[AE] Re-fitting normalisation for new round data ...")
+            norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
+            autoencoder.fit_normalisation(norm_loader)
+            asd = self.data_module.get_asd()
+            if asd is not None:
+                autoencoder.set_noise_asd(asd)
         # --- callbacks ----------------------------------------------------
         checkpoint_cb = ModelCheckpoint(
             monitor="val_loss",
@@ -709,6 +727,9 @@ class SequentialTrainer:
             patience=ae_conf.get("early_stop_patience", 50),
             mode="min",
         )
+
+        from pembhb.diagnostics import AutoencoderDiagnosticsCallback
+        ae_diag_cb = AutoencoderDiagnosticsCallback()
 
         # --- logger -------------------------------------------------------
         log_name = ae_conf.get("log_name", "autoencoder")
@@ -724,7 +745,7 @@ class SequentialTrainer:
             accelerator=device,
             devices=1,
             enable_progress_bar=True,
-            callbacks=[checkpoint_cb, early_stop_cb],
+            callbacks=[checkpoint_cb, early_stop_cb, ae_diag_cb],
             gradient_clip_val=ae_conf.get("gradient_clip_val", None),
         )
 
@@ -752,6 +773,182 @@ class SequentialTrainer:
         # Free cached data and switch to disk-based loading to reduce memory
         self.data_module.full_dataset.clear_cache()
 
+    def _train_marginal_encoders(self, round_idx, finetune_previous=False):
+        """Train one ConvEncoder + RegressionHead per marginal and wrap the
+        result as a :class:`MarginalEncoderWrapper` stored in ``self.data_summary``.
+
+        Mirrors ``_train_autoencoder`` in structure so the overall round flow
+        is unchanged.
+        """
+        print(f"Training Marginal Encoders for round {round_idx}...")
+        me_conf = self.train_conf["architecture"]["data_summary"]["MarginalEncoder"]
+        device  = me_conf.get("device", self.train_conf["device"])
+
+        ckpt_dir     = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION)
+        ckpt_tag     = f"marginal_enc_round_{round_idx}"
+        ckpt_sentinel = os.path.join(ckpt_dir, f"{ckpt_tag}_done.txt")
+
+        # --- check for existing trained encoder for this round ----------------
+        if os.path.exists(ckpt_sentinel):
+            best_ckpt = open(ckpt_sentinel).read().strip()
+            if os.path.exists(best_ckpt):
+                resp = None
+                try:
+                    resp = input(
+                        f"Marginal encoder checkpoint for round {round_idx} already exists at "
+                        f"{best_ckpt}. Retrain and overwrite? [y/N]: "
+                    ).strip().lower()
+                except Exception:
+                    resp = "n"
+                if resp not in ("y", "yes"):
+                    print(f"Reusing existing marginal encoder checkpoint: {best_ckpt}")
+                    enc_trainer = MarginalEncoderTrainer.load_from_checkpoint(best_ckpt)
+                    enc_trainer.to(device).eval()
+                    self.data_summary = MarginalEncoderWrapper(enc_trainer, freeze=True)
+                    self.data_summary.to(device)
+                    print(f"Bottleneck dim  : {self.data_summary.get_n_features()}")
+                    print(f"Num marginals   : {self.data_summary.get_n_marginals()}")
+                    self.data_module.full_dataset.clear_cache()
+                    return
+
+        # --- flatten marginals across all domains (domain is irrelevant here) --
+        marginals_flat = [
+            marginal
+            for marginal_list in self.train_conf["marginals"].values()
+            for marginal in marginal_list
+        ]
+
+        # --- retrieve normalisation statistics --------------------------------
+        param_mean_np, param_std_np = self.data_module.get_params_mean_std()
+        prior_bounds = self.datagen_info.get("conf", {}).get("prior", None)
+
+        hidden_channels = me_conf.get("hidden_channels", (32, 64, 128, 256, 256))
+        if isinstance(hidden_channels, list):
+            hidden_channels = tuple(hidden_channels)
+        regressor_hidden = me_conf.get("regressor_hidden_sizes", (128, 64))
+        if isinstance(regressor_hidden, list):
+            regressor_hidden = tuple(regressor_hidden)
+
+        # --- build model or reuse previous encoder for fine-tuning -----------
+        if not finetune_previous or round_idx == 1:
+            enc_trainer = MarginalEncoderTrainer(
+                n_channels=me_conf.get("n_channels", 2),
+                n_freqs=me_conf.get("n_freqs", 4096),
+                marginals=marginals_flat,
+                bottleneck_dim=me_conf.get("bottleneck_dim", 200),
+                hidden_channels=hidden_channels,
+                kernel_size=me_conf.get("kernel_size", 5),
+                stride=me_conf.get("stride", 2),
+                dropout=me_conf.get("dropout", 0.0),
+                residual=me_conf.get("residual", False),
+                regressor_hidden_sizes=regressor_hidden,
+                param_mean=param_mean_np.tolist(),
+                param_std=param_std_np.tolist(),
+                lr=me_conf.get("lr", 1e-3),
+                weight_decay=me_conf.get("weight_decay", 1e-5),
+                scheduler_patience=me_conf.get("scheduler_patience", 75),
+                scheduler_factor=me_conf.get("scheduler_factor", 0.3),
+                representation=me_conf.get("representation", "real_imag"),
+                prior_bounds=prior_bounds,
+            )
+            enc_trainer = enc_trainer.to(device)
+
+            print("[MarginalEncoder] Fitting normalisation statistics ...")
+            norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
+            enc_trainer.fit_normalisation(norm_loader)
+        else:
+            # Fine-tune from previous round (marginals must be unchanged)
+            prev_wrapper = getattr(self, "data_summary", None)
+            if prev_wrapper is None or not isinstance(prev_wrapper, MarginalEncoderWrapper):
+                raise RuntimeError(
+                    "finetune_previous=True but no previous MarginalEncoderWrapper found."
+                )
+            if [list(m) for m in prev_wrapper.trainer.marginals] != marginals_flat:
+                print(
+                    "[MarginalEncoder] WARNING: marginals changed between rounds; "
+                    "falling back to training from scratch."
+                )
+                # Recurse with finetune_previous=False
+                self._train_marginal_encoders(round_idx, finetune_previous=False)
+                return
+            enc_trainer = prev_wrapper.trainer
+            prev_wrapper.unfreeze_parameters()
+            print(
+                f"[MarginalEncoder] Fine-tuning from previous round "
+                f"(bottleneck_dim={enc_trainer.bottleneck_dim})"
+            )
+
+        # --- callbacks --------------------------------------------------------
+        checkpoint_cb = ModelCheckpoint(
+            monitor="val_loss",
+            mode="min",
+            save_top_k=2,
+            filename=f"{ckpt_tag}" + "-{epoch:03d}-{val_loss:.4e}",
+        )
+        early_stop_cb = EarlyStopping(
+            monitor="val_loss",
+            patience=me_conf.get("early_stop_patience", 100),
+            mode="min",
+        )
+        log_name = me_conf.get("log_name", "marginal_encoder")
+        logger = TensorBoardLogger(
+            save_dir=os.path.join(DATA_ROOT_DIR, "logs"),
+            name=f"{TIME_OF_EXECUTION}_{log_name}_round_{round_idx}",
+        )
+
+        # --- trainer ----------------------------------------------------------
+        me_trainer = Trainer(
+            logger=logger,
+            max_epochs=me_conf.get("epochs", 500),
+            accelerator=device,
+            devices=1,
+            enable_progress_bar=True,
+            callbacks=[checkpoint_cb, early_stop_cb],
+            gradient_clip_val=me_conf.get("gradient_clip_val", None),
+        )
+        me_trainer.fit(enc_trainer, self.data_module)
+
+        best_ckpt = checkpoint_cb.best_model_path
+        print(f"[MarginalEncoder] Best checkpoint : {best_ckpt}")
+        print(f"[MarginalEncoder] Best val_loss   : {checkpoint_cb.best_model_score:.6e}")
+
+        # Write sentinel for re-run skipping
+        os.makedirs(ckpt_dir, exist_ok=True)
+        with open(ckpt_sentinel, "w") as f:
+            f.write(best_ckpt)
+
+        # --- wrap best model --------------------------------------------------
+        enc_trainer = MarginalEncoderTrainer.load_from_checkpoint(best_ckpt)
+        enc_trainer.to(device).eval()
+        self.data_summary = MarginalEncoderWrapper(enc_trainer, freeze=True)
+        self.data_summary.to(device)
+
+        print(f"[MarginalEncoder] Bottleneck dim  : {self.data_summary.get_n_features()}")
+        print(f"[MarginalEncoder] Num marginals   : {self.data_summary.get_n_marginals()}")
+
+        self.data_module.full_dataset.clear_cache()
+
+    def _load_marginal_encoders(self, round_idx):
+        """Load a trained MarginalEncoderTrainer from the checkpoint path
+        specified in ``train_config.yaml`` and wrap it as data_summary.
+        """
+        me_conf   = self.train_conf["architecture"]["data_summary"]["MarginalEncoder"]
+        ckpt_path = me_conf["filename"]
+        device    = me_conf.get("device", self.train_conf["device"])
+
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(
+                f"MarginalEncoder checkpoint not found at {ckpt_path}."
+            )
+        print(f"Loading MarginalEncoder from {ckpt_path}...")
+        enc_trainer = MarginalEncoderTrainer.load_from_checkpoint(ckpt_path)
+        enc_trainer.to(device).eval()
+        self.data_summary = MarginalEncoderWrapper(enc_trainer, freeze=True)
+        self.data_summary.to(device)
+        print(f"Bottleneck dim : {self.data_summary.get_n_features()}")
+        print(f"Num marginals  : {self.data_summary.get_n_marginals()}")
+        self.data_module.full_dataset.clear_cache()
+
     def _train_inference_network ( self, round_idx, data_summary=None) :
         #  initialise data summarizer (ROM)
         mean, std = self.data_module.get_params_mean_std()
@@ -759,7 +956,9 @@ class SequentialTrainer:
                          "param_mean": np.array(mean),
                          "param_std": np.array(std)}
         old_model = getattr(self, "model", None)
-        self.model = InferenceNetwork(train_conf=self.train_conf, dataset_info=self.datagen_info, normalisation=normalisation, data_summarizer=data_summary, periodic_bc_params=self.train_conf["periodic_bc_params"])
+        ds_type = self.train_conf["architecture"]["data_summary"]["type"]
+        NetworkClass = PerMarginalInferenceNetwork if ds_type == "MarginalEncoder" else InferenceNetwork
+        self.model = NetworkClass(train_conf=self.train_conf, dataset_info=self.datagen_info, normalisation=normalisation, data_summarizer=data_summary, periodic_bc_params=self.train_conf["periodic_bc_params"])
         # Carry over classifier weights from the previous round (finetune)
         if old_model is not None:
             transfer_classifier_weights(old_model, self.model)
@@ -786,7 +985,19 @@ class SequentialTrainer:
             input_idx_list=self.model.marginals_list,
             output_idx_list=list(range(len(self.model.marginals_list))),
             round_idx=round_idx,
-            call_every_n_epochs=5)
+            call_every_n_epochs=2)
+
+        callbacks_list = [checkpoint_callback, early_stopping_callback, plot_posterior_callback]
+        vr_conf = self.train_conf.get("volume_ratio_early_stop", {})
+        if vr_conf.get("enabled", False):
+            vr_callback = VolumeRatioEarlyStopping(
+                warmup_epochs=vr_conf.get("warmup_epochs", 50),
+                patience=vr_conf.get("patience", 10),
+                rel_tol=vr_conf.get("rel_tol", 0.02),
+                ema_alpha=vr_conf.get("ema_alpha", 0.3),
+                min_ratio_threshold=vr_conf.get("min_ratio_threshold", 0.5),
+            )
+            callbacks_list.append(vr_callback)
 
         trainer = Trainer(
             logger=logger,
@@ -794,7 +1005,7 @@ class SequentialTrainer:
             accelerator=self.train_conf["device"],
             devices=1,
             enable_progress_bar=True,
-            callbacks=[checkpoint_callback, early_stopping_callback, plot_posterior_callback],
+            callbacks=callbacks_list,
         )
 
         # if round_idx == 0: 
@@ -829,6 +1040,15 @@ class SequentialTrainer:
                 self._load_autoencoder(round_idx=idx)
             else:
                 self._train_autoencoder(round_idx=idx, finetune_previous=self.train_conf["architecture"]["data_summary"]["Autoencoder"]["finetune_previous"])
+            self._train_inference_network(round_idx=idx, data_summary=self.data_summary)
+        elif data_summary_type == "MarginalEncoder":
+            if data_summary_load:
+                self._load_marginal_encoders(round_idx=idx)
+            else:
+                self._train_marginal_encoders(
+                    round_idx=idx,
+                    finetune_previous=self.train_conf["architecture"]["data_summary"]["MarginalEncoder"].get("finetune_previous", True),
+                )
             self._train_inference_network(round_idx=idx, data_summary=self.data_summary)
         else:
             # No data summary (direct inference on raw data)
@@ -909,11 +1129,16 @@ class SequentialTrainer:
                     elif len(marginal) == 2:
                         # 2D marginal
                         inj1, inj2 = marginal
-                        #utils.pp_plot_2d(self.test_dataloader, self.model, in_param_idx=marginal, out_idx=out_idx,
-                        #           name=f"{ROOT_DIR}/plots/{TIME_OF_EXECUTION}/round_{i}_{utils._ORDERED_PRIOR_KEYS[inj1]}_{utils._ORDERED_PRIOR_KEYS[inj2]}")
-            
+                        if marginal_key == (7, 8):  # sky marginal
+                            from pembhb.sky_truncation import truncate_sky_prior
+                            _, sky_info = truncate_sky_prior(
+                                self.model, self.test_dataloader, out_param_idx=out_idx,
+                                datagen_conf=self.datagen_conf,
+                                mode="rectangle",
+                                credible_level=0.9545, dilation_factor=1.5,
+                            )
                         # Get widest_box for this specific marginal from the dictionary
-                        if hasattr(self.model, 'widest_boxes') and marginal_key in self.model.widest_boxes:
+                        elif hasattr(self.model, 'widest_boxes') and marginal_key in self.model.widest_boxes:
                             widest_box = self.model.widest_boxes[marginal_key]
                             tmp_prior = copy.deepcopy(self.datagen_conf["prior"])
                             tmp_prior[utils._ORDERED_PRIOR_KEYS[inj1]] = [widest_box[0], widest_box[1]]
@@ -930,23 +1155,26 @@ class SequentialTrainer:
                 torch.cuda.empty_cache()
 
 if __name__ == "__main__":
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument("--config", type=str, required=True)
-    # args = parser.parse_args()
-    train_config_filename = "train_config.yaml"
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train-config", default="train_config.yaml",
+                        help="Train config filename inside configs/")
+    args = parser.parse_args()
+
+    train_config_filename = args.train_config
     datagen_config_filename = "datagen_config.yaml"
-    
+
     train_config   = utils.read_config(os.path.join(ROOT_DIR, "configs", train_config_filename))
     datagen_config = utils.read_config(os.path.join(ROOT_DIR, "configs", datagen_config_filename))
 
     # Activate the configured precision (default: float32)
     set_precision(train_config.get("precision", "float32"))
 
-    trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path="/data/gpuleo/mbhb/obs_logspace_freqonly_q3.h5")
-    #trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path="/u/g/gpuleo/pembhb/data/testes_newdata_fixall_notmcq.h5")
+    # Dynamic timestamp incorporating the data summary type
+    ds_type = train_config["architecture"]["data_summary"]["type"].lower()
+    TIME_OF_EXECUTION = get_timestamp() + f"_{ds_type}_sequential_v3nonres"
 
-    # run with low noise: 
-    # trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path=os.path.join(ROOT_DIR, "/data/gpuleo/mbhb/observation_low_noise.h5"))
+    trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path="/data/gpuleo/mbhb/obs_logfreq_q3_t.h5")
     trainer.run(n_rounds=9)
 
     #round(conf, sampler_init_kwargs={'low': 0.5, 'high': 1.0} , lr=conf["training"]["learning_rate"], idx=0)

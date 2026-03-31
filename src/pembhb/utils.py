@@ -2,7 +2,7 @@ import yaml
 import copy
 import torch
 import os 
-from pembhb import ROOT_DIR
+from pembhb import ROOT_DIR, get_torch_dtype
 import numpy as np
 # from pembhb.data import MBHBDataset, mbhb_collate_fn
 from glob import glob
@@ -80,30 +80,38 @@ def get_logratios_grid(dataloader: torch.utils.data.DataLoader, model: 'Inferenc
     grid_padded = torch.cat((zero_pad1d[:, :in_param_idx], grid, zero_pad1d[:, in_param_idx:]), dim=1)  # Shape: [ngrid_points, 11]
     with torch.no_grad():
         for batch in tqdm( dataloader ) :
-            
             data_fd = (batch["wave_fd"]+batch["noise_fd"]).to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
-            #data_td = (batch["wave_td"]+batch["noise_td"]).to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
             source_parameters = batch["source_parameters"]  # Shape: [batchsize, 11]
-
+            has_td = "wave_td" in batch and "noise_td" in batch
+            if has_td:
+                data_td = (batch["wave_td"]+batch["noise_td"]).to("cuda")
 
             batch_size = data_fd.shape[0]
 
-            #data_td_expanded = data_td.unsqueeze(1).expand(batch_size, ngrid_points, -1, -1)  # Shape: [batchsize, ngrid_points, n_channels, n_datapoints]
             data_fd_expanded = data_fd.unsqueeze(1).expand(batch_size, ngrid_points, -1, -1)  # Shape: [batchsize, ngrid_points, n_channels, n_datapoints]
             grid_expanded = grid_padded.unsqueeze(0).expand(batch_size, -1, -1) # shape is [batchsize, ngrid_points, 11]
 
-            #batched_data_td = data_td_expanded.reshape(-1, data_td_expanded.shape[-2], data_td_expanded.shape[-1])  # Flatten batch and ngrid_points
             batched_data_fd = data_fd_expanded.reshape(-1, data_fd_expanded.shape[-2], data_fd_expanded.shape[-1])  # Flatten batch and ngrid_points
             batched_grid = grid_expanded.reshape(-1, grid_expanded.shape[-1])  # Flatten batch and ngrid_points
 
-            batched2dataset = TensorDataset(batched_data_fd, batched_grid)
+            if has_td:
+                data_td_expanded = data_td.unsqueeze(1).expand(batch_size, ngrid_points, -1, -1)
+                batched_data_td = data_td_expanded.reshape(-1, data_td_expanded.shape[-2], data_td_expanded.shape[-1])
+                batched2dataset = TensorDataset(batched_data_fd, batched_data_td, batched_grid)
+            else:
+                batched2dataset = TensorDataset(batched_data_fd, batched_grid)
             batched2dataloader = DataLoader(batched2dataset, batch_size=50, shuffle=False)
             logratios_list = []
             for batch2 in batched2dataloader:
-                batched2_data_fd, batched2_grid = batch2
+                if has_td:
+                    batched2_data_fd, batched2_data_td, batched2_grid = batch2
+                    batched2_data_td = batched2_data_td.to("cuda")
+                else:
+                    batched2_data_fd, batched2_grid = batch2
+                    batched2_data_td = None
                 batched2_data_fd = batched2_data_fd.to("cuda")
                 batched2_grid = batched2_grid.to("cuda")
-                logratios= model(batched2_data_fd, None, batched2_grid)[:, out_param_idx]  
+                logratios= model(batched2_data_fd, batched2_data_td, batched2_grid)[:, out_param_idx]
                 logratios_list.append(logratios)
             logratios = torch.cat(logratios_list, dim=0)            # view them as [batchsize, ngrid_points]
             logratios = logratios.reshape(batch_size, ngrid_points)
@@ -174,23 +182,32 @@ def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'Infer
         for batch in tqdm(dataloader):
             data_fd = (batch["wave_fd"] + batch["noise_fd"]).to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
             source_parameters = batch["source_parameters"]
-            data_td  = (batch["wave_td"] + batch["noise_td"]).to("cuda")  
+            has_td = "wave_td" in batch and "noise_td" in batch
+            if has_td:
+                data_td = (batch["wave_td"] + batch["noise_td"]).to("cuda")
             batch_size = data_fd.shape[0]
             data_fd_expanded = data_fd.unsqueeze(1).expand(-1, ngrid_points**2, -1, -1)  # Shape: [batchsize, ngrid_points^2, n_channels, n_datapoints]
             grid_expanded = grid_padded_input.unsqueeze(0).expand(batch_size, -1, -1) # shape is [batchsize, ngrid_points^2, 11]
-            data_td_expanded = data_td.unsqueeze(1).expand(-1, ngrid_points**2, -1,-1)  # Shape: [batchsize, ngrid_points^2, n_datapoints]
             batched_data_fd = data_fd_expanded.reshape(-1, data_fd_expanded.shape[-2], data_fd_expanded.shape[-1])
             batched_grid = grid_expanded.reshape(-1, grid_expanded.shape[-1])  # Flatten batch and ngrid_points
-            batched_data_td = data_td_expanded.reshape(-1, data_td_expanded.shape[-2], data_td_expanded.shape[-1])
-            batched2dataset = TensorDataset(batched_data_fd, batched_data_td, batched_grid)
+            if has_td:
+                data_td_expanded = data_td.unsqueeze(1).expand(-1, ngrid_points**2, -1,-1)
+                batched_data_td = data_td_expanded.reshape(-1, data_td_expanded.shape[-2], data_td_expanded.shape[-1])
+                batched2dataset = TensorDataset(batched_data_fd, batched_data_td, batched_grid)
+            else:
+                batched2dataset = TensorDataset(batched_data_fd, batched_grid)
             batched2dataloader = DataLoader(batched2dataset, batch_size=20, shuffle=False)
             logratios_list = []
             for batch2 in batched2dataloader:
-                batched2_data_fd, batched2_data_td, batched2_grid = batch2
+                if has_td:
+                    batched2_data_fd, batched2_data_td, batched2_grid = batch2
+                    batched2_data_td = batched2_data_td.to("cuda")
+                else:
+                    batched2_data_fd, batched2_grid = batch2
+                    batched2_data_td = None
                 batched2_data_fd = batched2_data_fd.to("cuda")
-                batched2_data_td = batched2_data_td.to("cuda")
                 batched2_grid = batched2_grid.to("cuda")
-                logratios= model(batched2_data_fd, batched2_data_td, batched2_grid)[:, out_param_idx]  
+                logratios= model(batched2_data_fd, batched2_data_td, batched2_grid)[:, out_param_idx]
                 logratios_list.append(logratios)
             logratios = torch.cat(logratios_list, dim=0)
             # logratios = model(batched_data_fd, batched_data_td,  batched_grid)[:, out_idx] # shape is [batchsize*ngrid_points^2, ]
@@ -1022,31 +1039,46 @@ def posterior_contours_2d_imshow(grid_x: np.array, grid_y: np.array, ratios: np.
 
 
 
-def mbhb_collate_fn(batch, subset: torch.utils.data.Subset, noise_factor, noise_shuffling=True):
+def mbhb_collate_fn(batch, noise_scale, noise_factor, noise_shuffling=True, td_params=None):
+    """Collate a batch, generating FD (and optionally TD) noise on the fly.
+
+    :param batch: list of sample dicts from MBHBDataset.__getitem__
+    :param noise_scale: real tensor of shape (n_channels, n_freqs) equal to
+        ``filtered_asd / sqrt(4 * df)``; multiplied against unit CN(0,1) draws
+    :param noise_factor: scalar multiplier applied to the generated noise amplitude
+    :param noise_shuffling: kept for API compatibility, has no effect — noise is
+        always freshly generated per call
+    :param td_params: tuple ``(dt, n_time)`` needed to derive TD noise via IFFT,
+        or ``None`` when only FD data is required
+    """
     B = len(batch)
     wave_fd = torch.stack([b["wave_fd"] for b in batch])
     params  = torch.stack([b["params"] for b in batch])
     has_td = "wave_td" in batch[0]
 
-    # pick noise indices randomly
-    if noise_shuffling:
-        subset_idxs = torch.tensor(subset.indices)
-        pick = subset_idxs[torch.randint(0, len(subset_idxs), (B,))]
-    else:
-        pick = torch.tensor([b["idx"] for b in batch])
-
-    noise_fd = noise_factor*torch.stack([subset.dataset._load("noise_fd", i) for i in pick])
+    # Generate coloured complex Gaussian noise: z ~ CN(0,1) * noise_scale
+    C, F = noise_scale.shape
+    re = torch.randn(B, C, F, dtype=noise_scale.dtype)
+    im = torch.randn(B, C, F, dtype=noise_scale.dtype)
+    noise_fd = noise_factor * torch.complex(re, im) * noise_scale.unsqueeze(0)
 
     out = {
         "source_parameters": params,
         "wave_fd": wave_fd,
         "noise_fd": noise_fd,
-        "noise_index": pick,
     }
 
     if has_td:
         out["wave_td"] = torch.stack([b["wave_td"] for b in batch])
-        out["noise_td"] = noise_factor*torch.stack([subset.dataset._load("noise_td", i) for i in pick])
+        if td_params is not None:
+            dt, n_time = td_params
+            # Reconstruct two-sided FD spectrum (DC + positive + conjugate-flipped negative)
+            dc = torch.zeros(B, C, 1, dtype=noise_fd.dtype)
+            pos2 = torch.cat([dc, noise_fd], dim=2)
+            neg = torch.flip(pos2[..., 1:].conj(), dims=[-1])
+            two_sided = torch.cat([pos2, neg], dim=2)
+            noise_td = torch.fft.ifft(two_sided, dim=-1).real / dt
+            out["noise_td"] = noise_td[..., :n_time]
 
     return out
 
@@ -1553,300 +1585,101 @@ def get_widest_box_2d(model, dataloader, in_param_idx, out_param_idx, ax_buffer=
     widest_box = boxes[0]
     return widest_box, inj_params
 
-class PlotPosteriorCallback(Callback):
-    def __init__(self, timestamp: str, obs_loader: DataLoader, input_idx_list: list, output_idx_list: list, round_idx: int , call_every_n_epochs=1): 
-        self.epochs_elapsed = 0
-        self.call_every_n_epochs = call_every_n_epochs
-        self.timestamp = timestamp
-        self.obs_loader = obs_loader
-        self.input_idx_list = input_idx_list
-        self.output_idx_list = output_idx_list
-        self.n_marginals = len(input_idx_list)
-        self.init_time = datetime.now()
-        self.round_idx = round_idx
-        # Storage for volume ratio diagnostics
-        self.volume_ratios = {}
-    
-    def _compute_posterior_volume_2d(self, widest_box):
-        """
-        Compute the area/volume of the posterior from the widest contour box.
-        
-        Parameters:
-        -----------
-        widest_box : tuple
-            The bounding box of the 99.99% contour.
-            Currently: (x_min, x_max, y_min, y_max) for axis-aligned boxes.
-            
-        Returns:
-        --------
-        float
-            Area enclosed by the posterior contour.
-            
-        Notes:
-        ------
-        FUTURE EXTENSION FOR TILTED BOXES:
-        - If posterior contours become non-axis-aligned, widest_box format may change
-          to a list of vertices [(x1,y1), (x2,y2), ...]
-        - In that case, use Shoelace formula or similar for polygon area:
-          area = 0.5 * abs(sum(x[i]*y[i+1] - x[i+1]*y[i] for i in range(n)))
-        - Consider using shapely.geometry.Polygon for robust area calculation
-        """
-        # Current implementation: axis-aligned box
-        # widest_box = (x_min, x_max, y_min, y_max)
-        posterior_area = (widest_box[1] - widest_box[0]) * (widest_box[3] - widest_box[2])
-        return posterior_area
-    
-    def _compute_prior_volume_2d(self, pl_module, in_param_idx):
-        """
-        Compute the area/volume of the prior for a 2D marginal.
-        
-        Parameters:
-        -----------
-        pl_module : LightningModule
-            The model containing prior information in hparams.
-        in_param_idx : tuple
-            Indices of the two parameters defining the 2D marginal.
-            
-        Returns:
-        --------
-        float
-            Area of the prior region.
-            
-        Notes:
-        ------
-        **MODIFY THIS METHOD WHEN SWITCHING TO TILTED BOUNDING BOXES**
-        
-        Current implementation assumes axis-aligned rectangular priors.
-        Prior bounds are stored as:
-            prior_dict[param_name] = [min_value, max_value]
-        
-        For tilted/rotated bounding boxes:
-        1. Prior specification will change (e.g., vertices, rotation matrix, etc.)
-        2. Access prior from: pl_module.hparams["dataset_info"]["conf"]["prior"]
-        3. Compute area based on new representation:
-           - If vertices: use Shoelace formula or shapely.geometry.Polygon
-           - If rotation + bounds: compute area of rotated rectangle
-           - Example with vertices:
-             ```python
-             vertices = prior_dict[marginal_key]  # [(x1,y1), (x2,y2), ...]
-             from shapely.geometry import Polygon
-             prior_area = Polygon(vertices).area
-             ```
-        4. Ensure consistency with sampler_init_kwargs format in sampler.py
-        
-        Potential issues to address:
-        - Normalization: If grid evaluation doesn't align with tilted prior,
-          posterior normalization may be affected
-        - Grid coverage: Axis-aligned grids may inefficiently cover tilted regions
-        - Coordinate transforms: May need to transform between rotated and
-          canonical coordinate systems
-        """
-        # Current implementation: axis-aligned rectangular prior
-        # Use the actual sampling prior (sampler_init_kwargs) as the
-        # authoritative source.  Fall back to conf["prior"] for backward compat.
-        _sik = pl_module.hparams["dataset_info"].get("sampler_init_kwargs", {})
-        if "prior_bounds" in _sik:
-            prior_dict = _sik["prior_bounds"]
+
+def get_widest_box_sky(model, dataloader, in_param_idx, out_param_idx,
+                       credible_level=0.9545, dilation_factor=1.5,
+                       ax_buffer=None, do_plot=False):
+    """Robust sky truncation: bounding box of the main mode on S^2.
+
+    Drop-in replacement for ``get_widest_box_2d`` when the marginal is the
+    sky (lambda, sin beta).  Uses the 95 % HPD contour dilated by 1.5x
+    (more stable than the raw 99.99 % contour) and handles periodic lambda.
+
+    Parameters
+    ----------
+    model, dataloader, in_param_idx, out_param_idx :
+        Same as ``get_widest_box_2d``.
+    credible_level : float
+        HPD level for thresholding (default 0.9545 = 95 %).
+    dilation_factor : float
+        Linear inflation factor applied to the 95 % region (default 1.5).
+    ax_buffer : matplotlib Axes or None
+    do_plot : bool
+
+    Returns
+    -------
+    widest_box : tuple (x_low, x_high, y_low, y_high)
+        Compatible with the existing truncation pipeline.
+    inj_params : np.ndarray
+    sky_analysis : dict
+        Full output of ``analyse_sky_posterior`` (includes mask, components, etc.)
+    """
+    from pembhb.sky_truncation import get_main_mode_box, get_sky_mask, analyse_sky_posterior
+
+    logratios, inj_params, gx, gy = get_logratios_grid_2d(
+        dataloader, model,
+        ngrid_points=100,
+        in_param_idx=in_param_idx,
+        out_param_idx=out_param_idx,
+    )
+
+    ratios = np.exp(logratios)
+    dp1 = gx[0, 1] - gx[0, 0]
+    dp2 = gy[1, 0] - gy[0, 0]
+    norm2d = ratios / np.sum(ratios * dp1 * dp2, axis=(1, 2), keepdims=True)
+
+    # Use first (only) observation
+    posterior = norm2d[0]
+
+    # --- Robust sky analysis -----------------------------------------------
+    box = get_main_mode_box(gx, gy, posterior,
+                            credible_level=credible_level,
+                            dilation_factor=dilation_factor)
+    sky_analysis = analyse_sky_posterior(gx, gy, posterior,
+                                         credible_level=credible_level,
+                                         dilation_factor=dilation_factor)
+
+    lam_lo, lam_hi = box['lam']
+    beta_lo, beta_hi = box['beta']
+
+    print(f"[sky_truncation] {box['n_modes']} mode(s) detected, "
+          f"main mode mass = {box['mass']:.4f}, "
+          f"wrapped = {box['is_wrapped']}")
+    print(f"[sky_truncation] lambda = [{lam_lo:.4f}, {lam_hi:.4f}], "
+          f"sin(beta) = [{beta_lo:.4f}, {beta_hi:.4f}]")
+
+    # --- Optional plot -----------------------------------------------------
+    if do_plot and ax_buffer is not None:
+        ax_buffer.pcolormesh(gx, gy, posterior, shading='auto', cmap='inferno')
+        # Overlay the dilated mask as a semi-transparent region
+        mask = sky_analysis['mask']
+        masked_arr = np.ma.masked_where(~mask, np.ones_like(mask, dtype=float))
+        ax_buffer.pcolormesh(gx, gy, masked_arr, shading='auto',
+                             cmap='Greens', alpha=0.25, vmin=0, vmax=1)
+        # Mark the main-mode bounding box
+        from matplotlib.patches import Rectangle
+        if not box['is_wrapped']:
+            rect = Rectangle((lam_lo, beta_lo), lam_hi - lam_lo, beta_hi - beta_lo,
+                              linewidth=1.5, edgecolor='lime', facecolor='none',
+                              linestyle='--', label='main mode box')
+            ax_buffer.add_patch(rect)
         else:
-            prior_dict = pl_module.hparams["dataset_info"]["conf"]["prior"]
-        
-        # Get bounds for each parameter
-        param_name_0 = _ORDERED_PRIOR_KEYS[in_param_idx[0]]
-        param_name_1 = _ORDERED_PRIOR_KEYS[in_param_idx[1]]
-        
-        prior_bounds_0 = prior_dict[param_name_0]
-        prior_bounds_1 = prior_dict[param_name_1]
-        
-        # Compute area as product of widths
-        prior_area = (prior_bounds_0[1] - prior_bounds_0[0]) * (prior_bounds_1[1] - prior_bounds_1[0])
-        
-        return prior_area
+            # Two rectangles for wrapped interval
+            TWO_PI = 2 * np.pi
+            rect1 = Rectangle((lam_lo, beta_lo), TWO_PI - lam_lo, beta_hi - beta_lo,
+                               linewidth=1.5, edgecolor='lime', facecolor='none', linestyle='--')
+            rect2 = Rectangle((0, beta_lo), lam_hi, beta_hi - beta_lo,
+                               linewidth=1.5, edgecolor='lime', facecolor='none', linestyle='--')
+            ax_buffer.add_patch(rect1)
+            ax_buffer.add_patch(rect2)
+        # Injection
+        ax_buffer.axvline(inj_params[0, 0], color='r', ls='--', lw=0.8)
+        ax_buffer.axhline(inj_params[0, 1], color='r', ls='--', lw=0.8)
+        ax_buffer.set_xlabel(_ORDERED_PRIOR_KEYS[in_param_idx[0]])
+        ax_buffer.set_ylabel(_ORDERED_PRIOR_KEYS[in_param_idx[1]])
+        ax_buffer.legend(fontsize=7)
 
-    def _compute_posterior_volume_1d(self, widest_interval):
-        """Compute the width of the posterior credible interval for a 1D marginal.
-        
-        Parameters:
-        -----------
-        widest_interval : list
-            [low, high] bounds of the credible interval.
-            
-        Returns:
-        --------
-        float
-            Width of the posterior interval.
-        """
-        return widest_interval[1] - widest_interval[0]
-    
-    def _compute_prior_volume_1d(self, pl_module, in_param_idx):
-        """Compute the width of the prior for a 1D marginal.
-        
-        Parameters:
-        -----------
-        pl_module : LightningModule
-            The model containing prior information in hparams.
-        in_param_idx : int
-            Index of the parameter.
-            
-        Returns:
-        --------
-        float
-            Width of the prior range.
-        """
-        # Use the actual sampling prior (sampler_init_kwargs) as the
-        # authoritative source.  Fall back to conf["prior"] for backward compat.
-        _sik = pl_module.hparams["dataset_info"].get("sampler_init_kwargs", {})
-        if "prior_bounds" in _sik:
-            prior_dict = _sik["prior_bounds"]
-        else:
-            prior_dict = pl_module.hparams["dataset_info"]["conf"]["prior"]
-        param_name = _ORDERED_PRIOR_KEYS[in_param_idx]
-        prior_bounds = prior_dict[param_name]
-        return prior_bounds[1] - prior_bounds[0]
+    # Return in the same (x_low, x_high, y_low, y_high) format as get_widest_box_2d
+    widest_box = (lam_lo, lam_hi, beta_lo, beta_hi)
+    return widest_box, inj_params, sky_analysis
 
-    def on_validation_epoch_end(self, trainer, pl_module):
-        if self.epochs_elapsed == 0: 
-            os.makedirs(os.path.join(ROOT_DIR, "plots", self.timestamp), exist_ok=True)
-
-        self.epochs_elapsed += 1
-        if (self.epochs_elapsed-2) % self.call_every_n_epochs == 0:
-            #print("plotting posteriors on observed data")
-            train_time = datetime.now() - self.init_time
-            td_trunc = train_time - timedelta(microseconds=train_time.microseconds)
-            title_plot = f"training time={td_trunc}s"
-            # plot the posterior on the observed data , using the current model
-            for i in range(self.n_marginals):
-                in_param_idx = self.input_idx_list[i]
-                out_param_idx = self.output_idx_list[i]
-
-                # Initialize widest_boxes dict if not present
-                if not hasattr(pl_module, 'widest_boxes'):
-                    pl_module.widest_boxes = {}
-                marginal_key = tuple(in_param_idx)
-
-                if len(in_param_idx) == 1:
-                    # Handle 1D marginals
-                    param_idx = in_param_idx[0]
-                    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
-                    fig.suptitle(
-                        f"Round {self.round_idx} - Epoch {trainer.current_epoch} - {title_plot}",
-                        fontsize=10,
-                    )
-                    
-                    try:
-                        epsilon_value = 1e-4
-                        widest_interval, norm1d, grid, inj_params = get_widest_interval_1d(
-                            pl_module,
-                            self.obs_loader,
-                            in_param_idx=param_idx,
-                            out_param_idx=out_param_idx,
-                            eps=epsilon_value
-                        )
-                        
-                        # Plot
-                        ax.plot(grid.flatten(), norm1d, 'b-', linewidth=1.5)
-                        ax.axvline(inj_params[0], color='r', linestyle='--', label='Injection')
-                        ax.axvline(widest_interval[0], color='g', linestyle=':', label=f'{100*(1-epsilon_value):.2f}% CI')
-                        ax.axvline(widest_interval[1], color='g', linestyle=':')
-                        ax.fill_between(grid.flatten(), 0, norm1d, 
-                                       where=(grid.flatten() >= widest_interval[0]) & (grid.flatten() <= widest_interval[1]),
-                                       alpha=0.3, color='green')
-                        ax.set_xlabel(_ORDERED_PRIOR_KEYS[param_idx])
-                        ax.set_ylabel('Posterior density')
-                        ax.legend()
-                        
-                        # Store the widest interval
-                        pl_module.widest_boxes[marginal_key] = widest_interval
-                        
-                        # Compute posterior-to-prior volume (width) ratio for 1D marginal
-                        posterior_width = self._compute_posterior_volume_1d(widest_interval)
-                        prior_width = self._compute_prior_volume_1d(pl_module, param_idx)
-                        volume_ratio = posterior_width / prior_width
-                        
-                        # Store and log the volume ratio
-                        if marginal_key not in self.volume_ratios:
-                            self.volume_ratios[marginal_key] = []
-                        self.volume_ratios[marginal_key].append({
-                            'epoch': trainer.current_epoch,
-                            'ratio': volume_ratio,
-                            'posterior_width': posterior_width,
-                            'prior_width': prior_width
-                        })
-                        
-                        # Log metric to tensorboard if logger exists
-                        if trainer.logger is not None:
-                            metric_name = f"volume_ratio/{_ORDERED_PRIOR_KEYS[param_idx]}"
-                            trainer.logger.log_metrics({metric_name: volume_ratio}, step=trainer.current_epoch)
-                        
-                        # Print diagnostic
-                        param_name = _ORDERED_PRIOR_KEYS[param_idx]
-                        print(f"Round {self.round_idx}, Epoch {trainer.current_epoch}, {param_name}: "
-                              f"Volume ratio (posterior/prior) = {volume_ratio:.6f} "
-                              f"(posterior width: {posterior_width:.6e}, prior width: {prior_width:.6e})")
-                        
-                        out = os.path.join(ROOT_DIR, "plots", self.timestamp, 
-                                          f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{_ORDERED_PRIOR_KEYS[param_idx]}.pdf")
-                        fig.savefig(out, bbox_inches="tight")
-                    except Exception as e:
-                        print(f"Error plotting 1D marginal for {_ORDERED_PRIOR_KEYS[param_idx]}: {e}")
-                    finally:
-                        plt.close(fig)
-
-                elif len(in_param_idx) == 2:
-                    # Handle 2D marginals
-                    fig, ax = plt.subplots(1, 1, figsize=(4, 4))
-                    fig.tight_layout()
-                    fig.suptitle(
-                        f"Round {self.round_idx} - Epoch {trainer.current_epoch} - {title_plot}",
-                        fontsize=10,
-                    )
-
-                    try:
-                        widest_box, inj_params = get_widest_box_2d(
-                            pl_module,
-                            self.obs_loader,
-                            in_param_idx=in_param_idx,
-                            out_param_idx=out_param_idx,
-                            ax_buffer=ax,
-                            do_plot=True
-                        )
-
-                        # Store widest_box keyed by the marginal (tuple of input parameter indices)
-                        pl_module.widest_boxes[marginal_key] = widest_box
-                        
-                        # Compute posterior-to-prior volume ratio for 2D marginal
-                        posterior_area = self._compute_posterior_volume_2d(widest_box)
-                        prior_area = self._compute_prior_volume_2d(pl_module, in_param_idx)
-                        volume_ratio = posterior_area / prior_area
-                        
-                        # Store and log the volume ratio
-                        if marginal_key not in self.volume_ratios:
-                            self.volume_ratios[marginal_key] = []
-                        self.volume_ratios[marginal_key].append({
-                            'epoch': trainer.current_epoch,
-                            'ratio': volume_ratio,
-                            'posterior_area': posterior_area,
-                            'prior_area': prior_area
-                        })
-                        
-                        # Log metric to tensorboard if logger exists
-                        if trainer.logger is not None:
-                            metric_name = f"volume_ratio/{_ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{_ORDERED_PRIOR_KEYS[in_param_idx[1]]}"
-                            trainer.logger.log_metrics({metric_name: volume_ratio}, step=trainer.current_epoch)
-                        
-                        # Print diagnostic
-                        param_names = f"{_ORDERED_PRIOR_KEYS[in_param_idx[0]]}-{_ORDERED_PRIOR_KEYS[in_param_idx[1]]}"
-                        print(f"Round {self.round_idx}, Epoch {trainer.current_epoch}, {param_names}: "
-                              f"Volume ratio (posterior/prior) = {volume_ratio:.6f} "
-                              f"(posterior area: {posterior_area:.6e}, prior area: {prior_area:.6e})")
-                        
-                        out = os.path.join(ROOT_DIR, "plots", self.timestamp,
-                                          f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{_ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{_ORDERED_PRIOR_KEYS[in_param_idx[1]]}.pdf")
-                        fig.savefig(out, bbox_inches="tight")
-                    except ValueError as ve:
-                        print(f"caught ValueError: {ve} during contour plotting, skipping this plot")
-                    finally:
-                        plt.close(fig)
-
-    def on_train_end(self, trainer, pl_module):
-        self.on_validation_epoch_end(trainer, pl_module)
-        print(f"Total training time: {datetime.now() - self.init_time}")

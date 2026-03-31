@@ -25,9 +25,9 @@ DAY_SI = 24 * 3600
 
 class MBHBSimulatorFD_TD:
 
-    def __init__(self, conf, sampler_init_kwargs, seed=0):
+    def __init__(self, conf, sampler_init_kwargs, seed=0, sampler=None):
         self.rng = np.random.default_rng(seed)
-        self.sampler = UniformSampler(**sampler_init_kwargs)
+        self.sampler = sampler if sampler is not None else UniformSampler(**sampler_init_kwargs)
         self.backend_name = conf.get("backend", "cpu")
 
         self.dt = conf["waveform_params"]["dt"] 
@@ -143,30 +143,22 @@ class MBHBSimulatorFD_TD:
             wave_pos = wave_pos.get()
         wave_pos = wave_pos.astype(np.complex64)
         wave_pos = wave_pos[:, self.channels_idx,:]
-        noise_pos = self._noise_pos(n_obs).astype(get_numpy_complex_dtype())
 
         wave_two = self._two_sided(wave_pos)
-        noise_two = self._two_sided(noise_pos)
-
         wave_td = np.fft.ifft(wave_two, axis=2).real / self.dt
-        noise_td = np.fft.ifft(noise_two, axis=2).real / self.dt
-
         wave_td = wave_td[..., :self.n_time]
-        noise_td = noise_td[..., :self.n_time]
 
-        return noise_pos, wave_pos, noise_td, wave_td
+        return wave_pos, wave_td
 
     # -----------------------------------------
     def sample(self, N):
         z, inj = self.sampler.sample(N, self.t_obs_end_SI)
 
-        noise_fd, wave_fd, noise_td, wave_td = self.generate(z)
+        wave_fd, wave_td = self.generate(z)
         return {
             "parameters": inj,
             "bbhx_parameters": z,
-            "noise_fd": noise_fd,
             "wave_fd": wave_fd,
-            "noise_td": noise_td,
             "wave_td": wave_td
         }
 
@@ -193,41 +185,34 @@ class MBHBSimulatorFD_TD:
             sample_times_SI = f.create_dataset("times_SI", data=np.arange(0, self.n_time)*self.dt, dtype=_np_real)
             wave_fd = f.create_dataset("wave_fd", shape=(N, self.n_channels, self.n_freqs_pos), dtype=_np_complex)
             wave_td = f.create_dataset("wave_td", shape=(N, self.n_channels, self.n_time), dtype=_np_real)
-            noise_fd = f.create_dataset("noise_fd", shape=(N, self.n_channels, self.n_freqs_pos), dtype=_np_complex)
-            noise_td = f.create_dataset("noise_td", shape=(N, self.n_channels, self.n_time), dtype=_np_real)
             snr = f.create_dataset("snr", shape = (N,), dtype=_np_real)
             asd_dataset = f.create_dataset("asd", data=self.asd, dtype=_np_real)
             print("Sampling and storing simulations to ", filename)
             maximum_timedomain = 0
-            
+
             for i in tqdm(range(0, N, batch_size)):
                 batch_end = min(i + batch_size, N)
                 batch_size_actual = batch_end - i
                 out = self.sample(batch_size_actual)
                 z_samples = out["parameters"]
-                noise_fd_batch = out["noise_fd"]
                 wave_fd_batch = out["wave_fd"]
-                noise_td_batch = out["noise_td"]
                 wave_td_batch = out["wave_td"]
                 bbhx_params_batch = out["bbhx_parameters"].T
                 current_max_td = np.max( np.abs(wave_td_batch) )
                 #for normalisation purpose and easy access during training, store the maximum value across the time domain data
                 if current_max_td > maximum_timedomain:
                     maximum_timedomain = current_max_td
-                noise_fd_batch = out["noise_fd"]
-                snr_batch = self.get_SNR_FD(noise_fd_batch + wave_fd_batch)
+                # SNR is matched-filter (waveform-only) rather than noisy-data SNR
+                snr_batch = self.get_SNR_FD(wave_fd_batch)
                 source_params[i:batch_end] = z_samples.T # Reshape to (batch_size, 11) instead of (11, batch_size)
                 wave_fd[i:batch_end] = wave_fd_batch
                 wave_td[i:batch_end] = wave_td_batch
-                noise_fd[i:batch_end] = noise_fd_batch
-                noise_td[i:batch_end] = noise_td_batch
                 bbhx_params[i:batch_end] = bbhx_params_batch
                 snr[i:batch_end] = snr_batch
         # print all shapes
             print("HDF5 dataset shapes (current state):")
             for dname in ["source_parameters", "frequencies", "times_SI",
-                        "wave_fd", "wave_td", "noise_fd", "noise_td",
-                        "snr", "asd"]:
+                        "wave_fd", "wave_td", "snr", "asd"]:
                 if dname in f:
                     ds = f[dname]
                     print(f"  {dname}: shape={tuple(ds.shape)}, dtype={ds.dtype}")
@@ -324,9 +309,9 @@ class MBHBSimulatorFD_TD:
 # =========================================================================
 
 _SENS_MAP = {
-    "A": lisasens.A1TDISens,
-    "E": lisasens.E1TDISens,
-    "T": lisasens.T1TDISens,
+    "A": lisasens.A2TDISens,
+    "E": lisasens.E2TDISens,
+    "T": lisasens.T2TDISens,
 }
 
 
@@ -383,6 +368,7 @@ def setup_bbhx(backend):
         "TDItag": "AET",
         "rescaled": False,
         "orbits": orbits,
+        "tdi2": True
     }
     wfd = BBHWaveformFD(
         amp_phase_kwargs=dict(run_phenomd=False),
@@ -404,16 +390,17 @@ class MBHBSimulatorFD:
     """
 
     def __init__(self, conf, sampler_init_kwargs, seed=0,
-                 n_freq_bins=4096, freq_spacing="linear"):
+                 n_freq_bins=4096, freq_spacing="linear", sampler=None):
         """
         :param conf: datagen config dict (same format as MBHBSimulatorFD_TD)
         :param sampler_init_kwargs: dict with 'prior_bounds' key
         :param seed: RNG seed
         :param n_freq_bins: number of frequency bins (default 4096)
         :param freq_spacing: 'linear' or 'log'
+        :param sampler: optional pre-built sampler (overrides sampler_init_kwargs)
         """
         self.rng = np.random.default_rng(seed)
-        self.sampler = UniformSampler(**sampler_init_kwargs)
+        self.sampler = sampler if sampler is not None else UniformSampler(**sampler_init_kwargs)
         self.backend_name = conf.get("backend", "cpu")
 
         self.channels = conf["waveform_params"]["channels"]
@@ -425,11 +412,11 @@ class MBHBSimulatorFD:
         dt = conf["waveform_params"]["dt"]
         self.t_obs_start_SI = 0
         self.t_obs_end_SI = conf["waveform_params"]["duration"] * WEEK_SI
-        obs_length = self.t_obs_end_SI - self.t_obs_start_SI
+        self.obs_length = self.t_obs_end_SI - self.t_obs_start_SI
 
         # Frequency grid — free from FFT constraints
         self.fmax = 1.0 / (2.0 * dt)
-        self.fmin = max(1e-5, 1.0 / obs_length)
+        self.fmin = max(1e-5, 1.0 / self.obs_length)
         self.n_freq_bins = n_freq_bins
         self.freq_spacing = freq_spacing
 
@@ -491,10 +478,10 @@ class MBHBSimulatorFD:
 
     # -----------------------------------------
     def generate(self, inj):
-        """Generate FD waveform and noise for a batch of injections.
+        """Generate FD waveform for a batch of injections.
 
         :param inj: injection parameters, shape (n_params, n_obs)
-        :return: (noise_fd, wave_fd) — both shape (n_obs, n_channels, n_freq_bins)
+        :return: wave_fd — shape (n_obs, n_channels, n_freq_bins)
         """
         inj = inj.copy()
         n_obs = inj.shape[1]
@@ -505,25 +492,20 @@ class MBHBSimulatorFD:
         wave = wave.astype(get_numpy_complex_dtype())
         wave = wave[:, self.channels_idx, :]
 
-        noise = generate_noise_fd(
-            self.rng, self.filtered_asd, self.df, n_obs
-        ).astype(get_numpy_complex_dtype())
-
-        return noise, wave
+        return wave
 
     # -----------------------------------------
     def sample(self, N):
         """Draw N samples from the prior and simulate FD data.
 
         :param N: number of samples
-        :return: dict with keys 'parameters', 'bbhx_parameters', 'noise_fd', 'wave_fd'
+        :return: dict with keys 'parameters', 'bbhx_parameters', 'wave_fd'
         """
         z, inj = self.sampler.sample(N, self.t_obs_end_SI)
-        noise_fd, wave_fd = self.generate(z)
+        wave_fd = self.generate(z)
         return {
             "parameters": inj,
             "bbhx_parameters": z,
-            "noise_fd": noise_fd,
             "wave_fd": wave_fd,
         }
 
@@ -551,7 +533,6 @@ class MBHBSimulatorFD:
             f.create_dataset("frequencies", data=self.freqs, dtype=_np_real)
             f.create_dataset("df", data=self.df, dtype=_np_real)
             wave_fd = f.create_dataset("wave_fd", shape=(N, self.n_channels, self.n_freq_bins), dtype=_np_complex)
-            noise_fd = f.create_dataset("noise_fd", shape=(N, self.n_channels, self.n_freq_bins), dtype=_np_complex)
             snr = f.create_dataset("snr", shape=(N,), dtype=_np_real)
             f.create_dataset("asd", data=self.asd, dtype=_np_real)
 
@@ -560,7 +541,7 @@ class MBHBSimulatorFD:
             f.attrs["n_freq_bins"] = self.n_freq_bins
             f.attrs["fmin"] = self.fmin
             f.attrs["fmax"] = self.fmax
-
+            f.attrs["observation_duration_SI"] = self.obs_length
             print("Sampling and storing FD-only simulations to", filename)
             for i in tqdm(range(0, N, batch_size)):
                 batch_end = min(i + batch_size, N)
@@ -569,12 +550,12 @@ class MBHBSimulatorFD:
                 source_params[i:batch_end] = out["parameters"].T
                 bbhx_params[i:batch_end] = out["bbhx_parameters"].T
                 wave_fd[i:batch_end] = out["wave_fd"]
-                noise_fd[i:batch_end] = out["noise_fd"]
-                snr[i:batch_end] = self.get_SNR_FD(out["noise_fd"] + out["wave_fd"])
+                # SNR is matched-filter (waveform-only) rather than noisy-data SNR
+                snr[i:batch_end] = self.get_SNR_FD(out["wave_fd"])
 
             print("HDF5 dataset shapes (current state):")
             for dname in ["source_parameters", "frequencies", "df",
-                          "wave_fd", "noise_fd", "snr", "asd"]:
+                          "wave_fd", "snr", "asd"]:
                 if dname in f:
                     ds = f[dname]
                     print(f"  {dname}: shape={tuple(ds.shape)}, dtype={ds.dtype}")

@@ -13,15 +13,15 @@ waveform_params:
 prior:
   "logMchirp": [5.2, 5.3]
   "q":         [1.0, 5.0]          # mass ratio
-  "chi1":       [0.0,0.0]
-  "chi2":       [0.0,0.0]
+  "chi1":       [0.0, 0.0]
+  "chi2":       [0,0]
   "dist":       [10,10]            # dist in Gpc (note that we shall sample uniformly dist^3)
-  "phi":        [0.0, 0.0]
-  "inc":        [0.5 ,0.5]         # cos inclination
+  "phi":        [0.0,6.283185307179586]       # phase at coalescence
+  "inc":        [-1.0,1.0]         # cos inclination
   "lambda":     [0,6.283185307179586]       # ecliptic longitude
   "beta":       [-1.0,1.0]             # sin ecliptic latitude
-  "psi":        [1.0, 1.0]
-  "Deltat":     [-2.45, -2.55]         # t_merger from end of observation in days
+  "psi":        [1.0,1.0]      # polarization angle
+  "Deltat":     [-2.55, -2.45]         # t_merger from end of observation in days
 
 backend: "cuda12x"
 

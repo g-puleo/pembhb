@@ -29,23 +29,41 @@ class MBHBDataset(Dataset):
             else:
                 self.asd = None
 
+            # Pre-compute noise_scale = filtered_asd / sqrt(4 * df) for on-the-fly noise generation.
+            # Zero-valued bins (below high-pass cutoff) naturally produce zero noise.
+            if "asd" in f and "frequencies" in f:
+                asd_np = f["asd"][()]
+                freqs_np = f["frequencies"][()]
+                # Per-bin df: stored explicitly for non-uniform grids; derived for uniform grids
+                T_obs_total = f.attrs["observation_duration_SI"]
+                filtered_asd = asd_np.copy()
+                filtered_asd[:, freqs_np < 5e-5] = 0.0
+                self.noise_scale = torch.tensor( 
+                    filtered_asd / np.sqrt(4.0 / T_obs_total ), dtype=get_torch_dtype()
+                )
+            else:
+                self.noise_scale = None
+
+            # TD params (dt, n_time) needed for on-the-fly TD noise via IFFT
+            if self.has_td and "times_SI" in f:
+                times_np = f["times_SI"][()]
+                self.td_params = (float(times_np[1] - times_np[0]), len(times_np))
+            else:
+                self.td_params = None
+
             if cache_in_memory:
                 self.wave_fd = torch.tensor(f["wave_fd"][()], device="cpu", dtype=get_torch_complex_dtype())
-                self.noise_fd = torch.tensor(f["noise_fd"][()], device="cpu", dtype=get_torch_complex_dtype())
                 self.source_parameters = torch.tensor(f["source_parameters"][()], device="cpu", dtype=get_torch_dtype())
                 if self.has_td:
                     self.wave_td = torch.tensor(f["wave_td"][()], device="cpu", dtype=get_torch_dtype())
-                    self.noise_td = torch.tensor(f["noise_td"][()], device="cpu", dtype=get_torch_dtype())
                 else:
                     self.wave_td = None
-                    self.noise_td = None
             else:
                 self.wave_fd = self.wave_td = self.parameters = None
-                # noise_fd / noise_td not loaded; collate_fn will handle sampling
 
         if self.cache_in_memory:
             self._load = self._load_from_memory
-        else: 
+        else:
             self._load  = self._load_from_disk
         
     def _load_from_memory(self, key, idx):
@@ -75,13 +93,15 @@ class MBHBDataset(Dataset):
     
     def to(self, device):
         if self.cache_in_memory:
-            keys = ["wave_fd", "source_parameters", "noise_fd"]
+            keys = ["wave_fd", "source_parameters"]
             if self.has_td:
-                keys += ["wave_td", "noise_td"]
+                keys += ["wave_td"]
             for k in keys:
                 tensor = getattr(self, k, None)
                 if tensor is not None:
                     setattr(self, k, tensor.to(device))
+            if self.noise_scale is not None:
+                self.noise_scale = self.noise_scale.to(device)
             self.device = device
         else:
             print("Dataset not cached in memory; cannot move to device.")
@@ -90,17 +110,17 @@ class MBHBDataset(Dataset):
     def clear_cache(self):
         """Free cached tensors and switch to disk-based loading."""
         if self.cache_in_memory:
-            keys = ["wave_fd", "wave_td", "source_parameters", "noise_fd", "noise_td"]
+            keys = ["wave_fd", "wave_td", "source_parameters"]
             for k in keys:
                 if hasattr(self, k) and getattr(self, k) is not None:
                     delattr(self, k)
-            self.wave_fd = self.wave_td = self.source_parameters = self.noise_fd = self.noise_td = None
+            self.wave_fd = self.wave_td = self.source_parameters = None
             self.cache_in_memory = False
             self._load = self._load_from_disk
             gc.collect()
             torch.cuda.empty_cache()
             print("[Dataset] Cache cleared, switched to disk-based loading.")
-        else: 
+        else:
             print("[Dataset] Not cached in memory; nothing to clear.")
     #         print("Dataset not cached in memory; nothing to clear.")
     #         return
@@ -196,17 +216,27 @@ class MBHBDataModule( L.LightningDataModule ):
 
     def train_dataloader(self, shuffle=True, num_workers=None, pin_memory=False):
         if num_workers is None:
-            num_workers = self.num_workers  
-
-        return DataLoader(self.train, batch_size=self.batch_size, shuffle=shuffle, num_workers=num_workers, 
+            num_workers = self.num_workers
+        noise_scale = self.full_dataset.noise_scale
+        td_params = self.full_dataset.td_params
+        return DataLoader(self.train, batch_size=self.batch_size, shuffle=shuffle, num_workers=num_workers,
                           pin_memory=pin_memory,
-                          collate_fn=lambda b: mbhb_collate_fn(b, self.train, self.noise_factor, noise_shuffling=shuffle))
+                          collate_fn=lambda b: mbhb_collate_fn(b, noise_scale, self.noise_factor,
+                                                                noise_shuffling=shuffle, td_params=td_params))
 
     def val_dataloader(self, shuffle=True):
-        return DataLoader(self.val, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, collate_fn=lambda b: mbhb_collate_fn(b, self.val, self.noise_factor, noise_shuffling=False))
-    
+        noise_scale = self.full_dataset.noise_scale
+        td_params = self.full_dataset.td_params
+        return DataLoader(self.val, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers,
+                          collate_fn=lambda b: mbhb_collate_fn(b, noise_scale, self.noise_factor,
+                                                                noise_shuffling=False, td_params=td_params))
+
     def test_dataloader(self):
-        return DataLoader(self.test, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, collate_fn=lambda b: mbhb_collate_fn(b, self.test, self.noise_factor, noise_shuffling=False))
+        noise_scale = self.full_dataset.noise_scale
+        td_params = self.full_dataset.td_params
+        return DataLoader(self.test, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers,
+                          collate_fn=lambda b: mbhb_collate_fn(b, noise_scale, self.noise_factor,
+                                                                noise_shuffling=False, td_params=td_params))
 
 class DummyDataset(Dataset):
     def __init__(self, params, data):

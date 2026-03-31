@@ -10,7 +10,7 @@ import numpy as np
 import corner
 import matplotlib.pyplot as plt
 from bbhx.likelihood import Likelihood
-from pembhb.simulator import MBHBSimulatorFD_TD
+from pembhb.simulator import MBHBSimulatorFD_TD, MBHBSimulatorFD
 from pembhb.utils import read_config, _ORDERED_PRIOR_KEYS
 from pembhb import ROOT_DIR
 import h5py
@@ -24,7 +24,7 @@ def main():
     # 5d
     #observation_file = "/data/gpuleo/mbhb/observation_skyloc_tc_mass.h5"
     # 2d 
-    observation_file = "/data/gpuleo/mbhb/observation_skyloc_distGpc_tc.h5"
+    observation_file = "/data/gpuleo/mbhb/obs_logspace_freqonly_q3.h5"
     config_file = os.path.join(ROOT_DIR, "configs", "datagen_config.yaml")
     
     # Load configuration and data
@@ -52,13 +52,17 @@ def main():
         "Deltat": [0.0, 0.0],
     }
     print("Initializing simulator...")
-    simulator = MBHBSimulatorFD_TD(
+    wp = datagen_config["waveform_params"]
+    datagen_config["backend"] = "cpu"  # CuPy JIT incompatible with CUDA 12.4
+    simulator = MBHBSimulatorFD(
         datagen_config,
         sampler_init_kwargs={'prior_bounds': prior_bounds_dummy},
-        seed=42
+        seed=42,
+        n_freq_bins=wp.get("n_freq_bins", 4096),
+        freq_spacing=wp.get("freq_spacing", "log"),
     )
     sampler = simulator.sampler
-    frequencies = simulator.freqs_pos
+    frequencies = simulator.freqs
     
     # Extract observation
     print(f"Extracting event {event_idx}...")
@@ -227,7 +231,6 @@ def main():
 
     # Run MCMC
     nsteps = 1000
-    exit(1)
     print(f"\\n=== Running MCMC for {nsteps} steps ===")
     state = sampler_emcee.run_mcmc(pos, nsteps, progress=True)
     
@@ -267,7 +270,7 @@ def main():
         show_titles=True,
         title_kwargs={"fontsize": 12}
     )
-    name="5d_new"
+    name="5d_qwide"
     outdir = os.path.join(ROOT_DIR, "mc_results_emcee_vec", name)
     os.makedirs(outdir, exist_ok=True)
     output_file = os.path.join(outdir, "flat_samples.npy")

@@ -71,19 +71,6 @@ for i in indices:
     fig_fd, ax_fd = plt.subplots(1, 2, figsize=(8, 4))
 
     for c in range(2): 
-    #     ax_td[c].plot(times/DAY_SI, wave_td[i,c], label='A (wave)' if c==0 else 'E (wave)')
-    #     ax_td[c].plot(times/DAY_SI, noise_td[i,c], label='A (noise)' if c==0 else 'E (noise)', linestyle='--', alpha=0.7)
-    #     ax_td[c].plot(times/DAY_SI, wave_td[i,c] + noise_td[i,c], label='A (wave+noise)' if c==0 else 'E (wave+noise)', linestyle='-.', color='C3')
-        
-    #     ax_td[c].set_xlim(4.4,4.6)
-    #     # ax_td.set_ylim(-2e-21, 2e-21)
-
-    #     ax_td[c].set_title('data_td Example 1')
-    #     ax_td[c].set_xlabel('Time (days)')
-    #     ax_td[c].set_ylabel('Amplitude')
-    #     ax_td[c].legend()
-    #     ax_td[c].grid(True)
-
 
 
 

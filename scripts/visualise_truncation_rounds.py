@@ -58,7 +58,9 @@ def load_prior_box(round_dir: str, round_number: int) -> dict:
 
     Returns a dict mapping parameter name → ``(low, high)`` tuple.
     """
-    yaml_path = os.path.join(round_dir, f"simulation_round_{round_number}.yaml")
+    round_dir_basename = os.path.basename(round_dir)
+    round_path_data = f"/data/gpuleo/mbhb/{round_dir_basename}"
+    yaml_path = os.path.join(round_path_data, f"simulation_round_{round_number}.yaml")
     with open(yaml_path, "r") as f:
         conf = yaml.safe_load(f)
     prior = conf.get("prior") or conf["conf"]["prior"]
@@ -102,6 +104,20 @@ def get_all_marginals(model: InferenceNetwork) -> list:
             continue  # skip higher-dimensional marginals
         result.append((label, ndim, in_idx, out_idx))
     return result
+
+
+def find_out_param_idx(model: InferenceNetwork, in_param_idx):
+    """Return the output column index for *in_param_idx* in *model.marginals_list*.
+
+    Returns ``None`` if the marginal is not present in this model (e.g. it was
+    only introduced in a later round).
+    """
+    for out_idx, marginal in enumerate(model.marginals_list):
+        ndim = len(marginal)
+        in_idx = marginal[0] if ndim == 1 else tuple(marginal)
+        if in_idx == in_param_idx:
+            return out_idx
+    return None
 
 
 def compute_normalised_posterior(
@@ -303,22 +319,33 @@ def plot_1d_prior_evolution(
         print(f"  [1-D {param_key}] Round {i + 1}: evaluating posterior...")
         model = load_model(os.path.join(round_dir, "checkpoints"))
 
+        # Look up the output column for this marginal in this round's model.
+        # It may be absent if the marginal was only introduced in a later round.
+        _out_param_idx = find_out_param_idx(model, in_param_idx)
+        if _out_param_idx is None:
+            print(f"  [1-D {param_key}] Round {i + 1}: marginal not in model — skipping.")
+            del model
+            for lvl in hpd_levels:
+                hpd_lows[lvl].append(np.nan)
+                hpd_highs[lvl].append(np.nan)
+            continue
+
         # Use higher resolution for the final round if requested
         _ngrid = ngrid_points_1d if (i == n_rounds - 1) else ngrid_points
-        if in_param_idx == 10: 
+        if in_param_idx == 10:
             low = -2.5-3e-5
             high = -2.5+3e-5
         else:
             low = None
             high = None
-        
+
         logratios, inj_params, grid = get_logratios_grid(
             dataloader,
             model,
             ngrid_points=_ngrid,
             in_param_idx=in_param_idx,
-            out_param_idx=out_param_idx,
-            low=low, 
+            out_param_idx=_out_param_idx,
+            low=low,
             high=high
         )
         del model
@@ -326,6 +353,10 @@ def plot_1d_prior_evolution(
         dp = grid[1, 0] - grid[0, 0]
         norm1d = ratios / np.sum(ratios * dp)
         grid_1d = grid[:, 0]
+
+        # Store injection value from the first available round (same obs every round)
+        if final_inj is None:
+            final_inj = float(inj_params[0])
 
         # HPD intervals (use the ngrid_points resolution for consistency
         # when this is not the final round; for the final round the higher
@@ -335,11 +366,9 @@ def plot_1d_prior_evolution(
             hpd_lows[lvl].append(lo)
             hpd_highs[lvl].append(hi)
 
-        # Keep final round data
-        if i == n_rounds - 1:
-            final_norm1d = norm1d
-            final_grid_1d = grid_1d
-            final_inj = float(inj_params[0])
+        # Keep final available round's data for the density panel
+        final_norm1d = norm1d
+        final_grid_1d = grid_1d
 
     # ---- Create figure with two panels: HPD evolution + final-round density ----
     fig, (ax_hpd, ax_dens) = plt.subplots(
@@ -368,6 +397,11 @@ def plot_1d_prior_evolution(
     ax_hpd.plot(round_indices, prior_highs, color="black",
                 linestyle="--", linewidth=1.2)
 
+    # True parameter value as a horizontal reference line
+    if final_inj is not None:
+        ax_hpd.axhline(y=final_inj, color="r", linestyle="--",
+                       linewidth=1.5, label="True value")
+
     ax_hpd.set_xlabel("Round")
     ax_hpd.set_ylabel(param_key)
     ax_hpd.set_title(f"1-D posterior HPD evolution: {param_key}")
@@ -376,6 +410,13 @@ def plot_1d_prior_evolution(
     ax_hpd.grid(True, linestyle="--", alpha=0.4)
 
     # --- Right panel: final-round 1-D posterior density ---
+    if final_norm1d is None:
+        ax_dens.text(0.5, 0.5, "marginal not trained\nin any round",
+                     ha="center", va="center", transform=ax_dens.transAxes,
+                     fontsize=11, color="gray")
+        axes_dict = {"hpd": ax_hpd, "density": ax_dens}
+        return fig, axes_dict
+
     ax_dens.plot(final_grid_1d, final_norm1d, "b-", linewidth=2, label="NRE")
     ax_dens.fill_between(final_grid_1d, 0, final_norm1d, alpha=0.3, color="b")
     ax_dens.axvline(x=final_inj, color="r", linestyle="--", linewidth=2, label="Injection")
@@ -788,6 +829,7 @@ def plot_truncation_rounds(
     rect_lw: float = 2.0,
     wspace: float = 0.35,
     mcmc_samples_dir: str = None,
+    in_param_idx_override=None,
 ):
     """Plot posterior-contour evolution across successive truncation rounds.
 
@@ -840,25 +882,35 @@ def plot_truncation_rounds(
     # Load prior boxes for every round (yaml files are 1-indexed)
     prior_boxes = [load_prior_box(d, i + 1) for i, d in enumerate(round_dirs)]
 
-    # Discover 2-D marginals from the first round's model
-    model_first = load_model(os.path.join(round_dirs[0], "checkpoints"))
-    marginals_2d = [
-        (label, in_idx, out_idx)
-        for label, ndim, in_idx, out_idx in get_all_marginals(model_first)
-        if ndim == 2
-    ]
-    del model_first
-    if not marginals_2d:
-        raise ValueError("No 2-D marginals found in the model output.")
-    print("    Available 2-D marginals:")
-    for j, (lbl, _, _) in enumerate(marginals_2d):
-        print(f"      [{j}] {lbl}")
-    if marginal_pair_idx >= len(marginals_2d):
-        raise IndexError(
-            f"marginal_pair_idx={marginal_pair_idx} out of range "
-            f"({len(marginals_2d)} 2-D marginals available)."
-        )
-    marginal_label, in_param_idx_fixed, out_param_idx_fixed = marginals_2d[marginal_pair_idx]
+    if in_param_idx_override is not None:
+        # Caller supplied in_param_idx directly; derive label and skip discovery.
+        in_param_idx_fixed = in_param_idx_override
+        p0 = _ORDERED_PRIOR_KEYS[in_param_idx_fixed[0]]
+        p1 = _ORDERED_PRIOR_KEYS[in_param_idx_fixed[1]]
+        marginal_label = f"{p0} vs {p1}"
+    else:
+        # Discover 2-D marginals across ALL rounds (union), so marginals that
+        # appear only in later rounds are included.
+        marginals_2d_seen = {}  # in_idx -> (label, out_idx) from first occurrence
+        for _rd in round_dirs:
+            _m = load_model(os.path.join(_rd, "checkpoints"))
+            for label, ndim, in_idx, out_idx in get_all_marginals(_m):
+                if ndim == 2 and in_idx not in marginals_2d_seen:
+                    marginals_2d_seen[in_idx] = (label, out_idx)
+            del _m
+        marginals_2d = [(lbl, in_idx, oidx)
+                        for in_idx, (lbl, oidx) in marginals_2d_seen.items()]
+        if not marginals_2d:
+            raise ValueError("No 2-D marginals found in any model output.")
+        print("    Available 2-D marginals (across all rounds):")
+        for j, (lbl, _, _) in enumerate(marginals_2d):
+            print(f"      [{j}] {lbl}")
+        if marginal_pair_idx >= len(marginals_2d):
+            raise IndexError(
+                f"marginal_pair_idx={marginal_pair_idx} out of range "
+                f"({len(marginals_2d)} 2-D marginals available)."
+            )
+        marginal_label, in_param_idx_fixed, _ = marginals_2d[marginal_pair_idx]
 
     # Detect sky-localisation marginal (lambda vs beta)
     p0_key_fixed = _ORDERED_PRIOR_KEYS[in_param_idx_fixed[0]]
@@ -907,7 +959,18 @@ def plot_truncation_rounds(
         model = load_model(os.path.join(round_dir, "checkpoints"))
 
         in_param_idx  = in_param_idx_fixed
-        out_param_idx = out_param_idx_fixed
+        # Look up the correct output column for this marginal in this round's model.
+        out_param_idx = find_out_param_idx(model, in_param_idx)
+        if out_param_idx is None:
+            print(f"    Marginal '{marginal_label}' not in round {i + 1} model — skipping panel.")
+            ax.text(0.5, 0.5, "not trained\nthis round",
+                    ha="center", va="center", transform=ax.transAxes,
+                    fontsize=11, color="gray")
+            ax.set_title(f"Round {i + 1}")
+            rectangles.append(None)
+            del model
+            continue
+
         p0_key = _ORDERED_PRIOR_KEYS[in_param_idx[0]]
         p1_key = _ORDERED_PRIOR_KEYS[in_param_idx[1]]
 
@@ -975,15 +1038,15 @@ def plot_truncation_rounds(
                 ax.grid(True, linestyle="--", alpha=0.4)
                 ax.set_aspect("equal", adjustable="box")
 
-            ax.set_title(f"Round {i + 1}")
-
-            # --- NRE sky area (widest contour = levels[-1], the lowest threshold) ---
+            # --- NRE sky area (widest contour: levels[0] = lowest threshold) ---
             dp_lam = gx[0, 1] - gx[0, 0]  if p0_key == "lambda" else gy[0, 1] - gy[0, 0]
             dp_bet = gy[1, 0] - gy[0, 0]  if p1_key == "beta"   else gx[1, 0] - gx[0, 0]
             nre_area = _compute_sky_area(norm2d[0], levels[0], dp_lam, dp_bet)
             sky_areas[i] = {"nre": nre_area}
             print(f"    NRE sky area ({level_labels[0]*100:.1f}% CR): "
                   f"{nre_area:.2f} sq deg")
+
+            ax.set_title(f"Round {i + 1}  ({nre_area:.1f} sq deg, {level_labels[0]*100:.0f}% CR)")
 
             # --- Overlay MCMC contours + area on last panel ---
             if mcmc_samples_dir is not None and i == n_rounds - 1:
@@ -1222,14 +1285,21 @@ def plot_all_marginals(
     -------
     dict mapping ``label → (fig, axes_or_ax)``
     """
-    # Discover all marginals once from the first round's model
-    model_0 = load_model(os.path.join(round_dirs[0], "checkpoints"))
-    all_marginals = get_all_marginals(model_0)
-    del model_0
+    # Discover all marginals across ALL rounds (union), so that marginals
+    # introduced in later rounds (e.g. round 2+) are not missed.
+    all_marginals_seen = {}  # in_param_idx -> (label, ndim, out_param_idx)
+    for _rd in round_dirs:
+        _m = load_model(os.path.join(_rd, "checkpoints"))
+        for label, ndim, in_idx, out_idx in get_all_marginals(_m):
+            if in_idx not in all_marginals_seen:
+                all_marginals_seen[in_idx] = (label, ndim, out_idx)
+        del _m
+    all_marginals = [(label, ndim, in_idx, out_idx)
+                     for in_idx, (label, ndim, out_idx) in all_marginals_seen.items()]
 
     n1d = sum(1 for _, ndim, _, _ in all_marginals if ndim == 1)
     n2d = sum(1 for _, ndim, _, _ in all_marginals if ndim == 2)
-    print(f"Found {n2d} 2-D marginal(s) and {n1d} 1-D marginal(s).")
+    print(f"Found {n2d} 2-D marginal(s) and {n1d} 1-D marginal(s) across all rounds.")
     for label, ndim, in_idx, out_idx in all_marginals:
         print(f"  {ndim}-D: {label}  (in={in_idx}, out={out_idx})")
 
@@ -1250,6 +1320,7 @@ def plot_all_marginals(
                 rect_lw=rect_lw,
                 wspace=wspace,
                 mcmc_samples_dir=mcmc_samples_dir,
+                in_param_idx_override=in_param_idx,
             )
             results[label] = (fig, axes, sky_areas)
             pair_idx += 1
@@ -1275,15 +1346,18 @@ def plot_all_marginals(
 # ---------------------------------------------------------------------------
 # Configuration — edit these to match your setup
 # ---------------------------------------------------------------------------
-name = "20260306autoenc_test5d"
+name = "202603267dim_inc_phi"
 round_dirs = [
     f"/data/gpuleo/mbhb/logs/{name}_round_1/version_0",
-    # "/data/gpuleo/mbhb/logs/{name}_round_2/version_0",
-    # f"/data/gpuleo/mbhb/logs/{name}_round_3/version_0",
+    f"/data/gpuleo/mbhb/logs/{name}_round_2/version_0",
+    f"/data/gpuleo/mbhb/logs/{name}_round_3/version_0",
     # f"/data/gpuleo/mbhb/logs/{name}_round_4/version_0",
+    # f"/data/gpuleo/mbhb/logs/{name}_round_5/version_0",
+    # f"/data/gpuleo/mbhb/logs/{name}_round_6/version_0",
+    # f"/data/gpuleo/mbhb/logs/{name}_round_7/version_0",
 ]
 
-data_path = "/data/gpuleo/mbhb/observation_skyloc_distGpc_tc.h5"
+data_path = "/data/gpuleo/mbhb/obs_logspace_freqonly_q3.h5"
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -1309,7 +1383,7 @@ if __name__ == "__main__":
         dataloader=dataloader_obs,
         ngrid_points=100,
         ngrid_points_1d=100,
-        mcmc_samples_dir="/u/g/gpuleo/pembhb/mc_results_emcee_vec/5d_new"
+        mcmc_samples_dir=None
     )
 
     for label, (fig, _, sky_areas) in figures.items():

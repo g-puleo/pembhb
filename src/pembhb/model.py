@@ -515,6 +515,124 @@ class InferenceNetwork(LightningModule):
         # )
         
 
+class PerMarginalInferenceNetwork(InferenceNetwork):
+    """InferenceNetwork variant where each marginal has its own dedicated
+    data encoder (ConvEncoder trained with parameter regression).
+
+    Architecture
+    ------------
+    For each marginal i:
+
+        noisy_FD  →  ConvEncoder_i  →  bottleneck_i
+        (bottleneck_i ‖ params_i)   →  classifier_i  →  logratio_i
+
+    The per-marginal encoders are produced by :class:`MarginalEncoderTrainer`
+    and frozen during NRE training.  Everything else (loss, optimiser,
+    callbacks, prior truncation, weight transfer across rounds) is inherited
+    unchanged from :class:`InferenceNetwork`.
+
+    Activation
+    ----------
+    Set ``architecture.data_summary.type: "MarginalEncoder"`` in
+    ``train_config.yaml``.  ``tmnre.py`` will then call
+    :meth:`SequentialTrainer._train_marginal_encoders` before the NRE step
+    and instantiate this class instead of :class:`InferenceNetwork`.
+    """
+
+    def __init__(
+        self,
+        train_conf: dict,
+        dataset_info: dict,
+        normalisation: dict,
+        data_summarizer=None,
+        periodic_bc_params: list = None,
+    ):
+        # If loading from checkpoint, data_summarizer is None.
+        # Build a dummy MarginalEncoderWrapper with the right architecture so
+        # that the parent __init__ succeeds; weights will be overwritten by
+        # load_state_dict() afterwards.
+        if data_summarizer is None:
+            data_summarizer = self._build_dummy_wrapper(train_conf)
+
+        # Parent constructs logratios_model_dict with one MarginalClassifierHead
+        # per domain.  Each classifier head holds individual nn.Sequential
+        # classifiers whose input size is (bottleneck_dim + len(remapped_marginal)).
+        # We reuse those classifiers verbatim – only the *routing* changes.
+        super().__init__(train_conf, dataset_info, normalisation, data_summarizer, periodic_bc_params)
+
+        # Build a flat ordered list of (domain, position-in-domain, remapped-indices)
+        # so that forward() can pair bottleneck[i] with the right classifier.
+        self._marginal_order = []
+        for domain in self.marginals_dict_remapped:
+            for pos, remapped_marginal in enumerate(self.marginals_dict_remapped[domain]):
+                self._marginal_order.append((domain, pos, remapped_marginal))
+
+    # ------------------------------------------------------------------
+    # Dummy wrapper for checkpoint loading
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_dummy_wrapper(train_conf: dict):
+        """Create a structurally correct MarginalEncoderWrapper with random
+        weights so that the module graph is valid during checkpoint loading.
+        Actual weights are restored from the checkpoint state-dict.
+        """
+        from pembhb.autoencoder import MarginalEncoderTrainer, MarginalEncoderWrapper
+        me_conf = train_conf["architecture"]["data_summary"]["MarginalEncoder"]
+        marginals_flat = [
+            marginal
+            for marginal_list in train_conf["marginals"].values()
+            for marginal in marginal_list
+        ]
+        hidden_channels = me_conf.get("hidden_channels", (32, 64, 128, 256, 256))
+        if isinstance(hidden_channels, list):
+            hidden_channels = tuple(hidden_channels)
+        regressor_hidden = me_conf.get("regressor_hidden_sizes", (128, 64))
+        if isinstance(regressor_hidden, list):
+            regressor_hidden = tuple(regressor_hidden)
+        trainer_model = MarginalEncoderTrainer(
+            n_channels=me_conf.get("n_channels", 2),
+            n_freqs=me_conf.get("n_freqs", 4096),
+            marginals=marginals_flat,
+            bottleneck_dim=me_conf.get("bottleneck_dim", 200),
+            hidden_channels=hidden_channels,
+            kernel_size=me_conf.get("kernel_size", 5),
+            stride=me_conf.get("stride", 2),
+            dropout=me_conf.get("dropout", 0.0),
+            residual=me_conf.get("residual", False),
+            regressor_hidden_sizes=regressor_hidden,
+            representation=me_conf.get("representation", "real_imag"),
+        )
+        return MarginalEncoderWrapper(trainer_model, freeze=True, device="cpu")
+
+    # ------------------------------------------------------------------
+    # Override forward: route each encoder's bottleneck to its classifier
+    # ------------------------------------------------------------------
+
+    def forward(self, d_f, d_t, parameters):
+        """Per-marginal forward pass.
+
+        Each encoder produces an independent bottleneck; each classifier
+        receives only its encoder's bottleneck (not a shared summary).
+        The output shape is identical to :class:`InferenceNetwork`:
+        ``(B, N_marginals)``.
+        """
+        # bottlenecks: list of (B, bottleneck_dim), one per marginal
+        bottlenecks, _d_t = self.data_summary(d_f, d_t)
+
+        normalised_parameters = (parameters - self.param_mean) / self.param_std
+        reparametrised = reparametrise_periodic_bc(normalised_parameters, self.periodic_bc_params)
+
+        logratios_list = []
+        for i, (domain, pos, remapped_marginal) in enumerate(self._marginal_order):
+            bottleneck  = bottlenecks[i]
+            classifier  = self.logratios_model_dict[domain].classifiers[pos]
+            input_data  = torch.cat([bottleneck, reparametrised[:, remapped_marginal]], dim=-1)
+            logratios_list.append(classifier(input_data))
+
+        return torch.cat(logratios_list, dim=-1)
+
+
 class SimpleModel(torch.nn.Module):
     def __init__(self, num_features: int, num_channels: int,  hlayersizes: tuple,  marginals: dict[list[list]], marginal_hidden_size: int, lr: float):  
         super().__init__()
@@ -1100,7 +1218,11 @@ class JointAEInferenceNetwork(LightningModule):
     # ------------------------------------------------------------------
 
     def _calc_ae_loss(self, batch):
-        """Compute the autoencoder reconstruction loss."""
+        """Compute the autoencoder reconstruction loss.
+
+        Always uses standard MSE on normalised representations.
+        Noise-weighted MSE caused bottleneck collapse (LISA ASD dynamic range).
+        """
         noisy = batch["wave_fd"] + batch["noise_fd"]
         clean = batch["wave_fd"]
 
