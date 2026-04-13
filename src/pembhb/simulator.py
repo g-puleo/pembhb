@@ -27,7 +27,7 @@ class MBHBSimulatorFD_TD:
 
     def __init__(self, conf, sampler_init_kwargs, seed=0, sampler=None):
         self.rng = np.random.default_rng(seed)
-        self.sampler = sampler if sampler is not None else UniformSampler(**sampler_init_kwargs)
+        self.sampler = sampler if sampler is not None else UniformSampler(**sampler_init_kwargs, rng=self.rng)
         self.backend_name = conf.get("backend", "cpu")
 
         self.dt = conf["waveform_params"]["dt"] 
@@ -162,7 +162,8 @@ class MBHBSimulatorFD_TD:
             "wave_td": wave_td
         }
 
-    def sample_and_store(self, filename:str, N:int, batch_size=None): 
+    def sample_and_store(self, filename:str, N:int, batch_size=None,
+                         store_noise: bool = False, noise_seed: int = 0):
         """Sample N samples and store them in an HDF5 file.
 
         :param filename: name of the file to store the samples
@@ -171,11 +172,21 @@ class MBHBSimulatorFD_TD:
         :type N: int
         :param batch_size: number of samples to generate in each batch, defaults to 1000
         :type batch_size: int, optional
+        :param store_noise: if True, also draw and persist a fixed noise
+            realisation per sample under the ``noise_fd`` HDF5 dataset.  The
+            draw uses an independent RNG seeded by ``noise_seed`` so signal
+            and noise sampling are decoupled.
+        :param noise_seed: seed for the noise RNG when ``store_noise=True``.
         :return: None
         """
         if batch_size is None:
             batch_size = max(1,int(N/10.0))
-        
+
+        noise_rng = np.random.default_rng(noise_seed) if store_noise else None
+        # Use the same colouring formula as _noise_pos / mbhb_collate_fn so
+        # stored noise is statistically identical to on-the-fly noise.
+        noise_scale_np = self.filtered_asd / np.sqrt(4 * self.df)
+
         with h5py.File(filename, "a") as f:
             _np_real = get_numpy_dtype()
             _np_complex = get_numpy_complex_dtype()
@@ -187,6 +198,13 @@ class MBHBSimulatorFD_TD:
             wave_td = f.create_dataset("wave_td", shape=(N, self.n_channels, self.n_time), dtype=_np_real)
             snr = f.create_dataset("snr", shape = (N,), dtype=_np_real)
             asd_dataset = f.create_dataset("asd", data=self.asd, dtype=_np_real)
+            if store_noise:
+                noise_fd_ds = f.create_dataset(
+                    "noise_fd",
+                    shape=(N, self.n_channels, self.n_freqs_pos),
+                    dtype=_np_complex,
+                )
+                f.attrs["noise_seed"] = int(noise_seed)
             print("Sampling and storing simulations to ", filename)
             maximum_timedomain = 0
 
@@ -209,10 +227,14 @@ class MBHBSimulatorFD_TD:
                 wave_td[i:batch_end] = wave_td_batch
                 bbhx_params[i:batch_end] = bbhx_params_batch
                 snr[i:batch_end] = snr_batch
+                if store_noise:
+                    z = (noise_rng.normal(size=(batch_size_actual, self.n_channels, self.n_freqs_pos))
+                         + 1j * noise_rng.normal(size=(batch_size_actual, self.n_channels, self.n_freqs_pos)))
+                    noise_fd_ds[i:batch_end] = (z * noise_scale_np[None, :, :]).astype(_np_complex)
         # print all shapes
             print("HDF5 dataset shapes (current state):")
             for dname in ["source_parameters", "frequencies", "times_SI",
-                        "wave_fd", "wave_td", "snr", "asd"]:
+                        "wave_fd", "wave_td", "noise_fd", "snr", "asd"]:
                 if dname in f:
                     ds = f[dname]
                     print(f"  {dname}: shape={tuple(ds.shape)}, dtype={ds.dtype}")
@@ -400,7 +422,7 @@ class MBHBSimulatorFD:
         :param sampler: optional pre-built sampler (overrides sampler_init_kwargs)
         """
         self.rng = np.random.default_rng(seed)
-        self.sampler = sampler if sampler is not None else UniformSampler(**sampler_init_kwargs)
+        self.sampler = sampler if sampler is not None else UniformSampler(**sampler_init_kwargs, rng=self.rng)
         self.backend_name = conf.get("backend", "cpu")
 
         self.channels = conf["waveform_params"]["channels"]
@@ -514,18 +536,29 @@ class MBHBSimulatorFD:
         return compute_snr_fd(signal, self.freqs, self.asd, self.df)
 
     # -----------------------------------------
-    def sample_and_store(self, filename: str, N: int, batch_size=None):
+    def sample_and_store(self, filename: str, N: int, batch_size=None,
+                         store_noise: bool = False, noise_seed: int = 0):
         """Sample N waveforms and store FD-only data to HDF5.
 
         :param filename: output HDF5 path
         :param N: total number of samples
         :param batch_size: samples per batch (default N/10)
+        :param store_noise: if True, also draw and persist a fixed noise
+            realisation per sample under the ``noise_fd`` HDF5 dataset.  The
+            draw uses an independent RNG seeded by ``noise_seed`` so signal
+            and noise sampling are decoupled.
+        :param noise_seed: seed for the noise RNG when ``store_noise=True``.
         """
         if batch_size is None:
             batch_size = max(1, int(N / 10.0))
 
         _np_real = get_numpy_dtype()
         _np_complex = get_numpy_complex_dtype()
+
+        noise_rng = np.random.default_rng(noise_seed) if store_noise else None
+        # Use the same colouring formula as mbhb_collate_fn so stored noise
+        # is statistically identical to on-the-fly noise.
+        noise_scale_np = self.filtered_asd / np.sqrt(4 * self.df)
 
         with h5py.File(filename, "a") as f:
             source_params = f.create_dataset("source_parameters", shape=(N, 11), dtype=_np_real)
@@ -535,6 +568,13 @@ class MBHBSimulatorFD:
             wave_fd = f.create_dataset("wave_fd", shape=(N, self.n_channels, self.n_freq_bins), dtype=_np_complex)
             snr = f.create_dataset("snr", shape=(N,), dtype=_np_real)
             f.create_dataset("asd", data=self.asd, dtype=_np_real)
+            if store_noise:
+                noise_fd_ds = f.create_dataset(
+                    "noise_fd",
+                    shape=(N, self.n_channels, self.n_freq_bins),
+                    dtype=_np_complex,
+                )
+                f.attrs["noise_seed"] = int(noise_seed)
 
             # Store metadata as HDF5 attributes
             f.attrs["freq_spacing"] = self.freq_spacing
@@ -552,10 +592,14 @@ class MBHBSimulatorFD:
                 wave_fd[i:batch_end] = out["wave_fd"]
                 # SNR is matched-filter (waveform-only) rather than noisy-data SNR
                 snr[i:batch_end] = self.get_SNR_FD(out["wave_fd"])
+                if store_noise:
+                    z = (noise_rng.normal(size=(batch_size_actual, self.n_channels, self.n_freq_bins))
+                         + 1j * noise_rng.normal(size=(batch_size_actual, self.n_channels, self.n_freq_bins)))
+                    noise_fd_ds[i:batch_end] = (z * noise_scale_np[None, :, :]).astype(_np_complex)
 
             print("HDF5 dataset shapes (current state):")
             for dname in ["source_parameters", "frequencies", "df",
-                          "wave_fd", "snr", "asd"]:
+                          "wave_fd", "noise_fd", "snr", "asd"]:
                 if dname in f:
                     ds = f[dname]
                     print(f"  {dname}: shape={tuple(ds.shape)}, dtype={ds.dtype}")

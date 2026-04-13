@@ -21,6 +21,9 @@ class MBHBDataset(Dataset):
         with h5py.File(self.filename, "r") as f:
             self.len = f["wave_fd"].shape[0]
             self.has_td = "wave_td" in f
+            # Stored noise (e.g. for observation files): when present, the
+            # collate fn will use it as-is rather than drawing fresh noise.
+            self.has_stored_noise = "noise_fd" in f
 
             # Load ASD (Amplitude Spectral Density) for noise-weighting.
             # Shape: (n_channels, n_freq).  This is the same for all samples.
@@ -38,7 +41,7 @@ class MBHBDataset(Dataset):
                 T_obs_total = f.attrs["observation_duration_SI"]
                 filtered_asd = asd_np.copy()
                 filtered_asd[:, freqs_np < 5e-5] = 0.0
-                self.noise_scale = torch.tensor( 
+                self.noise_scale = torch.tensor(
                     filtered_asd / np.sqrt(4.0 / T_obs_total ), dtype=get_torch_dtype()
                 )
             else:
@@ -58,8 +61,13 @@ class MBHBDataset(Dataset):
                     self.wave_td = torch.tensor(f["wave_td"][()], device="cpu", dtype=get_torch_dtype())
                 else:
                     self.wave_td = None
+                if self.has_stored_noise:
+                    self.noise_fd = torch.tensor(f["noise_fd"][()], device="cpu", dtype=get_torch_complex_dtype())
+                else:
+                    self.noise_fd = None
             else:
                 self.wave_fd = self.wave_td = self.parameters = None
+                self.noise_fd = None
 
         if self.cache_in_memory:
             self._load = self._load_from_memory
@@ -89,13 +97,17 @@ class MBHBDataset(Dataset):
         }
         if self.has_td:
             out["wave_td"] = self._load("wave_td", idx)
+        if self.has_stored_noise:
+            out["noise_fd"] = self._load("noise_fd", idx)
         return out
-    
+
     def to(self, device):
         if self.cache_in_memory:
             keys = ["wave_fd", "source_parameters"]
             if self.has_td:
                 keys += ["wave_td"]
+            if self.has_stored_noise:
+                keys += ["noise_fd"]
             for k in keys:
                 tensor = getattr(self, k, None)
                 if tensor is not None:
@@ -110,11 +122,12 @@ class MBHBDataset(Dataset):
     def clear_cache(self):
         """Free cached tensors and switch to disk-based loading."""
         if self.cache_in_memory:
-            keys = ["wave_fd", "wave_td", "source_parameters"]
+            keys = ["wave_fd", "wave_td", "source_parameters", "noise_fd"]
             for k in keys:
                 if hasattr(self, k) and getattr(self, k) is not None:
                     delattr(self, k)
             self.wave_fd = self.wave_td = self.source_parameters = None
+            self.noise_fd = None
             self.cache_in_memory = False
             self._load = self._load_from_disk
             gc.collect()
@@ -129,17 +142,19 @@ class MBHBDataset(Dataset):
 
 class MBHBDataModule( L.LightningDataModule ): 
 
-    def __init__(self, filename: str, batch_size: int, num_workers: int = 15, cache_in_memory: bool = False, shuffle_data: bool = True, noise_factor=1.0):
+    def __init__(self, filename: str, batch_size: int, num_workers: int = 15, cache_in_memory: bool = False, shuffle_data: bool = True, noise_factor=1.0, seed: int = 31415):
         """Initialize the data module.
 
         :param filename: Path to the HDF5 file.
         :type filename: str
         :param batch_size: Batch size for data loading.
         :type batch_size: int
+        :param seed: RNG seed for the train/val/test split.
+        :type seed: int
         """
         super().__init__()
         self.batch_size = batch_size
-        self.generator = torch.Generator().manual_seed(31415)
+        self.generator = torch.Generator().manual_seed(seed)
         self.filename = filename
         self.num_workers = num_workers
         self.cache_in_memory = cache_in_memory

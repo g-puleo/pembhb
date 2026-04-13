@@ -16,13 +16,15 @@ marginal output of the trained model and produces:
 
 Usage
 -----
-Edit ``round_dirs``, ``data_path``, and optionally ``mcmc_samples_dir`` at the
+Edit ``round_dirs``, ``data_path``, and optionally ``mcmc_samples_path`` at the
 bottom of this file, then run::
 
     python scripts/visualise_truncation_rounds.py
 """
 
+import argparse
 import os
+import re
 from glob import glob
 
 import numpy as np
@@ -33,7 +35,7 @@ import yaml
 from torch.utils.data import DataLoader, Subset
 
 from pembhb import ROOT_DIR
-from pembhb.model import InferenceNetwork
+from pembhb.model import InferenceNetwork, load_inference_network
 from pembhb.data import MBHBDataset
 from scipy.stats import gaussian_kde
 from matplotlib.lines import Line2D
@@ -51,6 +53,80 @@ from pembhb.utils import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+def find_round_dirs(
+    name: str,
+    base_log_dir: str = "/data/gpuleo/mbhb/logs",
+) -> list:
+    """Return a sorted list of round directories for a given run name.
+
+    Scans *base_log_dir* for sub-directories matching ``{name}_round_<N>``
+    and returns the corresponding ``version_0`` paths (the only version
+    directory that Lightning creates by default).
+
+    Parameters
+    ----------
+    name : str
+        Run-name prefix, e.g. ``"20260330_marginalencoder_sequential"``.
+    base_log_dir : str
+        Root directory that contains per-round Lightning log directories.
+
+    Returns
+    -------
+    list of str
+        Absolute paths to each round's ``version_0`` directory, sorted by
+        round number.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no matching round directories are found.
+    """
+    candidates = sorted(glob(os.path.join(base_log_dir, f"{name}_round_*")))
+    round_dirs = []
+    for d in candidates:
+        m_round = re.search(r"_round_(\d+)$", d)
+        if m_round is None:
+            continue
+        round_num = int(m_round.group(1))
+
+        # Collect all version_N subdirs, sorted descending (latest first).
+        version_nums = sorted(
+            [int(m_v.group(1))
+             for entry in os.listdir(d)
+             for m_v in [re.match(r"^version_(\d+)$", entry)]
+             if m_v],
+            reverse=True,
+        )
+        if not version_nums:
+            continue
+
+        # Pick the latest version that has both a checkpoint and the simulation YAML.
+        chosen = None
+        for v in version_nums:
+            vdir = os.path.join(d, f"version_{v}")
+            has_ckpt = bool(glob(os.path.join(vdir, "checkpoints", "*.ckpt")))
+            has_yaml = os.path.isfile(os.path.join(vdir, f"simulation_round_{round_num}.yaml"))
+            if has_ckpt and has_yaml:
+                chosen = vdir
+                break
+        if chosen is None:
+            print(f"  WARNING: no usable version in {d} (need checkpoint + YAML) — skipping.")
+            continue
+        round_dirs.append((round_num, chosen))
+
+    round_dirs.sort(key=lambda x: x[0])
+    return [v for _, v in round_dirs]
+
+
+def load_duration_weeks(round_dir: str, round_number: int) -> float:
+    """Read ``conf.waveform_params.duration`` (in weeks) from the round YAML."""
+    yaml_path = os.path.join(round_dir, f"simulation_round_{round_number}.yaml")
+    with open(yaml_path, "r") as f:
+        conf = yaml.safe_load(f)
+    wf = conf.get("waveform_params") or conf["conf"]["waveform_params"]
+    return float(wf["duration"])
+
+
 def load_prior_box(round_dir: str, round_number: int) -> dict:
     """Read the prior bounds stored in ``simulation_round_<round_number>.yaml``.
 
@@ -58,9 +134,7 @@ def load_prior_box(round_dir: str, round_number: int) -> dict:
 
     Returns a dict mapping parameter name → ``(low, high)`` tuple.
     """
-    round_dir_basename = os.path.basename(round_dir)
-    round_path_data = f"/data/gpuleo/mbhb/{round_dir_basename}"
-    yaml_path = os.path.join(round_path_data, f"simulation_round_{round_number}.yaml")
+    yaml_path = os.path.join(round_dir, f"simulation_round_{round_number}.yaml")
     with open(yaml_path, "r") as f:
         conf = yaml.safe_load(f)
     prior = conf.get("prior") or conf["conf"]["prior"]
@@ -68,14 +142,17 @@ def load_prior_box(round_dir: str, round_number: int) -> dict:
 
 
 def load_model(ckpt_dir: str) -> InferenceNetwork:
-    """Load the first ``*.ckpt`` checkpoint found inside *ckpt_dir*."""
+    """Load the first ``*.ckpt`` checkpoint found inside *ckpt_dir*.
+
+    Delegates to :func:`pembhb.model.load_inference_network` which
+    inspects the checkpoint hparams to select the correct model class
+    (e.g. :class:`PerMarginalInferenceNetwork` for marginal-encoder runs).
+    """
     ckpt_files = glob(os.path.join(ckpt_dir, "*.ckpt"))
     if not ckpt_files:
         raise FileNotFoundError(f"No .ckpt file found in {ckpt_dir}")
-    model = InferenceNetwork.load_from_checkpoint(ckpt_files[0])
-    model.eval()
-    model = model.to("cuda" if torch.cuda.is_available() else "cpu")
-    # workaround for older checkpoints that lack the architecture attribute
+    model = load_inference_network(ckpt_files[0])
+    # Workaround for older checkpoints that lack the architecture attribute
     try:
         model.data_summary.autoencoder.architecture = "conv"
     except AttributeError:
@@ -218,7 +295,7 @@ def _hpd_interval_1d(norm1d: np.ndarray, grid: np.ndarray, level: float):
     grid : 1-D array
         Parameter values corresponding to *norm1d*.
     level : float
-        Target credibility (e.g. 0.50, 0.90, 0.9999).
+        Target credibility (e.g. 0.50, 0.90).
 
     Returns
     -------
@@ -233,6 +310,193 @@ def _hpd_interval_1d(norm1d: np.ndarray, grid: np.ndarray, level: float):
     return float(grid[idx_low]), float(grid[idx_high])
 
 
+def _differential_entropy_1d(norm1d: np.ndarray, dp: float) -> float:
+    """Differential entropy H = -∫ p log p dx via Riemann sum (nats).
+
+    The convention 0 · log 0 = 0 is applied so that zero-density bins
+    contribute nothing to the sum.
+    """
+    with np.errstate(divide="ignore"):
+        log_p = np.where(norm1d > 0, np.log(norm1d), 0.0)
+    return -float(np.sum(norm1d * log_p * dp))
+
+
+def _differential_entropy_2d(norm2d: np.ndarray, dp0: float, dp1: float) -> float:
+    """Joint differential entropy H = -∫∫ p log p dx dy via Riemann sum (nats).
+
+    Parameters
+    ----------
+    norm2d : 2-D array, shape (ngrid, ngrid)
+        Normalised posterior density (single observation, no batch dim).
+    dp0, dp1 : float
+        Grid spacings along each axis.
+    """
+    with np.errstate(divide="ignore"):
+        log_p = np.where(norm2d > 0, np.log(norm2d), 0.0)
+    return -float(np.sum(norm2d * log_p * dp0 * dp1))
+
+
+def read_final_volume_ratio(round_dir: str, tb_key: str) -> float:
+    """Read the last logged value of *tb_key* from the TensorBoard events file.
+
+    Parameters
+    ----------
+    round_dir : str
+        Path to the Lightning version directory (e.g. ``…/version_0``).
+        The events file is expected directly inside this directory.
+    tb_key : str
+        Scalar tag as logged by :class:`~pembhb.callbacks.PlotPosteriorCallback`,
+        e.g. ``"volume_ratio/logMchirp"`` or
+        ``"volume_ratio/lambda_beta"``.
+
+    Returns
+    -------
+    float or nan
+        Final (last-step) value of the scalar, or ``np.nan`` if the tag
+        is absent or the events file cannot be read.
+    """
+    try:
+        from tensorboard.backend.event_processing.event_accumulator import (
+            EventAccumulator,
+        )
+    except ImportError:
+        print("  WARNING: tensorboard package not found — cannot read volume ratios.")
+        return np.nan
+
+    try:
+        ea = EventAccumulator(round_dir)
+        ea.Reload()
+        scalars = ea.Tags().get("scalars", [])
+        if tb_key not in scalars:
+            return np.nan
+        events = ea.Scalars(tb_key)
+        return float(events[-1].value) if events else np.nan
+    except Exception as exc:
+        print(f"  WARNING: could not read {tb_key} from {round_dir}: {exc}")
+        return np.nan
+
+
+def read_round_duration_hours(round_dir: str) -> float:
+    """Return the wall-clock training duration for one round in hours.
+
+    Computed as the difference between the ``wall_time`` of the last and
+    first events of the ``val_loss_epoch`` scalar tag.  Returns ``np.nan``
+    if the events file is missing or the tag is absent.
+
+    Parameters
+    ----------
+    round_dir : str
+        Path to the Lightning version directory (e.g. ``…/version_0``).
+    """
+    try:
+        from tensorboard.backend.event_processing.event_accumulator import (
+            EventAccumulator,
+        )
+    except ImportError:
+        return np.nan
+
+    try:
+        ea = EventAccumulator(round_dir)
+        ea.Reload()
+        if "val_loss_epoch" not in ea.Tags().get("scalars", []):
+            return np.nan
+        events = ea.Scalars("val_loss_epoch")
+        if len(events) < 2:
+            return np.nan
+        return (events[-1].wall_time - events[0].wall_time) / 3600.0
+    except Exception as exc:
+        print(f"  WARNING: could not read duration from {round_dir}: {exc}")
+        return np.nan
+
+
+def plot_volume_ratio_evolution(
+    ratios_per_round: list,
+    label: str,
+    figsize: tuple = (6, 4),
+):
+    """Plot the final posterior/prior volume ratio at the end of each round.
+
+    The ratio is read from TensorBoard logs written by
+    :class:`~pembhb.callbacks.PlotPosteriorCallback`.  A value of 1 means
+    the posterior fills the entire (current-round) prior window; values
+    close to 0 indicate a well-concentrated posterior.
+
+    Note: each round's ratio is normalised to **that round's** prior, not
+    the original round-1 prior.
+
+    Parameters
+    ----------
+    ratios_per_round : list of float
+        Volume ratio at the end of training for each round.  ``np.nan``
+        marks rounds where the metric was not logged.
+    label : str
+        Marginal label used in the plot title.
+    figsize : tuple
+        Figure size in inches.
+
+    Returns
+    -------
+    fig, ax
+    """
+    round_indices = np.arange(1, len(ratios_per_round) + 1)
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot(round_indices, ratios_per_round, "s-", color="darkorange",
+            linewidth=2, markersize=6, label="posterior / prior volume")
+    ax.axhline(1.0, color="gray", linestyle="--", linewidth=1.2,
+               label="prior = posterior (ratio = 1)")
+    ax.set_xlabel("Round")
+    ax.set_ylabel("Volume ratio (posterior / prior)")
+    ax.set_title(f"Volume ratio evolution: {label}")
+    ax.set_xticks(round_indices)
+    ax.set_ylim(bottom=0)
+    ax.legend(loc="best", fontsize=9)
+    ax.grid(True, linestyle="--", alpha=0.4)
+    return fig, ax
+
+
+def plot_entropy_evolution(
+    entropy_per_round: list,
+    label: str,
+    figsize: tuple = (6, 4),
+    prior_entropy: float = None,
+):
+    """Plot differential entropy as a function of round index.
+
+    Parameters
+    ----------
+    entropy_per_round : list of float
+        Entropy value (nats) for each round.  Use ``np.nan`` for rounds
+        where the marginal was not trained.
+    label : str
+        Marginal label used in the plot title.
+    figsize : tuple
+        Figure size in inches.
+    prior_entropy : float, optional
+        Differential entropy of the flat (uniform) prior at round 1,
+        drawn as a horizontal dashed reference line.  For a uniform
+        prior U(a, b) this is log(b − a); for a 2-D uniform prior it
+        is log((b₀ − a₀) · (b₁ − a₁)).
+
+    Returns
+    -------
+    fig, ax
+    """
+    round_indices = np.arange(1, len(entropy_per_round) + 1)
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot(round_indices, entropy_per_round, "o-", color="steelblue",
+            linewidth=2, markersize=6, label="NRE posterior")
+    if prior_entropy is not None:
+        ax.axhline(prior_entropy, color="gray", linestyle="--", linewidth=1.5,
+                   label=f"Flat prior (round 1):  {prior_entropy:.2f} nats")
+    ax.set_xlabel("Round")
+    ax.set_ylabel("Differential entropy [nats]")
+    ax.set_title(f"Posterior entropy evolution: {label}")
+    ax.set_xticks(round_indices)
+    ax.legend(loc="best", fontsize=9)
+    ax.grid(True, linestyle="--", alpha=0.4)
+    return fig, ax
+
+
 def plot_1d_prior_evolution(
     round_dirs: list,
     param_key: str,
@@ -240,11 +504,12 @@ def plot_1d_prior_evolution(
     out_param_idx: int,
     dataloader,
     figsize: tuple = (7, 4),
-    hpd_levels: tuple = (0.50, 0.90, 0.9999),
+    hpd_levels: tuple = (0.50, 0.90),
     band_colors: tuple = ("#4393c3", "#92c5de", "#d1e5f0"),
     ngrid_points: int = 1000,
-    mcmc_samples_dir: str = None,
+    mcmc_samples_path: str = None,
     ngrid_points_1d: int = 500,
+    duration_weeks: float = None,
 ):
     """Plot how the 1-D posterior HPD intervals evolve across rounds.
 
@@ -256,7 +521,7 @@ def plot_1d_prior_evolution(
 
     Additionally, the final-round 1-D posterior density is plotted on a
     secondary axes (right-hand panel) with an optional MCMC KDE overlay
-    when *mcmc_samples_dir* is provided.
+    when *mcmc_samples_path* is provided.
 
     Reuses ``get_logratios_grid`` from pembhb.utils (the same function called
     by ``get_widest_interval_1d`` in tmnre.py).
@@ -282,12 +547,24 @@ def plot_1d_prior_evolution(
         Fill colours for each band, matched by position to *hpd_levels*.
     ngrid_points : int
         Grid resolution for posterior evaluation (HPD panel).
-    mcmc_samples_dir : str, optional
-        Directory containing ``flat_samples.npy`` and
-        ``varying_params.txt``.  When provided, the MCMC marginal KDE is
-        overlaid on the final-round density panel.
+    mcmc_samples_path : str, optional
+        Path to an HDF5 file containing flat MCMC samples (see
+        :func:`load_mcmc_samples` for the expected layout).  When
+        provided, the MCMC marginal KDE is overlaid on the final-round
+        density panel.
     ngrid_points_1d : int
         Grid resolution for the final-round 1-D density panel.
+    duration_weeks : float, optional
+        Observation duration in weeks (read from
+        ``simulation_round_1.yaml``).  Required only when *param_key* is
+        ``"Deltat"``: in that case both NRE and MCMC are displayed in
+        ``seconds offset from the true merger time``, computed as
+        ``(Deltat - Deltat_true) * 86400`` for NRE and
+        ``tref - tref_true`` for MCMC, where
+        ``tref_true = duration * 7 * 86400 + Deltat_true * 86400``
+        bridges the two reference conventions (pembhb measures Deltat
+        from the end of observation, the MCMC file measures tref from
+        the start).
 
     Returns
     -------
@@ -309,6 +586,7 @@ def plot_1d_prior_evolution(
     # HPD intervals from model evaluation: shape (n_rounds, n_levels, 2)
     hpd_lows  = {lvl: [] for lvl in hpd_levels}
     hpd_highs = {lvl: [] for lvl in hpd_levels}
+    entropy_per_round = []
 
     # Store final-round density for the secondary panel
     final_norm1d = None
@@ -328,16 +606,11 @@ def plot_1d_prior_evolution(
             for lvl in hpd_levels:
                 hpd_lows[lvl].append(np.nan)
                 hpd_highs[lvl].append(np.nan)
+            entropy_per_round.append(np.nan)
             continue
 
         # Use higher resolution for the final round if requested
         _ngrid = ngrid_points_1d if (i == n_rounds - 1) else ngrid_points
-        if in_param_idx == 10:
-            low = -2.5-3e-5
-            high = -2.5+3e-5
-        else:
-            low = None
-            high = None
 
         logratios, inj_params, grid = get_logratios_grid(
             dataloader,
@@ -345,8 +618,8 @@ def plot_1d_prior_evolution(
             ngrid_points=_ngrid,
             in_param_idx=in_param_idx,
             out_param_idx=_out_param_idx,
-            low=low,
-            high=high
+            low=prior_lows[i],
+            high=prior_highs[i],
         )
         del model
         ratios = np.exp(logratios[0])
@@ -366,9 +639,38 @@ def plot_1d_prior_evolution(
             hpd_lows[lvl].append(lo)
             hpd_highs[lvl].append(hi)
 
+        entropy_per_round.append(_differential_entropy_1d(norm1d, dp))
+
         # Keep final available round's data for the density panel
         final_norm1d = norm1d
         final_grid_1d = grid_1d
+
+    # ---- Optional Deltat coordinate transform ----
+    # When plotting Deltat, both NRE and MCMC are displayed in
+    # ``seconds offset from the true merger time``.  ``nre_to_x`` maps
+    # values in pembhb's native (days, from end of observation) coordinate;
+    # ``mcmc_to_x`` maps raw MCMC samples (seconds from start of observation).
+    is_deltat = (param_key == "Deltat")
+    if is_deltat and final_inj is not None:
+        if duration_weeks is None:
+            raise ValueError(
+                "duration_weeks must be provided when plotting Deltat "
+                "(needed to bridge the pembhb and MCMC time conventions)."
+            )
+        duration_sec = duration_weeks * 7.0 * _SECONDS_PER_DAY
+        tref_true_sec = duration_sec + final_inj * _SECONDS_PER_DAY
+        nre_to_x  = lambda v: (np.asarray(v, dtype=float) - final_inj) * _SECONDS_PER_DAY
+        mcmc_to_x = lambda v: np.asarray(v, dtype=float) - tref_true_sec
+        x_label = r"$\Delta t - \Delta t_{\rm true}$ [s]"
+        # Density rescale so that ∫ p dx_new = 1 when x is in seconds
+        # (NRE norm1d was computed per day; MCMC KDE will be evaluated
+        # on the seconds-offset grid and is already in sec⁻¹).
+        nre_density_scale = 1.0 / _SECONDS_PER_DAY
+    else:
+        nre_to_x  = lambda v: np.asarray(v, dtype=float)
+        mcmc_to_x = lambda v: np.asarray(v, dtype=float)
+        x_label = param_key
+        nre_density_scale = 1.0
 
     # ---- Create figure with two panels: HPD evolution + final-round density ----
     fig, (ax_hpd, ax_dens) = plt.subplots(
@@ -376,11 +678,11 @@ def plot_1d_prior_evolution(
         gridspec_kw={"width_ratios": [1, 1], "wspace": 0.35},
     )
 
-    # --- Left panel: HPD band evolution (unchanged logic) ---
+    # --- Left panel: HPD band evolution ---
     # Filled HPD bands (widest first so narrower ones paint on top)
     for lvl, color in zip(reversed(hpd_levels), reversed(band_colors)):
-        lows_arr  = np.array(hpd_lows[lvl])
-        highs_arr = np.array(hpd_highs[lvl])
+        lows_arr  = nre_to_x(np.array(hpd_lows[lvl]))
+        highs_arr = nre_to_x(np.array(hpd_highs[lvl]))
         pct = int(round(lvl * 100))
         ax_hpd.fill_between(
             round_indices, lows_arr, highs_arr,
@@ -392,22 +694,35 @@ def plot_1d_prior_evolution(
         ax_hpd.plot(round_indices, highs_arr, color=color, linewidth=1.5)
 
     # Prior window as dashed reference
-    ax_hpd.plot(round_indices, prior_lows,  color="black",
+    ax_hpd.plot(round_indices, nre_to_x(prior_lows),  color="black",
                 linestyle="--", linewidth=1.2, label="prior window")
-    ax_hpd.plot(round_indices, prior_highs, color="black",
+    ax_hpd.plot(round_indices, nre_to_x(prior_highs), color="black",
                 linestyle="--", linewidth=1.2)
 
     # True parameter value as a horizontal reference line
     if final_inj is not None:
-        ax_hpd.axhline(y=final_inj, color="r", linestyle="--",
-                       linewidth=1.5, label="True value")
+        ax_hpd.axhline(y=float(nre_to_x([final_inj])[0]), color="r",
+                       linestyle="--", linewidth=1.5, label="True value")
 
     ax_hpd.set_xlabel("Round")
-    ax_hpd.set_ylabel(param_key)
+    ax_hpd.set_ylabel(x_label)
     ax_hpd.set_title(f"1-D posterior HPD evolution: {param_key}")
     ax_hpd.set_xticks(round_indices)
     ax_hpd.legend(loc="best", fontsize=9)
     ax_hpd.grid(True, linestyle="--", alpha=0.4)
+
+    # --- Secondary x-axis (top): cumulative training time ---
+    duration_h = np.array([read_round_duration_hours(rd) for rd in round_dirs])
+    cumulative_h = np.nancumsum(duration_h)
+    tick_labels = [
+        f"{t:.2f}" if not np.isnan(t) else "?"
+        for t in cumulative_h
+    ]
+    ax_top = ax_hpd.twiny()
+    ax_top.set_xlim(ax_hpd.get_xlim())
+    ax_top.set_xticks(round_indices)
+    ax_top.set_xticklabels(tick_labels, fontsize=8)
+    ax_top.set_xlabel("Cumulative training time [h]", fontsize=9)
 
     # --- Right panel: final-round 1-D posterior density ---
     if final_norm1d is None:
@@ -417,51 +732,116 @@ def plot_1d_prior_evolution(
         axes_dict = {"hpd": ax_hpd, "density": ax_dens}
         return fig, axes_dict
 
-    ax_dens.plot(final_grid_1d, final_norm1d, "b-", linewidth=2, label="NRE")
-    ax_dens.fill_between(final_grid_1d, 0, final_norm1d, alpha=0.3, color="b")
-    ax_dens.axvline(x=final_inj, color="r", linestyle="--", linewidth=2, label="Injection")
+    # Display-space grid + density (transformed for Deltat, identity otherwise)
+    final_grid_x = nre_to_x(final_grid_1d)
+    final_norm_x = final_norm1d * nre_density_scale
+    # Rescale so the curve peaks at 1 (visual comparison only).
+    _nre_peak = float(np.max(final_norm_x)) if np.max(final_norm_x) > 0 else 1.0
+    final_norm_x = final_norm_x / _nre_peak
+
+    ax_dens.plot(final_grid_x, final_norm_x, "b-", linewidth=2, label="NRE")
+    ax_dens.fill_between(final_grid_x, 0, final_norm_x, alpha=0.3, color="b")
+    ax_dens.axvline(x=float(nre_to_x([final_inj])[0]), color="r",
+                    linestyle="--", linewidth=2, label="Injection")
 
     # MCMC overlay
-    if mcmc_samples_dir is not None:
-        flat_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_dir)
+    if mcmc_samples_path is not None:
+        flat_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_path)
         if param_key in mcmc_param_names:
             idx_mc = mcmc_param_names.index(param_key)
-            mcmc_samp = flat_samples[:, idx_mc]
+            mcmc_samp = mcmc_to_x(flat_samples[:, idx_mc])
             kde = gaussian_kde(mcmc_samp)
-            mcmc_marginal = kde(final_grid_1d)
-            dp = final_grid_1d[1] - final_grid_1d[0]
-            mcmc_marginal = mcmc_marginal / np.sum(mcmc_marginal * dp)
-            ax_dens.plot(final_grid_1d, mcmc_marginal, color="orange",
+            mcmc_marginal = kde(final_grid_x)
+            # Rescale to peak at 1 (matches NRE rescaling).
+            _mc_peak = float(np.max(mcmc_marginal)) if np.max(mcmc_marginal) > 0 else 1.0
+            mcmc_marginal = mcmc_marginal / _mc_peak
+            ax_dens.plot(final_grid_x, mcmc_marginal, color="orange",
                          linewidth=2, label="MCMC")
-            ax_dens.fill_between(final_grid_1d, 0, mcmc_marginal,
+            ax_dens.fill_between(final_grid_x, 0, mcmc_marginal,
                                  alpha=0.3, color="orange")
 
-    ax_dens.set_xlabel(param_key)
-    ax_dens.set_ylabel("Posterior Density")
+    ax_dens.set_ylim(0, 1.05)
+    ax_dens.set_xlabel(x_label)
+    ax_dens.set_ylabel("Posterior Density (peak-normalised)")
     ax_dens.set_title(f"Final-round 1-D posterior: {param_key}")
     ax_dens.legend(loc="best", fontsize=9)
     ax_dens.grid(True, linestyle="--", alpha=0.4)
 
     axes_dict = {"hpd": ax_hpd, "density": ax_dens}
-    return fig, axes_dict
+    return fig, axes_dict, entropy_per_round
 
 
 # ---------------------------------------------------------------------------
 # MCMC overlay helpers
 # ---------------------------------------------------------------------------
 
-def load_mcmc_samples(samples_dir: str):
-    """Load flat MCMC samples and their parameter names.
+# Mapping from MCMC-file key → internal parameter name used by the model.
+# The MCMC samples file uses a slightly different naming convention than
+# the pembhb datagen config (``_ORDERED_PRIOR_KEYS``); we rename on load
+# so all downstream logic (``param_names.index(...)``, ``key in param_names``)
+# can use the pembhb names consistently.
+_MCMC_KEY_TO_INTERNAL = {
+    "tref":     "Deltat",
+    "dist_Gpc": "dist",
+    "cosinc":   "inc",
+    "sinbeta":  "beta",
+}
 
-    Expects:
-      - ``flat_samples.npy`` : array of shape (N_samples, N_params)
-      - ``varying_params.txt`` : one parameter name per line
+# Constants used by the Deltat-axis transform (seconds offset from the
+# true merger time).  See ``plot_1d_prior_evolution`` for the transform.
+_SECONDS_PER_DAY = 86400.0
 
-    Returns ``(flat_samples, param_names)``.
+# NOTE on Deltat units:
+# ---------------------
+# The MCMC file stores ``tref`` in seconds-from-start-of-observation, while
+# pembhb stores ``Deltat`` in days-from-end-of-observation.  Rather than
+# pre-converting one to the other (which still leaves an offset because the
+# reference points differ), we keep ``tref`` in raw seconds here and apply
+# the full transform (shift + rescale) at plot time, where we know the
+# injection value and the observation duration.  Both NRE and MCMC are then
+# displayed in the same coordinate: seconds offset from the true merger.
+
+
+def load_mcmc_samples(samples_path: str):
+    """Load flat MCMC samples from a single HDF5 file.
+
+    The file is expected to contain one top-level dataset per parameter,
+    with keys drawn from a subset of::
+
+        ['chi1', 'chi2', 'cosinc', 'dist_Gpc', 'lambda', 'logMchirp',
+         'phi', 'psi', 'q', 'sinbeta', 'tref']
+
+    Keys are renamed to the pembhb internal convention on load
+    (``tref → Deltat``, ``dist_Gpc → dist``, ``cosinc → inc``,
+    ``sinbeta → beta``).  Note that ``cosinc`` and ``sinbeta`` hold the
+    same quantities as ``inc`` and ``beta`` (cos and sin, respectively) —
+    only the names differ.
+
+    Parameters
+    ----------
+    samples_path : str
+        Path to the ``.h5`` file containing the flat MCMC samples.
+
+    Returns
+    -------
+    flat_samples : ndarray of shape (N_samples, N_params_present)
+        Samples stacked column-wise, ordered to match ``param_names``.
+    param_names : list of str
+        Parameter names in the pembhb internal convention.  Only the
+        subset actually present in the file is returned.
     """
-    flat_samples = np.load(os.path.join(samples_dir, "flat_samples.npy"))
-    with open(os.path.join(samples_dir, "varying_params.txt"), "r") as f:
-        param_names = [line.strip() for line in f if line.strip()]
+    import h5py
+
+    with h5py.File(samples_path, "r") as f:
+        file_keys = list(f.keys())
+        param_names = [_MCMC_KEY_TO_INTERNAL.get(k, k) for k in file_keys]
+        columns = [np.asarray(f[k][()]).ravel() for k in file_keys]
+
+    flat_samples = np.column_stack(columns)
+    # NOTE: ``Deltat`` here is still in raw MCMC units (seconds from start of
+    # observation).  The plotting code converts it to ``seconds offset from
+    # true merger`` at display time so that NRE (days from end) and MCMC
+    # (seconds from start) end up in the same coordinate system.
     return flat_samples, param_names
 
 
@@ -479,6 +859,7 @@ def overlay_mcmc_contours(
     label: str = "MCMC",
     is_sky: bool = False,
     use_mollweide: bool = True,
+    targets: tuple = (0.50, 0.90),
 ):
     """Overlay Gaussian-KDE credibility contours from MCMC flat samples on *ax*.
 
@@ -554,7 +935,7 @@ def overlay_mcmc_contours(
     kde_norm = kde_vals / (kde_sum * dp0 * dp1)
 
     # Compute credibility-level thresholds on the KDE density
-    levels, level_labels = contour_levels(kde_norm, targets=[0.6827, 0.9545, 0.9973])
+    levels, level_labels = contour_levels(kde_norm, targets=list(targets))
     cs = ax.contour(
         gx,
         gy,
@@ -589,7 +970,7 @@ def _add_1d_marginal_insets(
     inj_params,
     p0_key: str,
     p1_key: str,
-    mcmc_samples_dir: str = None,
+    mcmc_samples_path: str = None,
     _sky_deg: bool = False,
     _p0_key_raw: str = None,
     _p1_key_raw: str = None,
@@ -603,7 +984,7 @@ def _add_1d_marginal_insets(
     * ``marginal_0 = sum(norm2d * dp1, axis=0)``  →  p(param_0)
     * ``marginal_1 = sum(norm2d * dp0, axis=1)``  →  p(param_1)
 
-    When *mcmc_samples_dir* is provided, a Gaussian-KDE marginal from the
+    When *mcmc_samples_path* is provided, a Gaussian-KDE marginal from the
     MCMC flat samples is overlaid in orange.
 
     Parameters
@@ -619,8 +1000,8 @@ def _add_1d_marginal_insets(
         True parameter values ``[p0_true, p1_true]``.
     p0_key, p1_key : str
         Parameter names for labelling.
-    mcmc_samples_dir : str, optional
-        Path to MCMC samples directory.
+    mcmc_samples_path : str, optional
+        Path to the MCMC samples HDF5 file.
     _sky_deg : bool
         If True, grids are in (lon, lat) degrees; MCMC samples must be
         converted from native (lambda, beta) to degrees before KDE.
@@ -654,12 +1035,20 @@ def _add_1d_marginal_insets(
     marginal_0 = np.sum(norm2d * dp1, axis=0)  # p(param_0), shape (ngrid,)
     marginal_1 = np.sum(norm2d * dp0, axis=1)  # p(param_1), shape (ngrid,)
 
+    # Rescale each curve to peak at 1 so that NRE and MCMC marginals are
+    # visually comparable on a common y-scale ∈ [0, 1].
+    _m0_peak = float(np.max(marginal_0)) if np.max(marginal_0) > 0 else 1.0
+    _m1_peak = float(np.max(marginal_1)) if np.max(marginal_1) > 0 else 1.0
+    marginal_0 = marginal_0 / _m0_peak
+    marginal_1 = marginal_1 / _m1_peak
+
     # --- Top inset: marginal for param_0 (x-axis of the 2-D plot) ---
     ax_top = ax.inset_axes([0.0, 1.02, 1.0, 0.25])  # [x0, y0, width, height] in axes fraction
     ax_top.plot(grid_0, marginal_0, "b-", linewidth=1.5, label="NRE")
     ax_top.fill_between(grid_0, 0, marginal_0, alpha=0.3, color="b")
     ax_top.axvline(x=float(inj_params[0]), color="r", linestyle="--", linewidth=1.5)
     ax_top.set_xlim(ax.get_xlim())
+    ax_top.set_ylim(0, 1.05)
     ax_top.tick_params(labelbottom=False, labelleft=False, left=False, bottom=True)
     ax_top.set_ylabel("p", fontsize=8)
     ax_top.grid(alpha=0.3)
@@ -670,13 +1059,14 @@ def _add_1d_marginal_insets(
     ax_right.fill_betweenx(grid_1, 0, marginal_1, alpha=0.3, color="b")
     ax_right.axhline(y=float(inj_params[1]), color="r", linestyle="--", linewidth=1.5)
     ax_right.set_ylim(ax.get_ylim())
+    ax_right.set_xlim(0, 1.05)
     ax_right.tick_params(labelbottom=False, labelleft=False, left=False, bottom=True)
     ax_right.set_xlabel("p", fontsize=8)
     ax_right.grid(alpha=0.3)
 
     # --- MCMC KDE overlay ---
-    if mcmc_samples_dir is not None:
-        flat_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_dir)
+    if mcmc_samples_path is not None:
+        flat_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_path)
 
         if _sky_deg:
             # Axes are in (lon_deg, lat_deg); MCMC columns are (lambda, beta)
@@ -689,7 +1079,8 @@ def _add_1d_marginal_insets(
                 lon_deg_samp = np.degrees(lam_samp - np.pi)
                 kde_0 = gaussian_kde(lon_deg_samp)
                 mcmc_m0 = kde_0(grid_0)
-                mcmc_m0 = mcmc_m0 / np.sum(mcmc_m0 * dp0)
+                _p = float(np.max(mcmc_m0)) if np.max(mcmc_m0) > 0 else 1.0
+                mcmc_m0 = mcmc_m0 / _p
                 ax_top.plot(grid_0, mcmc_m0, color="orange", linewidth=1.5, label="MCMC")
                 ax_top.fill_between(grid_0, 0, mcmc_m0, alpha=0.3, color="orange")
             if _has_lat:
@@ -697,7 +1088,8 @@ def _add_1d_marginal_insets(
                 lat_deg_samp = np.degrees(np.arcsin(np.clip(bet_samp, -1, 1)))
                 kde_1 = gaussian_kde(lat_deg_samp)
                 mcmc_m1 = kde_1(grid_1)
-                mcmc_m1 = mcmc_m1 / np.sum(mcmc_m1 * dp1)
+                _p = float(np.max(mcmc_m1)) if np.max(mcmc_m1) > 0 else 1.0
+                mcmc_m1 = mcmc_m1 / _p
                 ax_right.plot(mcmc_m1, grid_1, color="orange", linewidth=1.5, label="MCMC")
                 ax_right.fill_betweenx(grid_1, 0, mcmc_m1, alpha=0.3, color="orange")
         else:
@@ -708,7 +1100,8 @@ def _add_1d_marginal_insets(
                 mcmc_samp_0 = flat_samples[:, mcmc_param_names.index(p0_key)]
                 kde_0 = gaussian_kde(mcmc_samp_0)
                 mcmc_m0 = kde_0(grid_0)
-                mcmc_m0 = mcmc_m0 / np.sum(mcmc_m0 * dp0)
+                _p = float(np.max(mcmc_m0)) if np.max(mcmc_m0) > 0 else 1.0
+                mcmc_m0 = mcmc_m0 / _p
                 ax_top.plot(grid_0, mcmc_m0, color="orange", linewidth=1.5, label="MCMC")
                 ax_top.fill_between(grid_0, 0, mcmc_m0, alpha=0.3, color="orange")
 
@@ -716,7 +1109,8 @@ def _add_1d_marginal_insets(
                 mcmc_samp_1 = flat_samples[:, mcmc_param_names.index(p1_key)]
                 kde_1 = gaussian_kde(mcmc_samp_1)
                 mcmc_m1 = kde_1(grid_1)
-                mcmc_m1 = mcmc_m1 / np.sum(mcmc_m1 * dp1)
+                _p = float(np.max(mcmc_m1)) if np.max(mcmc_m1) > 0 else 1.0
+                mcmc_m1 = mcmc_m1 / _p
                 ax_right.plot(mcmc_m1, grid_1, color="orange", linewidth=1.5, label="MCMC")
                 ax_right.fill_betweenx(grid_1, 0, mcmc_m1, alpha=0.3, color="orange")
 
@@ -828,7 +1222,7 @@ def plot_truncation_rounds(
     rect_color: str = "red",
     rect_lw: float = 2.0,
     wspace: float = 0.35,
-    mcmc_samples_dir: str = None,
+    mcmc_samples_path: str = None,
     in_param_idx_override=None,
 ):
     """Plot posterior-contour evolution across successive truncation rounds.
@@ -836,7 +1230,7 @@ def plot_truncation_rounds(
     The final-round panel additionally includes inset axes showing
     1-D marginal distributions (top: param_0, right: param_1) obtained
     by integrating the 2-D posterior over the complementary axis.  When
-    *mcmc_samples_dir* is given, MCMC KDE marginals are overlaid.
+    *mcmc_samples_path* is given, MCMC KDE marginals are overlaid.
 
     Parameters
     ----------
@@ -864,12 +1258,13 @@ def plot_truncation_rounds(
     wspace : float
         Horizontal spacing between subplots, leaving room for the
         connecting lines.
-    mcmc_samples_dir : str, optional
-        Directory containing ``flat_samples.npy`` and
-        ``varying_params.txt`` from a previous MCMC run.  When provided,
-        Gaussian-KDE credibility contours from those samples are
-        superimposed on the **last** round's panel, and 1-D MCMC
-        marginals are overlaid on the inset axes.
+    mcmc_samples_path : str, optional
+        Path to an HDF5 file containing flat MCMC samples from a
+        previous MCMC run (see :func:`load_mcmc_samples` for the
+        expected layout).  When provided, Gaussian-KDE credibility
+        contours from those samples are superimposed on the **last**
+        round's panel, and 1-D MCMC marginals are overlaid on the inset
+        axes.
 
     Returns
     -------
@@ -878,6 +1273,9 @@ def plot_truncation_rounds(
         in square degrees (only populated for sky-localisation marginals).
     """
     n_rounds = len(round_dirs)
+    MAX_COLS = 5
+    n_cols = min(n_rounds, MAX_COLS)
+    n_rows = int(np.ceil(n_rounds / MAX_COLS))
 
     # Load prior boxes for every round (yaml files are 1-indexed)
     prior_boxes = [load_prior_box(d, i + 1) for i, d in enumerate(round_dirs)]
@@ -929,29 +1327,41 @@ def plot_truncation_rounds(
             sky_use_mollweide.append(
                 _is_full_sky(box_r[lam_key], box_r[bet_key])
             )
-        # Create figure with per-panel projection
-        fig = plt.figure(figsize=(figsize_per_panel[0] * n_rounds, figsize_per_panel[1]))
+        # Create figure with per-panel projection (multi-row grid)
+        fig = plt.figure(figsize=(figsize_per_panel[0] * n_cols, figsize_per_panel[1] * n_rows))
         axes = []
         for k in range(n_rounds):
             proj = "mollweide" if sky_use_mollweide[k] else None
-            axes.append(fig.add_subplot(1, n_rounds, k + 1, projection=proj))
+            row_k = k // MAX_COLS
+            col_k = k % MAX_COLS
+            axes.append(fig.add_subplot(n_rows, n_cols, row_k * n_cols + col_k + 1, projection=proj))
     else:
         sky_use_mollweide = [False] * n_rounds   # unused, keeps indexing safe
-        fig, axes = plt.subplots(
-            1,
-            n_rounds,
-            figsize=(figsize_per_panel[0] * n_rounds, figsize_per_panel[1]),
-            sharex=False,
-            sharey=False,
-        )
-        if n_rounds == 1:
-            axes = [axes]
+        fig = plt.figure(figsize=(figsize_per_panel[0] * n_cols, figsize_per_panel[1] * n_rows))
+        axes = []
+        for k in range(n_rounds):
+            row_k = k // MAX_COLS
+            col_k = k % MAX_COLS
+            axes.append(fig.add_subplot(n_rows, n_cols, row_k * n_cols + col_k + 1))
 
     # Collect sky-area measurements (populated in the sky branch)
     sky_areas = {}  # round_idx → {"nre": area_sqdeg, "mcmc": area_sqdeg}
+    entropy_per_round = []
+
+    # Cumulative training time (same data as the 1-D plot's top x-axis)
+    duration_h = np.array([read_round_duration_hours(rd) for rd in round_dirs])
+    cumulative_h = np.nancumsum(duration_h)
+
+    def _fmt_time(idx):
+        t = cumulative_h[idx]
+        return f"{t:.2f} h" if not np.isnan(t) else "? h"
 
     # Collect (rect_patch, ax) for each round that has a following round
     rectangles = []
+
+    # Cache the last round's evaluated posterior so we can re-render it on
+    # its own (in a separate, larger figure) with extended contour levels.
+    last_round_state = None
 
     for i, (round_dir, ax) in enumerate(zip(round_dirs, axes)):
         print(f"\n--- Round {i + 1} ---")
@@ -966,8 +1376,9 @@ def plot_truncation_rounds(
             ax.text(0.5, 0.5, "not trained\nthis round",
                     ha="center", va="center", transform=ax.transAxes,
                     fontsize=11, color="gray")
-            ax.set_title(f"Round {i + 1}")
+            ax.set_title(f"Round {i + 1} ({_fmt_time(i)})")
             rectangles.append(None)
+            entropy_per_round.append(np.nan)
             del model
             continue
 
@@ -991,7 +1402,28 @@ def plot_truncation_rounds(
             bounds_1=bounds_1,
             ngrid_points=ngrid_points,
         )
-        levels, level_labels = contour_levels(norm2d, targets=[0.6827, 0.9545, 0.9973])
+        _dp0 = gx[0, 1] - gx[0, 0]
+        _dp1 = gy[1, 0] - gy[0, 0]
+        entropy_per_round.append(_differential_entropy_2d(norm2d[0], _dp0, _dp1))
+        levels, level_labels = contour_levels(norm2d, targets=[0.50, 0.90])
+
+        # Save raw state for the optional standalone last-round figure.
+        if i == n_rounds - 1:
+            last_round_state = {
+                "norm2d":       norm2d,
+                "gx":           gx,
+                "gy":           gy,
+                "inj_params":   inj_params,
+                "p0_key":       p0_key,
+                "p1_key":       p1_key,
+                "bounds_0":     bounds_0,
+                "bounds_1":     bounds_1,
+                "is_sky":       is_sky,
+                "use_mollweide": (sky_use_mollweide[i] if is_sky else False),
+                "round_idx":    i,
+                "time_label":   _fmt_time(i),
+                "marginal_label": marginal_label,
+            }
 
         if is_sky:
             # ------------------------------------------------------------------
@@ -1009,6 +1441,7 @@ def plot_truncation_rounds(
             if use_mollweide:
                 # --- Full-sky Mollweide (radians) ---
                 lon_grid, lat_grid = _to_mollweide_coords(gx, gy, p0_key, p1_key)
+                # breakpoint()
                 cs = ax.contour(
                     lon_grid, lat_grid, norm2d[0], levels=levels,
                     colors=["blue"] * len(levels), linewidths=1.5, zorder=4,
@@ -1046,12 +1479,12 @@ def plot_truncation_rounds(
             print(f"    NRE sky area ({level_labels[0]*100:.1f}% CR): "
                   f"{nre_area:.2f} sq deg")
 
-            ax.set_title(f"Round {i + 1}  ({nre_area:.1f} sq deg, {level_labels[0]*100:.0f}% CR)")
+            ax.set_title(f"Round {i + 1}  ({nre_area:.1f} sq deg, {level_labels[0]*100:.0f}% CR, {_fmt_time(i)})")
 
             # --- Overlay MCMC contours + area on last panel ---
-            if mcmc_samples_dir is not None and i == n_rounds - 1:
+            if mcmc_samples_path is not None and i == n_rounds - 1:
                 print("    Overlaying MCMC contours...")
-                flat_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_dir)
+                flat_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_path)
                 mcmc_cs = overlay_mcmc_contours(
                     ax, flat_samples, mcmc_param_names, p0_key, p1_key,
                     is_sky=True, use_mollweide=use_mollweide,
@@ -1092,7 +1525,7 @@ def plot_truncation_rounds(
                         kde_norm = None
                     if kde_norm is not None:
                         mcmc_levels, mcmc_labels = contour_levels(
-                            kde_norm, targets=[0.6827, 0.9545, 0.9973]
+                            kde_norm, targets=[0.50, 0.90]
                         )
                         mcmc_area = _compute_sky_area(kde_norm, mcmc_levels[0],
                                                       dp_lam, dp_bet)
@@ -1109,7 +1542,7 @@ def plot_truncation_rounds(
                     ax, norm2d[0], lon_deg_grid, lat_deg_grid,
                     np.array([np.degrees(lon_inj_rad), np.degrees(lat_inj_rad)]),
                     "lon [deg]", "lat [deg]",
-                    mcmc_samples_dir=mcmc_samples_dir,
+                    mcmc_samples_path=mcmc_samples_path,
                     _sky_deg=True, _p0_key_raw=p0_key, _p1_key_raw=p1_key,
                 )
 
@@ -1134,6 +1567,15 @@ def plot_truncation_rounds(
                     zorder=10,
                 )
                 ax.add_patch(rect)
+                # Expand axes limits so the rectangle is fully visible
+                cur_xl = ax.get_xlim()
+                cur_yl = ax.get_ylim()
+                margin_x = 0.05 * abs(nb_lon1 - nb_lon0)
+                margin_y = 0.05 * abs(nb_lat1 - nb_lat0)
+                ax.set_xlim(min(cur_xl[0], nb_lon0 - margin_x),
+                            max(cur_xl[1], nb_lon1 + margin_x))
+                ax.set_ylim(min(cur_yl[0], nb_lat0 - margin_y),
+                            max(cur_yl[1], nb_lat1 + margin_y))
                 rectangles.append((rect, ax))
             else:
                 rectangles.append(None)
@@ -1149,7 +1591,7 @@ def plot_truncation_rounds(
                 inj_params[0],
                 ax_buffer=ax,
                 parameter_names=[p0_key, p1_key],
-                title=f"Round {i + 1}",
+                title=f"Round {i + 1} ({_fmt_time(i)})",
                 levels=levels,
                 levels_labels=level_labels,
                 do_plot=True,
@@ -1161,9 +1603,9 @@ def plot_truncation_rounds(
             ax.set_ylim(bounds_1)
 
             # Overlay MCMC KDE contours on the last panel
-            if mcmc_samples_dir is not None and i == n_rounds - 1:
+            if mcmc_samples_path is not None and i == n_rounds - 1:
                 print("    Overlaying MCMC contours...")
-                flat_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_dir)
+                flat_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_path)
                 overlay_mcmc_contours(
                     ax,
                     flat_samples,
@@ -1183,7 +1625,7 @@ def plot_truncation_rounds(
                     inj_params[0],
                     p0_key,
                     p1_key,
-                    mcmc_samples_dir=mcmc_samples_dir,
+                    mcmc_samples_path=mcmc_samples_path,
                 )
 
             # Draw a dashed rectangle marking the *next* round's prior bounds
@@ -1209,13 +1651,16 @@ def plot_truncation_rounds(
         del model  # release GPU memory between rounds
 
     # Finalise layout before computing figure-space transforms
-    plt.subplots_adjust(wspace=wspace)
+    plt.subplots_adjust(wspace=wspace, hspace=0.4)
     fig.canvas.draw()
 
     # Draw connecting lines: corners of rect in axes[i] → corners of axes[i+1] frame
     if connect_boxes:
         for i, rect_info in enumerate(rectangles):
             if rect_info is None:
+                continue
+            # Skip connection lines when panels are on different rows
+            if i // MAX_COLS != (i + 1) // MAX_COLS:
                 continue
             rect_patch, ax_rect = rect_info
             ax_next = axes[i + 1]
@@ -1230,7 +1675,164 @@ def plot_truncation_rounds(
                 linestyle="-",
             )
 
-    return fig, axes, sky_areas
+    # ------------------------------------------------------------------
+    # Standalone last-round figure with extended contour levels.
+    # The narrow last-panel of the multi-round figure is hard to read,
+    # so we re-render it on its own (single panel + 1-D insets) with
+    # additional contour levels.  This does not modify the multi-round
+    # figure created above.
+    # ------------------------------------------------------------------
+    fig_last_only = None
+    if last_round_state is not None:
+        print("\n--- Building standalone last-round figure (extended contours) ---")
+        # Force a (suitably big) square figsize regardless of how narrow the
+        # last round's prior box is — see _plot_last_round_standalone for the
+        # matching set_box_aspect(1) call that keeps the axes itself square.
+        _last_side = max(figsize_per_panel) * 1.8
+        fig_last_only = _plot_last_round_standalone(
+            state=last_round_state,
+            mcmc_samples_path=mcmc_samples_path,
+            contour_targets=(0.50, 0.90, 0.999),
+            figsize=(_last_side, _last_side),
+        )
+
+    return fig, axes, sky_areas, entropy_per_round, fig_last_only
+
+
+def _plot_last_round_standalone(
+    state: dict,
+    mcmc_samples_path: str = None,
+    contour_targets: tuple = (0.50, 0.90, 0.999),
+    figsize: tuple = (8, 8),
+):
+    """Render the cached last-round 2-D posterior in its own figure.
+
+    Mirrors the per-round rendering logic in :func:`plot_truncation_rounds`
+    but uses a single (large) panel and extended contour levels so the
+    last round is easier to read in isolation.  1-D marginal insets and
+    the optional MCMC overlay are included.  Sky-localisation marginals
+    are handled in both Mollweide (full-sky) and Cartesian (restricted)
+    projections, matching the per-round behaviour.
+    """
+    norm2d        = state["norm2d"]
+    gx            = state["gx"]
+    gy            = state["gy"]
+    inj_params    = state["inj_params"]
+    p0_key        = state["p0_key"]
+    p1_key        = state["p1_key"]
+    bounds_0      = state["bounds_0"]
+    bounds_1      = state["bounds_1"]
+    is_sky        = state["is_sky"]
+    use_mollweide = state["use_mollweide"]
+    round_idx     = state["round_idx"]
+    time_label    = state["time_label"]
+    marginal_label = state["marginal_label"]
+
+    levels, level_labels = contour_levels(norm2d, targets=list(contour_targets))
+
+    if is_sky:
+        proj = "mollweide" if use_mollweide else None
+        fig = plt.figure(figsize=figsize)
+        ax = fig.add_subplot(1, 1, 1, projection=proj)
+
+        lam_inj = float(inj_params[0, 0]) if p0_key == "lambda" else float(inj_params[0, 1])
+        bet_inj = float(inj_params[0, 1]) if p1_key == "beta"   else float(inj_params[0, 0])
+        lon_inj_rad = lam_inj - np.pi
+        lat_inj_rad = np.arcsin(np.clip(bet_inj, -1.0, 1.0))
+
+        if use_mollweide:
+            lon_grid, lat_grid = _to_mollweide_coords(gx, gy, p0_key, p1_key)
+            cs = ax.contour(
+                lon_grid, lat_grid, norm2d[0], levels=levels,
+                colors=["blue"] * len(levels), linewidths=1.5, zorder=4,
+            )
+            fmt = {lev: f"{p:.3f}" for lev, p in zip(levels, level_labels)}
+            ax.clabel(cs, fmt=fmt, fontsize=9)
+            ax.plot(lon_inj_rad, lat_inj_rad, "r+", markersize=12,
+                    markeredgewidth=2, zorder=5)
+        else:
+            lon_deg, lat_deg = _to_lonlat_deg(gx, gy, p0_key, p1_key)
+            lon_inj_deg = np.degrees(lon_inj_rad)
+            lat_inj_deg = np.degrees(lat_inj_rad)
+            cs = ax.contour(
+                lon_deg, lat_deg, norm2d[0], levels=levels,
+                colors=["blue"] * len(levels), linewidths=1.5, zorder=4,
+            )
+            fmt = {lev: f"{p:.3f}" for lev, p in zip(levels, level_labels)}
+            ax.clabel(cs, fmt=fmt, fontsize=9)
+            ax.plot(lon_inj_deg, lat_inj_deg, "r+", markersize=12,
+                    markeredgewidth=2, zorder=5)
+            ax.set_xlabel("Longitude [deg]")
+            ax.set_ylabel("Latitude [deg]")
+            ax.set_xlim(lon_deg.min(), lon_deg.max())
+            ax.set_ylim(lat_deg.min(), lat_deg.max())
+            ax.grid(True, linestyle="--", alpha=0.4)
+            ax.set_aspect("equal", adjustable="box")
+
+        ax.set_title(
+            f"Round {round_idx + 1} — {marginal_label}  ({time_label})\n"
+        )
+
+        # MCMC overlay (extended levels)
+        if mcmc_samples_path is not None:
+            print("    Overlaying MCMC contours (standalone, extended levels)...")
+            flat_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_path)
+            overlay_mcmc_contours(
+                ax, flat_samples, mcmc_param_names, p0_key, p1_key,
+                is_sky=True, use_mollweide=use_mollweide,
+                targets=contour_targets,
+            )
+
+        # 1-D marginal insets only when the panel uses Cartesian axes.
+        if not use_mollweide:
+            print("    Adding 1-D marginal insets (standalone, sky/Cartesian)...")
+            lon_deg_grid, lat_deg_grid = _to_lonlat_deg(gx, gy, p0_key, p1_key)
+            _add_1d_marginal_insets(
+                ax, norm2d[0], lon_deg_grid, lat_deg_grid,
+                np.array([np.degrees(lon_inj_rad), np.degrees(lat_inj_rad)]),
+                "lon [deg]", "lat [deg]",
+                mcmc_samples_path=mcmc_samples_path,
+                _sky_deg=True, _p0_key_raw=p0_key, _p1_key_raw=p1_key,
+            )
+
+    else:
+        fig = plt.figure(figsize=figsize)
+        ax = fig.add_subplot(1, 1, 1)
+        posterior_contours_2d(
+            gx, gy, norm2d[0], inj_params[0],
+            ax_buffer=ax,
+            parameter_names=[p0_key, p1_key],
+            title=(
+                f"Round {round_idx + 1} — {marginal_label}  ({time_label})\n"
+                f"contours: {', '.join(f'{int(round(t*100))}%' for t in contour_targets)}"
+            ),
+            levels=levels,
+            levels_labels=level_labels,
+            do_plot=True,
+            show_colormap=False,
+        )
+        ax.set_xlim(bounds_0)
+        ax.set_ylim(bounds_1)
+        # Keep the axes box itself square regardless of how narrow the prior
+        # box is — otherwise narrow priors render as a thin rectangle and the
+        # 1-D inset marginals end up squashed.
+        ax.set_box_aspect(1)
+
+        if mcmc_samples_path is not None:
+            print("    Overlaying MCMC contours (standalone, extended levels)...")
+            flat_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_path)
+            overlay_mcmc_contours(
+                ax, flat_samples, mcmc_param_names, p0_key, p1_key,
+                targets=contour_targets,
+            )
+
+        print("    Adding 1-D marginal insets (standalone)...")
+        _add_1d_marginal_insets(
+            ax, norm2d[0], gx, gy, inj_params[0], p0_key, p1_key,
+            mcmc_samples_path=mcmc_samples_path,
+        )
+
+    return fig
 
 
 # ---------------------------------------------------------------------------
@@ -1248,7 +1850,7 @@ def plot_all_marginals(
     rect_color: str = "red",
     rect_lw: float = 2.0,
     wspace: float = 0.35,
-    mcmc_samples_dir: str = None,
+    mcmc_samples_path: str = None,
 ):
     """Produce one figure per model marginal, dispatching by dimensionality.
 
@@ -1277,9 +1879,9 @@ def plot_all_marginals(
         ``(width, height)`` per 2-D subplot panel.
     figsize_1d : tuple
         Figure size for 1-D HPD + density plots.
-    connect_boxes, rect_color, rect_lw, wspace, mcmc_samples_dir
+    connect_boxes, rect_color, rect_lw, wspace, mcmc_samples_path
         Forwarded to ``plot_truncation_rounds`` for 2-D marginals, and
-        *mcmc_samples_dir* also to ``plot_1d_prior_evolution``.
+        *mcmc_samples_path* also to ``plot_1d_prior_evolution``.
 
     Returns
     -------
@@ -1303,13 +1905,26 @@ def plot_all_marginals(
     for label, ndim, in_idx, out_idx in all_marginals:
         print(f"  {ndim}-D: {label}  (in={in_idx}, out={out_idx})")
 
+    # Round-1 prior box used to compute the flat-prior reference entropy
+    box_r1 = load_prior_box(round_dirs[0], 1)
+    # Observation duration (in weeks) — needed to bridge the pembhb and MCMC
+    # time-of-merger conventions when plotting the Deltat marginal.
+    duration_weeks = load_duration_weeks(round_dirs[0], 1)
+
     results = {}
     pair_idx = 0  # running counter for 2-D marginals
 
     for label, ndim, in_param_idx, out_param_idx in all_marginals:
         if ndim == 2:
+            p0_key = _ORDERED_PRIOR_KEYS[in_param_idx[0]]
+            p1_key = _ORDERED_PRIOR_KEYS[in_param_idx[1]]
+            w0 = box_r1[p0_key][1] - box_r1[p0_key][0]
+            w1 = box_r1[p1_key][1] - box_r1[p1_key][0]
+            prior_entropy = float(np.log(w0 * w1))
+            tb_key = f"volume_ratio/{p0_key}_{p1_key}"
+
             print(f"\n=== 2-D marginal [{pair_idx}]: {label} ===")
-            fig, axes, sky_areas = plot_truncation_rounds(
+            fig, axes, sky_areas, entropy_per_round, fig_last = plot_truncation_rounds(
                 round_dirs=round_dirs,
                 dataloader=dataloader,
                 marginal_pair_idx=pair_idx,
@@ -1319,15 +1934,23 @@ def plot_all_marginals(
                 rect_color=rect_color,
                 rect_lw=rect_lw,
                 wspace=wspace,
-                mcmc_samples_dir=mcmc_samples_dir,
+                mcmc_samples_path=mcmc_samples_path,
                 in_param_idx_override=in_param_idx,
             )
-            results[label] = (fig, axes, sky_areas)
+            fig_ent, _ = plot_entropy_evolution(entropy_per_round, label,
+                                                prior_entropy=prior_entropy)
+            vol_ratios = [read_final_volume_ratio(rd, tb_key) for rd in round_dirs]
+            fig_vol, _ = plot_volume_ratio_evolution(vol_ratios, label)
+            results[label] = (fig, axes, sky_areas, fig_ent, fig_vol, fig_last)
             pair_idx += 1
 
         elif ndim == 1:
+            w = box_r1[label][1] - box_r1[label][0]
+            prior_entropy = float(np.log(w))
+            tb_key = f"volume_ratio/{label}"
+
             print(f"\n=== 1-D marginal: {label} ===")
-            fig, axes_dict = plot_1d_prior_evolution(
+            fig, axes_dict, entropy_per_round = plot_1d_prior_evolution(
                 round_dirs=round_dirs,
                 param_key=label,
                 in_param_idx=in_param_idx,
@@ -1335,43 +1958,94 @@ def plot_all_marginals(
                 dataloader=dataloader,
                 figsize=figsize_1d,
                 ngrid_points=ngrid_points,
-                mcmc_samples_dir=mcmc_samples_dir,
+                mcmc_samples_path=mcmc_samples_path,
                 ngrid_points_1d=ngrid_points_1d,
+                duration_weeks=duration_weeks,
             )
-            results[label] = (fig, axes_dict, {})
+            fig_ent, _ = plot_entropy_evolution(entropy_per_round, label,
+                                                prior_entropy=prior_entropy)
+            vol_ratios = [read_final_volume_ratio(rd, tb_key) for rd in round_dirs]
+            fig_vol, _ = plot_volume_ratio_evolution(vol_ratios, label)
+            results[label] = (fig, axes_dict, {}, fig_ent, fig_vol, None)
 
     return results
 
-
-# ---------------------------------------------------------------------------
-# Configuration — edit these to match your setup
-# ---------------------------------------------------------------------------
-name = "202603267dim_inc_phi"
-round_dirs = [
-    f"/data/gpuleo/mbhb/logs/{name}_round_1/version_0",
-    f"/data/gpuleo/mbhb/logs/{name}_round_2/version_0",
-    f"/data/gpuleo/mbhb/logs/{name}_round_3/version_0",
-    # f"/data/gpuleo/mbhb/logs/{name}_round_4/version_0",
-    # f"/data/gpuleo/mbhb/logs/{name}_round_5/version_0",
-    # f"/data/gpuleo/mbhb/logs/{name}_round_6/version_0",
-    # f"/data/gpuleo/mbhb/logs/{name}_round_7/version_0",
-]
-
-data_path = "/data/gpuleo/mbhb/obs_logspace_freqonly_q3.h5"
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    dataset_observation = MBHBDataset(data_path, cache_in_memory=False)
+    parser = argparse.ArgumentParser(
+        description="Visualise TMNRE truncation rounds for a given run name."
+    )
+    parser.add_argument(
+        "name",
+        help=(
+            "Run name prefix, e.g. '20260330_marginalencoder_sequential'. "
+            "The script auto-detects all available rounds under "
+            "/data/gpuleo/mbhb/logs/{name}_round_*."
+        ),
+    )
+    parser.add_argument(
+        "--data-path",
+        default="/data/gpuleo/mbhb/obs_logfreq_q3_t_noisy.h5",
+        help="Path to the observation HDF5 file.  Should contain a stored "
+             "'noise_fd' dataset (see scripts/add_noise_to_obs.py); otherwise "
+             "the script falls back to a freshly-drawn random noise per call, "
+             "which won't match what tmnre_joint.py saw at training time.",
+    )
+    parser.add_argument(
+        "--mcmc-file",
+        default=None,
+        help=(
+            "Path to an HDF5 file of flat MCMC samples (one dataset per "
+            "parameter, e.g. mcmc_coppa/logf_samples_5D_copparoni.h5)."
+        ),
+    )
+    parser.add_argument(
+        "--ngrid", type=int, default=100,
+        help="Grid resolution for 2-D posterior evaluation.",
+    )
+    parser.add_argument(
+        "--ngrid-1d", type=int, default=500,
+        help="Grid resolution for final-round 1-D posterior density.",
+    )
+    args = parser.parse_args()
+
+    name = args.name
+    round_dirs = find_round_dirs(name)
+    if not round_dirs:
+        raise RuntimeError(
+            f"No round directories found for name='{name}' under "
+            f"/data/gpuleo/mbhb/logs/."
+        )
+    if len(round_dirs) < 2:
+        raise RuntimeError(
+            f"Run '{name}' has only {len(round_dirs)} round — nothing to visualise."
+        )
+    print(f"Detected {len(round_dirs)} rounds for '{name}':")
+    for r in round_dirs:
+        print(f"  {r}")
+
+    dataset_observation = MBHBDataset(args.data_path, cache_in_memory=False)
     dataset_subset = Subset(dataset_observation, indices=[0])
+    if not dataset_observation.has_stored_noise:
+        print(
+            f"[warn] {args.data_path} does not contain a stored 'noise_fd' "
+            f"dataset.  Posteriors will use freshly-drawn random noise on "
+            f"every call and will NOT match training-time PlotPosteriorCallback. "
+            f"Run scripts/add_noise_to_obs.py to produce a noisy obs file."
+        )
+    # When the obs file has stored noise, the collate fn uses it as-is
+    # regardless of noise_scale; noise_factor=1.0 keeps full amplitude.
+    _noise_scale = dataset_observation.noise_scale
     dataloader_obs = DataLoader(
         dataset_subset,
         batch_size=1,
         shuffle=False,
         collate_fn=lambda b: mbhb_collate_fn(
-            b, dataset_subset, noise_shuffling=False, noise_factor=1.0
+            b, _noise_scale, noise_factor=1.0, noise_shuffling=False,
         ),
     )
 
@@ -1381,16 +2055,26 @@ if __name__ == "__main__":
     figures = plot_all_marginals(
         round_dirs=round_dirs,
         dataloader=dataloader_obs,
-        ngrid_points=100,
-        ngrid_points_1d=100,
-        mcmc_samples_dir=None
+        ngrid_points=args.ngrid,
+        ngrid_points_1d=args.ngrid_1d,
+        mcmc_samples_path=args.mcmc_file,
     )
 
-    for label, (fig, _, sky_areas) in figures.items():
+    for label, (fig, _, sky_areas, fig_ent, fig_vol, fig_last) in figures.items():
         safe_label = label.replace(" ", "_").replace("/", "_")
         out_path = os.path.join(outdir, f"{safe_label}.png")
         fig.savefig(out_path, dpi=150, bbox_inches="tight")
         print(f"Saved figure to {out_path}")
+        out_path_ent = os.path.join(outdir, f"{safe_label}_entropy.png")
+        fig_ent.savefig(out_path_ent, dpi=150, bbox_inches="tight")
+        print(f"Saved entropy figure to {out_path_ent}")
+        out_path_vol = os.path.join(outdir, f"{safe_label}_volume_ratio.png")
+        fig_vol.savefig(out_path_vol, dpi=150, bbox_inches="tight")
+        print(f"Saved volume ratio figure to {out_path_vol}")
+        if fig_last is not None:
+            out_path_last = os.path.join(outdir, f"{safe_label}_last_round.png")
+            fig_last.savefig(out_path_last, dpi=150, bbox_inches="tight")
+            print(f"Saved last-round figure to {out_path_last}")
         if sky_areas:
             for rnd, areas in sorted(sky_areas.items()):
                 parts = [f"NRE={areas['nre']:.2f} sq deg"]

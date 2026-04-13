@@ -65,11 +65,11 @@ architecture:
       batch_train: 1000
       patience: 25
       freq_split_idx: 2048
-      high_freq_only: True
+      high_freq_only: False
     Autoencoder:
       load: False
       finetune_previous: True
-      filename: "/data/gpuleo/mbhb/logs/autoencoder/version_12/checkpoints/ae-epoch=261-val_loss=5.7389e-09.ckpt"  # Path to trained DenoisingAutoencoder checkpoint
+      filename: ""
       device: "cuda"
       # --- Training hyperparameters (used when load: False) ---
       architecture: "conv"        # "conv" or "unet"
@@ -85,7 +85,7 @@ architecture:
       stride: 2 # determines downsampling along the frequency dimension (start from 4096=2^12)
       dropout: 0.0
       residual: False           # residual shortcut connections in the ConvEncoder
-      high_freq_only: True
+      high_freq_only: False
       freq_split_idx: 2048
       # Training
       lr: 0.001
@@ -93,7 +93,7 @@ architecture:
       epochs: 150
       scheduler_patience: 75
       scheduler_factor: 0.3
-      early_stop_patience: 3
+      early_stop_patience: 30
       log_name: "autoencoder"
   
     # -----------------------------------------------------------------------
@@ -133,14 +133,14 @@ architecture:
 baseline_model:
   use: False
   #filename: "/data/gpuleo/mbhb/logs/20251205_100028_round_0/version_0/checkpoints/epoch=474-step=133000.ckpt"
-  filename: "/data/gpuleo/mbhb/logs/20260205withsky_v1_round_0/version_7/checkpoints/epoch=475-step=66640.ckpt"
+  filename: ""
 
 # -------------------------------------------------------------------------
 # Joint AE + NRE training  (used by scripts/tmnre_joint.py)
 # These settings are IGNORED by scripts/tmnre.py (sequential pipeline).
 # -------------------------------------------------------------------------
 joint_training:
-  ae_warmup_epochs: 80        # epochs of AE-only training before NRE kicks in (round 1 only)
+  ae_warmup_epochs: 1        # epochs of AE-only training before NRE kicks in (round 1 only)
   lr_ae: 0.001                # learning rate for autoencoder (encoder + decoder)
   lr_nre: 0.0001              # learning rate for NRE classifier heads
   ae_weight_decay: 0.00001    # weight decay for autoencoder param group
@@ -149,16 +149,32 @@ joint_training:
 
 
 # -------------------------------------------------------------------------
-# Volume-ratio early stopping  (used by scripts/tmnre_joint.py & tmnre.py)
+# Early stopping criterion: "volume_ratio" or "differential_entropy"
+# Selects which callback stops NRE training.
+# -------------------------------------------------------------------------
+early_stop_criterion: "volume_ratio"   # "volume_ratio" | "differential_entropy"
+
+# -------------------------------------------------------------------------
+# Volume-ratio early stopping  (used when early_stop_criterion: "volume_ratio")
 # Stops NRE training when the posterior/prior volume ratio has plateaued.
 # -------------------------------------------------------------------------
 volume_ratio_early_stop:
   enabled: true
   warmup_epochs: 50       # ignore first N epochs (posterior is noisy)
-  patience: 15            # consecutive stalled evaluations before stopping
+  patience: 10            # consecutive stalled evaluations before stopping
   rel_tol: 0.02           # relative EMA change threshold for "stalled"
   ema_alpha: 0.3          # EMA smoothing factor (higher = more reactive)
   min_ratio_threshold: 0.5  # stop immediately if any marginal ratio drops here
+
+# -------------------------------------------------------------------------
+# Differential-entropy early stopping  (used when early_stop_criterion: "differential_entropy")
+# Stops NRE training when the posterior differential entropy has plateaued.
+# -------------------------------------------------------------------------
+diff_entropy_early_stop:
+  warmup_epochs: 50
+  patience: 10
+  rel_tol: 0.02
+  ema_alpha: 0.3
 
 rom_use_pinned_memory: false  # Only set true for single-session usage
 rom_prefetch_batches: 4       # Increase to reduce Python overhead

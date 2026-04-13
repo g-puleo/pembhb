@@ -38,10 +38,28 @@ def read_config(fname: str):
         conf = yaml.safe_load(file)
     return conf
 
-def get_logratios_grid(dataloader: torch.utils.data.DataLoader, model: 'InferenceNetwork', ngrid_points: int, in_param_idx : int, out_param_idx: int, low: float=None , high: float=None):
+def choose_device_for_pp(required_gib: float = 2.0) -> torch.device:
+    """Check if enough CUDA memory is free for pp_plot; fall back to CPU."""
+    if torch.cuda.is_available():
+        free, _ = torch.cuda.mem_get_info()
+        free_gib = free / (1024 ** 3)
+        if free_gib >= required_gib:
+            print(f"[pp_plot] Using CUDA ({free_gib:.1f} GiB free)")
+            return torch.device("cuda")
+        else:
+            print(f"[pp_plot] Only {free_gib:.1f} GiB free on CUDA (need {required_gib}), falling back to CPU")
+    else:
+        print("[pp_plot] CUDA not available, using CPU")
+    return torch.device("cpu")
+
+
+def get_logratios_grid(dataloader: torch.utils.data.DataLoader, model: 'InferenceNetwork', ngrid_points: int, in_param_idx : int, out_param_idx: int, low: float=None , high: float=None, device: torch.device = None, grid_chunk_size: int = 100):
     """Generate a grid of logratios for a given observation and model.
-    This is useful for plotting the posterior and to make pp plots
-    
+    This is useful for plotting the posterior and to make pp plots.
+
+    Processes one observation at a time to keep GPU memory bounded
+    regardless of dataloader batch size.
+
     :param data: observation data
     :type data: torch.Tensor
     :param model: trained model
@@ -56,14 +74,19 @@ def get_logratios_grid(dataloader: torch.utils.data.DataLoader, model: 'Inferenc
     :type in_param_idx: int
     :param out_param_idx: index that identifies the logratios to return , with respect to the output of the model, (i.e. order defined in config_td.yaml)
     :type out_param_idx: int
+    :param grid_chunk_size: number of grid points to evaluate per forward pass
+    :type grid_chunk_size: int
     :return: logratios for the grid, with shape [batchsize, ngrid_points], injection parameters with shape [batchsize, 11], grid with shape [ngrid_points, 1]
     """
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     results = []
     injection_params = []
 
     model.eval()
-    model = model.to("cuda")
+    model = model.to(device)
     # Use the actual sampling prior (sampler_init_kwargs) as the
     # authoritative source for the grid range.  Fall back to conf["prior"]
     # for backward compatibility with old YAML sidecars.
@@ -75,59 +98,51 @@ def get_logratios_grid(dataloader: torch.utils.data.DataLoader, model: 'Inferenc
     prior_bounds = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx]]
     low = low if low is not None else prior_bounds[0]
     high = high if high is not None else prior_bounds[1]
-    grid = torch.linspace(low, high, ngrid_points).to("cuda").reshape(-1, 1)
-    zero_pad1d = torch.zeros(ngrid_points, 10).to("cuda")
+    grid = torch.linspace(low, high, ngrid_points).to(device).reshape(-1, 1)
+    zero_pad1d = torch.zeros(ngrid_points, 10, device=device)
     grid_padded = torch.cat((zero_pad1d[:, :in_param_idx], grid, zero_pad1d[:, in_param_idx:]), dim=1)  # Shape: [ngrid_points, 11]
     with torch.no_grad():
-        for batch in tqdm( dataloader ) :
-            data_fd = (batch["wave_fd"]+batch["noise_fd"]).to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
+        for batch in dataloader:
+            data_fd = (batch["wave_fd"]+batch["noise_fd"]).to(device)  # Shape: [batchsize, n_channels, n_datapoints]
             source_parameters = batch["source_parameters"]  # Shape: [batchsize, 11]
             has_td = "wave_td" in batch and "noise_td" in batch
             if has_td:
-                data_td = (batch["wave_td"]+batch["noise_td"]).to("cuda")
+                data_td = (batch["wave_td"]+batch["noise_td"]).to(device)
 
             batch_size = data_fd.shape[0]
 
-            data_fd_expanded = data_fd.unsqueeze(1).expand(batch_size, ngrid_points, -1, -1)  # Shape: [batchsize, ngrid_points, n_channels, n_datapoints]
-            grid_expanded = grid_padded.unsqueeze(0).expand(batch_size, -1, -1) # shape is [batchsize, ngrid_points, 11]
+            # Process one observation at a time to avoid materialising
+            # [batch_size * ngrid_points, C, F] tensors on GPU.
+            for obs_idx in range(batch_size):
+                single_fd = data_fd[obs_idx:obs_idx + 1]  # [1, C, F]
+                single_td = data_td[obs_idx:obs_idx + 1] if has_td else None
 
-            batched_data_fd = data_fd_expanded.reshape(-1, data_fd_expanded.shape[-2], data_fd_expanded.shape[-1])  # Flatten batch and ngrid_points
-            batched_grid = grid_expanded.reshape(-1, grid_expanded.shape[-1])  # Flatten batch and ngrid_points
+                logratios_chunks = []
+                for start in range(0, ngrid_points, grid_chunk_size):
+                    end = min(start + grid_chunk_size, ngrid_points)
+                    chunk_grid = grid_padded[start:end]  # [chunk, 11]
+                    chunk_size = end - start
+                    chunk_fd = single_fd.expand(chunk_size, -1, -1)
+                    chunk_td = single_td.expand(chunk_size, -1, -1) if has_td else None
+                    logits = model(chunk_fd, chunk_td, chunk_grid)[:, out_param_idx]
+                    logratios_chunks.append(logits.detach().cpu())
 
-            if has_td:
-                data_td_expanded = data_td.unsqueeze(1).expand(batch_size, ngrid_points, -1, -1)
-                batched_data_td = data_td_expanded.reshape(-1, data_td_expanded.shape[-2], data_td_expanded.shape[-1])
-                batched2dataset = TensorDataset(batched_data_fd, batched_data_td, batched_grid)
-            else:
-                batched2dataset = TensorDataset(batched_data_fd, batched_grid)
-            batched2dataloader = DataLoader(batched2dataset, batch_size=50, shuffle=False)
-            logratios_list = []
-            for batch2 in batched2dataloader:
-                if has_td:
-                    batched2_data_fd, batched2_data_td, batched2_grid = batch2
-                    batched2_data_td = batched2_data_td.to("cuda")
-                else:
-                    batched2_data_fd, batched2_grid = batch2
-                    batched2_data_td = None
-                batched2_data_fd = batched2_data_fd.to("cuda")
-                batched2_grid = batched2_grid.to("cuda")
-                logratios= model(batched2_data_fd, batched2_data_td, batched2_grid)[:, out_param_idx]
-                logratios_list.append(logratios)
-            logratios = torch.cat(logratios_list, dim=0)            # view them as [batchsize, ngrid_points]
-            logratios = logratios.reshape(batch_size, ngrid_points)
-
-            results.append(logratios.detach().cpu())
-            injection_params.append(source_parameters[:, in_param_idx].detach().cpu())
+                obs_logratios = torch.cat(logratios_chunks, dim=0)  # [ngrid_points]
+                results.append(obs_logratios.unsqueeze(0))  # [1, ngrid_points]
+                injection_params.append(source_parameters[obs_idx, in_param_idx].detach().cpu().unsqueeze(0))
 
         results = torch.cat(results, dim=0).numpy()
         injection_params = torch.cat(injection_params, dim=0).numpy()
         grid = grid.detach().cpu().numpy()
     return results, injection_params, grid
 
-def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'InferenceNetwork', ngrid_points: int, out_param_idx : int, in_param_idx : tuple, 
-                          bounds_0: tuple = None, bounds_1: tuple = None):
+def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'InferenceNetwork', ngrid_points: int, out_param_idx : int, in_param_idx : tuple,
+                          bounds_0: tuple = None, bounds_1: tuple = None, device: torch.device = None, grid_chunk_size: int = 500):
     """
     Compute logratios on a 2D grid for two input parameters.
+
+    Processes one observation at a time and chunks the grid to keep GPU
+    memory bounded regardless of dataloader batch size.
 
     :param dataloader: the data loader providing the observations
     :type dataloader: torch.utils.data.DataLoader
@@ -139,18 +154,27 @@ def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'Infer
     :type out_param_idx: int
     :param in_param_idx: the indices of the input parameters
     :type in_param_idx: tuple
-    :param prior_bounds_0: the bounds of the interval on which the first input parameter is defined, defaults to the trained prior
-    :type prior_bounds_0: tuple, optional
-    :param prior_bounds_1: the bounds of the interval on which the second input parameter is defined, defaults to trained prior
-    :type prior_bounds_1: tuple, optional
+    :param bounds_0: the bounds of the interval on which the first input parameter is defined, defaults to the trained prior
+    :type bounds_0: tuple, optional
+    :param bounds_1: the bounds of the interval on which the second input parameter is defined, defaults to trained prior
+    :type bounds_1: tuple, optional
+    :param device: device to run on, defaults to CUDA if available
+    :type device: torch.device, optional
+    :param grid_chunk_size: number of grid points to evaluate per forward pass (controls peak GPU memory)
+    :type grid_chunk_size: int
     :return: results, injection_params, grid_x, grid_y where results has shape (batch size, ngrid_points, ngrid_points), injection_params has shape (batch size, 2), grid_x and grid_y have shape (ngrid_points, ngrid_points)
     :rtype: _type_
     """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     results = []
     injection_params = []
+    n_total = ngrid_points ** 2
+
     with torch.no_grad():
         model.eval()
-        model = model.to("cuda")
+        model = model.to(device)
         # Use the actual sampling prior (sampler_init_kwargs) as the
         # authoritative source for the grid range.  Fall back to conf["prior"]
         # for backward compatibility with old YAML sidecars.
@@ -163,58 +187,50 @@ def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'Infer
             bounds_0 = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx[0]]]
         if bounds_1 is None:
             bounds_1 = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx[1]]]
-        
+
         lows = [bounds_0[0], bounds_1[0]]
         highs = [bounds_0[1], bounds_1[1]]
         grid_0 = torch.linspace(lows[0], highs[0], ngrid_points).reshape(-1)
         grid_1 = torch.linspace(lows[1], highs[1], ngrid_points).reshape(-1)
 
-        grid_x, grid_y = torch.meshgrid(grid_0, grid_1, indexing="xy")# grid_x and grid_y have shape (ngrid_points, ngrid_points)
-        flattened_x = grid_x.flatten() # values of param_0 to test
-        flattened_y = grid_y.flatten() # values of param_1 to test
-        grid = torch.stack((flattened_x, flattened_y), dim=1).to("cuda")  # Shape: [ngrid_points^2, 2]
-        
-        # Create the padded input with parameters at correct positions
-        grid_padded_input = torch.zeros(ngrid_points**2, 11).to("cuda")
+        grid_x, grid_y = torch.meshgrid(grid_0, grid_1, indexing="xy")  # (ngrid, ngrid)
+        flattened_x = grid_x.flatten()
+        flattened_y = grid_y.flatten()
+        grid = torch.stack((flattened_x, flattened_y), dim=1).to(device)  # [n_total, 2]
+
+        # Padded grid input: [n_total, 11]
+        grid_padded_input = torch.zeros(n_total, 11, device=device)
         grid_padded_input[:, in_param_idx[0]] = grid[:, 0]
         grid_padded_input[:, in_param_idx[1]] = grid[:, 1]
 
-        for batch in tqdm(dataloader):
-            data_fd = (batch["wave_fd"] + batch["noise_fd"]).to("cuda")  # Shape: [batchsize, n_channels, n_datapoints]
+        for batch in dataloader:
+            data_fd = (batch["wave_fd"] + batch["noise_fd"]).to(device)
             source_parameters = batch["source_parameters"]
             has_td = "wave_td" in batch and "noise_td" in batch
             if has_td:
-                data_td = (batch["wave_td"] + batch["noise_td"]).to("cuda")
+                data_td = (batch["wave_td"] + batch["noise_td"]).to(device)
             batch_size = data_fd.shape[0]
-            data_fd_expanded = data_fd.unsqueeze(1).expand(-1, ngrid_points**2, -1, -1)  # Shape: [batchsize, ngrid_points^2, n_channels, n_datapoints]
-            grid_expanded = grid_padded_input.unsqueeze(0).expand(batch_size, -1, -1) # shape is [batchsize, ngrid_points^2, 11]
-            batched_data_fd = data_fd_expanded.reshape(-1, data_fd_expanded.shape[-2], data_fd_expanded.shape[-1])
-            batched_grid = grid_expanded.reshape(-1, grid_expanded.shape[-1])  # Flatten batch and ngrid_points
-            if has_td:
-                data_td_expanded = data_td.unsqueeze(1).expand(-1, ngrid_points**2, -1,-1)
-                batched_data_td = data_td_expanded.reshape(-1, data_td_expanded.shape[-2], data_td_expanded.shape[-1])
-                batched2dataset = TensorDataset(batched_data_fd, batched_data_td, batched_grid)
-            else:
-                batched2dataset = TensorDataset(batched_data_fd, batched_grid)
-            batched2dataloader = DataLoader(batched2dataset, batch_size=20, shuffle=False)
-            logratios_list = []
-            for batch2 in batched2dataloader:
-                if has_td:
-                    batched2_data_fd, batched2_data_td, batched2_grid = batch2
-                    batched2_data_td = batched2_data_td.to("cuda")
-                else:
-                    batched2_data_fd, batched2_grid = batch2
-                    batched2_data_td = None
-                batched2_data_fd = batched2_data_fd.to("cuda")
-                batched2_grid = batched2_grid.to("cuda")
-                logratios= model(batched2_data_fd, batched2_data_td, batched2_grid)[:, out_param_idx]
-                logratios_list.append(logratios)
-            logratios = torch.cat(logratios_list, dim=0)
-            # logratios = model(batched_data_fd, batched_data_td,  batched_grid)[:, out_idx] # shape is [batchsize*ngrid_points^2, ]
-            logratios = logratios.reshape(batch_size, ngrid_points**2)  # Reshape to [batchsize, ngrid_points^2]
 
-            results.append(logratios.detach().cpu())
-            injection_params.append(source_parameters[:, in_param_idx].detach().cpu())
+            # Process one observation at a time to avoid materialising
+            # [batch_size * n_total, C, F] tensors on GPU.
+            for obs_idx in range(batch_size):
+                single_fd = data_fd[obs_idx:obs_idx + 1]   # [1, C, F]
+                single_td = data_td[obs_idx:obs_idx + 1] if has_td else None
+
+                logratios_chunks = []
+                for start in range(0, n_total, grid_chunk_size):
+                    end = min(start + grid_chunk_size, n_total)
+                    chunk_grid = grid_padded_input[start:end]  # [chunk, 11]
+                    chunk_size = end - start
+                    # expand is a view — no memory allocation until forward pass
+                    chunk_fd = single_fd.expand(chunk_size, -1, -1)
+                    chunk_td = single_td.expand(chunk_size, -1, -1) if has_td else None
+                    logits = model(chunk_fd, chunk_td, chunk_grid)[:, out_param_idx]
+                    logratios_chunks.append(logits.detach().cpu())
+
+                obs_logratios = torch.cat(logratios_chunks, dim=0)  # [n_total]
+                results.append(obs_logratios.unsqueeze(0))  # [1, n_total]
+                injection_params.append(source_parameters[obs_idx, in_param_idx].detach().cpu().unsqueeze(0))
 
         results = torch.cat(results, dim=0).numpy().reshape(-1, ngrid_points, ngrid_points)
         injection_params = torch.cat(injection_params, dim=0).numpy()
@@ -352,8 +368,8 @@ def update_bounds_2d(model: 'InferenceNetwork', observation_loader: DataLoader, 
 
     # get the grid of 
 
-def pp_plot( dataloader, model , in_param_idx: int, name: str, out_param_idx: int):  
-    """Generate a pp plot using the examples in dataset, and the posteriors obtained by the model . 
+def pp_plot( dataloader, model , in_param_idx: int, name: str, out_param_idx: int, output_dir: str = None, device: torch.device = None):
+    """Generate a pp plot using the examples in dataset, and the posteriors obtained by the model .
     :param dataset: dataset used to make the pp plot
     :type dataset: MBHBDataset
     :param model:  trained model used to make the pp plot
@@ -362,13 +378,17 @@ def pp_plot( dataloader, model , in_param_idx: int, name: str, out_param_idx: in
     :type low: float
     :param high: upper bound of the prior used to generate the dataset
     :type high: float
-    :param inj_param_idx: index of the parameter that you want to make the pp plot for, with respect to the output of the model. 
+    :param inj_param_idx: index of the parameter that you want to make the pp plot for, with respect to the output of the model.
     :type inj_param_idx: int
     :param name: name of the plot, defaults to None
     :type name: str, optional
+    :param output_dir: directory to save the plot to. Defaults to ROOT_DIR/plots.
+    :type output_dir: str, optional
+    :param device: device to run inference on. Defaults to CUDA if available.
+    :type device: torch.device, optional
     """
     print(f"Making pp plot for {name}...")
-    logratios, injection_params, grid = get_logratios_grid(dataloader, model, ngrid_points=100, in_param_idx=in_param_idx, out_param_idx=out_param_idx)
+    logratios, injection_params, grid = get_logratios_grid(dataloader, model, ngrid_points=100, in_param_idx=in_param_idx, out_param_idx=out_param_idx, device=device)
     p_values = get_pvalues_1d(logratios, grid, injection_params)
     sorted_pvalues = np.sort(p_values)
     sorted_rank = np.arange(sorted_pvalues.shape[0])
@@ -379,12 +399,15 @@ def pp_plot( dataloader, model , in_param_idx: int, name: str, out_param_idx: in
     ax.set_title(f'P-P plot, {name}')
     ax.grid(visible=True)
     if name is not None:
-        fig.savefig(os.path.join(ROOT_DIR, "plots", f"{name}_pp_plot.png"))
+        if output_dir is None:
+            output_dir = os.path.join(ROOT_DIR, "plots")
+        os.makedirs(output_dir, exist_ok=True)
+        fig.savefig(os.path.join(output_dir, f"{name}_pp_plot.png"))
     plt.close()
 
-def pp_plot_2d(dataloader, model,  in_param_idx: tuple, out_idx: int, name: str):
+def pp_plot_2d(dataloader, model,  in_param_idx: tuple, out_idx: int, name: str, output_dir: str = None, device: torch.device = None):
     print(f"Making pp plot for {name}...")
-    logratios, injection_params, grid_x, grid_y = get_logratios_grid_2d(dataloader, model, ngrid_points=50, out_param_idx=out_idx, in_param_idx=in_param_idx)
+    logratios, injection_params, grid_x, grid_y = get_logratios_grid_2d(dataloader, model, ngrid_points=50, out_param_idx=out_idx, in_param_idx=in_param_idx, device=device)
     p_values = get_pvalues_2d(logratios, grid_x, grid_y, injection_params)
     sorted_pvalues = np.sort(p_values)
     sorted_normalised_rank = np.arange(sorted_pvalues.shape[0])/sorted_pvalues.shape[0]
@@ -396,7 +419,10 @@ def pp_plot_2d(dataloader, model,  in_param_idx: tuple, out_idx: int, name: str)
     ax.set_title(f'P-P plot, {name}')
     ax.grid(visible=True)
     if name is not None:
-        fig.savefig(os.path.join(ROOT_DIR, "plots", f"{name}_pp_plot_2d.png"))
+        if output_dir is None:
+            output_dir = os.path.join(ROOT_DIR, "plots")
+        os.makedirs(output_dir, exist_ok=True)
+        fig.savefig(os.path.join(output_dir, f"{name}_pp_plot_2d.png"))
     plt.close()
 
 
@@ -1044,10 +1070,12 @@ def mbhb_collate_fn(batch, noise_scale, noise_factor, noise_shuffling=True, td_p
 
     :param batch: list of sample dicts from MBHBDataset.__getitem__
     :param noise_scale: real tensor of shape (n_channels, n_freqs) equal to
-        ``filtered_asd / sqrt(4 * df)``; multiplied against unit CN(0,1) draws
-    :param noise_factor: scalar multiplier applied to the generated noise amplitude
+        ``filtered_asd / sqrt(4 * df)``; multiplied against unit CN(0,1) draws.
+        Unused when the batch already carries a stored ``noise_fd`` per sample.
+    :param noise_factor: scalar multiplier applied to the noise amplitude
+        (works for both freshly-generated and stored noise)
     :param noise_shuffling: kept for API compatibility, has no effect — noise is
-        always freshly generated per call
+        always freshly generated per call when not stored on disk
     :param td_params: tuple ``(dt, n_time)`` needed to derive TD noise via IFFT,
         or ``None`` when only FD data is required
     """
@@ -1055,12 +1083,19 @@ def mbhb_collate_fn(batch, noise_scale, noise_factor, noise_shuffling=True, td_p
     wave_fd = torch.stack([b["wave_fd"] for b in batch])
     params  = torch.stack([b["params"] for b in batch])
     has_td = "wave_td" in batch[0]
+    has_stored_noise = "noise_fd" in batch[0]
 
-    # Generate coloured complex Gaussian noise: z ~ CN(0,1) * noise_scale
-    C, F = noise_scale.shape
-    re = torch.randn(B, C, F, dtype=noise_scale.dtype)
-    im = torch.randn(B, C, F, dtype=noise_scale.dtype)
-    noise_fd = noise_factor * torch.complex(re, im) * noise_scale.unsqueeze(0)
+    if has_stored_noise:
+        # Use the noise realisation persisted on disk (e.g. observation files).
+        # This is what makes the obs deterministic across calls and consistent
+        # with post-hoc visualisation scripts.
+        noise_fd = noise_factor * torch.stack([b["noise_fd"] for b in batch])
+    else:
+        # Generate coloured complex Gaussian noise: z ~ CN(0,1) * noise_scale
+        C, F = noise_scale.shape
+        re = torch.randn(B, C, F, dtype=noise_scale.dtype)
+        im = torch.randn(B, C, F, dtype=noise_scale.dtype)
+        noise_fd = noise_factor * torch.complex(re, im) * noise_scale.unsqueeze(0)
 
     out = {
         "source_parameters": params,
@@ -1549,16 +1584,18 @@ def get_widest_interval_1d(model, dataloader, in_param_idx, out_param_idx, eps=0
     widest_interval = [float(grid[idx_low, 0]), float(grid[idx_high, 0])]
     return widest_interval, norm1d, grid, inj_params
 
-def get_widest_box_2d(model, dataloader, in_param_idx, out_param_idx, ax_buffer=None, do_plot=False):
+def get_widest_box_2d(model, dataloader, in_param_idx, out_param_idx, ax_buffer=None, do_plot=False,
+                      return_norm2d=False):
     """Get the widest credible box for a 2D marginal posterior.
-    
+
     :param model: trained inference model
     :param dataloader: dataloader containing the observation
     :param in_param_idx: tuple of indices for the two input parameters
     :param out_param_idx: index of the output (logratio)
     :param ax_buffer: matplotlib axis to plot on (optional)
     :param do_plot: whether to create the contour plot
-    :return: (widest_box, inj_params) where widest_box is [x_low, x_high, y_low, y_high]
+    :param return_norm2d: if True, also return (norm2d, dp1, dp2, gx, gy)
+    :return: (widest_box, inj_params) or (widest_box, inj_params, norm2d, dp1, dp2, gx, gy)
     """
     logratios, inj_params, gx, gy = get_logratios_grid_2d(
         dataloader,
@@ -1575,14 +1612,16 @@ def get_widest_box_2d(model, dataloader, in_param_idx, out_param_idx, ax_buffer=
     levels, labels = contour_levels(norm2d)
     boxes = posterior_contours_2d(
         gx, gy, norm2d[0],
-        inj_params[0], 
-        ax_buffer=ax_buffer, 
+        inj_params[0],
+        ax_buffer=ax_buffer,
         parameter_names=[_ORDERED_PRIOR_KEYS[in_param_idx[0]], _ORDERED_PRIOR_KEYS[in_param_idx[1]]],
-        levels=levels, 
+        levels=levels,
         levels_labels=labels,
         do_plot=do_plot
     )
     widest_box = boxes[0]
+    if return_norm2d:
+        return widest_box, inj_params, norm2d[0], float(dp1), float(dp2), gx, gy
     return widest_box, inj_params
 
 

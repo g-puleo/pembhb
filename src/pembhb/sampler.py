@@ -25,13 +25,16 @@ def lMcq_m1m2(x: np.array):
 
 class UniformSampler ():
 
-    def __init__(self, prior_bounds: dict = None ):
-        """Initialise sampler with given prior bounds. 
+    def __init__(self, prior_bounds: dict = None, rng: np.random.Generator = None):
+        """Initialise sampler with given prior bounds.
 
         :param prior_bounds: dict of prior bounds
         :type prior_bounds: dict
+        :param rng: NumPy random Generator. If None, uses the global np.random state.
+        :type rng: np.random.Generator or None
         """
         print("init of uniform sampler")
+        self.rng = rng
         self.prior_bounds = copy.deepcopy(prior_bounds)
         ## value is in Gpc^3
         self.prior_bounds["dist"][0]   = self.prior_bounds["dist"][0]**3
@@ -52,7 +55,8 @@ class UniformSampler ():
         
         """
 
-        unif_samples = np.random.uniform(0, 1, size=(self.n_params, n_samples))
+        _rng = self.rng if self.rng is not None else np.random
+        unif_samples = _rng.uniform(0, 1, size=(self.n_params, n_samples))
         tmnre_input = unif_samples * (self.upper_bounds - self.lower_bounds) + self.lower_bounds
 
         is_monotonic = self.lower_bounds <= self.upper_bounds
@@ -116,9 +120,10 @@ class MaskRejectSampler:
     """
 
     def __init__(self, prior_bounds: dict, sky_mask: np.ndarray,
-                 grid_lam: np.ndarray, grid_beta: np.ndarray):
+                 grid_lam: np.ndarray, grid_beta: np.ndarray,
+                 rng: np.random.Generator = None):
         print("init of MaskRejectSampler")
-        self.base_sampler = UniformSampler(prior_bounds)
+        self.base_sampler = UniformSampler(prior_bounds, rng=rng)
         self.sky_mask = sky_mask
         self.grid_lam = grid_lam
         self.grid_beta = grid_beta

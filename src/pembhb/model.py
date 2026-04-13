@@ -289,7 +289,8 @@ class InferenceNetwork(LightningModule):
                 name_output = name_output[:-1]  # remove trailing underscore
                 self.output_names.append(name_output)
                 self.marginals_list.append(marginal)
-        self.td_normalisation = normalisation["td_normalisation"].item()
+        _td_norm = normalisation["td_normalisation"]
+        self.td_normalisation = _td_norm.item() if _td_norm is not None else None
         self.param_mean = torch.tensor(normalisation["param_mean"], dtype=get_torch_dtype()).to(train_conf["device"])
         self.param_std = torch.tensor(normalisation["param_std"], dtype=get_torch_dtype()).to(train_conf["device"])
         print("Parameter mean:", self.param_mean.shape)
@@ -1369,3 +1370,115 @@ class JointAEInferenceNetwork(LightningModule):
         """
         from pembhb.autoencoder import AutoencoderWrapper
         return AutoencoderWrapper(self.autoencoder, freeze=freeze)
+
+    @classmethod
+    def load_from_checkpoint(cls, checkpoint_path, map_location=None, **kwargs):
+        """Load a ``JointAEInferenceNetwork`` from a Lightning checkpoint.
+
+        ``autoencoder`` is not stored in hparams, so the standard Lightning
+        ``load_from_checkpoint`` would fail.  This override reconstructs the
+        autoencoder architecture from ``train_conf`` stored in the checkpoint,
+        using the actual state-dict keys to infer ``residual`` (the config
+        value may be inconsistent with what was actually trained).
+        """
+        from pembhb.autoencoder import DenoisingAutoencoder
+        device = map_location or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        raw = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        hp = raw["hyper_parameters"]
+        ae_conf = hp["train_conf"]["architecture"]["data_summary"]["Autoencoder"]
+
+        # Infer residual from the actual saved weights (config may be stale).
+        ae_sd_keys = [k for k in raw["state_dict"] if k.startswith("autoencoder.encoder")]
+        residual = any(".main." in k for k in ae_sd_keys)
+
+        dummy_ae = DenoisingAutoencoder(
+            n_channels=ae_conf["n_channels"],
+            n_freqs=ae_conf["n_freqs"],
+            architecture=ae_conf.get("architecture", "conv"),
+            bottleneck_dim=ae_conf["bottleneck_dim"],
+            hidden_channels=ae_conf["hidden_channels"],
+            kernel_size=ae_conf["kernel_size"],
+            stride=ae_conf["stride"],
+            dropout=ae_conf.get("dropout", 0.0),
+            residual=residual,
+            representation=ae_conf.get("representation", "real_imag"),
+            high_freq_only=ae_conf.get("high_freq_only", False),
+            freq_split_idx=ae_conf.get("freq_split_idx", 2048),
+        )
+
+        norm = hp["normalisation"]
+        # normalisation values are stored as plain lists/scalars (not tensors)
+        model = cls(
+            train_conf=hp["train_conf"],
+            dataset_info=hp["dataset_info"],
+            normalisation=norm,
+            autoencoder=dummy_ae,
+            ae_warmup_epochs=hp.get("ae_warmup_epochs", 0),
+            lr_ae=hp.get("lr_ae", 1e-3),
+            lr_nre=hp.get("lr_nre", 1e-4),
+            ae_weight_decay=hp.get("ae_weight_decay", 0.0),
+            ae_scheduler_patience=hp.get("ae_scheduler_patience", 10),
+            ae_scheduler_factor=hp.get("ae_scheduler_factor", 0.3),
+            periodic_bc_params=hp["train_conf"].get("periodic_bc_params"),
+        )
+        model.load_state_dict(raw["state_dict"])
+        model.to(device)
+        model.eval()
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint-aware model loader
+# ---------------------------------------------------------------------------
+
+# Registry: data_summary type string → model class.
+# Add entries here when new InferenceNetwork subclasses are introduced.
+_SUMMARY_TYPE_TO_MODEL_CLASS: dict = {
+    "MarginalEncoder": PerMarginalInferenceNetwork,
+}
+
+
+def load_inference_network(ckpt_path: str, device: str = None) -> InferenceNetwork:
+    """Load an InferenceNetwork (or subclass) from a Lightning checkpoint.
+
+    Inspects ``hparams["train_conf"]["architecture"]["data_summary"]["type"]``
+    to determine the correct class before calling ``load_from_checkpoint``,
+    so the right ``forward`` implementation is always used.
+
+    Parameters
+    ----------
+    ckpt_path : str
+        Path to a ``*.ckpt`` file.
+    device : str, optional
+        Target device string (e.g. ``"cuda"`` or ``"cpu"``).  Defaults to
+        ``"cuda"`` when a GPU is available, otherwise ``"cpu"``.
+
+    Returns
+    -------
+    InferenceNetwork
+        The loaded model in eval mode on *device*.
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Peek at hparams without constructing the model.
+    raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    hp = raw.get("hyper_parameters", {})
+
+    # Joint checkpoints (JointAEInferenceNetwork) carry ae_warmup_epochs in
+    # their hparams; sequential checkpoints do not.
+    if "ae_warmup_epochs" in hp:
+        cls = JointAEInferenceNetwork
+    else:
+        ds_type = (
+            hp.get("train_conf", {})
+              .get("architecture", {})
+              .get("data_summary", {})
+              .get("type", None)
+        )
+        cls = _SUMMARY_TYPE_TO_MODEL_CLASS.get(ds_type, InferenceNetwork)
+
+    model = cls.load_from_checkpoint(ckpt_path, map_location=device)
+    model.eval()
+    return model
