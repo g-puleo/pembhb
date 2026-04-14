@@ -8,11 +8,16 @@ from pembhb.utils import (
     get_widest_box_2d,
     get_logratios_grid,
     get_logratios_grid_2d,
+    eval_posterior_2d,
+    contour_levels,
+    posterior_contours_2d,
+    posterior_heatmap_2d,
+    contour_boxes
 )
 # from pembhb.data import MBHBDataset, mbhb_collate_fn
 from torch.utils.data import DataLoader
 from lightning.pytorch.callbacks import  Callback
-
+from pembhb.sky_truncation import get_main_mode_box
 from datetime import datetime, timedelta
 
 import matplotlib.pyplot as plt
@@ -94,7 +99,7 @@ class PeriodicProgressCallback(Callback):
 
 
 class PlotPosteriorCallback(Callback):
-    def __init__(self, timestamp: str, obs_loader: DataLoader, input_idx_list: list, output_idx_list: list, round_idx: int , call_every_n_epochs=1, training_start_time: datetime = None, print_every: int = 20):
+    def __init__(self, timestamp: str, obs_loader: DataLoader, input_idx_list: list, output_idx_list: list, round_idx: int , call_every_n_epochs=1, training_start_time: datetime = None, print_every: int = 20, warmup_epochs: int = 0):
         self.epochs_elapsed = 0
         self.call_every_n_epochs = call_every_n_epochs
         self.print_every = print_every
@@ -106,12 +111,13 @@ class PlotPosteriorCallback(Callback):
         self.init_time = datetime.now()
         self.training_start_time = training_start_time if training_start_time is not None else self.init_time
         self.round_idx = round_idx
+        self.warmup_epochs = warmup_epochs
         # Storage for volume ratio diagnostics
         self.volume_ratios = {}
         # Storage for differential entropy diagnostics
         self.differential_entropies = {}
     
-    def _compute_posterior_volume_2d(self, widest_box):
+    def _compute_posterior_volume_2d(self, widest_box, is_wrapped):
         """
         Compute the area/volume of the posterior from the widest contour box.
         
@@ -120,6 +126,9 @@ class PlotPosteriorCallback(Callback):
         widest_box : tuple
             The bounding box of the 99.99% contour.
             Currently: (x_min, x_max, y_min, y_max) for axis-aligned boxes.
+            
+        is_wrapped : bool
+            Whether the posterior is wrapped around the extrema of the lambda parameter space, which is periodic in the boundary.
             
         Returns:
         --------
@@ -137,7 +146,11 @@ class PlotPosteriorCallback(Callback):
         """
         # Current implementation: axis-aligned box
         # widest_box = (x_min, x_max, y_min, y_max)
-        posterior_area = (widest_box[1] - widest_box[0]) * (widest_box[3] - widest_box[2])
+        if is_wrapped: 
+            lam_width = 2*np.pi - widest_box[0] + widest_box[1]
+            posterior_area = lam_width * (widest_box[3] - widest_box[2])
+        else: 
+            posterior_area = (widest_box[1] - widest_box[0]) * (widest_box[3] - widest_box[2])
         return posterior_area
     
     def _compute_prior_volume_2d(self, pl_module, in_param_idx):
@@ -312,6 +325,9 @@ class PlotPosteriorCallback(Callback):
         return -float(np.sum(norm2d * log_p * dp0 * dp1))
 
     def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.current_epoch < self.warmup_epochs:
+            return
+
         if self.epochs_elapsed == 0:
             os.makedirs(os.path.join(ROOT_DIR, "plots", self.timestamp), exist_ok=True)
 
@@ -422,70 +438,79 @@ class PlotPosteriorCallback(Callback):
                         fontsize=10,
                     )
 
+                    out = os.path.join(ROOT_DIR, "plots", self.timestamp,
+                                      f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{_ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{_ORDERED_PRIOR_KEYS[in_param_idx[1]]}.pdf")
+                    param_names = [_ORDERED_PRIOR_KEYS[in_param_idx[0]], _ORDERED_PRIOR_KEYS[in_param_idx[1]]]
+                    param_label = f"{_ORDERED_PRIOR_KEYS[in_param_idx[0]]}-{_ORDERED_PRIOR_KEYS[in_param_idx[1]]}"
+
                     try:
-                        widest_box, inj_params, norm2d, dp0, dp1, gx, gy = get_widest_box_2d(
-                            pl_module,
-                            self.obs_loader,
-                            in_param_idx=in_param_idx,
-                            out_param_idx=out_param_idx,
-                            ax_buffer=ax,
-                            do_plot=True,
-                            return_norm2d=True,
-                        )
+                        # Baseline heatmap — always produced, independent of contour levels.
+                        norm_2d, inj_params, gx, gy, dp0, dp1 = eval_posterior_2d(pl_module, self.obs_loader, in_param_idx, out_param_idx)
+                        posterior_heatmap_2d(gx, gy, norm_2d, inj_params[0], ax, param_names)
 
-                        # Store widest_box keyed by the marginal (tuple of input parameter indices)
-                        pl_module.widest_boxes[marginal_key] = widest_box
+                        # Contour overlay + contour-derived diagnostics (best effort).
+                        # matplotlib raises ValueError when contour thresholds are
+                        # non-strictly-increasing (flat / degenerate posteriors); in
+                        # that case we keep the heatmap and skip the rest.
+                        try:
+                            levels, labels = contour_levels(norm_2d)
+                            boxes_overlay, cs = contour_boxes(gx, gy, norm_2d, levels, ax=ax)
+                            fmt = {lev: f"{p:.3f}" for lev, p in zip(levels, labels)}
+                            ax.clabel(cs, fmt=fmt, fontsize=8)
 
-                        # Compute posterior-to-prior volume ratio for 2D marginal
-                        posterior_area = self._compute_posterior_volume_2d(widest_box)
-                        prior_area = self._compute_prior_volume_2d(pl_module, in_param_idx)
-                        volume_ratio = posterior_area / prior_area
+                            if marginal_key == (7, 8):
+                                box = get_main_mode_box(gx, gy, norm_2d, credible_level=0.9545, dilation_factor=1.5)
+                                widest_box = (box['lam'][0], box['lam'][1], box['beta'][0], box['beta'][1])
+                                is_wrapped = box["is_wrapped"]
+                            else:
+                                widest_box = boxes_overlay[0]
+                                is_wrapped = False
 
-                        # Store and log the volume ratio
-                        if marginal_key not in self.volume_ratios:
-                            self.volume_ratios[marginal_key] = []
-                        self.volume_ratios[marginal_key].append({
-                            'epoch': trainer.current_epoch,
-                            'ratio': volume_ratio,
-                            'posterior_area': posterior_area,
-                            'prior_area': prior_area
-                        })
+                            pl_module.widest_boxes[marginal_key] = widest_box
 
-                        # Compute differential entropy for 2D marginal
-                        entropy = self._differential_entropy_2d(norm2d, dp0, dp1)
-                        if marginal_key not in self.differential_entropies:
-                            self.differential_entropies[marginal_key] = []
-                        self.differential_entropies[marginal_key].append({
-                            'epoch': trainer.current_epoch,
-                            'entropy': entropy,
-                        })
+                            posterior_area = self._compute_posterior_volume_2d(widest_box, is_wrapped)
+                            prior_area = self._compute_prior_volume_2d(pl_module, in_param_idx)
+                            volume_ratio = posterior_area / prior_area
 
-                        # Log metrics to tensorboard if logger exists
-                        param_tag = f"{_ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{_ORDERED_PRIOR_KEYS[in_param_idx[1]]}"
-                        if trainer.logger is not None:
-                            trainer.logger.log_metrics({f"volume_ratio/{param_tag}": volume_ratio}, step=trainer.current_epoch)
-                            trainer.logger.log_metrics({f"diff_entropy/{param_tag}": entropy}, step=trainer.current_epoch)
+                            if marginal_key not in self.volume_ratios:
+                                self.volume_ratios[marginal_key] = []
+                            self.volume_ratios[marginal_key].append({
+                                'epoch': trainer.current_epoch,
+                                'ratio': volume_ratio,
+                                'posterior_area': posterior_area,
+                                'prior_area': prior_area
+                            })
 
-                        # --- Sky dilation ratio diagnostics (7, 8) = (lambda, sin_beta) ---
-                        if marginal_key == (7, 8):
-                            self._log_sky_contour_ratios(
-                                norm2d, gx, gy, dp0, dp1,
-                                trainer, param_tag,
-                            )
+                            entropy = self._differential_entropy_2d(norm_2d, dp0, dp1)
+                            if marginal_key not in self.differential_entropies:
+                                self.differential_entropies[marginal_key] = []
+                            self.differential_entropies[marginal_key].append({
+                                'epoch': trainer.current_epoch,
+                                'entropy': entropy,
+                            })
 
-                        # Print diagnostic
-                        param_names = f"{_ORDERED_PRIOR_KEYS[in_param_idx[0]]}-{_ORDERED_PRIOR_KEYS[in_param_idx[1]]}"
-                        if trainer.current_epoch % self.print_every == 0:
-                            print(f"Round {self.round_idx}, Epoch {trainer.current_epoch}, {param_names}: "
-                                  f"vol_ratio={volume_ratio:.4f} "
-                                  f"(post={posterior_area:.3e}, prior={prior_area:.3e}), "
-                                  f"H={entropy:.4f} nats", flush=True)
-                        
-                        out = os.path.join(ROOT_DIR, "plots", self.timestamp,
-                                          f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{_ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{_ORDERED_PRIOR_KEYS[in_param_idx[1]]}.pdf")
+                            param_tag = f"{_ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{_ORDERED_PRIOR_KEYS[in_param_idx[1]]}"
+                            if trainer.logger is not None:
+                                trainer.logger.log_metrics({f"volume_ratio/{param_tag}": volume_ratio}, step=trainer.current_epoch)
+                                trainer.logger.log_metrics({f"diff_entropy/{param_tag}": entropy}, step=trainer.current_epoch)
+
+                            if marginal_key == (7, 8):
+                                self._log_sky_contour_ratios(
+                                    norm_2d, gx, gy, dp0, dp1,
+                                    trainer, param_tag,
+                                )
+
+                            if trainer.current_epoch % self.print_every == 0:
+                                print(f"Round {self.round_idx}, Epoch {trainer.current_epoch}, {param_label}: "
+                                      f"vol_ratio={volume_ratio:.4f} "
+                                      f"(post={posterior_area:.3e}, prior={prior_area:.3e}), "
+                                      f"H={entropy:.4f} nats", flush=True)
+                        except ValueError as ve:
+                            print(f"Round {self.round_idx}, Epoch {trainer.current_epoch}, {param_label}: "
+                                  f"contour overlay failed ({ve}); saving heatmap without contours.",
+                                  flush=True)
+
                         fig.savefig(out, bbox_inches="tight")
-                    except ValueError as ve:
-                        print(f"caught ValueError: {ve} during contour plotting, skipping this plot")
                     finally:
                         plt.close(fig)
 

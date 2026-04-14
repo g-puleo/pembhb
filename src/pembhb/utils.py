@@ -950,6 +950,28 @@ def contour_boxes(grid_x, grid_y, ratios, levels, ax=None, colors=None, linestyl
         plt.close(fig)
     return boxes, cs
 
+def posterior_heatmap_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, true_values: list, ax_buffer: plt.Axes, parameter_names: list, title: str=None, show_colormap=True, **plot_kwargs):
+    """Draw the baseline 2D posterior: pcolormesh + injection cross-hairs + labels.
+
+    Split out from :func:`posterior_contours_2d` so callers that need the
+    heatmap to appear even when contour levels are ill-defined can draw it
+    independently of the contour overlay.
+    """
+    if show_colormap:
+        c = ax_buffer.pcolormesh(grid_x, grid_y, ratios, shading='auto', cmap="inferno", **plot_kwargs)
+        fig = ax_buffer.get_figure()
+        fig.colorbar(c, ax=ax_buffer)
+
+    ax_buffer.axvline(x=true_values[0], color='r', linestyle='--', label='True Value')
+    ax_buffer.axhline(y=true_values[1], color='r', linestyle='--')
+
+    if title is not None:
+        ax_buffer.set_title(title)
+    ax_buffer.set_xlabel(parameter_names[0])
+    ax_buffer.set_ylabel(parameter_names[1])
+    ax_buffer.grid()
+
+
 def posterior_contours_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, true_values: list, ax_buffer: plt.Axes, parameter_names: list, levels: np.array, levels_labels: list[str], title: str=None, do_plot=False, show_colormap=True, contour_colors=None, contour_linestyles=None, contour_linewidths=None, contour_alpha=None, **plot_kwargs):
     """
     Find the bounding box of the contour levels specified in levels. 
@@ -983,34 +1005,20 @@ def posterior_contours_2d(grid_x: np.array, grid_y: np.array, ratios: np.array, 
     :return: the bounding box of the contour levels
     :rtype: tuple
     """
-    if do_plot: 
-        # make a colormesh on the ax_buffer (optional, for debugging)
-        if show_colormap:
-            c = ax_buffer.pcolormesh(grid_x, grid_y, ratios, shading='auto', cmap="inferno", **plot_kwargs)
-        
-        # add contour lines
+    if do_plot:
+        posterior_heatmap_2d(grid_x, grid_y, ratios, true_values, ax_buffer,
+                             parameter_names, title=title,
+                             show_colormap=show_colormap, **plot_kwargs)
+
         boxes, cs = contour_boxes(grid_x, grid_y, ratios, levels, ax=ax_buffer,
                                   colors=contour_colors, linestyles=contour_linestyles,
                                   linewidths=contour_linewidths, alpha=contour_alpha)
         fmt = {lev: f"{p:.3f}" for lev, p in zip(levels, levels_labels)}
         ax_buffer.clabel(cs, fmt=fmt, fontsize=8)
-        
-        ax_buffer.axvline(x=true_values[0], color='r', linestyle='--', label='True Value')
-        ax_buffer.axhline(y=true_values[1], color='r', linestyle='--')
-        
-        if show_colormap:
-            fig = ax_buffer.get_figure()
-            cbar = fig.colorbar(c, ax=ax_buffer)
-        
-        if title is not None:
-            ax_buffer.set_title(title)
-        ax_buffer.set_xlabel(parameter_names[0])
-        ax_buffer.set_ylabel(parameter_names[1])
-        ax_buffer.grid()
-    else: 
+    else:
         boxes , cs = contour_boxes(grid_x, grid_y, ratios, levels, ax=None)
         plt.close()
-    
+
     return boxes
 
 def posterior_contours_2d_imshow(grid_x: np.array, grid_y: np.array, ratios: np.array, true_values: list, ax_buffer: plt.Axes, parameter_names: list, levels: np.array, levels_labels: list[str], title: str=None, do_plot=False, **plot_kwargs):
@@ -1597,21 +1605,10 @@ def get_widest_box_2d(model, dataloader, in_param_idx, out_param_idx, ax_buffer=
     :param return_norm2d: if True, also return (norm2d, dp1, dp2, gx, gy)
     :return: (widest_box, inj_params) or (widest_box, inj_params, norm2d, dp1, dp2, gx, gy)
     """
-    logratios, inj_params, gx, gy = get_logratios_grid_2d(
-        dataloader,
-        model,
-        ngrid_points=100,
-        in_param_idx=in_param_idx,
-        out_param_idx=out_param_idx,
-    )
-
-    ratios = np.exp(logratios)
-    dp1 = gx[0, 1] - gx[0, 0]  # param_0 spacing (x varies along columns with xy indexing)
-    dp2 = gy[1, 0] - gy[0, 0]  # param_1 spacing (y varies along rows with xy indexing)
-    norm2d = ratios / np.sum(ratios * dp1 * dp2, axis=(1, 2), keepdims=True)
+    norm2d, inj_params, gx, gy, dp1, dp2 = eval_posterior_2d(model, dataloader, in_param_idx, out_param_idx)
     levels, labels = contour_levels(norm2d)
     boxes = posterior_contours_2d(
-        gx, gy, norm2d[0],
+        gx, gy, norm2d,
         inj_params[0],
         ax_buffer=ax_buffer,
         parameter_names=[_ORDERED_PRIOR_KEYS[in_param_idx[0]], _ORDERED_PRIOR_KEYS[in_param_idx[1]]],
@@ -1621,7 +1618,7 @@ def get_widest_box_2d(model, dataloader, in_param_idx, out_param_idx, ax_buffer=
     )
     widest_box = boxes[0]
     if return_norm2d:
-        return widest_box, inj_params, norm2d[0], float(dp1), float(dp2), gx, gy
+        return widest_box, inj_params, norm2d, float(dp1), float(dp2), gx, gy
     return widest_box, inj_params
 
 
@@ -1722,3 +1719,17 @@ def get_widest_box_sky(model, dataloader, in_param_idx, out_param_idx,
     widest_box = (lam_lo, lam_hi, beta_lo, beta_hi)
     return widest_box, inj_params, sky_analysis
 
+
+def eval_posterior_2d(model, dataloader, in_param_idx, out_param_idx, ngrid_points=100):
+    """Evaluate and normalize a 2D marginal posterior on a grid."""
+    logratios, inj_params, gx, gy = get_logratios_grid_2d(
+        dataloader, model,
+        ngrid_points=ngrid_points,
+        in_param_idx=in_param_idx,
+        out_param_idx=out_param_idx,
+    )
+    ratios = np.exp(logratios)
+    dp0 = float(gx[0, 1] - gx[0, 0])
+    dp1 = float(gy[1, 0] - gy[0, 0])
+    norm2d = ratios / np.sum(ratios * dp0 * dp1, axis=(1, 2), keepdims=True)
+    return norm2d[0], inj_params, gx, gy, dp0, dp1

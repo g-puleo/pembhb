@@ -148,6 +148,15 @@ def load_model(ckpt_dir: str) -> InferenceNetwork:
     inspects the checkpoint hparams to select the correct model class
     (e.g. :class:`PerMarginalInferenceNetwork` for marginal-encoder runs).
     """
+
+    ckpt_trunc = os.path.join(ckpt_dir, "../truncation.ckpt")
+    if os.path.exists(ckpt_trunc):
+        model = load_inference_network(ckpt_trunc)
+        return model
+    else:
+        
+        print(f"WARNING: truncation checkpoint {ckpt_trunc} not found. this model may not match what was used at truncation time!")
+
     ckpt_files = glob(os.path.join(ckpt_dir, "*.ckpt"))
     if not ckpt_files:
         raise FileNotFoundError(f"No .ckpt file found in {ckpt_dir}")

@@ -19,7 +19,7 @@ Two operating modes:
 
 import numpy as np
 from scipy import ndimage
-
+from pembhb.utils import eval_posterior_2d
 # ---------------------------------------------------------------------------
 #  Internal helpers
 # ---------------------------------------------------------------------------
@@ -609,22 +609,11 @@ def truncate_sky_prior(model, obs_loader, out_param_idx,
         sampler : MaskRejectSampler
         info : dict
     """
-    from pembhb.utils import get_logratios_grid_2d
 
     in_param_idx = (7, 8)  # (lambda, sin_beta)
+    norm2d, inj_params, gx, gy, dp1, dp2 = eval_posterior_2d(model, obs_loader, in_param_idx, out_param_idx)
 
-    logratios, inj_params, gx, gy = get_logratios_grid_2d(
-        obs_loader, model,
-        ngrid_points=100,
-        in_param_idx=in_param_idx,
-        out_param_idx=out_param_idx,
-    )
-
-    ratios = np.exp(logratios)
-    dp1 = gx[0, 1] - gx[0, 0]
-    dp2 = gy[1, 0] - gy[0, 0]
-    norm2d = ratios / np.sum(ratios * dp1 * dp2, axis=(1, 2), keepdims=True)
-    posterior = norm2d[0]
+    posterior = norm2d
 
     analysis = analyse_sky_posterior(
         gx, gy, posterior,

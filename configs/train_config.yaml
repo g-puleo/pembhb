@@ -24,7 +24,7 @@ marginals:
 marginal_schedule:
   - from_round: 1
     marginals:
-      f: [[0,], [10,]]
+      f: [[0,], [10,], [7, 8]]
   - from_round: 3
     marginals:
       f: [[0,], [10,], [7, 8]]
@@ -140,9 +140,9 @@ baseline_model:
 # These settings are IGNORED by scripts/tmnre.py (sequential pipeline).
 # -------------------------------------------------------------------------
 joint_training:
-  ae_warmup_epochs: 1        # epochs of AE-only training before NRE kicks in (round 1 only)
+  ae_warmup_epochs: 100        # epochs of AE-only training before NRE kicks in (round 1 only)
   lr_ae: 0.001                # learning rate for autoencoder (encoder + decoder)
-  lr_nre: 0.0001              # learning rate for NRE classifier heads
+  lr_nre: 0.00001              # learning rate for NRE classifier heads
   ae_weight_decay: 0.00001    # weight decay for autoencoder param group
   ae_scheduler_patience: 50   # ReduceLROnPlateau patience
   ae_scheduler_factor: 0.3    # ReduceLROnPlateau factor

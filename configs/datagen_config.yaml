@@ -11,17 +11,17 @@ waveform_params:
   freq_spacing: "log"   # "linear" or "log" (FD-only)
 
 prior:
-  "logMchirp": [5.249885082244873, 5.2501020431518555]
+  "logMchirp": [5.2499868981482, 5.25001543353302]
   "q":         [1.0, 5.0]          # mass ratio
   "chi1":       [0.0, 0.0]
   "chi2":       [0,0]
   "dist":       [10,10]            # dist in Gpc (note that we shall sample uniformly dist^3)
   "phi":        [0.0, 0.0]       # phase at coalescence
   "inc":        [0.5,0.5]         # cos inclination
-  "lambda":     [3.1391, 3.1740]       # ecliptic longitude
-  "beta":      [0.1831, 0.2150]            # sin ecliptic latitude
+  "lambda":     [3.13364303859817, 3.15005903108327]       # ecliptic longitude
+  "beta":      [0.193276968635122, 0.205711356305175]            # sin ecliptic latitude
   "psi":        [1.0,1.0]      # polarization angle
-  "Deltat":    [-2.500039577484131, -2.4999680519104004]        # t_merger from end of observation in days
+  "Deltat":    [-2.50002064857738, -2.49998439474129]        # t_merger from end of observation in days
 
 backend: "cuda12x"
 
