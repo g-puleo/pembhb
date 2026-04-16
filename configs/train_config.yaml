@@ -142,10 +142,11 @@ baseline_model:
 joint_training:
   ae_warmup_epochs: 100        # epochs of AE-only training before NRE kicks in (round 1 only)
   lr_ae: 0.001                # learning rate for autoencoder (encoder + decoder)
-  lr_nre: 0.00001              # learning rate for NRE classifier heads
-  ae_weight_decay: 0.00001    # weight decay for autoencoder param group
+  lr_nre: 0.0001              # learning rate for NRE classifier heads
+  ae_weight_decay: 0.0001    # weight decay for autoencoder param group
   ae_scheduler_patience: 50   # ReduceLROnPlateau patience
   ae_scheduler_factor: 0.3    # ReduceLROnPlateau factor
+  freeze_ae_after_warmup: false  # if true, freeze AE after warmup; only NRE trains post-warmup
 
 
 # -------------------------------------------------------------------------
@@ -160,8 +161,8 @@ early_stop_criterion: "volume_ratio"   # "volume_ratio" | "differential_entropy"
 # -------------------------------------------------------------------------
 volume_ratio_early_stop:
   enabled: true
-  warmup_epochs: 50       # ignore first N epochs (posterior is noisy)
-  patience: 10            # consecutive stalled evaluations before stopping
+  warmup_epochs: 100       # ignore first N epochs (posterior is noisy)
+  patience: 100            # consecutive stalled evaluations before stopping
   rel_tol: 0.02           # relative EMA change threshold for "stalled"
   ema_alpha: 0.3          # EMA smoothing factor (higher = more reactive)
   min_ratio_threshold: 0.5  # stop immediately if any marginal ratio drops here

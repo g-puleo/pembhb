@@ -8,11 +8,11 @@ waveform_params:
   # FD-only settings (used when domain="fd"; ignored for "fd_td")
   domain: "fd"          # "fd" for FD-only simulator, "fd_td" for FD+TD (default)
   n_freq_bins: 4096        # number of frequency bins (FD-only)
-  freq_spacing: "log"   # "linear" or "log" (FD-only)
+  freq_spacing: "linear"   # "linear" or "log" (FD-only)
 
 prior:
   "logMchirp": [5.2499868981482, 5.25001543353302]
-  "q":         [1.0, 5.0]          # mass ratio
+  "q":         [2.99882969771, 3.001046336]          # mass ratio (99.99% posterior width from mcmc_coppa/logf_samples_5D_copparoni.h5)
   "chi1":       [0.0, 0.0]
   "chi2":       [0,0]
   "dist":       [10,10]            # dist in Gpc (note that we shall sample uniformly dist^3)

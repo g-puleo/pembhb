@@ -1023,6 +1023,7 @@ class JointAEInferenceNetwork(LightningModule):
         ae_scheduler_patience: int = 10,
         ae_scheduler_factor: float = 0.3,
         periodic_bc_params: list = None,
+        freeze_ae_after_warmup: bool = False,
     ):
         super().__init__()
 
@@ -1038,6 +1039,7 @@ class JointAEInferenceNetwork(LightningModule):
         self.ae_scheduler_patience = ae_scheduler_patience
         self.ae_scheduler_factor = ae_scheduler_factor
         self.ae_warmup_epochs = ae_warmup_epochs
+        self.freeze_ae_after_warmup = freeze_ae_after_warmup
 
         # Use the actual sampling prior as authoritative source
         _sik = dataset_info.get("sampler_init_kwargs", {})
@@ -1256,9 +1258,17 @@ class JointAEInferenceNetwork(LightningModule):
     # Lightning training / validation steps
     # ------------------------------------------------------------------
 
+    def on_train_epoch_start(self):
+        if self.freeze_ae_after_warmup and self.current_epoch == self.ae_warmup_epochs:
+            for param in self.autoencoder.parameters():
+                param.requires_grad_(False)
+            print(f"[JointAE] AE frozen at epoch {self.current_epoch} "
+                  f"(ae_warmup_epochs={self.ae_warmup_epochs})")
+
     def training_step(self, batch, batch_idx):
         # AE reconstruction loss (gradients flow through encoder+decoder)
-        ae_loss = self._calc_ae_loss(batch)
+        ae_frozen = self.freeze_ae_after_warmup and self.current_epoch >= self.ae_warmup_epochs
+        ae_loss = torch.tensor(0.0, device=self.device) if ae_frozen else self._calc_ae_loss(batch)
 
         # NRE loss (bottleneck detached — no encoder gradients)
         in_warmup = self.current_epoch < self.ae_warmup_epochs
@@ -1293,7 +1303,8 @@ class JointAEInferenceNetwork(LightningModule):
         return total_loss
 
     def validation_step(self, batch, batch_idx):
-        ae_loss = self._calc_ae_loss(batch)
+        ae_frozen = self.freeze_ae_after_warmup and self.current_epoch >= self.ae_warmup_epochs
+        ae_loss = torch.tensor(0.0, device=self.device) if ae_frozen else self._calc_ae_loss(batch)
 
         in_warmup = self.current_epoch < self.ae_warmup_epochs
         if in_warmup:
