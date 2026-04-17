@@ -8,7 +8,7 @@ waveform_params:
   # FD-only settings (used when domain="fd"; ignored for "fd_td")
   domain: "fd"          # "fd" for FD-only simulator, "fd_td" for FD+TD (default)
   n_freq_bins: 4096        # number of frequency bins (FD-only)
-  freq_spacing: "linear"   # "linear" or "log" (FD-only)
+  freq_spacing: "log"   # "linear" or "log" (FD-only)
 
 prior:
   "logMchirp": [5.2499868981482, 5.25001543353302]

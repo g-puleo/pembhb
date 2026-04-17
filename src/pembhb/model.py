@@ -178,12 +178,16 @@ class GradnormHandler :
 
 class MarginalClassifierHead(nn.Module):
 
-    def __init__(self, n_data_features: int , marginals: list[list], hlayersizes: Iterable[int]):
-        """Classifier head for multiple marginals. 
-        Performs a binary classification for each marginal in the list of marginals. Used for TMNRE. 
+    def __init__(self, n_data_features: int | list[int], marginals: list[list], hlayersizes: Iterable[int]):
+        """Classifier head for multiple marginals.
+        Performs a binary classification for each marginal in the list of marginals. Used for TMNRE.
 
-        :param n_data_features: the number of features in the data summary
-        :type n_data_features: int
+        :param n_data_features: the number of features in the data summary.
+            If an int, the same value is used for all marginals (shared data summary).
+            If a list[int], each marginal gets its own data feature size
+            (e.g. for per-parameter encoders where 2D marginals receive
+            concatenated bottlenecks).
+        :type n_data_features: int | list[int]
         :param marginals: list of marginals that you want , in the reparametrised index space
         :type marginals: list[list]
         :param hidden_size: sizes of the hidden layers in the classifier
@@ -191,21 +195,25 @@ class MarginalClassifierHead(nn.Module):
         """
         super().__init__()
         self.marginals_dict = marginals
+        if isinstance(n_data_features, int):
+            n_data_features_list = [n_data_features] * len(marginals)
+        else:
+            n_data_features_list = list(n_data_features)
         self.classifiers = nn.ModuleList()
-        for marginal in marginals:
+        for marginal, n_df in zip(marginals, n_data_features_list):
             classifier = nn.Sequential()
             for i, output_size in enumerate(hlayersizes):
                 if i == 0:
-                    input_size = n_data_features + len(marginal)
+                    input_size = n_df + len(marginal)
                     output_size = hlayersizes[i]
                 else:
                     input_size = hlayersizes[i-1]
                     output_size = hlayersizes[i]
-        
+
                 classifier.add_module(f"fc_{i}", nn.Linear(input_size, output_size))
                 classifier.add_module(f"relu_{i}", nn.ReLU())
 
-            classifier.add_module("output", nn.Linear(output_size, 1)) 
+            classifier.add_module("output", nn.Linear(output_size, 1))
             self.classifiers.append(classifier)
         
 
@@ -252,6 +260,33 @@ def reparametrise_periodic_bc(parameters, position_indices: list):
         )
         offset += 1
     return parameters_out
+
+
+def normalise_sincos_cols(params_expanded, periodic_bc_params, param_index_remapping, sincos_mean, sincos_std):
+    """Normalize the sin/cos columns in the expanded parameter tensor.
+
+    After reparametrise_periodic_bc() each periodic parameter index i has been
+    replaced by two columns [sin, cos] tracked in param_index_remapping[i].
+    This function standardizes those columns using pre-computed statistics.
+
+    Args:
+        params_expanded: Tensor of shape (B, N + len(periodic_bc_params))
+        periodic_bc_params: list of original periodic parameter indices
+        param_index_remapping: dict mapping original index → [sin_col, cos_col]
+        sincos_mean: 1-D tensor of length 2*len(periodic_bc_params), ordered
+            [sin_mean_0, cos_mean_0, sin_mean_1, cos_mean_1, ...]
+        sincos_std: same shape as sincos_mean
+
+    Returns:
+        Tensor same shape as params_expanded with sin/cos columns normalized.
+    """
+    params_out = params_expanded.clone()
+    for k, idx in enumerate(periodic_bc_params):
+        sin_col, cos_col = param_index_remapping[idx]
+        params_out[:, sin_col] = (params_out[:, sin_col] - sincos_mean[2 * k]) / sincos_std[2 * k]
+        params_out[:, cos_col] = (params_out[:, cos_col] - sincos_mean[2 * k + 1]) / sincos_std[2 * k + 1]
+    return params_out
+
 
 class InferenceNetwork(LightningModule):
     """ 
@@ -313,7 +348,13 @@ class InferenceNetwork(LightningModule):
         self.param_mean[periodic_bc_params] = 0
         self.param_std[periodic_bc_params] = 1
 
-        
+        # sin/cos normalization statistics (identity fallback for backward compat)
+        _n_periodic = len(periodic_bc_params)
+        _sc_mean = normalisation.get("sincos_mean", [0.0] * (2 * _n_periodic))
+        _sc_std  = normalisation.get("sincos_std",  [1.0] * (2 * _n_periodic))
+        self.register_buffer("sincos_mean", torch.tensor(_sc_mean, dtype=get_torch_dtype()))
+        self.register_buffer("sincos_std",  torch.tensor(_sc_std,  dtype=get_torch_dtype()))
+
         self.param_index_remapping = {}
         offset = 0
         for idx in range(len(_ORDERED_PRIOR_KEYS)):
@@ -347,10 +388,22 @@ class InferenceNetwork(LightningModule):
             self.logratios_model_dict[key] = MarginalClassifierHead(
                 n_data_features=self.n_features_summary*len(key),
                 marginals=self.marginals_dict_remapped[key], 
-                hlayersizes=(64, 32, 16, 8)
+                hlayersizes=train_conf.get("classifier_hlayersizes", (64, 32, 16, 8))
             ).to(train_conf["device"])
 
-
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # Backward compatibility: old checkpoints don't have sincos_mean/sincos_std
+        # buffers. Fall back to the identity-normalization values built in __init__
+        # (mean=0, std=1) so load_state_dict doesn't fail on missing keys.
+        for buf_name in ("sincos_mean", "sincos_std"):
+            key = prefix + buf_name
+            if key not in state_dict and hasattr(self, buf_name):
+                state_dict[key] = getattr(self, buf_name)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
 
     def transform_td(self, data_t):
         """Applies time-domain normalisation to the input data.
@@ -397,11 +450,16 @@ class InferenceNetwork(LightningModule):
         normalised_parameters = (parameters - self.param_mean) / self.param_std
         # take sin and cos of the params specified in periodic_bc_params
         reparametrised_withbc_params = reparametrise_periodic_bc(normalised_parameters, self.periodic_bc_params)
+        if len(self.periodic_bc_params) > 0:
+            reparametrised_withbc_params = normalise_sincos_cols(
+                reparametrised_withbc_params, self.periodic_bc_params,
+                self.param_index_remapping, self.sincos_mean, self.sincos_std,
+            )
         logratios_1d_list = []
         for key in self.logratios_model_dict.keys():
             logratios_output = self.logratios_model_dict[key](features_dict[key], reparametrised_withbc_params)
             logratios_1d_list.append(logratios_output)
-        logratios_1d = torch.cat(logratios_1d_list, dim=-1)        
+        logratios_1d = torch.cat(logratios_1d_list, dim=-1)
         return logratios_1d
 
     def _calc_logits_base(self, batch):
@@ -517,17 +575,22 @@ class InferenceNetwork(LightningModule):
         
 
 class PerMarginalInferenceNetwork(InferenceNetwork):
-    """InferenceNetwork variant where each marginal has its own dedicated
+    """InferenceNetwork variant where each *parameter* has its own dedicated
     data encoder (ConvEncoder trained with parameter regression).
 
     Architecture
     ------------
-    For each marginal i:
+    Each unique parameter p gets its own encoder:
 
-        noisy_FD  →  ConvEncoder_i  →  bottleneck_i
-        (bottleneck_i ‖ params_i)   →  classifier_i  →  logratio_i
+        noisy_FD  →  ConvEncoder_p  →  bottleneck_p
 
-    The per-marginal encoders are produced by :class:`MarginalEncoderTrainer`
+    For a 1D marginal [p]:
+        (bottleneck_p ‖ params_p)  →  classifier  →  logratio
+
+    For a 2D marginal [p, q]:
+        (bottleneck_p ‖ bottleneck_q ‖ params_p ‖ params_q)  →  classifier  →  logratio
+
+    The per-parameter encoders are produced by :class:`MarginalEncoderTrainer`
     and frozen during NRE training.  Everything else (loss, optimiser,
     callbacks, prior truncation, weight transfer across rounds) is inherited
     unchanged from :class:`InferenceNetwork`.
@@ -556,17 +619,33 @@ class PerMarginalInferenceNetwork(InferenceNetwork):
             data_summarizer = self._build_dummy_wrapper(train_conf)
 
         # Parent constructs logratios_model_dict with one MarginalClassifierHead
-        # per domain.  Each classifier head holds individual nn.Sequential
-        # classifiers whose input size is (bottleneck_dim + len(remapped_marginal)).
-        # We reuse those classifiers verbatim – only the *routing* changes.
+        # per domain, using n_data_features = bottleneck_dim (shared summary).
+        # We override this below with per-marginal n_data_features.
         super().__init__(train_conf, dataset_info, normalisation, data_summarizer, periodic_bc_params)
 
-        # Build a flat ordered list of (domain, position-in-domain, remapped-indices)
-        # so that forward() can pair bottleneck[i] with the right classifier.
+        # Rebuild logratios_model_dict with per-parameter bottleneck sizes.
+        # For a 2D marginal [p, q] the classifier receives two concatenated
+        # bottlenecks, so n_data_features = 2 * bottleneck_dim.
+        bottleneck_dim = self.data_summary.get_n_features()
+        self.logratios_model_dict = nn.ModuleDict()
+        for domain in self.marginals_dict_remapped:
+            n_data_features_list = [
+                len(orig_marg) * bottleneck_dim
+                for orig_marg in self.marginals_dict[domain]
+            ]
+            self.logratios_model_dict[domain] = MarginalClassifierHead(
+                n_data_features=n_data_features_list,
+                marginals=self.marginals_dict_remapped[domain],
+                hlayersizes=train_conf.get("classifier_hlayersizes", (64, 32, 16, 8)),
+            ).to(train_conf["device"])
+
+        # Build a flat ordered list of (domain, pos, remapped_indices, original_marginal)
+        # so that forward() can pair per-parameter bottlenecks with the right classifier.
         self._marginal_order = []
         for domain in self.marginals_dict_remapped:
             for pos, remapped_marginal in enumerate(self.marginals_dict_remapped[domain]):
-                self._marginal_order.append((domain, pos, remapped_marginal))
+                original_marginal = self.marginals_dict[domain][pos]
+                self._marginal_order.append((domain, pos, remapped_marginal, original_marginal))
 
     # ------------------------------------------------------------------
     # Dummy wrapper for checkpoint loading
@@ -607,28 +686,31 @@ class PerMarginalInferenceNetwork(InferenceNetwork):
         return MarginalEncoderWrapper(trainer_model, freeze=True, device="cpu")
 
     # ------------------------------------------------------------------
-    # Override forward: route each encoder's bottleneck to its classifier
+    # Override forward: route per-parameter bottlenecks to classifiers
     # ------------------------------------------------------------------
 
     def forward(self, d_f, d_t, parameters):
-        """Per-marginal forward pass.
+        """Per-parameter forward pass.
 
-        Each encoder produces an independent bottleneck; each classifier
-        receives only its encoder's bottleneck (not a shared summary).
+        Each parameter's encoder produces an independent bottleneck.
+        For 2D marginals, bottlenecks from both parameters are concatenated.
         The output shape is identical to :class:`InferenceNetwork`:
         ``(B, N_marginals)``.
         """
-        # bottlenecks: list of (B, bottleneck_dim), one per marginal
-        bottlenecks, _d_t = self.data_summary(d_f, d_t)
+        # bottleneck_dict: {param_idx: (B, bottleneck_dim)}
+        bottleneck_dict, _d_t = self.data_summary(d_f, d_t)
 
         normalised_parameters = (parameters - self.param_mean) / self.param_std
         reparametrised = reparametrise_periodic_bc(normalised_parameters, self.periodic_bc_params)
 
         logratios_list = []
-        for i, (domain, pos, remapped_marginal) in enumerate(self._marginal_order):
-            bottleneck  = bottlenecks[i]
-            classifier  = self.logratios_model_dict[domain].classifiers[pos]
-            input_data  = torch.cat([bottleneck, reparametrised[:, remapped_marginal]], dim=-1)
+        for domain, pos, remapped_marginal, original_marginal in self._marginal_order:
+            # Concatenate bottlenecks for all params in this marginal
+            bottleneck = torch.cat(
+                [bottleneck_dict[p] for p in original_marginal], dim=-1
+            )  # (B, len(original_marginal) * bottleneck_dim)
+            classifier = self.logratios_model_dict[domain].classifiers[pos]
+            input_data = torch.cat([bottleneck, reparametrised[:, remapped_marginal]], dim=-1)
             logratios_list.append(classifier(input_data))
 
         return torch.cat(logratios_list, dim=-1)
@@ -1077,6 +1159,13 @@ class JointAEInferenceNetwork(LightningModule):
         self.param_mean[periodic_bc_params] = 0
         self.param_std[periodic_bc_params] = 1
 
+        # sin/cos normalization statistics (identity fallback for backward compat)
+        _n_periodic = len(periodic_bc_params)
+        _sc_mean = normalisation.get("sincos_mean", [0.0] * (2 * _n_periodic))
+        _sc_std  = normalisation.get("sincos_std",  [1.0] * (2 * _n_periodic))
+        self.register_buffer("sincos_mean", torch.tensor(_sc_mean, dtype=get_torch_dtype()))
+        self.register_buffer("sincos_std",  torch.tensor(_sc_std,  dtype=get_torch_dtype()))
+
         self.param_index_remapping = {}
         offset = 0
         for idx in range(len(_ORDERED_PRIOR_KEYS)):
@@ -1116,7 +1205,7 @@ class JointAEInferenceNetwork(LightningModule):
             self.logratios_model_dict[key] = MarginalClassifierHead(
                 n_data_features=self.n_features_summary * len(key),
                 marginals=self.marginals_dict_remapped[key],
-                hlayersizes=(64, 32, 16, 8),
+                hlayersizes=train_conf.get("classifier_hlayersizes", (64, 32, 16, 8)),
             )
 
         # ---- Save hyper-parameters for checkpoint / utils compat --------
@@ -1136,6 +1225,20 @@ class JointAEInferenceNetwork(LightningModule):
                 "ae_scheduler_factor": ae_scheduler_factor,
             },
             logger=True,
+        )
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # Backward compatibility: old checkpoints don't have sincos_mean/sincos_std
+        # buffers. Fall back to the identity-normalization values built in __init__
+        # (mean=0, std=1) so load_state_dict doesn't fail on missing keys.
+        for buf_name in ("sincos_mean", "sincos_std"):
+            key = prefix + buf_name
+            if key not in state_dict and hasattr(self, buf_name):
+                state_dict[key] = getattr(self, buf_name)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
         )
 
     # ------------------------------------------------------------------
@@ -1175,6 +1278,11 @@ class JointAEInferenceNetwork(LightningModule):
         features_dict = {"ft": None, "f": bottleneck, "t": d_t}
         normalised_parameters = (parameters - self.param_mean) / self.param_std
         reparametrised_withbc_params = reparametrise_periodic_bc(normalised_parameters, self.periodic_bc_params)
+        if len(self.periodic_bc_params) > 0:
+            reparametrised_withbc_params = normalise_sincos_cols(
+                reparametrised_withbc_params, self.periodic_bc_params,
+                self.param_index_remapping, self.sincos_mean, self.sincos_std,
+            )
 
         logratios_list = []
         for key in self.logratios_model_dict.keys():

@@ -10,6 +10,7 @@ early_stop_min_delta: 0.001
 early_stop_threshold: 0.999
 scheduler_factor: 0.3
 scheduler_patience: 80
+classifier_hlayersizes: [64, 128, 256, 512, 256, 128, 64, 32, 16, 8]
 keep_ckpt: True
 marginals:
   #  f: [[0]]
@@ -88,7 +89,7 @@ architecture:
       high_freq_only: False
       freq_split_idx: 2048
       # Training
-      lr: 0.001
+      lr: 0.0001
       weight_decay: 0.0001
       epochs: 150
       scheduler_patience: 75
@@ -161,8 +162,8 @@ early_stop_criterion: "volume_ratio"   # "volume_ratio" | "differential_entropy"
 # -------------------------------------------------------------------------
 volume_ratio_early_stop:
   enabled: true
-  warmup_epochs: 100       # ignore first N epochs (posterior is noisy)
-  patience: 100            # consecutive stalled evaluations before stopping
+  warmup_epochs: 80       # ignore first N epochs (posterior is noisy)
+  patience: 20            # consecutive stalled evaluations before stopping
   rel_tol: 0.02           # relative EMA change threshold for "stalled"
   ema_alpha: 0.3          # EMA smoothing factor (higher = more reactive)
   min_ratio_threshold: 0.5  # stop immediately if any marginal ratio drops here

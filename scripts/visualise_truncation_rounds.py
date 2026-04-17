@@ -681,6 +681,49 @@ def plot_1d_prior_evolution(
         x_label = param_key
         nre_density_scale = 1.0
 
+    # ---- Single-round shortcut: only the density panel ----
+    if n_rounds == 1:
+        fig, ax_dens = plt.subplots(figsize=figsize)
+
+        if final_norm1d is None:
+            ax_dens.text(0.5, 0.5, "marginal not trained",
+                         ha="center", va="center", transform=ax_dens.transAxes,
+                         fontsize=11, color="gray")
+            return fig, {"density": ax_dens}, entropy_per_round
+
+        final_grid_x = nre_to_x(final_grid_1d)
+        final_norm_x = final_norm1d * nre_density_scale
+        _nre_peak = float(np.max(final_norm_x)) if np.max(final_norm_x) > 0 else 1.0
+        final_norm_x = final_norm_x / _nre_peak
+
+        ax_dens.plot(final_grid_x, final_norm_x, "b-", linewidth=2, label="NRE")
+        ax_dens.fill_between(final_grid_x, 0, final_norm_x, alpha=0.3, color="b")
+        ax_dens.axvline(x=float(nre_to_x([final_inj])[0]), color="r",
+                        linestyle="--", linewidth=2, label="Injection")
+
+        if mcmc_samples_path is not None:
+            flat_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_path)
+            if param_key in mcmc_param_names:
+                idx_mc = mcmc_param_names.index(param_key)
+                mcmc_samp = mcmc_to_x(flat_samples[:, idx_mc])
+                kde = gaussian_kde(mcmc_samp)
+                mcmc_marginal = kde(final_grid_x)
+                _mc_peak = float(np.max(mcmc_marginal)) if np.max(mcmc_marginal) > 0 else 1.0
+                mcmc_marginal = mcmc_marginal / _mc_peak
+                ax_dens.plot(final_grid_x, mcmc_marginal, color="orange",
+                             linewidth=2, label="MCMC")
+                ax_dens.fill_between(final_grid_x, 0, mcmc_marginal,
+                                     alpha=0.3, color="orange")
+
+        ax_dens.set_ylim(0, 1.05)
+        ax_dens.set_xlabel(x_label)
+        ax_dens.set_ylabel("Posterior Density (peak-normalised)")
+        ax_dens.set_title(f"1-D posterior: {param_key}")
+        ax_dens.legend(loc="best", fontsize=9)
+        ax_dens.grid(True, linestyle="--", alpha=0.4)
+
+        return fig, {"density": ax_dens}, entropy_per_round
+
     # ---- Create figure with two panels: HPD evolution + final-round density ----
     fig, (ax_hpd, ax_dens) = plt.subplots(
         1, 2, figsize=(figsize[0] * 2 + 1, figsize[1]),
@@ -1922,15 +1965,12 @@ def plot_all_marginals(
 
     results = {}
     pair_idx = 0  # running counter for 2-D marginals
+    single_round = (len(round_dirs) == 1)
 
     for label, ndim, in_param_idx, out_param_idx in all_marginals:
         if ndim == 2:
             p0_key = _ORDERED_PRIOR_KEYS[in_param_idx[0]]
             p1_key = _ORDERED_PRIOR_KEYS[in_param_idx[1]]
-            w0 = box_r1[p0_key][1] - box_r1[p0_key][0]
-            w1 = box_r1[p1_key][1] - box_r1[p1_key][0]
-            prior_entropy = float(np.log(w0 * w1))
-            tb_key = f"volume_ratio/{p0_key}_{p1_key}"
 
             print(f"\n=== 2-D marginal [{pair_idx}]: {label} ===")
             fig, axes, sky_areas, entropy_per_round, fig_last = plot_truncation_rounds(
@@ -1946,18 +1986,24 @@ def plot_all_marginals(
                 mcmc_samples_path=mcmc_samples_path,
                 in_param_idx_override=in_param_idx,
             )
-            fig_ent, _ = plot_entropy_evolution(entropy_per_round, label,
-                                                prior_entropy=prior_entropy)
-            vol_ratios = [read_final_volume_ratio(rd, tb_key) for rd in round_dirs]
-            fig_vol, _ = plot_volume_ratio_evolution(vol_ratios, label)
-            results[label] = (fig, axes, sky_areas, fig_ent, fig_vol, fig_last)
+
+            if single_round:
+                # Only keep the standalone last-round figure; skip evolution plots
+                plt.close(fig)
+                results[label] = (None, axes, sky_areas, None, None, fig_last)
+            else:
+                w0 = box_r1[p0_key][1] - box_r1[p0_key][0]
+                w1 = box_r1[p1_key][1] - box_r1[p1_key][0]
+                prior_entropy = float(np.log(w0 * w1))
+                tb_key = f"volume_ratio/{p0_key}_{p1_key}"
+                fig_ent, _ = plot_entropy_evolution(entropy_per_round, label,
+                                                    prior_entropy=prior_entropy)
+                vol_ratios = [read_final_volume_ratio(rd, tb_key) for rd in round_dirs]
+                fig_vol, _ = plot_volume_ratio_evolution(vol_ratios, label)
+                results[label] = (fig, axes, sky_areas, fig_ent, fig_vol, fig_last)
             pair_idx += 1
 
         elif ndim == 1:
-            w = box_r1[label][1] - box_r1[label][0]
-            prior_entropy = float(np.log(w))
-            tb_key = f"volume_ratio/{label}"
-
             print(f"\n=== 1-D marginal: {label} ===")
             fig, axes_dict, entropy_per_round = plot_1d_prior_evolution(
                 round_dirs=round_dirs,
@@ -1971,11 +2017,19 @@ def plot_all_marginals(
                 ngrid_points_1d=ngrid_points_1d,
                 duration_weeks=duration_weeks,
             )
-            fig_ent, _ = plot_entropy_evolution(entropy_per_round, label,
-                                                prior_entropy=prior_entropy)
-            vol_ratios = [read_final_volume_ratio(rd, tb_key) for rd in round_dirs]
-            fig_vol, _ = plot_volume_ratio_evolution(vol_ratios, label)
-            results[label] = (fig, axes_dict, {}, fig_ent, fig_vol, None)
+
+            if single_round:
+                # Density-only figure already produced; skip evolution plots
+                results[label] = (fig, axes_dict, {}, None, None, None)
+            else:
+                w = box_r1[label][1] - box_r1[label][0]
+                prior_entropy = float(np.log(w))
+                tb_key = f"volume_ratio/{label}"
+                fig_ent, _ = plot_entropy_evolution(entropy_per_round, label,
+                                                    prior_entropy=prior_entropy)
+                vol_ratios = [read_final_volume_ratio(rd, tb_key) for rd in round_dirs]
+                fig_vol, _ = plot_volume_ratio_evolution(vol_ratios, label)
+                results[label] = (fig, axes_dict, {}, fig_ent, fig_vol, None)
 
     return results
 
@@ -2029,11 +2083,7 @@ if __name__ == "__main__":
             f"No round directories found for name='{name}' under "
             f"/data/gpuleo/mbhb/logs/."
         )
-    if len(round_dirs) < 2:
-        raise RuntimeError(
-            f"Run '{name}' has only {len(round_dirs)} round — nothing to visualise."
-        )
-    print(f"Detected {len(round_dirs)} rounds for '{name}':")
+    print(f"Detected {len(round_dirs)} round(s) for '{name}':")
     for r in round_dirs:
         print(f"  {r}")
 
@@ -2071,15 +2121,18 @@ if __name__ == "__main__":
 
     for label, (fig, _, sky_areas, fig_ent, fig_vol, fig_last) in figures.items():
         safe_label = label.replace(" ", "_").replace("/", "_")
-        out_path = os.path.join(outdir, f"{safe_label}.png")
-        fig.savefig(out_path, dpi=150, bbox_inches="tight")
-        print(f"Saved figure to {out_path}")
-        out_path_ent = os.path.join(outdir, f"{safe_label}_entropy.png")
-        fig_ent.savefig(out_path_ent, dpi=150, bbox_inches="tight")
-        print(f"Saved entropy figure to {out_path_ent}")
-        out_path_vol = os.path.join(outdir, f"{safe_label}_volume_ratio.png")
-        fig_vol.savefig(out_path_vol, dpi=150, bbox_inches="tight")
-        print(f"Saved volume ratio figure to {out_path_vol}")
+        if fig is not None:
+            out_path = os.path.join(outdir, f"{safe_label}.png")
+            fig.savefig(out_path, dpi=150, bbox_inches="tight")
+            print(f"Saved figure to {out_path}")
+        if fig_ent is not None:
+            out_path_ent = os.path.join(outdir, f"{safe_label}_entropy.png")
+            fig_ent.savefig(out_path_ent, dpi=150, bbox_inches="tight")
+            print(f"Saved entropy figure to {out_path_ent}")
+        if fig_vol is not None:
+            out_path_vol = os.path.join(outdir, f"{safe_label}_volume_ratio.png")
+            fig_vol.savefig(out_path_vol, dpi=150, bbox_inches="tight")
+            print(f"Saved volume ratio figure to {out_path_vol}")
         if fig_last is not None:
             out_path_last = os.path.join(outdir, f"{safe_label}_last_round.png")
             fig_last.savefig(out_path_last, dpi=150, bbox_inches="tight")

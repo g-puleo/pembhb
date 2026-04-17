@@ -142,7 +142,7 @@ class SequentialTrainer:
                 print(f"Using existing dataset at {fname_h5}")
         self.data_fname_yaml = fname_h5.replace(".h5", ".yaml")
         self.datagen_info = utils.read_config(self.data_fname_yaml)
-        self.data_module = MBHBDataModule(fname_h5, train_config["batch_size"], num_workers=4, cache_in_memory=True, noise_factor=self.train_conf["noise_factor"])
+        self.data_module = MBHBDataModule(fname_h5, self.train_conf["batch_size"], num_workers=4, cache_in_memory=True, noise_factor=self.train_conf["noise_factor"])
         assert self.data_module.median_snr > 8, f"Median SNR lower than 8. Please make sure this is what you want. "
         self.data_module.setup(stage="fit")
         self.test_dataloader = self.data_module.test_dataloader()
@@ -428,8 +428,10 @@ class SequentialTrainer:
                     enc_trainer.to(device).eval()
                     self.data_summary = MarginalEncoderWrapper(enc_trainer, freeze=True)
                     self.data_summary.to(device)
-                    print(f"Bottleneck dim  : {self.data_summary.get_n_features()}")
-                    print(f"Num marginals   : {self.data_summary.get_n_marginals()}")
+                    print(f"Bottleneck dim       : {self.data_summary.get_n_features()}")
+                    print(f"Num marginals        : {self.data_summary.get_n_marginals()}")
+                    print(f"Num encoders (params): {self.data_summary.get_n_encoders()}")
+                    print(f"Param indices        : {self.data_summary.get_param_indices()}")
                     self.data_module.full_dataset.clear_cache()
                     return
 
@@ -546,8 +548,10 @@ class SequentialTrainer:
         self.data_summary = MarginalEncoderWrapper(enc_trainer, freeze=True)
         self.data_summary.to(device)
 
-        print(f"[MarginalEncoder] Bottleneck dim  : {self.data_summary.get_n_features()}")
-        print(f"[MarginalEncoder] Num marginals   : {self.data_summary.get_n_marginals()}")
+        print(f"[MarginalEncoder] Bottleneck dim       : {self.data_summary.get_n_features()}")
+        print(f"[MarginalEncoder] Num marginals        : {self.data_summary.get_n_marginals()}")
+        print(f"[MarginalEncoder] Num encoders (params): {self.data_summary.get_n_encoders()}")
+        print(f"[MarginalEncoder] Param indices        : {self.data_summary.get_param_indices()}")
 
         self.data_module.full_dataset.clear_cache()
 
@@ -568,16 +572,22 @@ class SequentialTrainer:
         enc_trainer.to(device).eval()
         self.data_summary = MarginalEncoderWrapper(enc_trainer, freeze=True)
         self.data_summary.to(device)
-        print(f"Bottleneck dim : {self.data_summary.get_n_features()}")
-        print(f"Num marginals  : {self.data_summary.get_n_marginals()}")
+        print(f"Bottleneck dim       : {self.data_summary.get_n_features()}")
+        print(f"Num marginals        : {self.data_summary.get_n_marginals()}")
+        print(f"Num encoders (params): {self.data_summary.get_n_encoders()}")
+        print(f"Param indices        : {self.data_summary.get_param_indices()}")
         self.data_module.full_dataset.clear_cache()
 
     def _train_inference_network ( self, round_idx, data_summary=None) :
         #  initialise data summarizer (ROM)
         mean, std = self.data_module.get_params_mean_std()
+        periodic_bc_params = self.train_conf.get("periodic_bc_params", [])
+        sincos_mean, sincos_std = self.data_module.get_sincos_mean_std(periodic_bc_params)
         normalisation = {"td_normalisation": np.array(self.data_module.get_max_td()),
                          "param_mean": np.array(mean),
-                         "param_std": np.array(std)}
+                         "param_std": np.array(std),
+                         "sincos_mean": np.array(sincos_mean),
+                         "sincos_std": np.array(sincos_std)}
         old_model = getattr(self, "model", None)
         ds_type = self.train_conf["architecture"]["data_summary"]["type"]
         NetworkClass = PerMarginalInferenceNetwork if ds_type == "MarginalEncoder" else InferenceNetwork

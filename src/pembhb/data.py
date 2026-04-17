@@ -200,6 +200,32 @@ class MBHBDataModule( L.LightningDataModule ):
         params = self.train.dataset[self.train_indices]["params"]
         return params.mean(dim=0), params.std(dim=0)
 
+    def get_sincos_mean_std(self, periodic_bc_params: list):
+        """Return mean and std of sin and cos for each periodic parameter.
+
+        For each index in periodic_bc_params, computes sin and cos over
+        the training set and returns their means and stds as flat lists,
+        ordered as [sin_mean_0, cos_mean_0, sin_mean_1, cos_mean_1, ...].
+
+        Args:
+            periodic_bc_params: list of parameter column indices that use
+                periodic boundary condition encoding.
+
+        Returns:
+            sincos_mean: list of floats, length 2 * len(periodic_bc_params)
+            sincos_std:  list of floats, length 2 * len(periodic_bc_params)
+        """
+        params = self.train.dataset[self.train_indices]["params"]
+        sincos_mean = []
+        sincos_std = []
+        for idx in periodic_bc_params:
+            col = params[:, idx]
+            s = torch.sin(col)
+            c = torch.cos(col)
+            sincos_mean.extend([s.mean().item(), c.mean().item()])
+            sincos_std.extend([s.std().item(), c.std().item()])
+        return sincos_mean, sincos_std
+
     # def get_params_std(self):
     #     """get std of source parameters from training dataset."""
     #     params = self.train.dataset[self.train_indices]["params"]

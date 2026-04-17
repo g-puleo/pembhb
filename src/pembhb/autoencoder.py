@@ -869,10 +869,13 @@ class MarginalEncoderTrainer(LightningModule):
 
         n_real_channels = n_channels * 2
 
-        # One independent ConvEncoder + RegressionHead per marginal
+        # One independent ConvEncoder + RegressionHead per *unique parameter*
+        # (not per marginal).  For a 2D marginal like [7, 8], two separate
+        # encoders are trained — one for param 7, one for param 8.
+        self.param_indices = sorted(set(idx for marginal in marginals for idx in marginal))
         self.encoders = nn.ModuleList()
         self.regressors = nn.ModuleList()
-        for marginal in marginals:
+        for _ in self.param_indices:
             self.encoders.append(ConvEncoder(
                 n_in_channels=n_real_channels,
                 n_freqs=n_freqs,
@@ -885,7 +888,7 @@ class MarginalEncoderTrainer(LightningModule):
             ))
             self.regressors.append(RegressionHead(
                 bottleneck_dim=bottleneck_dim,
-                n_params=len(marginal),
+                n_params=1,
                 hidden_sizes=regressor_hidden_sizes,
             ))
 
@@ -958,18 +961,18 @@ class MarginalEncoderTrainer(LightningModule):
         params    = batch["source_parameters"]
 
         total_loss = torch.tensor(0.0, device=self.device, dtype=noisy_norm.dtype)
-        for i, (encoder, regressor, marginal) in enumerate(
-            zip(self.encoders, self.regressors, self.marginals)
+        for i, (encoder, regressor, param_idx) in enumerate(
+            zip(self.encoders, self.regressors, self.param_indices)
         ):
             bottleneck = encoder(noisy_norm)
-            predicted  = regressor(bottleneck)
-            target_raw = params[:, marginal].to(noisy_norm.dtype)
+            predicted  = regressor(bottleneck)                              # (B, 1)
+            target_raw = params[:, param_idx:param_idx+1].to(noisy_norm.dtype)
             # Normalise targets so MSE is scale-invariant across parameters
-            target_norm = (target_raw - self.param_mean[marginal]) / (self.param_std[marginal] + 1e-30)
+            target_norm = (target_raw - self.param_mean[param_idx]) / (self.param_std[param_idx] + 1e-30)
             loss_i = F.mse_loss(predicted, target_norm)
             total_loss = total_loss + loss_i
             self.log(
-                f"{prefix}_mse_marginal_{i}", loss_i,
+                f"{prefix}_mse_param_{param_idx}", loss_i,
                 on_step=True, on_epoch=True, prog_bar=False, logger=True,
             )
 
@@ -1002,9 +1005,9 @@ class MarginalEncoderWrapper(nn.Module):
     """Wraps a trained :class:`MarginalEncoderTrainer` so it can be used as
     ``PerMarginalInferenceNetwork.data_summary``.
 
-    Calling ``forward(d_f, d_t)`` returns a **list** of per-marginal
-    bottleneck tensors (one per marginal, in order) rather than a single
-    shared feature vector.
+    Calling ``forward(d_f, d_t)`` returns a **dict** mapping each unique
+    parameter index to its per-parameter bottleneck tensor
+    ``(B, bottleneck_dim)``.
 
     The encoder weights are frozen by default (``freeze=True``).
     """
@@ -1024,22 +1027,31 @@ class MarginalEncoderWrapper(nn.Module):
         return self._n_features
 
     def get_n_marginals(self) -> int:
+        return len(self.trainer.marginals)
+
+    def get_n_encoders(self) -> int:
         return len(self.trainer.encoders)
+
+    def get_param_indices(self) -> list[int]:
+        return self.trainer.param_indices
 
     def unfreeze_parameters(self):
         for p in self.trainer.parameters():
             p.requires_grad = True
 
     def forward(self, d_f: torch.Tensor, d_t: torch.Tensor):
-        """Encode noisy FD data with each per-marginal encoder.
+        """Encode noisy FD data with each per-parameter encoder.
 
         :param d_f: complex tensor (B, C, F) — raw frequency-domain data
         :param d_t: ignored (kept for API compatibility)
-        :return: (list of (B, bottleneck_dim) tensors, d_t)
+        :return: (dict mapping param_idx → (B, bottleneck_dim) tensor, d_t)
         """
         x_norm = self.trainer.preprocess(d_f)
-        bottlenecks = [encoder(x_norm) for encoder in self.trainer.encoders]
-        return bottlenecks, d_t
+        bottleneck_dict = {
+            param_idx: encoder(x_norm)
+            for param_idx, encoder in zip(self.trainer.param_indices, self.trainer.encoders)
+        }
+        return bottleneck_dict, d_t
 
 
 class AutoencoderWrapper(nn.Module):
