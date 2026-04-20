@@ -33,10 +33,31 @@ def print_params(params: np.array):
     for idx, param in enumerate(params):
         print(f"{_ORDERED_PRIOR_KEYS[idx]}: {params[param]}")
 
-def read_config(fname: str): 
+def read_config(fname: str):
     with open(fname, "r", encoding="utf-8") as file:
         conf = yaml.safe_load(file)
     return conf
+
+
+def apply_pipeline_section(cfg: dict, section_name: str) -> dict:
+    """Promote keys from ``cfg[section_name]`` to the top level of ``cfg``.
+
+    The training config is split into a shared part plus pipeline-specific
+    sub-sections (``sequential_training``, ``joint_training``).  Model classes
+    and scripts still read the historical flat keys (e.g. ``cfg["learning_rate"]``),
+    so we flatten the requested section at script startup.
+
+    - Keys from the section override top-level keys (section wins).
+    - If the section is missing or empty, ``cfg`` is returned unchanged (so
+      older YAMLs that still have the flat keys at the top level keep working).
+    - Returned value is the same dict (mutated in place) for chaining.
+    """
+    section = cfg.get(section_name)
+    if not section:
+        return cfg
+    for k, v in section.items():
+        cfg[k] = v
+    return cfg
 
 def choose_device_for_pp(required_gib: float = 2.0) -> torch.device:
     """Check if enough CUDA memory is free for pp_plot; fall back to CPU."""

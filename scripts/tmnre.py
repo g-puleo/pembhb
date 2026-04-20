@@ -21,7 +21,7 @@ from pembhb.autoencoder import (
 from pembhb.data import MBHBDataModule, MBHBDataset, mbhb_collate_fn
 from pembhb import ROOT_DIR, DATA_ROOT_DIR, set_precision
 from pembhb import utils
-from pembhb.utils import validate_marginals, resolve_marginals_for_round, transfer_classifier_weights, get_widest_interval_1d, get_widest_box_2d, choose_device_for_pp
+from pembhb.utils import validate_marginals, resolve_marginals_for_round, transfer_classifier_weights, get_widest_interval_1d, get_widest_box_2d, choose_device_for_pp, apply_pipeline_section
 from pembhb.callbacks import PlotPosteriorCallback, VolumeRatioEarlyStopping, PeriodicProgressCallback
 
 def get_timestamp():
@@ -813,6 +813,10 @@ if __name__ == "__main__":
 
     train_config   = utils.read_config(os.path.join(ROOT_DIR, "configs", train_config_filename))
     datagen_config = utils.read_config(os.path.join(ROOT_DIR, "configs", datagen_config_filename))
+
+    # Flatten pipeline-specific keys (sequential_training.*) onto the top level
+    # so InferenceNetwork.__init__ reads them at the flat keys it expects.
+    apply_pipeline_section(train_config, "sequential_training")
 
     # Activate the configured precision (default: float32)
     set_precision(train_config.get("precision", "float32"))

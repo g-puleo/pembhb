@@ -1044,25 +1044,89 @@ DATA_SUMMARY_REGISTRY = { "BrutalCompression": BrutalCompression, "PeregrineMode
 # Joint Autoencoder + InferenceNetwork
 # ---------------------------------------------------------------------------
 
+class SingleGroupReduceLROnPlateau(torch.optim.lr_scheduler.ReduceLROnPlateau):
+    """ReduceLROnPlateau that only touches a single ``param_group`` of the
+    optimizer, and optionally waits until epoch ``>= start_epoch`` before
+    doing anything.
+
+    Motivation: ``JointAEInferenceNetwork`` uses one optimizer with two
+    param groups (encoder + NRE heads).  Plain ``ReduceLROnPlateau`` reduces
+    all groups together and starts counting patience from epoch 0, which
+    causes the NRE group's LR to decay during the AE warmup (when
+    ``val_nre_loss`` is logged as 0) or because the AE warmup drove
+    ``val_loss`` to a minimum the NRE phase can never beat.
+    """
+
+    def __init__(self, optimizer, param_group_idx: int = 0,
+                 start_epoch: int = 0, **kwargs):
+        super().__init__(optimizer, **kwargs)
+        self.param_group_idx = param_group_idx
+        self.start_epoch = start_epoch
+        self._in_warmup = start_epoch > 0
+
+    def step(self, metrics, epoch=None):
+        if epoch is None:
+            epoch = self.last_epoch + 1
+        self.last_epoch = epoch
+
+        if epoch < self.start_epoch:
+            self._in_warmup = True
+            return
+
+        if self._in_warmup:
+            # Entering the active phase: reset tracking so the AE-warmup
+            # values don't poison the "best" the NRE phase is compared to.
+            self.best = self.mode_worse
+            self.num_bad_epochs = 0
+            self.cooldown_counter = 0
+            self._in_warmup = False
+
+        current = float(metrics)
+        if self.is_better(current, self.best):
+            self.best = current
+            self.num_bad_epochs = 0
+        else:
+            self.num_bad_epochs += 1
+
+        if self.in_cooldown:
+            self.cooldown_counter -= 1
+            self.num_bad_epochs = 0
+
+        if self.num_bad_epochs > self.patience:
+            self._reduce_lr(epoch)
+            self.cooldown_counter = self.cooldown
+            self.num_bad_epochs = 0
+
+        self._last_lr = [group["lr"] for group in self.optimizer.param_groups]
+
+    def _reduce_lr(self, epoch):
+        pg = self.optimizer.param_groups[self.param_group_idx]
+        old_lr = float(pg["lr"])
+        new_lr = max(old_lr * self.factor, self.min_lrs[self.param_group_idx])
+        if old_lr - new_lr > self.eps:
+            pg["lr"] = new_lr
+
+
 class JointAEInferenceNetwork(LightningModule):
-    """Joint training of a DenoisingAutoencoder and NRE classifier heads.
+    """Joint training of an encoder (AE or ME) and NRE classifier heads.
 
-    The autoencoder encoder+decoder are trained with the standard MSE
-    reconstruction loss.  The NRE classifier heads receive the encoder's
-    bottleneck representation **detached** from the computational graph so
-    that the BCE contrastive loss never back-propagates through the encoder.
+    Supports two encoder types via ``encoder_model``:
 
-    This means:
-    * Encoder gradients come **only** from the AE reconstruction loss.
-    * NRE gradients come **only** from the BCE contrastive loss.
-    * No conflicting gradient signals on the shared encoder weights.
+    * **DenoisingAutoencoder (AE)** — single encoder trained with MSE
+      reconstruction loss; its bottleneck is shared across all NRE heads.
+    * **MarginalEncoderTrainer (ME)** — N independent per-parameter encoders
+      each trained with MSE regression loss; each NRE head receives only the
+      bottleneck(s) for its own parameter(s).
 
-    An optional warm-up phase trains only the autoencoder for the first
+    In both modes the NRE classifier heads receive the bottleneck(s)
+    **detached** from the computational graph, so the BCE contrastive loss
+    never back-propagates through the encoder.
+
+    An optional warm-up phase trains only the encoder for the first
     ``ae_warmup_epochs`` epochs; the NRE loss is zero during that phase.
 
-    After training, the encoder can be extracted and wrapped in
-    :class:`AutoencoderWrapper` for standalone inference exactly like in
-    the sequential pipeline.
+    After training, call :meth:`get_encoder_wrapper` to extract the trained
+    encoder wrapped for use in a standalone ``InferenceNetwork``.
 
     Parameters
     ----------
@@ -1072,24 +1136,22 @@ class JointAEInferenceNetwork(LightningModule):
         YAML sidecar information for the dataset.
     normalisation : dict
         Contains ``td_normalisation``, ``param_mean``, ``param_std``.
-    autoencoder : DenoisingAutoencoder
-        An initialised (and normalisation-fitted) ``DenoisingAutoencoder``.
-        It will be owned by this module.  Its encoder is used as the data
-        summarizer; its decoder provides the reconstruction loss.
+    encoder_model : DenoisingAutoencoder | MarginalEncoderTrainer
+        An initialised (and normalisation-fitted) encoder.
+        Owned by this module.
     ae_warmup_epochs : int
-        Number of epochs during which only the AE loss is active (NRE loss
-        is switched off).  Set to 0 to train both from the start, e.g.
-        when fine-tuning from a previous round.
+        Number of epochs during which only the encoder loss is active (NRE
+        loss is switched off).  Set to 0 to train both from the start.
     lr_ae : float
-        Learning rate for the autoencoder (encoder + decoder) parameter group.
+        Learning rate for the encoder parameter group.
     lr_nre : float
         Learning rate for the NRE classifier heads parameter group.
     ae_weight_decay : float
-        Weight decay for the autoencoder parameter group.
+        Weight decay for the encoder parameter group.
     ae_scheduler_patience : int
-        Patience for the autoencoder learning-rate scheduler.
+        Patience for the encoder learning-rate scheduler.
     ae_scheduler_factor : float
-        Factor for the autoencoder learning-rate scheduler.
+        Factor for the encoder learning-rate scheduler.
     """
 
     def __init__(
@@ -1097,20 +1159,24 @@ class JointAEInferenceNetwork(LightningModule):
         train_conf: dict,
         dataset_info: dict,
         normalisation: dict,
-        autoencoder: 'DenoisingAutoencoder',
+        encoder_model,
         ae_warmup_epochs: int = 50,
         lr_ae: float = 1e-3,
         lr_nre: float = 1e-4,
         ae_weight_decay: float = 1e-5,
-        ae_scheduler_patience: int = 10,
-        ae_scheduler_factor: float = 0.3,
+        ae_scheduler_patience: int = 10,   # deprecated (use ae_scheduler dict)
+        ae_scheduler_factor: float = 0.3,  # deprecated (use ae_scheduler dict)
         periodic_bc_params: list = None,
         freeze_ae_after_warmup: bool = False,
+        ae_scheduler: dict = None,
+        nre_scheduler: dict = None,
     ):
         super().__init__()
 
-        # ---- Autoencoder (encoder + decoder) ----------------------------
-        self.autoencoder = autoencoder
+        # ---- Encoder (AE or ME) -----------------------------------------
+        from pembhb.autoencoder import MarginalEncoderTrainer
+        self._is_me = isinstance(encoder_model, MarginalEncoderTrainer)
+        self.encoder_model = encoder_model
 
         # ---- Marginals / NRE setup (mirrors InferenceNetwork) -----------
         self.marginals_dict = train_conf["marginals"]
@@ -1118,10 +1184,34 @@ class JointAEInferenceNetwork(LightningModule):
         self.lr_nre = lr_nre
         self.lr_ae = lr_ae
         self.ae_weight_decay = ae_weight_decay
-        self.ae_scheduler_patience = ae_scheduler_patience
-        self.ae_scheduler_factor = ae_scheduler_factor
         self.ae_warmup_epochs = ae_warmup_epochs
         self.freeze_ae_after_warmup = freeze_ae_after_warmup
+
+        # Backward-compat: if new dict-style scheduler configs are not
+        # provided, derive one from the deprecated scalar args.  Old behaviour
+        # used a single scheduler driving both groups on ``val_loss``; we
+        # replicate that only when the user has not opted into the new API.
+        _legacy = {
+            "enabled": True,
+            "monitor": "val_loss",
+            "mode": "min",
+            "factor": ae_scheduler_factor,
+            "patience": ae_scheduler_patience,
+            "min_lr": 1e-7,
+            "start_epoch": 0,
+        }
+        self.ae_scheduler_config = dict(ae_scheduler) if ae_scheduler is not None else dict(_legacy)
+        if nre_scheduler is not None:
+            self.nre_scheduler_config = dict(nre_scheduler)
+        else:
+            # Legacy default: both groups share the same config, but the NRE
+            # scheduler is gated to start after the AE warmup so the phase
+            # where ``val_nre_loss = 0`` does not corrupt its ``best``.
+            self.nre_scheduler_config = dict(_legacy)
+            self.nre_scheduler_config["start_epoch"] = ae_warmup_epochs
+        # Preserve the deprecated scalars for checkpoint backward-compat.
+        self.ae_scheduler_patience = ae_scheduler_patience
+        self.ae_scheduler_factor = ae_scheduler_factor
 
         # Use the actual sampling prior as authoritative source
         _sik = dataset_info.get("sampler_init_kwargs", {})
@@ -1129,9 +1219,6 @@ class JointAEInferenceNetwork(LightningModule):
             self.bounds_trained = _sik["prior_bounds"]
         else:
             self.bounds_trained = dataset_info["conf"]["prior"]
-
-        self.scheduler_patience = train_conf["scheduler_patience"]
-        self.scheduler_factor = train_conf["scheduler_factor"]
 
         self.output_names = []
         self.marginals_list = []
@@ -1189,24 +1276,46 @@ class JointAEInferenceNetwork(LightningModule):
             self.marginals_dict_remapped[key] = marginals_remapped
 
         # ---- Data summary dimensionality (from encoder) -----------------
-        if self.autoencoder.architecture == "conv":
-            self.n_features_summary = self.autoencoder.bottleneck_dim
+        if self._is_me:
+            self.n_features_summary = encoder_model.bottleneck_dim
+        elif encoder_model.architecture == "conv":
+            self.n_features_summary = encoder_model.bottleneck_dim
         else:
             # UNet: need a dummy forward to get bottleneck size
-            n_real_ch = self.autoencoder.n_channels * 2
+            n_real_ch = encoder_model.n_channels * 2
             with torch.no_grad():
-                dummy = torch.zeros(1, n_real_ch, self.autoencoder.n_freqs)
-                b, _ = self.autoencoder.encoder(dummy)
+                dummy = torch.zeros(1, n_real_ch, encoder_model.n_freqs)
+                b, _ = encoder_model.encoder(dummy)
             self.n_features_summary = b.numel()
 
-        # ---- NRE classifier heads (same as InferenceNetwork) ------------
+        # ---- NRE classifier heads ---------------------------------------
         self.logratios_model_dict = nn.ModuleDict()
-        for key in self.marginals_dict_remapped.keys():
-            self.logratios_model_dict[key] = MarginalClassifierHead(
-                n_data_features=self.n_features_summary * len(key),
-                marginals=self.marginals_dict_remapped[key],
-                hlayersizes=train_conf.get("classifier_hlayersizes", (64, 32, 16, 8)),
-            )
+        if self._is_me:
+            # ME: per-marginal n_data_features (2D marginal gets 2× bottleneck)
+            for domain in self.marginals_dict_remapped:
+                n_data_features_list = [
+                    len(orig_marg) * self.n_features_summary
+                    for orig_marg in self.marginals_dict[domain]
+                ]
+                self.logratios_model_dict[domain] = MarginalClassifierHead(
+                    n_data_features=n_data_features_list,
+                    marginals=self.marginals_dict_remapped[domain],
+                    hlayersizes=train_conf.get("classifier_hlayersizes", (64, 32, 16, 8)),
+                )
+            # Ordered list for forward(): (domain, pos, remapped_marginal, original_marginal)
+            self._marginal_order = []
+            for domain in self.marginals_dict_remapped:
+                for pos, remapped_marginal in enumerate(self.marginals_dict_remapped[domain]):
+                    original_marginal = self.marginals_dict[domain][pos]
+                    self._marginal_order.append((domain, pos, remapped_marginal, original_marginal))
+        else:
+            # AE: shared bottleneck for all marginals in a domain
+            for key in self.marginals_dict_remapped:
+                self.logratios_model_dict[key] = MarginalClassifierHead(
+                    n_data_features=self.n_features_summary * len(key),
+                    marginals=self.marginals_dict_remapped[key],
+                    hlayersizes=train_conf.get("classifier_hlayersizes", (64, 32, 16, 8)),
+                )
 
         # ---- Save hyper-parameters for checkpoint / utils compat --------
         self.save_hyperparameters(
@@ -1221,8 +1330,12 @@ class JointAEInferenceNetwork(LightningModule):
                 "lr_ae": lr_ae,
                 "lr_nre": lr_nre,
                 "ae_weight_decay": ae_weight_decay,
+                # Deprecated scalars kept for backward-compat with older ckpts
                 "ae_scheduler_patience": ae_scheduler_patience,
                 "ae_scheduler_factor": ae_scheduler_factor,
+                # New per-group scheduler configs (authoritative)
+                "ae_scheduler": self.ae_scheduler_config,
+                "nre_scheduler": self.nre_scheduler_config,
             },
             logger=True,
         )
@@ -1241,41 +1354,57 @@ class JointAEInferenceNetwork(LightningModule):
             missing_keys, unexpected_keys, error_msgs,
         )
 
+    @property
+    def autoencoder(self):
+        """Backward-compatibility alias for ``self.encoder_model``."""
+        return self.encoder_model
+
     # ------------------------------------------------------------------
     # Forward  (NRE path — used at inference / posterior evaluation time)
     # ------------------------------------------------------------------
 
-    def _encode_detached(self, d_f: torch.Tensor) -> torch.Tensor:
-        """Encode FD data through the autoencoder encoder and detach.
+    def _encode_detached(self, d_f: torch.Tensor):
+        """Encode FD data with no NRE gradient flow.
 
-        The detach ensures no NRE gradients flow into the encoder.
+        Returns a detached ``(B, bottleneck_dim)`` tensor for AE mode, or a
+        detached ``{param_idx: (B, bottleneck_dim)}`` dict for ME mode.
         """
-        x_norm = self.autoencoder.preprocess(d_f)
-        bottleneck = self.autoencoder.encode(x_norm)
-        if self.autoencoder.architecture != "conv":
-            bottleneck, _ = bottleneck
-            bottleneck = bottleneck.reshape(bottleneck.shape[0], -1)
-        return bottleneck.detach()
+        if self._is_me:
+            x_norm = self.encoder_model.preprocess(d_f)
+            return {
+                p: enc(x_norm).detach()
+                for p, enc in zip(self.encoder_model.param_indices, self.encoder_model.encoders)
+            }
+        else:
+            x_norm = self.encoder_model.preprocess(d_f)
+            bottleneck = self.encoder_model.encode(x_norm)
+            if self.encoder_model.architecture != "conv":
+                bottleneck, _ = bottleneck
+                bottleneck = bottleneck.reshape(bottleneck.shape[0], -1)
+            return bottleneck.detach()
 
-    def _encode(self, d_f: torch.Tensor) -> torch.Tensor:
-        """Encode FD data through the autoencoder encoder (with grad)."""
-        x_norm = self.autoencoder.preprocess(d_f)
-        bottleneck = self.autoencoder.encode(x_norm)
-        if self.autoencoder.architecture != "conv":
-            bottleneck, _ = bottleneck
-            bottleneck = bottleneck.reshape(bottleneck.shape[0], -1)
-        return bottleneck
+    def _encode(self, d_f: torch.Tensor):
+        """Encode FD data with gradients (used only for encoder loss)."""
+        if self._is_me:
+            x_norm = self.encoder_model.preprocess(d_f)
+            return {
+                p: enc(x_norm)
+                for p, enc in zip(self.encoder_model.param_indices, self.encoder_model.encoders)
+            }
+        else:
+            x_norm = self.encoder_model.preprocess(d_f)
+            bottleneck = self.encoder_model.encode(x_norm)
+            if self.encoder_model.architecture != "conv":
+                bottleneck, _ = bottleneck
+                bottleneck = bottleneck.reshape(bottleneck.shape[0], -1)
+            return bottleneck
 
     def forward(self, d_f, d_t, parameters):
         """NRE forward pass (same signature as InferenceNetwork.forward).
 
         Used by ``utils.get_logratios_grid`` and posterior evaluation.
-        The bottleneck is **detached** so this is safe even if called
-        inside a training loop.
+        Bottleneck(s) are detached so this is safe inside a training loop.
         """
-        bottleneck = self._encode_detached(d_f)
-
-        features_dict = {"ft": None, "f": bottleneck, "t": d_t}
         normalised_parameters = (parameters - self.param_mean) / self.param_std
         reparametrised_withbc_params = reparametrise_periodic_bc(normalised_parameters, self.periodic_bc_params)
         if len(self.periodic_bc_params) > 0:
@@ -1284,11 +1413,24 @@ class JointAEInferenceNetwork(LightningModule):
                 self.param_index_remapping, self.sincos_mean, self.sincos_std,
             )
 
-        logratios_list = []
-        for key in self.logratios_model_dict.keys():
-            logratios_list.append(
-                self.logratios_model_dict[key](features_dict[key], reparametrised_withbc_params)
-            )
+        if self._is_me:
+            bottleneck_dict = self._encode_detached(d_f)
+            logratios_list = []
+            for domain, pos, remapped_marginal, original_marginal in self._marginal_order:
+                bottleneck = torch.cat(
+                    [bottleneck_dict[p] for p in original_marginal], dim=-1
+                )
+                classifier = self.logratios_model_dict[domain].classifiers[pos]
+                input_data = torch.cat([bottleneck, reparametrised_withbc_params[:, remapped_marginal]], dim=-1)
+                logratios_list.append(classifier(input_data))
+        else:
+            bottleneck = self._encode_detached(d_f)
+            features_dict = {"ft": None, "f": bottleneck, "t": d_t}
+            logratios_list = []
+            for key in self.logratios_model_dict.keys():
+                logratios_list.append(
+                    self.logratios_model_dict[key](features_dict[key], reparametrised_withbc_params)
+                )
         return torch.cat(logratios_list, dim=-1)
 
     # ------------------------------------------------------------------
@@ -1325,26 +1467,48 @@ class JointAEInferenceNetwork(LightningModule):
         return all_logits, task_losses, nre_loss
 
     # ------------------------------------------------------------------
-    # AE loss (reconstruction MSE — mirrors DenoisingAutoencoder)
+    # Encoder loss (AE reconstruction MSE or ME regression MSE)
     # ------------------------------------------------------------------
 
-    def _calc_ae_loss(self, batch):
-        """Compute the autoencoder reconstruction loss.
+    def _calc_encoder_loss(self, batch):
+        """Compute the encoder training loss.
 
-        Always uses standard MSE on normalised representations.
-        Noise-weighted MSE caused bottleneck collapse (LISA ASD dynamic range).
+        AE mode: standard MSE reconstruction loss on normalised representations.
+        (Noise-weighted MSE caused bottleneck collapse with LISA ASD dynamic range.)
+
+        ME mode: sum of per-parameter MSE regression losses on normalised targets.
         """
-        noisy = batch["wave_fd"] + batch["noise_fd"]
-        clean = batch["wave_fd"]
+        if self._is_me:
+            noisy = batch["wave_fd"] + batch["noise_fd"]
+            params = batch["source_parameters"]
+            x_norm = self.encoder_model.preprocess(noisy)
+            total_loss = torch.tensor(0.0, device=self.device, dtype=x_norm.dtype)
+            for encoder, regressor, param_idx in zip(
+                self.encoder_model.encoders,
+                self.encoder_model.regressors,
+                self.encoder_model.param_indices,
+            ):
+                bottleneck = encoder(x_norm)
+                predicted = regressor(bottleneck)                        # (B, 1)
+                target_raw = params[:, param_idx:param_idx + 1].to(x_norm.dtype)
+                target_norm = (
+                    (target_raw - self.encoder_model.param_mean[param_idx])
+                    / (self.encoder_model.param_std[param_idx] + 1e-30)
+                )
+                total_loss = total_loss + F.mse_loss(predicted, target_norm)
+            return total_loss
+        else:
+            noisy = batch["wave_fd"] + batch["noise_fd"]
+            clean = batch["wave_fd"]
+            noisy_norm = self.encoder_model.preprocess(noisy)
+            clean_norm = self.encoder_model.preprocess(clean)
+            reconstructed = self.encoder_model(noisy_norm)
+            target = self.encoder_model._get_target(clean_norm)
+            return F.mse_loss(reconstructed, target)
 
-        noisy_norm = self.autoencoder.preprocess(noisy)
-        clean_norm = self.autoencoder.preprocess(clean)
-
-        reconstructed = self.autoencoder(noisy_norm)
-        target = self.autoencoder._get_target(clean_norm)
-
-        ae_loss = F.mse_loss(reconstructed, target)
-        return ae_loss
+    def _calc_ae_loss(self, batch):
+        """Deprecated alias for ``_calc_encoder_loss``."""
+        return self._calc_encoder_loss(batch)
 
     # ------------------------------------------------------------------
     # Accuracy (same as InferenceNetwork)
@@ -1368,17 +1532,15 @@ class JointAEInferenceNetwork(LightningModule):
 
     def on_train_epoch_start(self):
         if self.freeze_ae_after_warmup and self.current_epoch == self.ae_warmup_epochs:
-            for param in self.autoencoder.parameters():
+            for param in self.encoder_model.parameters():
                 param.requires_grad_(False)
-            print(f"[JointAE] AE frozen at epoch {self.current_epoch} "
+            print(f"[Joint] Encoder frozen at epoch {self.current_epoch} "
                   f"(ae_warmup_epochs={self.ae_warmup_epochs})")
 
     def training_step(self, batch, batch_idx):
-        # AE reconstruction loss (gradients flow through encoder+decoder)
-        ae_frozen = self.freeze_ae_after_warmup and self.current_epoch >= self.ae_warmup_epochs
-        ae_loss = torch.tensor(0.0, device=self.device) if ae_frozen else self._calc_ae_loss(batch)
+        enc_frozen = self.freeze_ae_after_warmup and self.current_epoch >= self.ae_warmup_epochs
+        encoder_loss = torch.tensor(0.0, device=self.device) if enc_frozen else self._calc_encoder_loss(batch)
 
-        # NRE loss (bottleneck detached — no encoder gradients)
         in_warmup = self.current_epoch < self.ae_warmup_epochs
         if in_warmup:
             nre_loss = torch.tensor(0.0, device=self.device)
@@ -1387,15 +1549,14 @@ class JointAEInferenceNetwork(LightningModule):
         else:
             all_logits, task_losses, nre_loss = self._calc_nre_loss(batch)
 
-        total_loss = ae_loss + nre_loss
+        total_loss = encoder_loss + nre_loss
 
-        # ---- Logging ----------------------------------------------------
-        self.log("train_ae_loss", ae_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        enc_log_key = "train_me_loss" if self._is_me else "train_ae_loss"
+        self.log(enc_log_key, encoder_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log("train_nre_loss", nre_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log("train_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
         if in_warmup:
-            # Log dummy accuracy so EarlyStopping / callbacks never miss the metric
             self.log("train_accuracy", 0.5, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         else:
             accuracy_params, accuracy = self._calc_accuracies(all_logits)
@@ -1411,8 +1572,8 @@ class JointAEInferenceNetwork(LightningModule):
         return total_loss
 
     def validation_step(self, batch, batch_idx):
-        ae_frozen = self.freeze_ae_after_warmup and self.current_epoch >= self.ae_warmup_epochs
-        ae_loss = torch.tensor(0.0, device=self.device) if ae_frozen else self._calc_ae_loss(batch)
+        enc_frozen = self.freeze_ae_after_warmup and self.current_epoch >= self.ae_warmup_epochs
+        encoder_loss = torch.tensor(0.0, device=self.device) if enc_frozen else self._calc_encoder_loss(batch)
 
         in_warmup = self.current_epoch < self.ae_warmup_epochs
         if in_warmup:
@@ -1422,9 +1583,10 @@ class JointAEInferenceNetwork(LightningModule):
         else:
             all_logits, task_losses, nre_loss = self._calc_nre_loss(batch)
 
-        total_loss = ae_loss + nre_loss
+        total_loss = encoder_loss + nre_loss
 
-        self.log("val_ae_loss", ae_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        enc_log_key = "val_me_loss" if self._is_me else "val_ae_loss"
+        self.log(enc_log_key, encoder_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log("val_nre_loss", nre_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         self.log("val_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
@@ -1451,7 +1613,7 @@ class JointAEInferenceNetwork(LightningModule):
         optimizer = torch.optim.AdamW(
             [
                 {
-                    "params": self.autoencoder.parameters(),
+                    "params": self.encoder_model.parameters(),
                     "lr": self.lr_ae,
                     "weight_decay": self.ae_weight_decay,
                 },
@@ -1461,87 +1623,157 @@ class JointAEInferenceNetwork(LightningModule):
                 },
             ],
         )
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=self.ae_scheduler_factor,
-            patience=self.ae_scheduler_patience,
-            min_lr=1e-7,
-        )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "val_loss",
-            },
-        }
+
+        scheduler_configs = []
+        for cfg, group_idx, label in (
+            (self.ae_scheduler_config, 0, "ae"),
+            (self.nre_scheduler_config, 1, "nre"),
+        ):
+            if not cfg.get("enabled", True):
+                continue
+            sched = SingleGroupReduceLROnPlateau(
+                optimizer,
+                param_group_idx=group_idx,
+                start_epoch=cfg.get("start_epoch", 0),
+                mode=cfg.get("mode", "min"),
+                factor=cfg.get("factor", 0.3),
+                patience=cfg.get("patience", 10),
+                min_lr=cfg.get("min_lr", 1e-7),
+            )
+            scheduler_configs.append({
+                "scheduler": sched,
+                "monitor": cfg.get("monitor", "val_loss"),
+                "interval": "epoch",
+                "frequency": 1,
+                "name": f"lr-{label}",
+            })
+
+        if not scheduler_configs:
+            return optimizer
+        # Multiple schedulers attached to a single optimizer: Lightning expects
+        # ([optimizer], [lr_scheduler_config, ...]).
+        return [optimizer], scheduler_configs
 
     # ------------------------------------------------------------------
     # Helpers (for compatibility with existing utils / callbacks)
     # ------------------------------------------------------------------
 
-    def get_autoencoder_wrapper(self, freeze: bool = True) -> 'AutoencoderWrapper':
-        """Build an ``AutoencoderWrapper`` from the trained encoder.
+    def get_encoder_wrapper(self, freeze: bool = True):
+        """Extract the trained encoder wrapped for standalone inference.
 
-        Useful for extracting the data summarizer after joint training,
-        e.g. for use in a standalone ``InferenceNetwork`` or for the next
-        TMNRE round.
+        Returns an ``AutoencoderWrapper`` (AE mode) or a
+        ``MarginalEncoderWrapper`` (ME mode).
         """
-        from pembhb.autoencoder import AutoencoderWrapper
-        return AutoencoderWrapper(self.autoencoder, freeze=freeze)
+        if self._is_me:
+            from pembhb.autoencoder import MarginalEncoderWrapper
+            return MarginalEncoderWrapper(self.encoder_model, freeze=freeze)
+        else:
+            from pembhb.autoencoder import AutoencoderWrapper
+            return AutoencoderWrapper(self.encoder_model, freeze=freeze)
+
+    def get_autoencoder_wrapper(self, freeze: bool = True):
+        """Deprecated alias for :meth:`get_encoder_wrapper`."""
+        return self.get_encoder_wrapper(freeze=freeze)
 
     @classmethod
     def load_from_checkpoint(cls, checkpoint_path, map_location=None, **kwargs):
         """Load a ``JointAEInferenceNetwork`` from a Lightning checkpoint.
 
-        ``autoencoder`` is not stored in hparams, so the standard Lightning
+        ``encoder_model`` is not stored in hparams, so the standard Lightning
         ``load_from_checkpoint`` would fail.  This override reconstructs the
-        autoencoder architecture from ``train_conf`` stored in the checkpoint,
-        using the actual state-dict keys to infer ``residual`` (the config
-        value may be inconsistent with what was actually trained).
+        encoder architecture from ``train_conf`` stored in the checkpoint.
+
+        Supports both AE (``DenoisingAutoencoder``) and ME
+        (``MarginalEncoderTrainer``) encoder types, detected from
+        ``train_conf["architecture"]["data_summary"]["type"]``.
+
+        Also handles old-style checkpoints whose state-dict uses the legacy
+        ``"autoencoder.*"`` key prefix by remapping it to ``"encoder_model.*"``.
         """
-        from pembhb.autoencoder import DenoisingAutoencoder
+        from pembhb.autoencoder import (
+            DenoisingAutoencoder, MarginalEncoderTrainer,
+        )
         device = map_location or ("cuda" if torch.cuda.is_available() else "cpu")
 
         raw = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         hp = raw["hyper_parameters"]
-        ae_conf = hp["train_conf"]["architecture"]["data_summary"]["Autoencoder"]
-
-        # Infer residual from the actual saved weights (config may be stale).
-        ae_sd_keys = [k for k in raw["state_dict"] if k.startswith("autoencoder.encoder")]
-        residual = any(".main." in k for k in ae_sd_keys)
-
-        dummy_ae = DenoisingAutoencoder(
-            n_channels=ae_conf["n_channels"],
-            n_freqs=ae_conf["n_freqs"],
-            architecture=ae_conf.get("architecture", "conv"),
-            bottleneck_dim=ae_conf["bottleneck_dim"],
-            hidden_channels=ae_conf["hidden_channels"],
-            kernel_size=ae_conf["kernel_size"],
-            stride=ae_conf["stride"],
-            dropout=ae_conf.get("dropout", 0.0),
-            residual=residual,
-            representation=ae_conf.get("representation", "real_imag"),
-            high_freq_only=ae_conf.get("high_freq_only", False),
-            freq_split_idx=ae_conf.get("freq_split_idx", 2048),
+        ds_type = (
+            hp["train_conf"].get("architecture", {})
+            .get("data_summary", {})
+            .get("type", "Autoencoder")
         )
 
+        # Remap old-style "autoencoder.*" keys → "encoder_model.*"
+        state_dict = raw["state_dict"]
+        if any(k.startswith("autoencoder.") for k in state_dict):
+            state_dict = {
+                ("encoder_model." + k[len("autoencoder."):] if k.startswith("autoencoder.") else k): v
+                for k, v in state_dict.items()
+            }
+
+        if ds_type == "MarginalEncoder":
+            me_conf = hp["train_conf"]["architecture"]["data_summary"]["MarginalEncoder"]
+            marginals_flat = [
+                m for mlist in hp["train_conf"]["marginals"].values() for m in mlist
+            ]
+            hidden_channels = me_conf.get("hidden_channels", (32, 64, 128, 256, 256))
+            if isinstance(hidden_channels, list):
+                hidden_channels = tuple(hidden_channels)
+            regressor_hidden = me_conf.get("regressor_hidden_sizes", (128, 64))
+            if isinstance(regressor_hidden, list):
+                regressor_hidden = tuple(regressor_hidden)
+            # Infer residual from state-dict keys (config value may be stale)
+            me_keys = [k for k in state_dict if k.startswith("encoder_model.encoders")]
+            residual = any(".main." in k for k in me_keys)
+            dummy_encoder = MarginalEncoderTrainer(
+                n_channels=me_conf.get("n_channels", 2),
+                n_freqs=me_conf.get("n_freqs", 4096),
+                marginals=marginals_flat,
+                bottleneck_dim=me_conf.get("bottleneck_dim", 200),
+                hidden_channels=hidden_channels,
+                kernel_size=me_conf.get("kernel_size", 5),
+                stride=me_conf.get("stride", 2),
+                dropout=me_conf.get("dropout", 0.0),
+                residual=residual,
+                regressor_hidden_sizes=regressor_hidden,
+                representation=me_conf.get("representation", "real_imag"),
+            )
+        else:  # "Autoencoder"
+            ae_conf = hp["train_conf"]["architecture"]["data_summary"]["Autoencoder"]
+            ae_keys = [k for k in state_dict if k.startswith("encoder_model.encoder")]
+            residual = any(".main." in k for k in ae_keys)
+            dummy_encoder = DenoisingAutoencoder(
+                n_channels=ae_conf["n_channels"],
+                n_freqs=ae_conf["n_freqs"],
+                architecture=ae_conf.get("architecture", "conv"),
+                bottleneck_dim=ae_conf["bottleneck_dim"],
+                hidden_channels=ae_conf["hidden_channels"],
+                kernel_size=ae_conf["kernel_size"],
+                stride=ae_conf["stride"],
+                dropout=ae_conf.get("dropout", 0.0),
+                residual=residual,
+                representation=ae_conf.get("representation", "real_imag"),
+                high_freq_only=ae_conf.get("high_freq_only", False),
+                freq_split_idx=ae_conf.get("freq_split_idx", 2048),
+            )
+
         norm = hp["normalisation"]
-        # normalisation values are stored as plain lists/scalars (not tensors)
         model = cls(
             train_conf=hp["train_conf"],
             dataset_info=hp["dataset_info"],
             normalisation=norm,
-            autoencoder=dummy_ae,
+            encoder_model=dummy_encoder,
             ae_warmup_epochs=hp.get("ae_warmup_epochs", 0),
             lr_ae=hp.get("lr_ae", 1e-3),
             lr_nre=hp.get("lr_nre", 1e-4),
             ae_weight_decay=hp.get("ae_weight_decay", 0.0),
             ae_scheduler_patience=hp.get("ae_scheduler_patience", 10),
             ae_scheduler_factor=hp.get("ae_scheduler_factor", 0.3),
+            ae_scheduler=hp.get("ae_scheduler"),
+            nre_scheduler=hp.get("nre_scheduler"),
             periodic_bc_params=hp["train_conf"].get("periodic_bc_params"),
         )
-        model.load_state_dict(raw["state_dict"])
+        model.load_state_dict(state_dict)
         model.to(device)
         model.eval()
         return model

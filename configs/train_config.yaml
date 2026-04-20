@@ -1,15 +1,12 @@
+# =========================================================================
+# SHARED settings (used by both scripts/tmnre.py and scripts/tmnre_joint.py)
+# =========================================================================
 batch_size: 250
 epochs: 500
-learning_rate: 0.0001
 precision: "float32"  # "float32" (default) or "float64"
 #transform_td: "normalise_max" # options: "none", "logwhiten", "log", "whiten"
 transform_fd: "log" # options: "none", "logwhiten", "log", "whiten", "normalise_max"
 noise_factor: 1.0
-early_stop_patience: 50
-early_stop_min_delta: 0.001
-early_stop_threshold: 0.999
-scheduler_factor: 0.3
-scheduler_patience: 80
 classifier_hlayersizes: [64, 128, 256, 512, 256, 128, 64, 32, 16, 8]
 keep_ckpt: True
 marginals:
@@ -44,7 +41,7 @@ architecture:
 
   data_summary:
 
-    type: "Autoencoder"  # Options: "ROM", "Autoencoder", "MarginalEncoder"
+    type: "MarginalAutoencoder"  # Options: "ROM", "Autoencoder", "MarginalEncoder"
     BrutalCompression:
       Nfreqs: 1000
       lowdim: 16
@@ -94,7 +91,7 @@ architecture:
       epochs: 150
       scheduler_patience: 75
       scheduler_factor: 0.3
-      early_stop_patience: 30
+      early_stop_patience: 80
       log_name: "autoencoder"
   
     # -----------------------------------------------------------------------
@@ -136,30 +133,85 @@ baseline_model:
   #filename: "/data/gpuleo/mbhb/logs/20251205_100028_round_0/version_0/checkpoints/epoch=474-step=133000.ckpt"
   filename: ""
 
-# -------------------------------------------------------------------------
-# Joint AE + NRE training  (used by scripts/tmnre_joint.py)
-# These settings are IGNORED by scripts/tmnre.py (sequential pipeline).
-# -------------------------------------------------------------------------
+# =========================================================================
+# SEQUENTIAL training  (scripts/tmnre.py only)
+# These keys are merged into the top level of the config at script startup,
+# so InferenceNetwork reads them at the flat keys it expects (learning_rate,
+# scheduler_patience, ...).  Old configs with these keys at the top level
+# continue to work unchanged.
+# =========================================================================
+sequential_training:
+  learning_rate: 0.0001
+  scheduler_patience: 80
+  scheduler_factor: 0.3
+  # Accuracy-based EarlyStopping on the NRE validation accuracy.
+  early_stop_patience: 100
+  early_stop_min_delta: 0.001
+  early_stop_threshold: 0.999
+
+
+# =========================================================================
+# JOINT AE + NRE training  (scripts/tmnre_joint.py only)
+# =========================================================================
 joint_training:
   ae_warmup_epochs: 100        # epochs of AE-only training before NRE kicks in (round 1 only)
   lr_ae: 0.001                # learning rate for autoencoder (encoder + decoder)
   lr_nre: 0.0001              # learning rate for NRE classifier heads
   ae_weight_decay: 0.0001    # weight decay for autoencoder param group
-  ae_scheduler_patience: 50   # ReduceLROnPlateau patience
-  ae_scheduler_factor: 0.3    # ReduceLROnPlateau factor
-  freeze_ae_after_warmup: false  # if true, freeze AE after warmup; only NRE trains post-warmup
+  freeze_ae_after_warmup: true  # if true, freeze AE after warmup; only NRE trains post-warmup
+
+  # -----------------------------------------------------------------------
+  # Per-parameter-group LR schedulers.
+  # Each block is wired to its own optimizer param group (encoder vs. NRE)
+  # via SingleGroupReduceLROnPlateau, so reducing one does not touch the
+  # other.  Set enabled: false to disable the scheduler for that group.
+  #
+  # `monitor`:  any scalar logged by training_step / validation_step,
+  #             e.g. "val_ae_loss", "val_nre_loss", "val_loss".
+  # `start_epoch`: ignore epochs before this index (useful for the NRE
+  #             scheduler so it does not see val_nre_loss = 0 during the
+  #             AE warmup).  If omitted, the NRE scheduler auto-defaults to
+  #             ae_warmup_epochs.
+  # Deprecated flat keys ae_scheduler_patience / ae_scheduler_factor are
+  # still read as fallbacks when these dicts are absent.
+  # -----------------------------------------------------------------------
+  ae_scheduler:
+    enabled: true
+    monitor: "val_ae_loss"
+    mode: "min"
+    factor: 0.3
+    patience: 50
+    min_lr: 1.0e-7
+    start_epoch: 0
+
+  nre_scheduler:
+    enabled: false          # set true to enable ReduceLROnPlateau on the NRE group
+    monitor: "val_nre_loss"
+    mode: "min"
+    factor: 0.3
+    patience: 30
+    min_lr: 1.0e-7
+    # start_epoch: <defaults to ae_warmup_epochs if omitted>
+
+  # -----------------------------------------------------------------------
+  # Joint-only early stopping criterion: "volume_ratio" | "differential_entropy"
+  # (tmnre.py always uses accuracy-based EarlyStopping from sequential_training)
+  # -----------------------------------------------------------------------
+  early_stop_criterion: "volume_ratio"
+
+  # differential-entropy stop parameters (used when
+  # early_stop_criterion == "differential_entropy")
+  diff_entropy_early_stop:
+    warmup_epochs: 50
+    patience: 10
+    rel_tol: 0.02
+    ema_alpha: 0.3
 
 
-# -------------------------------------------------------------------------
-# Early stopping criterion: "volume_ratio" or "differential_entropy"
-# Selects which callback stops NRE training.
-# -------------------------------------------------------------------------
-early_stop_criterion: "volume_ratio"   # "volume_ratio" | "differential_entropy"
-
-# -------------------------------------------------------------------------
-# Volume-ratio early stopping  (used when early_stop_criterion: "volume_ratio")
-# Stops NRE training when the posterior/prior volume ratio has plateaued.
-# -------------------------------------------------------------------------
+# =========================================================================
+# Volume-ratio early stopping  (shared — used by both tmnre.py and
+# tmnre_joint.py when their respective configs select it)
+# =========================================================================
 volume_ratio_early_stop:
   enabled: true
   warmup_epochs: 80       # ignore first N epochs (posterior is noisy)
@@ -167,16 +219,6 @@ volume_ratio_early_stop:
   rel_tol: 0.02           # relative EMA change threshold for "stalled"
   ema_alpha: 0.3          # EMA smoothing factor (higher = more reactive)
   min_ratio_threshold: 0.5  # stop immediately if any marginal ratio drops here
-
-# -------------------------------------------------------------------------
-# Differential-entropy early stopping  (used when early_stop_criterion: "differential_entropy")
-# Stops NRE training when the posterior differential entropy has plateaued.
-# -------------------------------------------------------------------------
-diff_entropy_early_stop:
-  warmup_epochs: 50
-  patience: 10
-  rel_tol: 0.02
-  ema_alpha: 0.3
 
 rom_use_pinned_memory: false  # Only set true for single-session usage
 rom_prefetch_batches: 4       # Increase to reduce Python overhead
