@@ -2,12 +2,12 @@
 # SHARED settings (used by both scripts/tmnre.py and scripts/tmnre_joint.py)
 # =========================================================================
 batch_size: 250
-epochs: 500
+epochs: 570  # ae_warmup_epochs (270) + NRE budget (300, reference best ckpt epoch=300-step=42140)
 precision: "float32"  # "float32" (default) or "float64"
 #transform_td: "normalise_max" # options: "none", "logwhiten", "log", "whiten"
 transform_fd: "log" # options: "none", "logwhiten", "log", "whiten", "normalise_max"
 noise_factor: 1.0
-classifier_hlayersizes: [64, 128, 256, 512, 256, 128, 64, 32, 16, 8]
+classifier_hlayersizes: [64, 32, 16, 8]
 keep_ckpt: True
 marginals:
   #  f: [[0]]
@@ -19,13 +19,7 @@ marginals:
 # Entries are evaluated in order; the LAST matching entry wins.
 # If omitted or empty, "marginals" above is used for all rounds.
 # -------------------------------------------------------------------------
-marginal_schedule:
-  - from_round: 1
-    marginals:
-      f: [[0,], [10,], [7, 8]]
-  - from_round: 3
-    marginals:
-      f: [[0,], [10,], [7, 8]]
+marginal_schedule: []  # disabled — use the `marginals` block above for all rounds
 
 periodic_bc_params: [ 7, ]
 device: "cuda"
@@ -41,7 +35,7 @@ architecture:
 
   data_summary:
 
-    type: "MarginalAutoencoder"  # Options: "ROM", "Autoencoder", "MarginalEncoder"
+    type: "Autoencoder"  # Options: "ROM", "Autoencoder", "MarginalEncoder", "MarginalAutoencoder"
     BrutalCompression:
       Nfreqs: 1000
       lowdim: 16
@@ -63,35 +57,33 @@ architecture:
       batch_train: 1000
       patience: 25
       freq_split_idx: 2048
-      high_freq_only: False
+      high_freq_only: True
     Autoencoder:
       load: False
       finetune_previous: True
       filename: ""
       device: "cuda"
-      # --- Training hyperparameters (used when load: False) ---
-      architecture: "conv"        # "conv" or "unet"
+      # --- Reference (20260420autoenc_test5d) architecture ---
+      architecture: "conv"         # "conv" or "unet"
       representation: "real_imag"  # "amp_phase" or "real_imag"
       n_channels: 2                # TDI channels (AE→2, AET→3)
       n_freqs: 4096
-      bottleneck_dim: 200
-      # input_channels is 4, hidden_channels determines the progressive increase in the channel dimension
-      # Channels double at each layer (constant capacity heuristic: ch × spatial ≈ const)
-      # With stride=2 and 7 layers: 4096 → 32 spatial bins before FC
-      hidden_channels: [32, 64, 128, 256, 512, 512, 512]
-      kernel_size: 5
-      stride: 2 # determines downsampling along the frequency dimension (start from 4096=2^12)
+      bottleneck_dim: 128
+      hidden_channels: [32, 64, 128, 256, 256]
+      kernel_size: 3
+      stride: 2
       dropout: 0.0
-      residual: False           # residual shortcut connections in the ConvEncoder
-      high_freq_only: False
+      residual: False              # matches reference (no residual shortcuts)
+      decoder_post_fc_bn: False    # matches reference (cb948642): no BatchNorm between FC and conv-transpose stack
+      high_freq_only: True         # KEEP CURRENT (reference was True with freq_split_idx=2048)
       freq_split_idx: 2048
-      # Training
-      lr: 0.0001
-      weight_decay: 0.0001
-      epochs: 150
-      scheduler_patience: 75
+      # --- Reference training hyper-parameters ---
+      lr: 0.001
+      weight_decay: 1.0e-5
+      epochs: 500                  # inert in joint mode (warmup uses ae_warmup_epochs)
+      scheduler_patience: 10
       scheduler_factor: 0.3
-      early_stop_patience: 80
+      early_stop_patience: 20
       log_name: "autoencoder"
   
     # -----------------------------------------------------------------------
@@ -154,11 +146,11 @@ sequential_training:
 # JOINT AE + NRE training  (scripts/tmnre_joint.py only)
 # =========================================================================
 joint_training:
-  ae_warmup_epochs: 100        # epochs of AE-only training before NRE kicks in (round 1 only)
-  lr_ae: 0.001                # learning rate for autoencoder (encoder + decoder)
-  lr_nre: 0.0001              # learning rate for NRE classifier heads
-  ae_weight_decay: 0.0001    # weight decay for autoencoder param group
-  freeze_ae_after_warmup: true  # if true, freeze AE after warmup; only NRE trains post-warmup
+  ae_warmup_epochs: 270         # matches reference round-1 AE training duration (best ckpt at 256, ran to 270)
+  lr_ae: 0.001                  # matches reference AE lr
+  lr_nre: 0.0001                # matches reference NRE learning_rate
+  ae_weight_decay: 1.0e-5       # matches reference AE weight_decay
+  freeze_ae_after_warmup: true  # mimics tmnre.py's frozen-encoder NRE training
 
   # -----------------------------------------------------------------------
   # Per-parameter-group LR schedulers.
@@ -179,25 +171,35 @@ joint_training:
     enabled: true
     monitor: "val_ae_loss"
     mode: "min"
-    factor: 0.3
-    patience: 50
+    factor: 0.3            # matches autoencoder.py @ cb948642 (scheduler_factor=0.3)
+    patience: 10           # matches autoencoder.py @ cb948642 (scheduler_patience=10)
     min_lr: 1.0e-7
     start_epoch: 0
 
   nre_scheduler:
-    enabled: false          # set true to enable ReduceLROnPlateau on the NRE group
+    enabled: false         # reference model.py @ cb948642 returns optimizer with NO scheduler
     monitor: "val_nre_loss"
     mode: "min"
     factor: 0.3
-    patience: 30
+    patience: 10
     min_lr: 1.0e-7
     # start_epoch: <defaults to ae_warmup_epochs if omitted>
 
   # -----------------------------------------------------------------------
-  # Joint-only early stopping criterion: "volume_ratio" | "differential_entropy"
-  # (tmnre.py always uses accuracy-based EarlyStopping from sequential_training)
+  # Joint-only early stopping criterion: "volume_ratio" | "differential_entropy" | "accuracy"
+  # The reference run (sequential tmnre.py) used accuracy-based EarlyStopping;
+  # "accuracy" is implemented in tmnre_joint.py via WarmupEarlyStopping that
+  # ignores epochs before ae_warmup_epochs (where val_accuracy is constant 0.5).
   # -----------------------------------------------------------------------
-  early_stop_criterion: "volume_ratio"
+  early_stop_criterion: "accuracy"
+
+  # accuracy-based early-stopping parameters (used when
+  # early_stop_criterion == "accuracy"); values from reference sequential_training.
+  accuracy_early_stop:
+    enabled: true
+    patience: 90
+    min_delta: 0.001
+    threshold: 0.999
 
   # differential-entropy stop parameters (used when
   # early_stop_criterion == "differential_entropy")
@@ -213,7 +215,7 @@ joint_training:
 # tmnre_joint.py when their respective configs select it)
 # =========================================================================
 volume_ratio_early_stop:
-  enabled: true
+  enabled: false          # disabled — reproducing reference uses accuracy-based EarlyStopping
   warmup_epochs: 80       # ignore first N epochs (posterior is noisy)
   patience: 20            # consecutive stalled evaluations before stopping
   rel_tol: 0.02           # relative EMA change threshold for "stalled"

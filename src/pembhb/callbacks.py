@@ -16,7 +16,8 @@ from pembhb.utils import (
 )
 # from pembhb.data import MBHBDataset, mbhb_collate_fn
 from torch.utils.data import DataLoader
-from lightning.pytorch.callbacks import  Callback
+from lightning.pytorch.callbacks import Callback
+from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from pembhb.sky_truncation import get_main_mode_box
 from datetime import datetime, timedelta
 
@@ -808,3 +809,24 @@ class DifferentialEntropyEarlyStopping(Callback):
             self.stop_reason = triggered_reason
             print(f"[EntropyES] Stopping at epoch {trainer.current_epoch}: {triggered_reason}")
             trainer.should_stop = True
+
+
+class WarmupEarlyStopping(EarlyStopping):
+    """EarlyStopping that ignores the first ``warmup_epochs`` epochs.
+
+    During AE warm-up in joint training, the NRE accuracy is logged as a
+    constant ~0.5 (the heads are not being trained yet); a stock EarlyStopping
+    on ``val_accuracy`` would either trigger immediately or burn its patience
+    budget before the NRE phase even starts. This wrapper short-circuits the
+    check until ``warmup_epochs`` have elapsed, then behaves identically to
+    Lightning's :class:`EarlyStopping`.
+    """
+
+    def __init__(self, warmup_epochs: int, **kwargs):
+        super().__init__(**kwargs)
+        self._warmup_epochs = warmup_epochs
+
+    def _run_early_stopping_check(self, trainer):
+        if trainer.current_epoch < self._warmup_epochs:
+            return
+        super()._run_early_stopping_check(trainer)

@@ -153,16 +153,21 @@ class ConvDecoder(nn.Module):
         pre_fc_channels: int = None,
         pre_fc_length: int = None,
         dropout: float = 0.0,
+        decoder_post_fc_bn: bool = True,
     ):
         super().__init__()
         self.n_freqs = n_freqs
         self.pre_fc_channels = pre_fc_channels
         self.pre_fc_length = pre_fc_length
-        
+
         # Linear from bottleneck to pre-conv shape
         self.fc = nn.Linear(bottleneck_dim, pre_fc_channels * pre_fc_length)
         self.fc_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self.post_fc_norm = nn.BatchNorm1d(pre_fc_channels)
+        # Optional BatchNorm right after the bottleneck → conv-shape projection.
+        # Set False to recover the architecture used at commit cb948642.
+        self.post_fc_norm = (
+            nn.BatchNorm1d(pre_fc_channels) if decoder_post_fc_bn else nn.Identity()
+        )
 
         # Build conv transpose layers (reverse order of encoder)
         reversed_ch = list(reversed(hidden_channels))
@@ -334,6 +339,7 @@ class DenoisingAutoencoder(LightningModule):
         stride: int = 2,
         dropout: float = 0.0,
         residual: bool = False,
+        decoder_post_fc_bn: bool = True,
         # --- Unet architecture params (legacy) ---
         sizes: tuple = (16, 32, 64, 128, 256),
         down_sampling: tuple = (2, 2, 2, 2),
@@ -408,6 +414,7 @@ class DenoisingAutoencoder(LightningModule):
                 pre_fc_channels=self.encoder.pre_fc_channels,
                 pre_fc_length=self.encoder.pre_fc_length,
                 dropout=dropout,
+                decoder_post_fc_bn=decoder_post_fc_bn,
             )
         else:  # unet
             # Unet-based autoencoder with skip connections (legacy)

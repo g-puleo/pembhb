@@ -3,25 +3,29 @@ waveform_params:
   modes:  [[2,2], [2,1], [3,3], [3,2], [4,4], [4,3]]
   noise: "sangria"
   duration: 1 # weeks
-  dt: 5 # seconds
+  dt: 100 # seconds
   t_max: 5 # days
   # FD-only settings (used when domain="fd"; ignored for "fd_td")
   domain: "fd"          # "fd" for FD-only simulator, "fd_td" for FD+TD (default)
   n_freq_bins: 4096        # number of frequency bins (FD-only)
-  freq_spacing: "log"   # "linear" or "log" (FD-only)
+  freq_spacing: "linear"   # "linear" or "log" (FD-only)
 
 prior:
-  "logMchirp": [5.2499868981482, 5.25001543353302]
-  "q":         [2.99882969771, 3.001046336]          # mass ratio (99.99% posterior width from mcmc_coppa/logf_samples_5D_copparoni.h5)
-  "chi1":       [0.0, 0.0]
-  "chi2":       [0,0]
-  "dist":       [10,10]            # dist in Gpc (note that we shall sample uniformly dist^3)
-  "phi":        [0.0, 0.0]       # phase at coalescence
-  "inc":        [0.5,0.5]         # cos inclination
-  "lambda":     [3.13364303859817, 3.15005903108327]       # ecliptic longitude
-  "beta":      [0.193276968635122, 0.205711356305175]            # sin ecliptic latitude
-  "psi":        [1.0,1.0]      # polarization angle
-  "Deltat":    [-2.50002064857738, -2.49998439474129]        # t_merger from end of observation in days
+  # Copied from the reference run 20260420autoenc_test5d
+  # /data/gpuleo/mbhb/20260420autoenc_test5d/simulation_round_1.yaml
+  # (Fisher-widened 15-sigma box around the fiducial event; using these
+  # verbatim so fisher_prior can stay disabled in train_config.yaml.)
+  "logMchirp": [5.249960881397025, 5.250039118602975]
+  "q":         [2.996074595121879, 3.003925404878121]
+  "chi1":      [0.0, 0.0]
+  "chi2":      [0.0, 0.0]
+  "dist":      [10.0, 10.0]                                      # Gpc (sampled uniformly in dist^3)
+  "phi":       [0.0, 0.0]                                        # phase at coalescence
+  "inc":       [0.5, 0.5]                                        # cos inclination
+  "lambda":    [3.1124873962687998, 3.16751281353955]            # ecliptic longitude
+  "beta":      [0.18623696704815745, 0.21376303891230702]        # sin ecliptic latitude
+  "psi":       [1.0, 1.0]                                        # polarization angle
+  "Deltat":    [-2.5000186218908196, -2.4999813781091804]        # t_merger from end of observation (days)
 
 backend: "cuda12x"
 

@@ -1742,6 +1742,13 @@ class JointAEInferenceNetwork(LightningModule):
             ae_conf = hp["train_conf"]["architecture"]["data_summary"]["Autoencoder"]
             ae_keys = [k for k in state_dict if k.startswith("encoder_model.encoder")]
             residual = any(".main." in k for k in ae_keys)
+            # Infer decoder_post_fc_bn from state-dict keys (config value may
+            # be stale, e.g. when reloading an older checkpoint after toggling
+            # the flag in train_config.yaml).  BatchNorm1d registers
+            # post_fc_norm.weight; nn.Identity registers nothing.
+            decoder_post_fc_bn = any(
+                k.endswith("decoder.post_fc_norm.weight") for k in state_dict
+            )
             dummy_encoder = DenoisingAutoencoder(
                 n_channels=ae_conf["n_channels"],
                 n_freqs=ae_conf["n_freqs"],
@@ -1752,6 +1759,7 @@ class JointAEInferenceNetwork(LightningModule):
                 stride=ae_conf["stride"],
                 dropout=ae_conf.get("dropout", 0.0),
                 residual=residual,
+                decoder_post_fc_bn=decoder_post_fc_bn,
                 representation=ae_conf.get("representation", "real_imag"),
                 high_freq_only=ae_conf.get("high_freq_only", False),
                 freq_split_idx=ae_conf.get("freq_split_idx", 2048),

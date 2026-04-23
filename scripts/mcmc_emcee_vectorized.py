@@ -19,12 +19,16 @@ from mcmc import BBHXLikelihood, load_observation, compute_fisher_information_ma
 
 
 def main():
-    # Configuration
-    event_idx = 0  # Which event to analyze
-    # 5d
-    #observation_file = "/data/gpuleo/mbhb/observation_skyloc_tc_mass.h5"
-    # 2d 
-    observation_file = "/data/gpuleo/mbhb/obs_logspace_freqonly_q3.h5"
+    # ---- Load MCMC settings ----
+    mcmc_config_file = os.path.join(ROOT_DIR, "configs", "mcmc_config.yaml")
+    mcmc_conf = read_config(mcmc_config_file)
+    event_idx        = mcmc_conf["event_idx"]
+    high_freq_only   = mcmc_conf["high_freq_only"]
+    freq_split_idx   = mcmc_conf["freq_split_idx"]
+    observation_file = mcmc_conf["observation_file"]
+    fisher_conf      = mcmc_conf["fisher"]
+    manual_conf      = mcmc_conf.get("manual", {})
+    emcee_conf       = mcmc_conf["emcee"]
     config_file = os.path.join(ROOT_DIR, "configs", "datagen_config.yaml")
     
     # Load configuration and data
@@ -79,7 +83,26 @@ def main():
     
     data_T_channels = np.zeros(shape=(1, data_fd_complex.shape[1]), dtype=np.complex128)
     data_fd = np.concatenate([data_fd_complex, data_T_channels], axis=0)
-    
+
+    # Optional high-freq-only slicing (mirrors AE/NRE training-time config).
+    # Restricts every later bbhx_likelihood.get_ll call to frequencies[freq_split_idx:].
+    if high_freq_only:
+        n_full = frequencies.shape[0]
+        if not (0 < freq_split_idx < n_full):
+            raise ValueError(
+                f"freq_split_idx={freq_split_idx} out of range for n_freqs={n_full}"
+            )
+        frequencies = frequencies[freq_split_idx:]
+        data_fd     = data_fd[:, freq_split_idx:]
+        psd_AET     = psd_AET[:, freq_split_idx:]
+        assert frequencies.shape[0] == data_fd.shape[1] == psd_AET.shape[1]
+        # Keep simulator.waveform_kwargs in sync. bbhx.Likelihood.get_ll
+        # overrides "freqs" with its own data_freqs, but pre-slicing here
+        # guards against likelihood classes that don't override.
+        simulator.waveform_kwargs["freqs"] = simulator.xp.asarray(frequencies)
+        print(f"[mcmc] high_freq_only: keeping bins [{freq_split_idx}:{n_full}] "
+              f"= {frequencies.shape[0]} bins (band {frequencies[0]:.3e}–{frequencies[-1]:.3e} Hz)")
+
     # Create BBHX likelihood
     print("Creating BBHX likelihood...")
     bbhx_likelihood = Likelihood(
@@ -106,13 +129,7 @@ def main():
 
     # Separate fixed and varying parameters
     print("\\nSetting up parameters...")
-    varying_params = [ #declare explicitly which ones : 
-        "logMchirp",
-        "q", 
-        "Deltat",
-        "lambda",
-        "beta"
-    ]
+    varying_params = list(mcmc_conf["varying_params"])
     # Save varying_params to a file for reproducibility
 
     varying_indices = [
@@ -134,23 +151,35 @@ def main():
         fixed_params=fixed_params
     )
     
-    # Compute Fisher Information Matrix
-    print("\\n=== Computing Fisher Information Matrix ===")
-    true_params_dict = {key: true_tmnre_params[i] for i, key in enumerate(_ORDERED_PRIOR_KEYS) 
+    true_params_dict = {key: true_tmnre_params[i] for i, key in enumerate(_ORDERED_PRIOR_KEYS)
                         if key not in fixed_params}
-    
-    fisher_matrix, param_uncertainties = compute_fisher_information_matrix(
-        likelihood,
-        true_params_dict,
-        varying_params,
-        delta_frac=1e-6
-    )
 
-    
-    
-    # Define prior bounds for varying params
-    prior_mins = np.array([true_tmnre_params[i]-15*param_uncertainties[j] for j, i in enumerate(varying_indices)])
-    prior_maxs = np.array([true_tmnre_params[i]+15*param_uncertainties[j] for j, i in enumerate(varying_indices)])
+    # Compute Fisher Information Matrix (optional — sets prior bounds + walker init scale).
+    if fisher_conf.get("enabled", True):
+        print("\\n=== Computing Fisher Information Matrix ===")
+        fisher_matrix, param_uncertainties = compute_fisher_information_matrix(
+            likelihood,
+            true_params_dict,
+            varying_params,
+            delta_frac=fisher_conf.get("delta_frac", 1.0e-6),
+        )
+        n_sigma = fisher_conf.get("prior_n_sigma", 15.0)
+        prior_mins = np.array([true_tmnre_params[i] - n_sigma * param_uncertainties[j]
+                               for j, i in enumerate(varying_indices)])
+        prior_maxs = np.array([true_tmnre_params[i] + n_sigma * param_uncertainties[j]
+                               for j, i in enumerate(varying_indices)])
+        init_widths = fisher_conf.get("init_widths_factor", 0.1) * param_uncertainties
+    else:
+        print("\\n=== Skipping Fisher matrix; using manual prior bounds ===")
+        param_uncertainties = None
+        manual_prior = manual_conf.get("prior", {})
+        missing_p = [p for p in varying_params if p not in manual_prior]
+        if missing_p:
+            raise KeyError(f"manual.prior missing entries for: {missing_p}")
+        prior_mins  = np.array([manual_prior[p][0] for p in varying_params], dtype=np.float64)
+        prior_maxs  = np.array([manual_prior[p][1] for p in varying_params], dtype=np.float64)
+        init_widths = manual_conf.get("init_widths_frac", 0.01) * (prior_maxs - prior_mins)
+
     prior_widths = prior_maxs - prior_mins
     for i, param in enumerate(varying_params):
         print(f"{param}: [{prior_mins[i]:.3e}, {prior_maxs[i]:.3e}] (width: {prior_widths[i]:.3e})")
@@ -202,16 +231,13 @@ def main():
         return log_posts
     
     # Initialize walkers
-    nwalkers = 32
+    nwalkers = emcee_conf.get("nwalkers", 32)
     print(f"\\n=== Initializing {nwalkers} walkers ===")
-    
-    # Initialize in small ball around true parameters using FIM uncertainties
+
+    # Gaussian ball around the true parameters (init_widths set above —
+    # FIM-derived or manual depending on fisher_conf.enabled).
     true_theta = np.array([true_params_dict[param] for param in varying_params])
-    
-    # Use FIM uncertainties if available, otherwise use 1% of prior range
-    init_widths = 0.1 * param_uncertainties  # 10% of 1σ uncertainty
-    
-    
+
     pos = true_theta + init_widths * np.random.randn(nwalkers, ndim)
     
     # Ensure all walkers start within prior
@@ -230,7 +256,7 @@ def main():
     )
 
     # Run MCMC
-    nsteps = 1000
+    nsteps = emcee_conf.get("nsteps", 1000)
     print(f"\\n=== Running MCMC for {nsteps} steps ===")
     state = sampler_emcee.run_mcmc(pos, nsteps, progress=True)
     
@@ -270,12 +296,48 @@ def main():
         show_titles=True,
         title_kwargs={"fontsize": 12}
     )
-    name="5d_qwide"
+    if "output_name" not in mcmc_conf or not mcmc_conf["output_name"]:
+        raise KeyError("mcmc_config.yaml: 'output_name' is required (refusing to "
+                       "default — would risk overwriting a previous run).")
+    name = mcmc_conf["output_name"]
     outdir = os.path.join(ROOT_DIR, "mc_results_emcee_vec", name)
     os.makedirs(outdir, exist_ok=True)
-    output_file = os.path.join(outdir, "flat_samples.npy")
-    np.save(output_file, flat_samples)
-    print(f"Saved flat samples to {output_file}")
+    npy_file = os.path.join(outdir, "flat_samples.npy")
+    np.save(npy_file, flat_samples)
+    print(f"Saved flat samples to {npy_file}")
+
+    # Also write samples in copparoni HDF5 format (per-parameter datasets) so
+    # that scripts/visualise_truncation_rounds.py can consume them via
+    # load_mcmc_samples().  Keys + units must match the convention in
+    # mcmc_coppa/logf_samples_5D_copparoni.h5.
+    duration_sec = datagen_config["waveform_params"]["duration"] * 7 * 86400.0
+    _INTERNAL_TO_MCMC = {
+        "logMchirp": ("logMchirp", lambda v: v),
+        "q":         ("q",         lambda v: v),
+        "lambda":    ("lambda",    lambda v: v),
+        "beta":      ("sinbeta",   lambda v: v),
+        "inc":       ("cosinc",    lambda v: v),
+        "dist":      ("dist_Gpc",  lambda v: v),
+        "Deltat":    ("tref",      lambda v: duration_sec + v * 86400.0),
+        "chi1":      ("chi1",      lambda v: v),
+        "chi2":      ("chi2",      lambda v: v),
+        "phi":       ("phi",       lambda v: v),
+        "psi":       ("psi",       lambda v: v),
+    }
+    samples_h5 = {}
+    for col_idx, internal_name in enumerate(varying_params):
+        if internal_name not in _INTERNAL_TO_MCMC:
+            raise KeyError(
+                f"No copparoni-key mapping for varying parameter '{internal_name}'"
+            )
+        mcmc_key, transform = _INTERNAL_TO_MCMC[internal_name]
+        samples_h5[mcmc_key] = transform(flat_samples[:, col_idx])
+
+    h5_file = os.path.join(outdir, "flat_samples.h5")
+    with h5py.File(h5_file, "w") as f:
+        for k, v in samples_h5.items():
+            f.create_dataset(k, data=np.asarray(v, dtype=np.float64))
+    print(f"Saved flat samples (copparoni format) to {h5_file}")
     varying_params_file = os.path.join(outdir, "varying_params.txt")
     with open(varying_params_file, "w") as f:
         for param in varying_params:
@@ -303,12 +365,16 @@ def main():
         mcmc_median = np.median(flat_samples[:, i])
         mcmc_std = np.std(flat_samples[:, i])
         true_val = true_theta[i]
-        fim_std = param_uncertainties[i] if np.isfinite(param_uncertainties[i]) else np.nan
-        
+        if param_uncertainties is not None:
+            fim_std = param_uncertainties[i] if np.isfinite(param_uncertainties[i]) else np.nan
+            fim_str = f"{fim_std:.6e}"
+        else:
+            fim_str = "N/A (fisher disabled)"
+
         print(f"{param}:")
         print(f"  True: {true_val:.6e}")
         print(f"  MCMC: {mcmc_median:.6e} ± {mcmc_std:.6e}")
-        print(f"  FIM σ: {fim_std:.6e}")
+        print(f"  FIM σ: {fim_str}")
         print(f"  Bias: {(mcmc_median - true_val)/true_val * 100:.2f}%")
     
     print("\\nDone!")
