@@ -15,17 +15,17 @@ prior:
   # /data/gpuleo/mbhb/20260420autoenc_test5d/simulation_round_1.yaml
   # (Fisher-widened 15-sigma box around the fiducial event; using these
   # verbatim so fisher_prior can stay disabled in train_config.yaml.)
-  "logMchirp": [5.249960881397025, 5.250039118602975]
-  "q":         [2.996074595121879, 3.003925404878121]
-  "chi1":      [0.0, 0.0]
-  "chi2":      [0.0, 0.0]
+  "logMchirp": [5.2, 5.3]
+  "q":         [1, 5]
+  "chi1":      [-0.9, 0.9]
+  "chi2":      [-0.9, 0.9]
   "dist":      [10.0, 10.0]                                      # Gpc (sampled uniformly in dist^3)
-  "phi":       [0.0, 0.0]                                        # phase at coalescence
-  "inc":       [0.5, 0.5]                                        # cos inclination
-  "lambda":    [3.1124873962687998, 3.16751281353955]            # ecliptic longitude
-  "beta":      [0.18623696704815745, 0.21376303891230702]        # sin ecliptic latitude
-  "psi":       [1.0, 1.0]                                        # polarization angle
-  "Deltat":    [-2.5000186218908196, -2.4999813781091804]        # t_merger from end of observation (days)
+  "phi":       [0.0, 6.283185307179586]                                        # phase at coalescence
+  "inc":       [-1.0, 1.0]                                        # cos inclination
+  "lambda":    [0, 6.283185307179586]            # ecliptic longitude
+  "beta":      [-1.0, 1.0]        # sin ecliptic latitude
+  "psi":       [0.0, 3.141592653589793]                                        # polarization angle in [0, pi]
+  "Deltat":    [-2.55, -2.45]        # t_merger from end of observation (days)
 
 backend: "cuda12x"
 

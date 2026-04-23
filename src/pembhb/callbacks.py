@@ -460,7 +460,7 @@ class PlotPosteriorCallback(Callback):
                             ax.clabel(cs, fmt=fmt, fontsize=8)
 
                             if marginal_key == (7, 8):
-                                box = get_main_mode_box(gx, gy, norm_2d, credible_level=0.9545, dilation_factor=1.5)
+                                box = get_main_mode_box(gx, gy, norm_2d, credible_level=0.999, dilation_factor=1.1)
                                 widest_box = (box['lam'][0], box['lam'][1], box['beta'][0], box['beta'][1])
                                 is_wrapped = box["is_wrapped"]
                             else:

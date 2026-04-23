@@ -621,9 +621,13 @@ class SequentialTrainer:
             call_every_n_epochs=2,
             training_start_time=self.training_start)
 
-        callbacks_list = [checkpoint_callback, early_stopping_callback, plot_posterior_callback]
-        vr_conf = self.train_conf.get("volume_ratio_early_stop", {})
-        if vr_conf.get("enabled", False):
+        seq_conf = self.train_conf.get("sequential_training", {})
+        es_criterion = seq_conf.get("early_stop_criterion", "accuracy")
+
+        callbacks_list = [checkpoint_callback, plot_posterior_callback]
+
+        if es_criterion == "volume_ratio":
+            vr_conf = self.train_conf.get("volume_ratio_early_stop", {})
             vr_callback = VolumeRatioEarlyStopping(
                 warmup_epochs=vr_conf.get("warmup_epochs", 50),
                 patience=vr_conf.get("patience", 10),
@@ -632,6 +636,8 @@ class SequentialTrainer:
                 min_ratio_threshold=vr_conf.get("min_ratio_threshold", 0.5),
             )
             callbacks_list.append(vr_callback)
+        else:
+            callbacks_list.append(early_stopping_callback)
 
         callbacks_list.append(PeriodicProgressCallback(print_every=20, label="NRE"))
         trainer = Trainer(
