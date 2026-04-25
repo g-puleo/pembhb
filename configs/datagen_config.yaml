@@ -17,14 +17,14 @@ prior:
   # verbatim so fisher_prior can stay disabled in train_config.yaml.)
   "logMchirp": [5.2, 5.3]
   "q":         [1, 5]
-  "chi1":      [-0.9, 0.9]
-  "chi2":      [-0.9, 0.9]
+  "chi1":      [0.0, 0.0]
+  "chi2":      [0.0, 0.0]
   "dist":      [10.0, 10.0]                                      # Gpc (sampled uniformly in dist^3)
-  "phi":       [0.0, 6.283185307179586]                                        # phase at coalescence
-  "inc":       [-1.0, 1.0]                                        # cos inclination
+  "phi":       [0.0, 0.0]                                        # phase at coalescence
+  "inc":       [0.5, 0.5]                                        # cos inclination
   "lambda":    [0, 6.283185307179586]            # ecliptic longitude
   "beta":      [-1.0, 1.0]        # sin ecliptic latitude
-  "psi":       [0.0, 3.141592653589793]                                        # polarization angle in [0, pi]
+  "psi":       [1.0,1.0]                                        # polarization angle in [0, pi]
   "Deltat":    [-2.55, -2.45]        # t_merger from end of observation (days)
 
 backend: "cuda12x"

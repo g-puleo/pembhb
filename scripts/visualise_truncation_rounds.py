@@ -2052,7 +2052,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--data-path",
-        default="/data/gpuleo/mbhb/obs_logfreq_q3_t_noisy.h5",
+        required=True,
         help="Path to the observation HDF5 file.  Should contain a stored "
              "'noise_fd' dataset (see scripts/add_noise_to_obs.py); otherwise "
              "the script falls back to a freshly-drawn random noise per call, "
