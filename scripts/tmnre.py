@@ -25,9 +25,9 @@ from pembhb.utils import validate_marginals, resolve_marginals_for_round, transf
 from pembhb.callbacks import PlotPosteriorCallback, VolumeRatioEarlyStopping, PeriodicProgressCallback
 
 def get_timestamp():
-    return datetime.now().strftime("%Y%m%d")
+    return datetime.now().strftime("%Y/%m/%d")
 
-TIME_OF_EXECUTION = get_timestamp() + "_sequential_volratio_earlystop"
+TIME_OF_EXECUTION = get_timestamp() + "/sequential_volratio_earlystop"
 
 class SequentialTrainer:
     def __init__(self, train_conf, datagen_conf, dataset_obs_path):
@@ -309,33 +309,28 @@ class SequentialTrainer:
                 representation=ae_conf.get("representation", "amp_phase"),
                 high_freq_only=ae_conf.get("high_freq_only", False),
                 freq_split_idx=ae_conf.get("freq_split_idx", 2048),
+                amplitude_normalise=ae_conf.get("amplitude_normalise", False),
                 prior_bounds=prior_bounds,
             )
             autoencoder = autoencoder.to(device)
 
-            # --- fit normalisation from training split (clean signals) --------
-            print("[AE] Fitting normalisation statistics ...")
-            norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
-            autoencoder.fit_normalisation(norm_loader)
-
-            # --- set noise ASD for noise-weighted reconstruction loss --------
-            asd = self.data_module.get_asd()
-            if asd is not None:
-                autoencoder.set_noise_asd(asd)
+            autoencoder.set_whitening(self.data_module.get_noise_scale())
+            if autoencoder.amplitude_normalise:
+                norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
+                autoencoder.fit_amplitude_normalisation(norm_loader)
 
         else:
             autoencoder = self.data_summary.autoencoder
             self.data_summary.unfreeze_parameters()
             print(f"Finetuning autoencoder from previous round with bottleneck dim {autoencoder.hparams.bottleneck_dim} and prior bounds {autoencoder.hparams.prior_bounds}")
 
-            # Re-fit normalisation on the new round's data and re-set noise
-            # ASD so the noise-weighted loss is used consistently across rounds.
-            print("[AE] Re-fitting normalisation for new round data ...")
-            norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
-            autoencoder.fit_normalisation(norm_loader)
-            asd = self.data_module.get_asd()
-            if asd is not None:
-                autoencoder.set_noise_asd(asd)
+            # Whitening scale depends only on ASD and T_obs (constant across
+            # rounds in the standard setup); re-set defensively in case the
+            # new round's dataset has different noise settings.
+            autoencoder.set_whitening(self.data_module.get_noise_scale())
+            if autoencoder.amplitude_normalise:
+                norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
+                autoencoder.fit_amplitude_normalisation(norm_loader)
         # --- callbacks ----------------------------------------------------
         checkpoint_cb = ModelCheckpoint(
             monitor="val_loss",
@@ -356,7 +351,7 @@ class SequentialTrainer:
         log_name = ae_conf.get("log_name", "autoencoder")
         logger = TensorBoardLogger(
             save_dir=os.path.join(DATA_ROOT_DIR, "logs"),
-            name=f"{TIME_OF_EXECUTION}_{log_name}_round_{round_idx}",
+            name=f"{TIME_OF_EXECUTION}/{log_name}/round_{round_idx}",
         )
 
         # --- trainer ------------------------------------------------------
@@ -473,13 +468,15 @@ class SequentialTrainer:
                 scheduler_patience=me_conf.get("scheduler_patience", 75),
                 scheduler_factor=me_conf.get("scheduler_factor", 0.3),
                 representation=me_conf.get("representation", "real_imag"),
+                amplitude_normalise=me_conf.get("amplitude_normalise", False),
                 prior_bounds=prior_bounds,
             )
             enc_trainer = enc_trainer.to(device)
 
-            print("[MarginalEncoder] Fitting normalisation statistics ...")
-            norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
-            enc_trainer.fit_normalisation(norm_loader)
+            enc_trainer.set_whitening(self.data_module.get_noise_scale())
+            if enc_trainer.amplitude_normalise:
+                norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
+                enc_trainer.fit_amplitude_normalisation(norm_loader)
         else:
             # Fine-tune from previous round (marginals must be unchanged)
             prev_wrapper = getattr(self, "data_summary", None)
@@ -517,7 +514,7 @@ class SequentialTrainer:
         log_name = me_conf.get("log_name", "marginal_encoder")
         logger = TensorBoardLogger(
             save_dir=os.path.join(DATA_ROOT_DIR, "logs"),
-            name=f"{TIME_OF_EXECUTION}_{log_name}_round_{round_idx}",
+            name=f"{TIME_OF_EXECUTION}/{log_name}/round_{round_idx}",
         )
 
         # --- trainer ----------------------------------------------------------
@@ -599,7 +596,7 @@ class SequentialTrainer:
         copy_bounds_file = True
 
         logger = TensorBoardLogger(
-            os.path.join(DATA_ROOT_DIR, "logs"), name=f"{TIME_OF_EXECUTION}_round_{round_idx}"
+            os.path.join(DATA_ROOT_DIR, "logs"), name=f"{TIME_OF_EXECUTION}/round_{round_idx}"
         )
         
         checkpoint_callback = ModelCheckpoint(monitor="val_loss", mode="min")
@@ -829,7 +826,7 @@ if __name__ == "__main__":
 
     # Dynamic timestamp incorporating the data summary type
     ds_type = train_config["architecture"]["data_summary"]["type"].lower()
-    TIME_OF_EXECUTION = get_timestamp() + f"_{ds_type}_{run_name}"
+    TIME_OF_EXECUTION = get_timestamp() + f"/{ds_type}_{run_name}"
 
     trainer = SequentialTrainer(train_conf=train_config, datagen_conf=datagen_config, dataset_obs_path="/data/gpuleo/mbhb/obs_logfreq_q3_t.h5")
     trainer.run(n_rounds=9)

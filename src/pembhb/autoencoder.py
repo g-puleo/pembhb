@@ -352,6 +352,8 @@ class DenoisingAutoencoder(LightningModule):
         # --- High-frequency only mode ---
         high_freq_only: bool = False,
         freq_split_idx: int = 2048,
+        # --- Optional global amplitude normalisation on top of whitening ---
+        amplitude_normalise: bool = False,
         # --- Prior bounds (for provenance tracking) ---
         prior_bounds: dict = None,
     ):
@@ -365,6 +367,11 @@ class DenoisingAutoencoder(LightningModule):
             raise ValueError(
                 f"architecture must be one of {self.VALID_ARCHITECTURES}, "
                 f"got '{architecture}'"
+            )
+        if amplitude_normalise and representation != "real_imag":
+            raise NotImplementedError(
+                "amplitude_normalise=True is only supported with "
+                "representation='real_imag'."
             )
         self.save_hyperparameters()
 
@@ -380,6 +387,7 @@ class DenoisingAutoencoder(LightningModule):
         self.dropout = dropout
         self.high_freq_only = high_freq_only
         self.freq_split_idx = freq_split_idx
+        self.amplitude_normalise = amplitude_normalise
         self.prior_bounds = prior_bounds  # stored in hparams for checkpoint
 
         # Determine the number of frequency bins to reconstruct
@@ -429,31 +437,16 @@ class DenoisingAutoencoder(LightningModule):
                 sizes=sizes,
             )
 
-        # ---- normalisation buffers (computed from training data) -----------
-        # These are registered as buffers so they are saved/loaded with the
-        # checkpoint and moved to the correct device automatically.
-        self.register_buffer("mean_vec", torch.zeros(n_real_channels, n_freqs, dtype=get_torch_dtype()))
-        self.register_buffer("global_scale_factor", torch.tensor(1.0, dtype=get_torch_dtype()))
-        self._normalisation_fitted = False
+        # Whitening scale: noise_scale = ASD * sqrt(T_obs/4), shape (C, F).
+        # Set via set_whitening() before training; persisted in state_dict so
+        # resume picks it up automatically. Initialised to 1 (identity) so
+        # forward passes are well-defined before set_whitening is called.
+        self.register_buffer("whitening", torch.ones(n_channels, n_freqs, dtype=get_torch_dtype()))
 
-        # ---- noise ASD buffer for noise-weighted loss ---------------------
-        # We store the ASD (not the PSD) because the loss whitens the complex
-        # signals *before* squaring: loss = mean |recon/ASD - h/ASD|².
-        # Dividing by ASD first keeps intermediate values O(1) (whitened),
-        # avoiding the large dynamic range that would arise from computing
-        # |diff|² (tiny GW amplitudes squared) and then dividing by PSD.
-        # Shape: (n_channels, n_freqs).  Set via set_noise_asd() before training.
-        self.register_buffer("noise_asd", torch.zeros(n_channels, n_freqs, dtype=get_torch_dtype()))
-
-    @property
-    def _noise_asd_set(self) -> bool:
-        """True when ``noise_asd`` has been populated with real ASD values.
-
-        Derived from the buffer content so it survives checkpoint round-trips
-        (unlike a plain Python attribute, which is lost on ``load_from_checkpoint``).
-        """
-        return self.noise_asd.any().item()
-
+        # Optional global amplitude scale: scalar max over (samples, channels,
+        # freqs) of the whitened clean training signal. Populated by
+        # fit_amplitude_normalisation(). Initialised to 1 (identity).
+        self.register_buffer("amplitude_scale", torch.tensor(1.0, dtype=get_torch_dtype()))
 
     # ------------------------------------------------------------------
     # Complex → real conversion
@@ -491,95 +484,79 @@ class DenoisingAutoencoder(LightningModule):
             return torch.complex(re, im)
 
     # ------------------------------------------------------------------
-    # Normalisation helpers  (mirror ReducedOrderModel._normalize / _denormalize)
+    # Whitening
     # ------------------------------------------------------------------
 
-    def fit_normalisation(self, dataloader: DataLoader):
-        """Compute mean and global scale from the **clean** training signals.
+    def set_whitening(self, noise_scale: torch.Tensor) -> None:
+        """Store ``noise_scale = ASD * sqrt(T_obs/4)`` as the whitening scale.
 
-        Call this **once** before training.  The statistics are stored as
-        buffers and will be saved together with the model checkpoint.
+        Zero bins (e.g. below the high-pass cutoff) are mapped to ``inf`` so
+        that those frequencies whiten to 0.
 
-        :param dataloader: training DataLoader whose batches contain ``wave_fd``.
+        :param noise_scale: real tensor of shape ``(n_channels, n_freqs)``.
         """
-        device = next(self.parameters()).device
-        running_sum = torch.zeros(self.n_channels * 2, self.n_freqs, device=device)
-        n_samples = 0
-        max_val = 0.0
-
-        with torch.no_grad():
-            for batch in dataloader:
-                wave_fd = batch["wave_fd"].to(device)
-                real = self._complex_to_real(wave_fd)  # (B, 2C, F)
-                running_sum += real.sum(dim=0)
-                n_samples += real.shape[0]
-                max_val = max(max_val, real.abs().max().item())
-
-        self.mean_vec.copy_(running_sum / n_samples)
-        self.global_scale_factor.fill_(max_val)
-        self._normalisation_fitted = True
+        whitening_safe = noise_scale.to(self.whitening.dtype).clone()
+        whitening_safe[noise_scale == 0] = float("inf")
+        self.whitening.copy_(whitening_safe)
+        nonzero = noise_scale[noise_scale > 0]
         print(
-            f"[AutoEncoder] normalisation fitted on {n_samples} samples  "
-            f"(representation={self.representation}, "
-            f"global_scale={self.global_scale_factor.item():.4e})"
+            f"[AutoEncoder] whitening set (shape={tuple(self.whitening.shape)}, "
+            f"range=[{nonzero.min().item():.4e}, {nonzero.max().item():.4e}])"
         )
 
-    def set_noise_asd(self, asd: torch.Tensor):
-        """Store the noise ASD for the noise-weighted reconstruction loss.
-
-        The raw ASD is stored directly (no PSD normalisation).  Whitening
-        divides by ASD, which amplifies the signal from ~1e-18 to O(SNR)
-        — exactly the physically meaningful scale.  The ``.mean()`` in the
-        loss already averages over frequency bins.
-
-        Previously the PSD was normalised to sum to 1, which collapsed the
-        whitening (signal stayed at ~1e-18 after division) and caused the
-        loss to underflow to ~1e-24 with zero gradients in float32.
-
-        :param asd: Amplitude Spectral Density, shape ``(n_channels, n_freqs)``.
-        """
-        asd = asd.to(self.noise_asd.dtype)
-
-        # Guard zero bins (e.g. DC) → inf so whitened values → 0
-        asd_safe = asd.clone()
-        asd_safe[asd_safe == 0] = float("inf")
-
-        self.noise_asd.copy_(asd_safe)
-        print(
-            f"[AutoEncoder] noise ASD set  (shape={tuple(asd.shape)}, "
-            f"ASD range=[{asd[asd>0].min().item():.4e}, {asd.max().item():.4e}])"
-        )
-
-    def _get_mean_vec_for(self, n_freq: int) -> torch.Tensor:
-        """Return the appropriate slice of ``mean_vec`` for the given frequency dimension.
-
-        Handles both the full-spectrum case and the high-freq-only case
-        where the decoder output has fewer bins than ``mean_vec``.
-        """
+    def _get_whitening_for(self, n_freq: int) -> torch.Tensor:
+        """Return the slice of ``whitening`` matching the decoder output size."""
         if n_freq == self.n_freqs:
-            return self.mean_vec
+            return self.whitening
         if self.high_freq_only and n_freq == self.n_freqs - self.freq_split_idx:
-            return self.mean_vec[:, self.freq_split_idx:]
+            return self.whitening[:, self.freq_split_idx:]
         raise ValueError(
             f"Frequency dimension {n_freq} does not match full ({self.n_freqs}) "
             f"or high-freq-only ({self.n_freqs - self.freq_split_idx}) expected size."
         )
 
-    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
-        """Center and scale: ``(x - mean) / scale``.
+    # ------------------------------------------------------------------
+    # Optional amplitude normalisation (real_imag only)
+    # ------------------------------------------------------------------
 
-        Handles both full-frequency and high-freq-only tensors.
+    def fit_amplitude_normalisation(self, dataloader: DataLoader) -> None:
+        """Compute the global amplitude scale on **whitened clean signals**.
+
+        Mirrors the old ``fit_normalisation`` (max over samples × channels ×
+        frequencies), but applied to the whitened clean signal — so the
+        scale is well-defined once ``set_whitening`` has been called.
+        Mean is *not* subtracted.
         """
-        mean = self._get_mean_vec_for(x.shape[-1])
-        return (x - mean) / self.global_scale_factor
+        if not self.amplitude_normalise:
+            raise RuntimeError(
+                "fit_amplitude_normalisation called but amplitude_normalise=False."
+            )
+        if self.representation != "real_imag":
+            raise NotImplementedError(
+                "amplitude_normalise is only supported with representation='real_imag'."
+            )
+        device = next(self.parameters()).device
+        max_val = 0.0
+        n_samples = 0
+        with torch.no_grad():
+            for batch in dataloader:
+                wave_fd = batch["wave_fd"].to(device)
+                wave_w = wave_fd / self.whitening
+                real = self._complex_to_real(wave_w)  # (B, 2C, F)
+                max_val = max(max_val, real.abs().max().item())
+                n_samples += real.shape[0]
+        self.amplitude_scale.fill_(max_val)
+        print(
+            f"[AutoEncoder] amplitude scale fitted on {n_samples} whitened "
+            f"clean samples: amplitude_scale={max_val:.4e}"
+        )
 
-    def _denormalize(self, x: torch.Tensor) -> torch.Tensor:
-        """Undo normalisation.
-
-        Handles both full-frequency and high-freq-only tensors.
-        """
-        mean = self._get_mean_vec_for(x.shape[-1])
-        return x * self.global_scale_factor + mean
+    def _denormalize_amplitude(self, x_real: torch.Tensor) -> torch.Tensor:
+        """Inverse of the amplitude scaling. For visualisation / inverse
+        passes — the loss is computed in the doubly-normalised space."""
+        if self.amplitude_normalise:
+            return x_real * self.amplitude_scale
+        return x_real
 
     # ------------------------------------------------------------------
     # Forward
@@ -626,13 +603,17 @@ class DenoisingAutoencoder(LightningModule):
     # ------------------------------------------------------------------
 
     def preprocess(self, z: torch.Tensor) -> torch.Tensor:
-        """Convert complex FD data to normalised real representation.
+        """Whiten complex FD data, convert to real channels, optionally
+        divide by the global amplitude scale.
 
-        :param z: complex tensor (B, C, F)
-        :return: normalised real tensor (B, 2C, F)
+        :param z: complex tensor (B, C, F).
+        :return: real tensor (B, 2C, F) — channel layout per ``representation``.
         """
-        return self._normalize(self._complex_to_real(z))
-
+        z_whitened = z / self.whitening
+        real = self._complex_to_real(z_whitened)
+        if self.amplitude_normalise:
+            real = real / self.amplitude_scale
+        return real
     # ------------------------------------------------------------------
     # Lightning training / validation steps
     # ------------------------------------------------------------------
@@ -666,58 +647,18 @@ class DenoisingAutoencoder(LightningModule):
             return clean_norm[:, :, self.freq_split_idx:]
         return clean_norm
 
-    def _get_asd_for_loss(self) -> torch.Tensor:
-        """Return ASD slice matching the decoder output frequency range."""
-        if self.high_freq_only:
-            return self.noise_asd[:, self.freq_split_idx:]
-        return self.noise_asd
-
-    def _noise_weighted_mse(self, reconstructed_norm: torch.Tensor,
-                            target_norm: torch.Tensor) -> torch.Tensor:
-        """Noise-weighted MSE in the complex frequency domain.
-
-        Computes  ``mean |recon(f)/ASD(f) - h(f)/ASD(f)|²``
-
-        which equals ``mean |recon - h|²/PSD`` but is more stable because
-        whitening first keeps intermediate values O(1).
-
-        :param reconstructed_norm: (B, 2C, F_target) normalised reconstructed signal
-        :param target_norm: (B, 2C, F_target) normalised clean signal
-        :return: scalar loss
-        """
-        # Denormalize back to original real representation
-        recon_real = self._denormalize(reconstructed_norm)
-        target_real = self._denormalize(target_norm)
-
-        # Convert to complex (B, C, F_target)
-        recon_complex = self._real_to_complex(recon_real)
-        target_complex = self._real_to_complex(target_real)
-
-        # ASD shape: (C, F_target) → (1, C, F_target) for broadcasting
-        asd = self._get_asd_for_loss().unsqueeze(0)
-        # Whiten first, then square — keeps intermediates O(1)
-        recon_w = recon_complex / asd
-        target_w = target_complex / asd
-        diff_w = recon_w - target_w
-        return (diff_w.real ** 2 + diff_w.imag ** 2).mean()
-
     def _step(self, batch, prefix: str):
         noisy = batch["wave_fd"] + batch["noise_fd"]
         clean = batch["wave_fd"]
 
-        # normalise
+        # Whiten then convert to real channels.
         noisy_norm = self.preprocess(noisy)
         clean_norm = self.preprocess(clean)
 
-        # forward (full autoencoder)
         reconstructed = self(noisy_norm)
-
-        # get target (possibly sliced for high_freq_only)
         target = self._get_target(clean_norm)
 
-        # Training loss: standard MSE on normalised representations.
-        # Noise-weighted MSE caused bottleneck collapse because LISA's ASD
-        # spans orders of magnitude — a handful of bins dominate the loss.
+        # MSE on whitened representations equals 4-side noise-weighted MSE.
         loss = F.mse_loss(reconstructed, target)
 
         mae, rel_err, max_rel_err = self._compute_extra_metrics(reconstructed, target)
@@ -726,12 +667,6 @@ class DenoisingAutoencoder(LightningModule):
         self.log(f"{prefix}_mae", mae, on_step=True, on_epoch=True, prog_bar=False, logger=True)
         self.log(f"{prefix}_rel_err", rel_err, on_step=True, on_epoch=True, prog_bar=(prefix == "val"), logger=True)
         self.log(f"{prefix}_max_rel_err", max_rel_err, on_step=True, on_epoch=True, prog_bar=False, logger=True)
-
-        # Log noise-weighted MSE as a diagnostic (not used for training)
-        if self._noise_asd_set:
-            with torch.no_grad():
-                nw_mse = self._noise_weighted_mse(reconstructed, target)
-            self.log(f"{prefix}_nw_mse", nw_mse, on_step=False, on_epoch=True, prog_bar=False, logger=True)
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -844,6 +779,8 @@ class MarginalEncoderTrainer(LightningModule):
         scheduler_patience: int = 10,
         scheduler_factor: float = 0.5,
         representation: str = "real_imag",
+        # --- Optional global amplitude normalisation on top of whitening ---
+        amplitude_normalise: bool = False,
         # --- Provenance ---
         prior_bounds: dict = None,
     ):
@@ -855,6 +792,11 @@ class MarginalEncoderTrainer(LightningModule):
             )
         if marginals is None:
             raise ValueError("marginals must be provided (list of lists of param indices)")
+        if amplitude_normalise and representation != "real_imag":
+            raise NotImplementedError(
+                "amplitude_normalise=True is only supported with "
+                "representation='real_imag'."
+            )
 
         self.save_hyperparameters()
 
@@ -867,6 +809,7 @@ class MarginalEncoderTrainer(LightningModule):
         self.scheduler_patience = scheduler_patience
         self.scheduler_factor = scheduler_factor
         self.representation = representation
+        self.amplitude_normalise = amplitude_normalise
         self.prior_bounds = prior_bounds
 
         if isinstance(hidden_channels, list):
@@ -899,11 +842,14 @@ class MarginalEncoderTrainer(LightningModule):
                 hidden_sizes=regressor_hidden_sizes,
             ))
 
-        # ---- input normalisation buffers (same scheme as DenoisingAutoencoder) ---
+        # Whitening scale: noise_scale = ASD * sqrt(T_obs/4), shape (C, F).
+        # See DenoisingAutoencoder.set_whitening for the contract.
         dtype = get_torch_dtype()
-        self.register_buffer("mean_vec", torch.zeros(n_real_channels, n_freqs, dtype=dtype))
-        self.register_buffer("global_scale_factor", torch.tensor(1.0, dtype=dtype))
-        self._normalisation_fitted = False
+        self.register_buffer("whitening", torch.ones(n_channels, n_freqs, dtype=dtype))
+
+        # Optional global amplitude scale (scalar). See
+        # DenoisingAutoencoder.fit_amplitude_normalisation.
+        self.register_buffer("amplitude_scale", torch.tensor(1.0, dtype=dtype))
 
         # ---- parameter normalisation buffers ---
         n_params_total = 11  # _ORDERED_PRIOR_KEYS has 11 entries
@@ -926,37 +872,65 @@ class MarginalEncoderTrainer(LightningModule):
         else:  # real_imag
             return torch.cat([z.real, z.imag], dim=1)
 
-    def _normalize_input(self, x: torch.Tensor) -> torch.Tensor:
-        return (x - self.mean_vec) / self.global_scale_factor
-
     def preprocess(self, z: torch.Tensor) -> torch.Tensor:
-        """Complex FD data → normalised real tensor (B, 2C, F)."""
-        return self._normalize_input(self._complex_to_real(z))
+        """Whiten complex FD data, convert to real channels, optionally
+        divide by the global amplitude scale.
 
-    def fit_normalisation(self, dataloader: DataLoader):
-        """Compute mean and global scale from clean training signals.
-
-        Must be called once before training; mirrors
-        :meth:`DenoisingAutoencoder.fit_normalisation`.
+        :return: real tensor (B, 2C, F).
         """
+        z_whitened = z / self.whitening
+        real = self._complex_to_real(z_whitened)
+        if self.amplitude_normalise:
+            real = real / self.amplitude_scale
+        return real
+
+    def set_whitening(self, noise_scale: torch.Tensor) -> None:
+        """Store ``noise_scale = ASD * sqrt(T_obs/4)`` as the whitening scale.
+
+        Zero bins are mapped to ``inf`` so masked frequencies whiten to 0.
+        """
+        whitening_safe = noise_scale.to(self.whitening.dtype).clone()
+        whitening_safe[noise_scale == 0] = float("inf")
+        self.whitening.copy_(whitening_safe)
+        nonzero = noise_scale[noise_scale > 0]
+        print(
+            f"[MarginalEncoder] whitening set (shape={tuple(self.whitening.shape)}, "
+            f"range=[{nonzero.min().item():.4e}, {nonzero.max().item():.4e}])"
+        )
+
+    def fit_amplitude_normalisation(self, dataloader: DataLoader) -> None:
+        """Compute the global amplitude scale on whitened clean signals.
+        See ``DenoisingAutoencoder.fit_amplitude_normalisation`` for details.
+        """
+        if not self.amplitude_normalise:
+            raise RuntimeError(
+                "fit_amplitude_normalisation called but amplitude_normalise=False."
+            )
+        if self.representation != "real_imag":
+            raise NotImplementedError(
+                "amplitude_normalise is only supported with representation='real_imag'."
+            )
         device = next(self.parameters()).device
-        dtype  = get_torch_dtype()
-        running_sum = torch.zeros(self.n_channels * 2, self.n_freqs, device=device, dtype=dtype)
-        n_samples, max_val = 0, 0.0
+        max_val = 0.0
+        n_samples = 0
         with torch.no_grad():
             for batch in dataloader:
                 wave_fd = batch["wave_fd"].to(device)
-                real = self._complex_to_real(wave_fd)
-                running_sum += real.sum(dim=0)
-                n_samples += real.shape[0]
+                wave_w = wave_fd / self.whitening
+                real = self._complex_to_real(wave_w)
                 max_val = max(max_val, real.abs().max().item())
-        self.mean_vec.copy_(running_sum / n_samples)
-        self.global_scale_factor.fill_(max_val)
-        self._normalisation_fitted = True
+                n_samples += real.shape[0]
+        self.amplitude_scale.fill_(max_val)
         print(
-            f"[MarginalEncoder] normalisation fitted on {n_samples} samples "
-            f"(global_scale={self.global_scale_factor.item():.4e})"
+            f"[MarginalEncoder] amplitude scale fitted on {n_samples} whitened "
+            f"clean samples: amplitude_scale={max_val:.4e}"
         )
+
+    def _denormalize_amplitude(self, x_real: torch.Tensor) -> torch.Tensor:
+        """Inverse of the amplitude scaling. For visualisation only."""
+        if self.amplitude_normalise:
+            return x_real * self.amplitude_scale
+        return x_real
 
     # ------------------------------------------------------------------
     # Lightning steps

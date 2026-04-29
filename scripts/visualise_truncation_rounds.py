@@ -1903,6 +1903,8 @@ def plot_all_marginals(
     rect_lw: float = 2.0,
     wspace: float = 0.35,
     mcmc_samples_path: str = None,
+    outdir: str = None,
+    save_dpi: int = 150,
 ):
     """Produce one figure per model marginal, dispatching by dimensionality.
 
@@ -1934,10 +1936,19 @@ def plot_all_marginals(
     connect_boxes, rect_color, rect_lw, wspace, mcmc_samples_path
         Forwarded to ``plot_truncation_rounds`` for 2-D marginals, and
         *mcmc_samples_path* also to ``plot_1d_prior_evolution``.
+    outdir : str, optional
+        If provided, each marginal's figures are saved to ``outdir`` and
+        closed immediately after, so memory does not grow with the number
+        of marginals.  When ``None``, figures are kept in memory and
+        returned by the caller (legacy behaviour).
+    save_dpi : int
+        DPI for saved figures (only used when *outdir* is not ``None``).
 
     Returns
     -------
-    dict mapping ``label → (fig, axes_or_ax)``
+    dict mapping ``label → (fig, axes, sky_areas, fig_ent, fig_vol, fig_last)``
+        When *outdir* is provided, the figure entries are ``None`` (already
+        saved and closed) and only ``sky_areas`` carries useful data.
     """
     # Discover all marginals across ALL rounds (union), so that marginals
     # introduced in later rounds (e.g. round 2+) are not missed.
@@ -1962,6 +1973,39 @@ def plot_all_marginals(
     # Observation duration (in weeks) — needed to bridge the pembhb and MCMC
     # time-of-merger conventions when plotting the Deltat marginal.
     duration_weeks = load_duration_weeks(round_dirs[0], 1)
+
+    if outdir is not None:
+        os.makedirs(outdir, exist_ok=True)
+
+    def _save_and_close(label, fig, fig_ent, fig_vol, fig_last, sky_areas):
+        """Save figures to *outdir* (if set) and close them to free memory."""
+        safe_label = label.replace(" ", "_").replace("/", "_")
+        if outdir is not None:
+            if fig is not None:
+                out_path = os.path.join(outdir, f"{safe_label}.png")
+                fig.savefig(out_path, dpi=save_dpi, bbox_inches="tight")
+                print(f"  Saved figure to {out_path}")
+            if fig_ent is not None:
+                out_path_ent = os.path.join(outdir, f"{safe_label}_entropy.png")
+                fig_ent.savefig(out_path_ent, dpi=save_dpi, bbox_inches="tight")
+                print(f"  Saved entropy figure to {out_path_ent}")
+            if fig_vol is not None:
+                out_path_vol = os.path.join(outdir, f"{safe_label}_volume_ratio.png")
+                fig_vol.savefig(out_path_vol, dpi=save_dpi, bbox_inches="tight")
+                print(f"  Saved volume ratio figure to {out_path_vol}")
+            if fig_last is not None:
+                out_path_last = os.path.join(outdir, f"{safe_label}_last_round.png")
+                fig_last.savefig(out_path_last, dpi=save_dpi, bbox_inches="tight")
+                print(f"  Saved last-round figure to {out_path_last}")
+            if sky_areas:
+                for rnd, areas in sorted(sky_areas.items()):
+                    parts = [f"NRE={areas['nre']:.2f} sq deg"]
+                    if "mcmc" in areas:
+                        parts.append(f"MCMC={areas['mcmc']:.2f} sq deg")
+                    print(f"    Round {rnd + 1} sky area: {', '.join(parts)}")
+            for f in (fig, fig_ent, fig_vol, fig_last):
+                if f is not None:
+                    plt.close(f)
 
     results = {}
     pair_idx = 0  # running counter for 2-D marginals
@@ -1990,7 +2034,9 @@ def plot_all_marginals(
             if single_round:
                 # Only keep the standalone last-round figure; skip evolution plots
                 plt.close(fig)
-                results[label] = (None, axes, sky_areas, None, None, fig_last)
+                fig = None
+                fig_ent = None
+                fig_vol = None
             else:
                 w0 = box_r1[p0_key][1] - box_r1[p0_key][0]
                 w1 = box_r1[p1_key][1] - box_r1[p1_key][0]
@@ -2000,7 +2046,16 @@ def plot_all_marginals(
                                                     prior_entropy=prior_entropy)
                 vol_ratios = [read_final_volume_ratio(rd, tb_key) for rd in round_dirs]
                 fig_vol, _ = plot_volume_ratio_evolution(vol_ratios, label)
-                results[label] = (fig, axes, sky_areas, fig_ent, fig_vol, fig_last)
+
+            _save_and_close(label, fig, fig_ent, fig_vol, fig_last, sky_areas)
+            results[label] = (
+                None if outdir is not None else fig,
+                axes,
+                sky_areas,
+                None if outdir is not None else fig_ent,
+                None if outdir is not None else fig_vol,
+                None if outdir is not None else fig_last,
+            )
             pair_idx += 1
 
         elif ndim == 1:
@@ -2020,7 +2075,8 @@ def plot_all_marginals(
 
             if single_round:
                 # Density-only figure already produced; skip evolution plots
-                results[label] = (fig, axes_dict, {}, None, None, None)
+                fig_ent = None
+                fig_vol = None
             else:
                 w = box_r1[label][1] - box_r1[label][0]
                 prior_entropy = float(np.log(w))
@@ -2029,7 +2085,16 @@ def plot_all_marginals(
                                                     prior_entropy=prior_entropy)
                 vol_ratios = [read_final_volume_ratio(rd, tb_key) for rd in round_dirs]
                 fig_vol, _ = plot_volume_ratio_evolution(vol_ratios, label)
-                results[label] = (fig, axes_dict, {}, fig_ent, fig_vol, None)
+
+            _save_and_close(label, fig, fig_ent, fig_vol, None, {})
+            results[label] = (
+                None if outdir is not None else fig,
+                axes_dict,
+                {},
+                None if outdir is not None else fig_ent,
+                None if outdir is not None else fig_vol,
+                None,
+            )
 
     return results
 
@@ -2074,6 +2139,15 @@ if __name__ == "__main__":
         "--ngrid-1d", type=int, default=500,
         help="Grid resolution for final-round 1-D posterior density.",
     )
+    parser.add_argument(
+        "--last-round", type=int, default=None,
+        help=(
+            "Stop at this round (1-indexed, inclusive). Only rounds 1..N "
+            "are loaded and plotted, treating round N as the 'final' round "
+            "for posterior density / standalone-contour panels. Defaults to "
+            "all available rounds."
+        ),
+    )
     args = parser.parse_args()
 
     name = args.name
@@ -2086,6 +2160,19 @@ if __name__ == "__main__":
     print(f"Detected {len(round_dirs)} round(s) for '{name}':")
     for r in round_dirs:
         print(f"  {r}")
+
+    if args.last_round is not None:
+        if args.last_round < 1:
+            raise ValueError(
+                f"--last-round must be >= 1, got {args.last_round}."
+            )
+        if args.last_round > len(round_dirs):
+            raise ValueError(
+                f"--last-round={args.last_round} exceeds the number of "
+                f"available rounds ({len(round_dirs)}) for '{name}'."
+            )
+        round_dirs = round_dirs[: args.last_round]
+        print(f"Truncated to first {args.last_round} round(s) (--last-round).")
 
     dataset_observation = MBHBDataset(args.data_path, cache_in_memory=False)
     dataset_subset = Subset(dataset_observation, indices=[0])
@@ -2108,40 +2195,19 @@ if __name__ == "__main__":
         ),
     )
 
-    outdir = os.path.join(ROOT_DIR, f"plots/{name}")
+    if args.last_round is not None:
+        outdir = os.path.join(ROOT_DIR, f"plots/{name}_upto_round_{args.last_round}")
+    else:
+        outdir = os.path.join(ROOT_DIR, f"plots/{name}")
     os.makedirs(outdir, exist_ok=True)
 
-    figures = plot_all_marginals(
+    plot_all_marginals(
         round_dirs=round_dirs,
         dataloader=dataloader_obs,
         ngrid_points=args.ngrid,
         ngrid_points_1d=args.ngrid_1d,
         mcmc_samples_path=args.mcmc_file,
+        outdir=outdir,
     )
-
-    for label, (fig, _, sky_areas, fig_ent, fig_vol, fig_last) in figures.items():
-        safe_label = label.replace(" ", "_").replace("/", "_")
-        if fig is not None:
-            out_path = os.path.join(outdir, f"{safe_label}.png")
-            fig.savefig(out_path, dpi=150, bbox_inches="tight")
-            print(f"Saved figure to {out_path}")
-        if fig_ent is not None:
-            out_path_ent = os.path.join(outdir, f"{safe_label}_entropy.png")
-            fig_ent.savefig(out_path_ent, dpi=150, bbox_inches="tight")
-            print(f"Saved entropy figure to {out_path_ent}")
-        if fig_vol is not None:
-            out_path_vol = os.path.join(outdir, f"{safe_label}_volume_ratio.png")
-            fig_vol.savefig(out_path_vol, dpi=150, bbox_inches="tight")
-            print(f"Saved volume ratio figure to {out_path_vol}")
-        if fig_last is not None:
-            out_path_last = os.path.join(outdir, f"{safe_label}_last_round.png")
-            fig_last.savefig(out_path_last, dpi=150, bbox_inches="tight")
-            print(f"Saved last-round figure to {out_path_last}")
-        if sky_areas:
-            for rnd, areas in sorted(sky_areas.items()):
-                parts = [f"NRE={areas['nre']:.2f} sq deg"]
-                if "mcmc" in areas:
-                    parts.append(f"MCMC={areas['mcmc']:.2f} sq deg")
-                print(f"    Round {rnd + 1} sky area: {', '.join(parts)}")
 
     plt.show()

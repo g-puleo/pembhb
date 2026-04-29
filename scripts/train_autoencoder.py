@@ -1,17 +1,28 @@
 #!/usr/bin/env python
-"""
-Train a DenoisingAutoencoder on frequency-domain MBHB data.
+"""Train a DenoisingAutoencoder on frequency-domain MBHB data.
+
+Settings come from a YAML config file (default ``configs/train_config.yaml``);
+only the dataset path is taken on the CLI.
 
 Usage
 -----
-    python scripts/train_autoencoder.py --dataset /path/to/data.h5   # required
-    python scripts/train_autoencoder.py --representation real_imag   # real/imag channels
-    python scripts/train_autoencoder.py --bottleneck_dim 256         # larger bottleneck
-    python scripts/train_autoencoder.py --dropout 0.1                # add regularization
-    python scripts/train_autoencoder.py --high_freq_only             # reconstruct only high freqs
-    python scripts/train_autoencoder.py --architecture unet          # legacy unet with skip connections
+    /data/gpuleo/envs/lisa_pip/bin/python scripts/train_autoencoder.py \\
+        --dataset /path/to/data.h5 \\
+        [--train-config train_config.yaml]
 
-Prior bounds from the corresponding .yaml file are automatically stored in the checkpoint.
+Config layout (relevant keys):
+  top-level:
+    batch_size, noise_factor, precision, device
+  architecture.data_summary.Autoencoder:
+    architecture, representation, n_channels, n_freqs,
+    bottleneck_dim, hidden_channels, kernel_size, stride, dropout,
+    residual, decoder_post_fc_bn,
+    high_freq_only, freq_split_idx, amplitude_normalise,
+    lr, weight_decay, epochs, scheduler_patience, scheduler_factor,
+    early_stop_patience, log_name, checkpoint_every_n_epochs
+
+The prior bounds in the corresponding ``<dataset>.yaml`` file are stored on
+the autoencoder checkpoint for provenance.
 """
 
 import argparse
@@ -22,25 +33,18 @@ from lightning.pytorch import Trainer
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 
-from pembhb import ROOT_DIR, DATA_ROOT_DIR
+from pembhb import ROOT_DIR, DATA_ROOT_DIR, set_precision
 from pembhb import utils
 from pembhb.data import MBHBDataModule
 from pembhb.autoencoder import DenoisingAutoencoder
 
-torch.set_float32_matmul_precision("medium")
-
 
 def load_prior_bounds(dataset_path: str) -> dict:
-    """Load prior bounds from the .yaml file corresponding to the dataset.
-    
-    :param dataset_path: Path to the HDF5 dataset file.
-    :return: Dictionary of prior bounds, or None if not found.
-    """
+    """Load prior bounds from the .yaml sidecar of the HDF5 dataset."""
     yaml_path = dataset_path.replace(".h5", ".yaml")
     if not os.path.exists(yaml_path):
         print(f"[train_autoencoder] Warning: No .yaml file found at {yaml_path}")
         return None
-    
     try:
         config = utils.read_config(yaml_path)
         prior_bounds = config.get("prior", None)
@@ -54,197 +58,113 @@ def load_prior_bounds(dataset_path: str) -> dict:
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train a denoising autoencoder.")
-
-    # ---------- data ---------------------------------------------------------
-    p.add_argument(
-        "--dataset",
-        type=str,
-        required=True,
-        help="Path to the HDF5 dataset (required).",
-    )
-    p.add_argument("--batch_size", type=int, default=250)
-    p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--noise_f actor", type=float, default=1.0)
-    p.add_argument("--cache_in_memory", action="store_true", default=True)
-
-    # ---------- architecture -------------------------------------------------
-    p.add_argument(
-        "--architecture",
-        type=str,
-        default="conv",
-        choices=DenoisingAutoencoder.VALID_ARCHITECTURES,
-        help="Architecture type: 'conv' (pure conv, no skip connections) or 'unet' (with skip connections).",
-    )
-    p.add_argument("--n_channels", type=int, default=2,
-                   help="Number of TDI channels (AE→2, AET→3).")
-    p.add_argument("--n_freqs", type=int, default=4096,
-                   help="Number of frequency bins per channel.")
-    
-    # Conv architecture params
-    p.add_argument("--bottleneck_dim", type=int, default=128,
-                   help="Bottleneck dimensionality (conv architecture only).")
-    p.add_argument(
-        "--hidden_channels",
-        type=int,
-        nargs="+",
-        default=[32, 64, 128, 256, 256],
-        help="Channel sizes for conv layers (conv architecture only).",
-    )
-    p.add_argument("--kernel_size", type=int, default=4,
-                   help="Kernel size for conv layers (conv architecture only).")
-    p.add_argument("--stride", type=int, default=2,
-                   help="Stride for conv layers (conv architecture only).")
-    p.add_argument("--dropout", type=float, default=0.0,
-                   help="Dropout rate for regularization (0.0 to 0.5 recommended).")
-    
-    # Unet architecture params (legacy)
-    p.add_argument(
-        "--sizes",
-        type=int,
-        nargs="+",
-        default=[16, 32, 64, 128, 256],
-        help="Channel sizes for the Unet levels (unet architecture only).",
-    )
-    p.add_argument(
-        "--down_sampling",
-        type=int,
-        nargs="+",
-        default=[4, 8, 8, 8],
-        help="Down-sampling factors for each encoder stage (unet architecture only).",
-    )
-    
-    p.add_argument(
-        "--representation",
-        type=str,
-        default="amp_phase",
-        choices=DenoisingAutoencoder.VALID_REPRESENTATIONS,
-        help="How to convert complex→real: 'amp_phase' or 'real_imag'.",
-    )
-    
-    # High-frequency only mode (simpler task)
-    p.add_argument("--high_freq_only", action="store_true", default=False,
-                   help="Reconstruct only the high-frequency half (bins 2048:4096).")
-    p.add_argument("--freq_split_idx", type=int, default=2048,
-                   help="Frequency index to split at for high_freq_only mode.")
-
-    # ---------- training hyper-params ----------------------------------------
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--weight_decay", type=float, default=1e-5,
-                   help="Weight decay (L2 regularization) for AdamW.")
-    p.add_argument("--epochs", type=int, default=500)
-    p.add_argument("--scheduler_patience", type=int, default=10)
-    p.add_argument("--scheduler_factor", type=float, default=0.3)
-    p.add_argument("--early_stop_patience", type=int, default=50)
-    p.add_argument("--gradient_clip_val", type=float, default=None,
-                   help="Gradient clipping value (None to disable).")
-
-    # ---------- misc ---------------------------------------------------------
-    p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--log_name", type=str, default="autoencoder",
-                   help="Name sub-folder under the TensorBoard log dir.")
-
+    p.add_argument("--dataset", type=str, required=True,
+                   help="Path to the HDF5 dataset (required).")
+    p.add_argument("--train-config", default="train_config.yaml",
+                   help="Filename inside configs/ (default: train_config.yaml).")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
-    # ---- resolve dataset path ------------------------------------------------
-    dataset_path = args.dataset
-    print(f"[train_autoencoder] Dataset : {dataset_path}")
-    print(f"[train_autoencoder] Architecture : {args.architecture}")
-    print(f"[train_autoencoder] Representation : {args.representation}")
-    if args.architecture == "conv":
-        print(f"[train_autoencoder] Bottleneck dim : {args.bottleneck_dim}")
-        print(f"[train_autoencoder] Dropout : {args.dropout}")
-    print(f"[train_autoencoder] High-freq only : {args.high_freq_only}")
-    print(f"[train_autoencoder] Weight decay : {args.weight_decay}")
-    print(f"[train_autoencoder] Device : {args.device}")
+    train_config = utils.read_config(os.path.join(ROOT_DIR, "configs", args.train_config))
+    set_precision(train_config.get("precision", "float32"))
 
-    # ---- load prior bounds from .yaml file -----------------------------------
+    ae_conf = train_config["architecture"]["data_summary"]["Autoencoder"]
+    device = ae_conf.get("device", train_config.get("device", "cuda"))
+    batch_size = train_config.get("batch_size", 250)
+    noise_factor = train_config.get("noise_factor", 1.0)
+
+    dataset_path = args.dataset
+    print(f"[train_autoencoder] config       : {args.train_config}")
+    print(f"[train_autoencoder] dataset      : {dataset_path}")
+    print(f"[train_autoencoder] architecture : {ae_conf['architecture']}")
+    print(f"[train_autoencoder] representation : {ae_conf['representation']}")
+    print(f"[train_autoencoder] device       : {device}")
+
     prior_bounds = load_prior_bounds(dataset_path)
 
-    # ---- data module ---------------------------------------------------------
     data_module = MBHBDataModule(
         filename=dataset_path,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        cache_in_memory=args.cache_in_memory,
-        noise_factor=args.noise_factor,
+        batch_size=batch_size,
+        num_workers=ae_conf.get("num_workers", 4),
+        cache_in_memory=ae_conf.get("cache_in_memory", True),
+        noise_factor=noise_factor,
     )
     data_module.setup(stage="fit")
 
-    # ---- model ---------------------------------------------------------------
+    hidden_channels = tuple(ae_conf.get("hidden_channels", [32, 64, 128, 256, 256]))
+    sizes = tuple(ae_conf.get("sizes", [16, 32, 64, 128, 256]))
+    down_sampling = tuple(ae_conf.get("down_sampling", [4, 8, 8, 8]))
+
     model = DenoisingAutoencoder(
-        n_channels=args.n_channels,
-        n_freqs=args.n_freqs,
-        architecture=args.architecture,
-        # Conv architecture params
-        bottleneck_dim=args.bottleneck_dim,
-        hidden_channels=tuple(args.hidden_channels),
-        kernel_size=args.kernel_size,
-        stride=args.stride,
-        dropout=args.dropout,
-        # Unet architecture params
-        sizes=tuple(args.sizes),
-        down_sampling=tuple(args.down_sampling),
-        # Training params
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        scheduler_patience=args.scheduler_patience,
-        scheduler_factor=args.scheduler_factor,
-        representation=args.representation,
-        # High-freq only mode
-        high_freq_only=args.high_freq_only,
-        freq_split_idx=args.freq_split_idx,
-        # Prior bounds (for provenance tracking)
+        n_channels=ae_conf.get("n_channels", 2),
+        n_freqs=ae_conf.get("n_freqs", 4096),
+        architecture=ae_conf.get("architecture", "conv"),
+        bottleneck_dim=ae_conf.get("bottleneck_dim", 128),
+        hidden_channels=hidden_channels,
+        kernel_size=ae_conf.get("kernel_size", 4),
+        stride=ae_conf.get("stride", 2),
+        dropout=ae_conf.get("dropout", 0.0),
+        residual=ae_conf.get("residual", False),
+        decoder_post_fc_bn=ae_conf.get("decoder_post_fc_bn", True),
+        sizes=sizes,
+        down_sampling=down_sampling,
+        lr=ae_conf.get("lr", 1e-3),
+        weight_decay=ae_conf.get("weight_decay", 1e-5),
+        scheduler_patience=ae_conf.get("scheduler_patience", 10),
+        scheduler_factor=ae_conf.get("scheduler_factor", 0.3),
+        representation=ae_conf.get("representation", "amp_phase"),
+        high_freq_only=ae_conf.get("high_freq_only", False),
+        freq_split_idx=ae_conf.get("freq_split_idx", 2048),
+        amplitude_normalise=ae_conf.get("amplitude_normalise", True),
         prior_bounds=prior_bounds,
     )
+    model = model.to(device)
 
-    # Move to device for normalisation fitting
-    model = model.to(args.device)
+    model.set_whitening(data_module.get_noise_scale())
+    if model.amplitude_normalise:
+        norm_loader = data_module.train_dataloader(shuffle=False, num_workers=0)
+        model.fit_amplitude_normalisation(norm_loader)
 
-    # ---- fit normalisation from training split (clean signals) ---------------
-    print("[train_autoencoder] Fitting normalisation statistics …")
-    norm_loader = data_module.train_dataloader(shuffle=False, num_workers=0)
-    model.fit_normalisation(norm_loader)
-
-    # ---- callbacks -----------------------------------------------------------
     checkpoint_cb = ModelCheckpoint(
         monitor="val_loss",
         mode="min",
         save_top_k=2,
         filename="ae-{epoch:03d}-{val_loss:.4e}",
     )
+    periodic_checkpoint_cb = ModelCheckpoint(
+        every_n_epochs=ae_conf.get("checkpoint_every_n_epochs", 10),
+        save_top_k=-1,
+        save_on_train_epoch_end=True,
+        filename="ae-periodic-{epoch:03d}",
+    )
     early_stop_cb = EarlyStopping(
         monitor="val_loss",
-        patience=args.early_stop_patience,
+        patience=ae_conf.get("early_stop_patience", 50),
         mode="min",
     )
 
-    # ---- logger --------------------------------------------------------------
     logger = TensorBoardLogger(
         save_dir=os.path.join(DATA_ROOT_DIR, "logs"),
-        name=args.log_name,
+        name=ae_conf.get("log_name", "autoencoder"),
     )
 
-    # ---- trainer -------------------------------------------------------------
     trainer = Trainer(
         logger=logger,
-        max_epochs=args.epochs,
-        accelerator=args.device,
+        max_epochs=ae_conf.get("epochs", train_config.get("epochs", 500)),
+        accelerator=device,
         devices=1,
         enable_progress_bar=True,
-        callbacks=[checkpoint_cb, early_stop_cb],
-        gradient_clip_val=args.gradient_clip_val,
+        callbacks=[checkpoint_cb, periodic_checkpoint_cb, early_stop_cb],
+        gradient_clip_val=ae_conf.get("gradient_clip_val", None),
     )
 
-    # ---- train ---------------------------------------------------------------
     trainer.fit(model, data_module)
 
-    # ---- report best checkpoint ----------------------------------------------
-    print(f"\n[train_autoencoder] Best checkpoint : {checkpoint_cb.best_model_path}")
-    print(f"[train_autoencoder] Best val_loss   : {checkpoint_cb.best_model_score:.6e}")
+    print(f"\n[train_autoencoder] best checkpoint : {checkpoint_cb.best_model_path}")
+    print(f"[train_autoencoder] best val_loss   : {checkpoint_cb.best_model_score:.6e}")
 
 
 if __name__ == "__main__":

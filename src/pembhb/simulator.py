@@ -15,7 +15,7 @@ import lisatools.sensitivity as lisasens
 from lisatools.detector import EqualArmlengthOrbits
 from lisatools.sensitivity import get_sensitivity
 
-from pembhb import ROOT_DIR
+from pembhb import ROOT_DIR, HIGHPASS_FMIN
 from pembhb import get_numpy_dtype, get_numpy_complex_dtype
 from pembhb.sampler import UniformSampler
 
@@ -52,7 +52,7 @@ class MBHBSimulatorFD_TD:
         # noise ASD grid
         self.asd = self._build_asd(conf)
         self.filtered_asd = self.asd.copy()
-        self.filtered_asd[:, self.freqs_pos < 5e-5] = 0
+        self.filtered_asd[:, self.freqs_pos < HIGHPASS_FMIN] = 0
 
         self.window = tukey(self.n_time, alpha=0.0005)
         orbits = EqualArmlengthOrbits(force_backend=self.backend_name)
@@ -314,7 +314,7 @@ class MBHBSimulatorFD_TD:
         :rtype: np.array
         """
         
-        high_pass_idx =  (self.freqs_pos >= 5e-5)
+        high_pass_idx =  (self.freqs_pos >= HIGHPASS_FMIN)
         data_over_asd = signal[..., high_pass_idx] / self.asd[..., high_pass_idx]
         data_over_asd_conj = data_over_asd.conj()
         prod = data_over_asd * data_over_asd_conj
@@ -362,7 +362,7 @@ def generate_noise_fd(rng, asd, df, n_obs):
     return z * (asd / np.sqrt(4 * df))[None, :, :]
 
 
-def compute_snr_fd(signal, freqs, asd, df, fmin_highpass=5e-5):
+def compute_snr_fd(signal, freqs, asd, df, fmin_highpass=HIGHPASS_FMIN):
     """Compute FD SNR with per-bin df.
 
     :param signal: complex FD data, shape (n_obs, n_channels, n_freqs)
@@ -464,7 +464,7 @@ class MBHBSimulatorFD:
         noise_model = conf["waveform_params"]["noise"]
         self.asd = build_asd(self.freqs, self.channels, noise_model)
         self.filtered_asd = self.asd.copy()
-        self.filtered_asd[:, self.freqs < 5e-5] = 0
+        self.filtered_asd[:, self.freqs < HIGHPASS_FMIN] = 0
 
         # BBHx waveform generator
         self.wfd = setup_bbhx(self.backend_name)

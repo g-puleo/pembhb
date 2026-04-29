@@ -169,6 +169,9 @@ def main():
         prior_maxs = np.array([true_tmnre_params[i] + n_sigma * param_uncertainties[j]
                                for j, i in enumerate(varying_indices)])
         init_widths = fisher_conf.get("init_widths_factor", 0.1) * param_uncertainties
+        print("proposed prior based on fim: ")
+        for i, param in enumerate(varying_params):
+            print(f"  {param}: [{prior_mins[i]:.6e}, {prior_maxs[i]:.6e}]")
     else:
         print("\\n=== Skipping Fisher matrix; using manual prior bounds ===")
         param_uncertainties = None
@@ -278,9 +281,9 @@ def main():
     
     # Flatten samples
     flat_samples = sampler_emcee.get_chain(discard=burnin, thin=thin, flat=True)
-    
+    loglikelihoods_samples = sampler_emcee.get_log_prob(discard=burnin, thin=thin, flat=True)
     # Save flat samples to a file
-
+    
     print(f"Burned {burnin} steps, thinned by {thin}")
     print(f"Final samples: {flat_samples.shape[0]}")
     
@@ -303,8 +306,11 @@ def main():
     outdir = os.path.join(ROOT_DIR, "mc_results_emcee_vec", name)
     os.makedirs(outdir, exist_ok=True)
     npy_file = os.path.join(outdir, "flat_samples.npy")
+    npy_logprobs_file = os.path.join(outdir, "loglikelihoods_samples.npy")
     np.save(npy_file, flat_samples)
+    np.save(npy_logprobs_file, loglikelihoods_samples)
     print(f"Saved flat samples to {npy_file}")
+    print(f"Saved log-likelihoods of samples to {npy_logprobs_file}")
 
     # Also write samples in copparoni HDF5 format (per-parameter datasets) so
     # that scripts/visualise_truncation_rounds.py can consume them via

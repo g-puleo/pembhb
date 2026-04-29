@@ -1,7 +1,7 @@
 from torch.utils.data import Dataset, random_split, DataLoader, Subset 
 import lightning as L
 from pembhb.utils import mbhb_collate_fn
-from pembhb import get_torch_dtype, get_torch_complex_dtype
+from pembhb import get_torch_dtype, get_torch_complex_dtype, HIGHPASS_FMIN
 import torch
 import numpy as np
 import h5py
@@ -40,7 +40,7 @@ class MBHBDataset(Dataset):
                 # Per-bin df: stored explicitly for non-uniform grids; derived for uniform grids
                 T_obs_total = f.attrs["observation_duration_SI"]
                 filtered_asd = asd_np.copy()
-                filtered_asd[:, freqs_np < 5e-5] = 0.0
+                filtered_asd[:, freqs_np < HIGHPASS_FMIN] = 0.0
                 self.noise_scale = torch.tensor(
                     filtered_asd / np.sqrt(4.0 / T_obs_total ), dtype=get_torch_dtype()
                 )
@@ -239,6 +239,26 @@ class MBHBDataModule( L.LightningDataModule ):
             if "asd" in f:
                 return torch.tensor(f["asd"][()], dtype=get_torch_dtype())
         return None
+
+    def get_noise_scale(self):
+        """Return the whitening / noise-generation scale ``ASD * sqrt(T_obs/4)``.
+
+        Shape ``(n_channels, n_freq)``. Bins below ``HIGHPASS_FMIN`` are zeroed.
+        Computed on disk if the dataset isn't yet set up.
+        """
+        if hasattr(self, 'full_dataset') and self.full_dataset.noise_scale is not None:
+            return self.full_dataset.noise_scale
+        with h5py.File(self.filename, "r") as f:
+            if "asd" not in f or "frequencies" not in f:
+                return None
+            asd_np = f["asd"][()]
+            freqs_np = f["frequencies"][()]
+            T_obs_total = f.attrs["observation_duration_SI"]
+            filtered_asd = asd_np.copy()
+            filtered_asd[:, freqs_np < HIGHPASS_FMIN] = 0.0
+            return torch.tensor(
+                filtered_asd / np.sqrt(4.0 / T_obs_total), dtype=get_torch_dtype()
+            )
 
     def get_freqs(self):
         """Get the frequency bins from the dataset."""

@@ -6,6 +6,12 @@ ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
 print(f"ROOT_DIR: {ROOT_DIR}")
 DATA_ROOT_DIR = "/data/gpuleo/mbhb"
 
+# Low-frequency high-pass cutoff [Hz]: bins below this are masked (ASD set to
+# 0, signal contribution dropped) in noise generation, SNR computation, and
+# whitening. Single source of truth for every site that needs to agree on
+# the cutoff.
+HIGHPASS_FMIN: float = 1e-4
+
 # ---------------------------------------------------------------------------
 # Global precision configuration
 # ---------------------------------------------------------------------------
