@@ -82,9 +82,12 @@ def find_round_dirs(
         If no matching round directories are found.
     """
     candidates = sorted(glob(os.path.join(base_log_dir, f"{name}_round_*")))
+    if not candidates:
+        # Nested layout: {base_log_dir}/{name}/round_<N>
+        candidates = sorted(glob(os.path.join(base_log_dir, name, "round_*")))
     round_dirs = []
     for d in candidates:
-        m_round = re.search(r"_round_(\d+)$", d)
+        m_round = re.search(r"[/_]round_(\d+)$", d)
         if m_round is None:
             continue
         round_num = int(m_round.group(1))

@@ -6,11 +6,12 @@ ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
 print(f"ROOT_DIR: {ROOT_DIR}")
 DATA_ROOT_DIR = "/data/gpuleo/mbhb"
 
-# Low-frequency high-pass cutoff [Hz]: bins below this are masked (ASD set to
-# 0, signal contribution dropped) in noise generation, SNR computation, and
-# whitening. Single source of truth for every site that needs to agree on
-# the cutoff.
-HIGHPASS_FMIN: float = 1e-4
+# Low-frequency floor [Hz] for the FD frequency grid and SNR computation.
+# The actual fmin used is ``max(FMIN_FLOOR, 1/T_obs)`` — i.e. this floor
+# wins when 1/T_obs is smaller, otherwise the natural T_obs resolution
+# wins. Single source of truth for every site that needs to agree on the
+# low-frequency cutoff.
+FMIN_FLOOR: float = 1e-4
 
 # ---------------------------------------------------------------------------
 # Global precision configuration

@@ -3,19 +3,15 @@ waveform_params:
   modes:  [[2,2], [2,1], [3,3], [3,2], [4,4], [4,3]]
   noise: "sangria"
   duration: 1 # weeks
-  dt: 100 # seconds
+  dt: 5 # seconds
   t_max: 5 # days
   # FD-only settings (used when domain="fd"; ignored for "fd_td")
   domain: "fd"          # "fd" for FD-only simulator, "fd_td" for FD+TD (default)
   n_freq_bins: 4096        # number of frequency bins (FD-only)
-  freq_spacing: "linear"   # "linear" or "log" (FD-only)
+  freq_spacing: "log"   # "linear" or "log" (FD-only)
 
 prior:
-  # Copied from the reference run 20260420autoenc_test5d
-  # /data/gpuleo/mbhb/20260420autoenc_test5d/simulation_round_1.yaml
-  # (Fisher-widened 15-sigma box around the fiducial event; using these
-  # verbatim so fisher_prior can stay disabled in train_config.yaml.)
-  "logMchirp": [5.249960881397025, 5.249960881397025]
+  "logMchirp": [5.249960881397025, 5.250039118602975]
   "q":         [2.996074595121879, 3.003925404878121]
   "chi1":      [0.0, 0.0]
   "chi2":      [0.0, 0.0]
@@ -23,7 +19,7 @@ prior:
   "phi":       [0.0, 0.0]                                        # phase at coalescence
   "inc":       [0.5, 0.5]                                        # cos inclination
   "lambda":    [3.1124873962687998, 3.16751281353955]            # ecliptic longitude
-  "beta":      [0.18623696704815745, 0.18623696704815745]        # sin ecliptic latitude
+  "beta":      [0.18623696704815745, 0.21376303891230702]        # sin ecliptic latitude
   "psi":       [1.0,1.0]                                        # polarization angle in [0, pi]
   "Deltat":    [-2.5000186218908196, -2.4999813781091804]        # t_merger from end of observation (days)
 

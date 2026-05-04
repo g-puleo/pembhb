@@ -75,7 +75,7 @@ architecture:
       dropout: 0.0
       residual: False              # matches reference (no residual shortcuts)
       decoder_post_fc_bn: False    # matches reference (cb948642): no BatchNorm between FC and conv-transpose stack
-      high_freq_only: True         # KEEP CURRENT (reference was True with freq_split_idx=2048)
+      high_freq_only: False         # KEEP CURRENT (reference was True with freq_split_idx=2048)
       freq_split_idx: 2048
       # --- Reference training hyper-parameters ---
       lr: 0.001
@@ -151,8 +151,8 @@ joint_training:
   lr_ae: 0.001                  # matches reference AE lr
   lr_nre: 0.0001                # matches reference NRE learning_rate
   ae_weight_decay: 1.0e-5       # matches reference AE weight_decay
-  freeze_ae_after_warmup: false  # mimics tmnre.py's frozen-encoder NRE training
-
+  freeze_ae_after_warmup: false # mimics tmnre.py's frozen-encoder NRE training
+  transfer_enabled: true        # retain the previously trained classifier for the next round
   # -----------------------------------------------------------------------
   # Per-parameter-group LR schedulers.
   # Each block is wired to its own optimizer param group (encoder vs. NRE)
@@ -247,5 +247,5 @@ fisher_prior:
     - "phi"
     - "inc"
     - "psi"
-  n_sigma: 25.0           # prior half-width in units of FIM sigma
+  n_sigma: 10.0           # prior half-width in units of FIM sigma
   delta_frac: 1.0e-4     # fractional step size for numerical derivatives

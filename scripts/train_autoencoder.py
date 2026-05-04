@@ -31,7 +31,7 @@ import os
 import torch
 from lightning.pytorch import Trainer
 from lightning.pytorch.loggers import TensorBoardLogger
-from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 
 from pembhb import ROOT_DIR, DATA_ROOT_DIR, set_precision
 from pembhb import utils
@@ -145,6 +145,7 @@ def main():
         patience=ae_conf.get("early_stop_patience", 50),
         mode="min",
     )
+    lr_monitor_cb = LearningRateMonitor(logging_interval="epoch")
 
     logger = TensorBoardLogger(
         save_dir=os.path.join(DATA_ROOT_DIR, "logs"),
@@ -157,7 +158,7 @@ def main():
         accelerator=device,
         devices=1,
         enable_progress_bar=True,
-        callbacks=[checkpoint_cb, periodic_checkpoint_cb, early_stop_cb],
+        callbacks=[checkpoint_cb, periodic_checkpoint_cb, early_stop_cb, lr_monitor_cb],
         gradient_clip_val=ae_conf.get("gradient_clip_val", None),
     )
 

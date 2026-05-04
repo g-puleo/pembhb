@@ -15,7 +15,7 @@ import lisatools.sensitivity as lisasens
 from lisatools.detector import EqualArmlengthOrbits
 from lisatools.sensitivity import get_sensitivity
 
-from pembhb import ROOT_DIR, HIGHPASS_FMIN
+from pembhb import ROOT_DIR, FMIN_FLOOR
 from pembhb import get_numpy_dtype, get_numpy_complex_dtype
 from pembhb.sampler import UniformSampler
 
@@ -26,6 +26,10 @@ DAY_SI = 24 * 3600
 class MBHBSimulatorFD_TD:
 
     def __init__(self, conf, sampler_init_kwargs, seed=0, sampler=None):
+        raise NotImplementedError(
+            "MBHBSimulatorFD_TD is no longer supported. Use MBHBSimulatorFD "
+            "(set waveform_params.domain='fd' in datagen_config.yaml)."
+        )
         self.rng = np.random.default_rng(seed)
         self.sampler = sampler if sampler is not None else UniformSampler(**sampler_init_kwargs, rng=self.rng)
         self.backend_name = conf.get("backend", "cpu")
@@ -52,7 +56,7 @@ class MBHBSimulatorFD_TD:
         # noise ASD grid
         self.asd = self._build_asd(conf)
         self.filtered_asd = self.asd.copy()
-        self.filtered_asd[:, self.freqs_pos < HIGHPASS_FMIN] = 0
+        self.filtered_asd[:, self.freqs_pos < FMIN_FLOOR] = 0
 
         self.window = tukey(self.n_time, alpha=0.0005)
         orbits = EqualArmlengthOrbits(force_backend=self.backend_name)
@@ -314,7 +318,7 @@ class MBHBSimulatorFD_TD:
         :rtype: np.array
         """
         
-        high_pass_idx =  (self.freqs_pos >= HIGHPASS_FMIN)
+        high_pass_idx =  (self.freqs_pos >= FMIN_FLOOR)
         data_over_asd = signal[..., high_pass_idx] / self.asd[..., high_pass_idx]
         data_over_asd_conj = data_over_asd.conj()
         prod = data_over_asd * data_over_asd_conj
@@ -362,7 +366,7 @@ def generate_noise_fd(rng, asd, df, n_obs):
     return z * (asd / np.sqrt(4 * df))[None, :, :]
 
 
-def compute_snr_fd(signal, freqs, asd, df, fmin_highpass=HIGHPASS_FMIN):
+def compute_snr_fd(signal, freqs, asd, df, fmin_highpass=FMIN_FLOOR):
     """Compute FD SNR with per-bin df.
 
     :param signal: complex FD data, shape (n_obs, n_channels, n_freqs)
@@ -436,9 +440,11 @@ class MBHBSimulatorFD:
         self.t_obs_end_SI = conf["waveform_params"]["duration"] * WEEK_SI
         self.obs_length = self.t_obs_end_SI - self.t_obs_start_SI
 
-        # Frequency grid — free from FFT constraints
+        # Frequency grid — free from FFT constraints. The floor FMIN_FLOOR
+        # wins when 1/T_obs is smaller, so the grid never extends below it
+        # and there are no PSD-masked dead bins to worry about downstream.
         self.fmax = 1.0 / (2.0 * dt)
-        self.fmin = max(1e-5, 1.0 / self.obs_length)
+        self.fmin = max(FMIN_FLOOR, 1.0 / self.obs_length)
         self.n_freq_bins = n_freq_bins
         self.freq_spacing = freq_spacing
 
@@ -460,11 +466,12 @@ class MBHBSimulatorFD:
         self.df[-1] = df_diff[-1]
         self.df[1:-1] = 0.5 * (df_diff[:-1] + df_diff[1:])
 
-        # ASD and filtered ASD
+        # ASD. The grid starts at fmin >= FMIN_FLOOR by construction, so no
+        # masking is needed; ``filtered_asd`` is kept as an alias for the
+        # raw ``asd`` for backward compatibility with downstream consumers.
         noise_model = conf["waveform_params"]["noise"]
         self.asd = build_asd(self.freqs, self.channels, noise_model)
         self.filtered_asd = self.asd.copy()
-        self.filtered_asd[:, self.freqs < HIGHPASS_FMIN] = 0
 
         # BBHx waveform generator
         self.wfd = setup_bbhx(self.backend_name)

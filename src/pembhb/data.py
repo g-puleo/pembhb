@@ -1,7 +1,7 @@
 from torch.utils.data import Dataset, random_split, DataLoader, Subset 
 import lightning as L
 from pembhb.utils import mbhb_collate_fn
-from pembhb import get_torch_dtype, get_torch_complex_dtype, HIGHPASS_FMIN
+from pembhb import get_torch_dtype, get_torch_complex_dtype
 import torch
 import numpy as np
 import h5py
@@ -32,17 +32,15 @@ class MBHBDataset(Dataset):
             else:
                 self.asd = None
 
-            # Pre-compute noise_scale = filtered_asd / sqrt(4 * df) for on-the-fly noise generation.
-            # Zero-valued bins (below high-pass cutoff) naturally produce zero noise.
+            # Pre-compute noise_scale = ASD / sqrt(4 * df) for on-the-fly noise
+            # generation. The simulator's frequency grid starts at
+            # ``max(FMIN_FLOOR, 1/T_obs)``, so no low-frequency masking is
+            # needed here.
             if "asd" in f and "frequencies" in f:
                 asd_np = f["asd"][()]
-                freqs_np = f["frequencies"][()]
-                # Per-bin df: stored explicitly for non-uniform grids; derived for uniform grids
                 T_obs_total = f.attrs["observation_duration_SI"]
-                filtered_asd = asd_np.copy()
-                filtered_asd[:, freqs_np < HIGHPASS_FMIN] = 0.0
                 self.noise_scale = torch.tensor(
-                    filtered_asd / np.sqrt(4.0 / T_obs_total ), dtype=get_torch_dtype()
+                    asd_np / np.sqrt(4.0 / T_obs_total), dtype=get_torch_dtype()
                 )
             else:
                 self.noise_scale = None
@@ -243,8 +241,8 @@ class MBHBDataModule( L.LightningDataModule ):
     def get_noise_scale(self):
         """Return the whitening / noise-generation scale ``ASD * sqrt(T_obs/4)``.
 
-        Shape ``(n_channels, n_freq)``. Bins below ``HIGHPASS_FMIN`` are zeroed.
-        Computed on disk if the dataset isn't yet set up.
+        Shape ``(n_channels, n_freq)``. Computed on disk if the dataset
+        isn't yet set up.
         """
         if hasattr(self, 'full_dataset') and self.full_dataset.noise_scale is not None:
             return self.full_dataset.noise_scale
@@ -252,12 +250,9 @@ class MBHBDataModule( L.LightningDataModule ):
             if "asd" not in f or "frequencies" not in f:
                 return None
             asd_np = f["asd"][()]
-            freqs_np = f["frequencies"][()]
             T_obs_total = f.attrs["observation_duration_SI"]
-            filtered_asd = asd_np.copy()
-            filtered_asd[:, freqs_np < HIGHPASS_FMIN] = 0.0
             return torch.tensor(
-                filtered_asd / np.sqrt(4.0 / T_obs_total), dtype=get_torch_dtype()
+                asd_np / np.sqrt(4.0 / T_obs_total), dtype=get_torch_dtype()
             )
 
     def get_freqs(self):
