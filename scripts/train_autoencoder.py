@@ -118,12 +118,15 @@ def main():
         representation=ae_conf.get("representation", "amp_phase"),
         high_freq_only=ae_conf.get("high_freq_only", False),
         freq_split_idx=ae_conf.get("freq_split_idx", 2048),
+        idx_lowerbound=ae_conf.get("idx_lowerbound", None),
+        idx_upperbound=ae_conf.get("idx_upperbound", None),
         amplitude_normalise=ae_conf.get("amplitude_normalise", True),
         prior_bounds=prior_bounds,
     )
     model = model.to(device)
 
-    model.set_whitening(data_module.get_noise_scale())
+    if ae_conf.get("whiten", True):
+        model.set_whitening(data_module.get_noise_scale())
     if model.amplitude_normalise:
         norm_loader = data_module.train_dataloader(shuffle=False, num_workers=0)
         model.fit_amplitude_normalisation(norm_loader)

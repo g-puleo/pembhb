@@ -440,11 +440,14 @@ class MBHBSimulatorFD:
         self.t_obs_end_SI = conf["waveform_params"]["duration"] * WEEK_SI
         self.obs_length = self.t_obs_end_SI - self.t_obs_start_SI
 
-        # Frequency grid — free from FFT constraints. The floor FMIN_FLOOR
-        # wins when 1/T_obs is smaller, so the grid never extends below it
-        # and there are no PSD-masked dead bins to worry about downstream.
+        # Frequency grid — free from FFT constraints. The requested fmin
+        # (from waveform_params.fmin, defaulting to FMIN_FLOOR) competes with
+        # 1/T_obs; whichever is *larger* wins, so the grid never extends below
+        # max(requested_fmin, 1/T_obs) and there are no PSD-masked dead bins
+        # to worry about downstream.
         self.fmax = 1.0 / (2.0 * dt)
-        self.fmin = max(FMIN_FLOOR, 1.0 / self.obs_length)
+        fmin_request = conf["waveform_params"].get("fmin", FMIN_FLOOR)
+        self.fmin = max(fmin_request, 1.0 / self.obs_length)
         self.n_freq_bins = n_freq_bins
         self.freq_spacing = freq_spacing
 

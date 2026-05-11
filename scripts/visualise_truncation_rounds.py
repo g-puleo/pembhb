@@ -53,6 +53,44 @@ from pembhb.utils import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+DATA_ROOT_DIR = "/data/gpuleo/mbhb"
+
+
+def _run_name_from_round_dir(round_dir: str, base_log_dir: str = "/data/gpuleo/mbhb/logs") -> str:
+    """Recover the run name (``TIME_OF_EXECUTION``) from a version directory path.
+
+    *round_dir* is expected to be ``{base_log_dir}/{name}/round_<N>/version_<M>``
+    (nested layout) or ``{base_log_dir}/{name}_round_<N>/version_<M>`` (legacy
+    flat layout).  Returns *name*.
+    """
+    # Drop trailing version_<M>
+    parent = os.path.dirname(round_dir.rstrip("/"))
+    # parent is now either `{base_log_dir}/{name}/round_<N>` (nested) or
+    # `{base_log_dir}/{name}_round_<N>` (flat).
+    rel = os.path.relpath(parent, base_log_dir)
+    # Nested: drop final `round_<N>` component.
+    nested_match = re.match(r"^(.*)/round_\d+$", rel)
+    if nested_match:
+        return nested_match.group(1)
+    # Flat: strip the trailing `_round_<N>`.
+    flat_match = re.match(r"^(.*)_round_\d+$", rel)
+    if flat_match:
+        return flat_match.group(1)
+    raise ValueError(f"Cannot recover run name from round_dir={round_dir!r}")
+
+
+def _sidecar_yaml_path(round_dir: str, round_number: int) -> str:
+    """Locate ``simulation_round_<N>.yaml`` in the data directory.
+
+    The sidecar is written by ``tmnre_joint.py`` to
+    ``{DATA_ROOT_DIR}/{name}/`` where *name* is ``TIME_OF_EXECUTION``.  We
+    recover *name* from *round_dir* (the version directory under
+    ``base_log_dir``) so callers don't need to thread it through.
+    """
+    name = _run_name_from_round_dir(round_dir)
+    return os.path.join(DATA_ROOT_DIR, name, f"simulation_round_{round_number}.yaml")
+
+
 def find_round_dirs(
     name: str,
     base_log_dir: str = "/data/gpuleo/mbhb/logs",
@@ -103,17 +141,20 @@ def find_round_dirs(
         if not version_nums:
             continue
 
-        # Pick the latest version that has both a checkpoint and the simulation YAML.
+        # The sidecar YAML lives in the data directory, not the log directory.
+        # Require a checkpoint in the version dir + the sidecar in the data dir.
+        sidecar_exists = os.path.isfile(
+            os.path.join(DATA_ROOT_DIR, name, f"simulation_round_{round_num}.yaml")
+        )
         chosen = None
         for v in version_nums:
             vdir = os.path.join(d, f"version_{v}")
             has_ckpt = bool(glob(os.path.join(vdir, "checkpoints", "*.ckpt")))
-            has_yaml = os.path.isfile(os.path.join(vdir, f"simulation_round_{round_num}.yaml"))
-            if has_ckpt and has_yaml:
+            if has_ckpt and sidecar_exists:
                 chosen = vdir
                 break
         if chosen is None:
-            print(f"  WARNING: no usable version in {d} (need checkpoint + YAML) — skipping.")
+            print(f"  WARNING: no usable version in {d} (need checkpoint + sidecar YAML in data dir) — skipping.")
             continue
         round_dirs.append((round_num, chosen))
 
@@ -123,7 +164,7 @@ def find_round_dirs(
 
 def load_duration_weeks(round_dir: str, round_number: int) -> float:
     """Read ``conf.waveform_params.duration`` (in weeks) from the round YAML."""
-    yaml_path = os.path.join(round_dir, f"simulation_round_{round_number}.yaml")
+    yaml_path = _sidecar_yaml_path(round_dir, round_number)
     with open(yaml_path, "r") as f:
         conf = yaml.safe_load(f)
     wf = conf.get("waveform_params") or conf["conf"]["waveform_params"]
@@ -137,7 +178,7 @@ def load_prior_box(round_dir: str, round_number: int) -> dict:
 
     Returns a dict mapping parameter name → ``(low, high)`` tuple.
     """
-    yaml_path = os.path.join(round_dir, f"simulation_round_{round_number}.yaml")
+    yaml_path = _sidecar_yaml_path(round_dir, round_number)
     with open(yaml_path, "r") as f:
         conf = yaml.safe_load(f)
     prior = conf.get("prior") or conf["conf"]["prior"]

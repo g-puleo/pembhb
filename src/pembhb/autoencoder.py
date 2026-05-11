@@ -11,6 +11,8 @@ Two architectures are supported:
 - "unet": Unet-based autoencoder with skip connections (reconstruction aided by encoder features)
 """
 
+import warnings
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -330,7 +332,7 @@ class DenoisingAutoencoder(LightningModule):
     def __init__(
         self,
         n_channels: int = 2,
-        n_freqs: int = 4096,
+        n_freqs: int = None,
         # --- Conv architecture params ---
         architecture: str = "conv",
         bottleneck_dim: int = 128,
@@ -349,7 +351,15 @@ class DenoisingAutoencoder(LightningModule):
         scheduler_patience: int = 10,
         scheduler_factor: float = 0.5,
         representation: str = "amp_phase",
-        # --- High-frequency only mode ---
+        # --- Reconstruction band masking ---
+        # Encoder always sees the full input; only the reconstruction
+        # target / decoder output is restricted to bins
+        # [idx_lowerbound : idx_upperbound]. ``None`` on either side means
+        # "no cut on that side"; both ``None`` reconstructs the full band.
+        idx_lowerbound: int | None = None,
+        idx_upperbound: int | None = None,
+        # --- DEPRECATED: old high-freq-only API, kept for back-compat ---
+        # Maps to idx_lowerbound=freq_split_idx, idx_upperbound=None.
         high_freq_only: bool = False,
         freq_split_idx: int = 2048,
         # --- Optional global amplitude normalisation on top of whitening ---
@@ -385,17 +395,50 @@ class DenoisingAutoencoder(LightningModule):
         self.architecture = architecture
         self.bottleneck_dim = bottleneck_dim
         self.dropout = dropout
-        self.high_freq_only = high_freq_only
-        self.freq_split_idx = freq_split_idx
         self.amplitude_normalise = amplitude_normalise
         self.prior_bounds = prior_bounds  # stored in hparams for checkpoint
 
-        # Determine the number of frequency bins to reconstruct
+        # Resolve old (high_freq_only/freq_split_idx) and new
+        # (idx_lowerbound/idx_upperbound) APIs into a single internal
+        # representation. Old takes precedence only if explicitly enabled.
         if high_freq_only:
-            n_freqs_target = n_freqs - freq_split_idx
-            print(f"[AutoEncoder] High-freq only mode: reconstructing bins [{freq_split_idx}:{n_freqs}] ({n_freqs_target} bins)")
+            if idx_lowerbound is not None or idx_upperbound is not None:
+                raise ValueError(
+                    "Cannot mix deprecated high_freq_only with new "
+                    "idx_lowerbound/idx_upperbound; use only the new API."
+                )
+            warnings.warn(
+                "high_freq_only/freq_split_idx are deprecated; "
+                "use idx_lowerbound/idx_upperbound instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            idx_lo = freq_split_idx
+            idx_hi = n_freqs
         else:
-            n_freqs_target = n_freqs
+            idx_lo = 0 if idx_lowerbound is None else int(idx_lowerbound)
+            idx_hi = n_freqs if idx_upperbound is None else int(idx_upperbound)
+
+        if not (0 <= idx_lo < idx_hi <= n_freqs):
+            raise ValueError(
+                f"Invalid band mask: idx_lowerbound={idx_lo}, "
+                f"idx_upperbound={idx_hi}, n_freqs={n_freqs}. "
+                f"Required: 0 <= lo < hi <= n_freqs."
+            )
+
+        self.idx_lowerbound = idx_lo
+        self.idx_upperbound = idx_hi
+        self._mask_active = (idx_lo > 0) or (idx_hi < n_freqs)
+        # Back-compat attributes (read by diagnostic / visualisation scripts).
+        self.high_freq_only = self._mask_active
+        self.freq_split_idx = idx_lo
+
+        n_freqs_target = idx_hi - idx_lo
+        if self._mask_active:
+            print(
+                f"[AutoEncoder] Band mask active: reconstructing bins "
+                f"[{idx_lo}:{idx_hi}] ({n_freqs_target} bins out of {n_freqs})"
+            )
 
         # Complex → real representation doubles the channels
         n_real_channels = n_channels * 2
@@ -508,11 +551,12 @@ class DenoisingAutoencoder(LightningModule):
         """Return the slice of ``whitening`` matching the decoder output size."""
         if n_freq == self.n_freqs:
             return self.whitening
-        if self.high_freq_only and n_freq == self.n_freqs - self.freq_split_idx:
-            return self.whitening[:, self.freq_split_idx:]
+        masked_size = self.idx_upperbound - self.idx_lowerbound
+        if self._mask_active and n_freq == masked_size:
+            return self.whitening[:, self.idx_lowerbound:self.idx_upperbound]
         raise ValueError(
             f"Frequency dimension {n_freq} does not match full ({self.n_freqs}) "
-            f"or high-freq-only ({self.n_freqs - self.freq_split_idx}) expected size."
+            f"or masked ({masked_size}) expected size."
         )
 
     # ------------------------------------------------------------------
@@ -638,13 +682,13 @@ class DenoisingAutoencoder(LightningModule):
         return abs_error, relative_error, max_relative_error
 
     def _get_target(self, clean_norm: torch.Tensor) -> torch.Tensor:
-        """Get the reconstruction target, possibly sliced for high_freq_only mode.
+        """Get the reconstruction target, sliced to the active band mask.
 
         :param clean_norm: (B, 2C, F) full normalised clean signal
-        :return: (B, 2C, F) or (B, 2C, F_target) depending on high_freq_only
+        :return: (B, 2C, F) or (B, 2C, F_target) depending on the mask
         """
-        if self.high_freq_only:
-            return clean_norm[:, :, self.freq_split_idx:]
+        if self._mask_active:
+            return clean_norm[:, :, self.idx_lowerbound:self.idx_upperbound]
         return clean_norm
 
     def _step(self, batch, prefix: str):

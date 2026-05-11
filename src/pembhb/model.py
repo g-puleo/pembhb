@@ -1763,6 +1763,8 @@ class JointAEInferenceNetwork(LightningModule):
                 representation=ae_conf.get("representation", "real_imag"),
                 high_freq_only=ae_conf.get("high_freq_only", False),
                 freq_split_idx=ae_conf.get("freq_split_idx", 2048),
+                idx_lowerbound=ae_conf.get("idx_lowerbound", None),
+                idx_upperbound=ae_conf.get("idx_upperbound", None),
             )
 
         norm = hp["normalisation"]

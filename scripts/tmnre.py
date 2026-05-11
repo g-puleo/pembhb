@@ -309,12 +309,15 @@ class SequentialTrainer:
                 representation=ae_conf.get("representation", "amp_phase"),
                 high_freq_only=ae_conf.get("high_freq_only", False),
                 freq_split_idx=ae_conf.get("freq_split_idx", 2048),
+                idx_lowerbound=ae_conf.get("idx_lowerbound", None),
+                idx_upperbound=ae_conf.get("idx_upperbound", None),
                 amplitude_normalise=ae_conf.get("amplitude_normalise", False),
                 prior_bounds=prior_bounds,
             )
             autoencoder = autoencoder.to(device)
 
-            autoencoder.set_whitening(self.data_module.get_noise_scale())
+            if ae_conf.get("whiten", True):
+                autoencoder.set_whitening(self.data_module.get_noise_scale())
             if autoencoder.amplitude_normalise:
                 norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
                 autoencoder.fit_amplitude_normalisation(norm_loader)
@@ -327,7 +330,8 @@ class SequentialTrainer:
             # Whitening scale depends only on ASD and T_obs (constant across
             # rounds in the standard setup); re-set defensively in case the
             # new round's dataset has different noise settings.
-            autoencoder.set_whitening(self.data_module.get_noise_scale())
+            if ae_conf.get("whiten", True):
+                autoencoder.set_whitening(self.data_module.get_noise_scale())
             if autoencoder.amplitude_normalise:
                 norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
                 autoencoder.fit_amplitude_normalisation(norm_loader)

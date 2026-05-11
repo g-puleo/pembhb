@@ -188,15 +188,26 @@ class MBHBDataModule( L.LightningDataModule ):
         """Get the maximum time-domain value from the training dataset."""
         if not self.full_dataset.has_td:
             return None
-        maxtd = self.train.dataset[self.train_indices]["wave_td"].abs().max()
+        if self.full_dataset.cache_in_memory:
+            wave_td = self.full_dataset.wave_td[self.train_indices]
+        else:
+            with h5py.File(self.filename, "r") as f:
+                wave_td = torch.tensor(f["wave_td"][self.train_indices], dtype=get_torch_dtype())
+        maxtd = wave_td.abs().max()
         print("Max td:", maxtd)
         return maxtd
-    
+
     def get_params_mean_std(self):
         """get mean of source parameters from training dataset."""
-
-        params = self.train.dataset[self.train_indices]["params"]
+        params = self._load_train_params()
         return params.mean(dim=0), params.std(dim=0)
+
+    def _load_train_params(self):
+        """Load only source_parameters for the training subset, bypassing __getitem__."""
+        if self.full_dataset.cache_in_memory:
+            return self.full_dataset.source_parameters[self.train_indices]
+        with h5py.File(self.filename, "r") as f:
+            return torch.tensor(f["source_parameters"][self.train_indices], dtype=get_torch_dtype())
 
     def get_sincos_mean_std(self, periodic_bc_params: list):
         """Return mean and std of sin and cos for each periodic parameter.
@@ -213,7 +224,7 @@ class MBHBDataModule( L.LightningDataModule ):
             sincos_mean: list of floats, length 2 * len(periodic_bc_params)
             sincos_std:  list of floats, length 2 * len(periodic_bc_params)
         """
-        params = self.train.dataset[self.train_indices]["params"]
+        params = self._load_train_params()
         sincos_mean = []
         sincos_std = []
         for idx in periodic_bc_params:

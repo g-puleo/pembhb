@@ -3,12 +3,15 @@ waveform_params:
   modes:  [[2,2], [2,1], [3,3], [3,2], [4,4], [4,3]]
   noise: "sangria"
   duration: 1 # weeks
-  dt: 5 # seconds
-  t_max: 5 # days
+  dt: 100 # seconds
   # FD-only settings (used when domain="fd"; ignored for "fd_td")
   domain: "fd"          # "fd" for FD-only simulator, "fd_td" for FD+TD (default)
   n_freq_bins: 4096        # number of frequency bins (FD-only)
-  freq_spacing: "log"   # "linear" or "log" (FD-only)
+  freq_spacing: "linear"   # "linear" or "log" (FD-only)
+  # Lower edge of the FD grid (Hz). Effective fmin is max(this, 1/T_obs).
+  # Defaults to FMIN_FLOOR (1e-4) when omitted. Use 1.0e-5 to reproduce
+  # the pre-60db969 baseline grid.
+  fmin: 1.0e-5
 
 prior:
   "logMchirp": [5.249960881397025, 5.250039118602975]
@@ -22,6 +25,18 @@ prior:
   "beta":      [0.18623696704815745, 0.21376303891230702]        # sin ecliptic latitude
   "psi":       [1.0,1.0]                                        # polarization angle in [0, pi]
   "Deltat":    [-2.5000186218908196, -2.4999813781091804]        # t_merger from end of observation (days)
+
+  # "logMchirp": [5.25, 5.25]
+  # "q":         [3.00, 3.00]
+  # "chi1":      [0.0, 0.0]
+  # "chi2":      [0.0, 0.0]
+  # "dist":      [10.0, 10.0]                                      # Gpc (sampled uniformly in dist^3)
+  # "phi":       [0.0, 0.0]                                        # phase at coalescence
+  # "inc":       [0.5, 0.5]                                        # cos inclination
+  # "lambda":    [3.14159265358979, 3.14159265358979]            # ecliptic longitude
+  # "beta":      [0.2, 0.2]        # sin ecliptic latitude
+  # "psi":       [1.0,1.0]                                        # polarization angle in [0, pi]
+  # "Deltat":    [-2.50, -2.50]        # t_merger from end of observation (days)
 
 backend: "cuda12x"
 
