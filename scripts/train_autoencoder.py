@@ -122,14 +122,19 @@ def main():
         idx_upperbound=ae_conf.get("idx_upperbound", None),
         amplitude_normalise=ae_conf.get("amplitude_normalise", True),
         prior_bounds=prior_bounds,
+        whiten=ae_conf.get("whiten", True),
+        subtract_mean_whitened=ae_conf.get("subtract_mean_whitened", False)
     )
     model = model.to(device)
 
     if ae_conf.get("whiten", True):
         model.set_whitening(data_module.get_noise_scale())
-    if model.amplitude_normalise:
-        norm_loader = data_module.train_dataloader(shuffle=False, num_workers=0)
-        model.fit_amplitude_normalisation(norm_loader)
+        if model.amplitude_normalise:
+            norm_loader = data_module.train_dataloader(shuffle=False, num_workers=0)
+            model.fit_white_normalisation(norm_loader)
+    else:
+        norm_loader = data_module.train_dataloader(shuffle=False, num_workers=4)
+        model.fit_normalisation(norm_loader)
 
     checkpoint_cb = ModelCheckpoint(
         monitor="val_loss",

@@ -1504,7 +1504,18 @@ class JointAEInferenceNetwork(LightningModule):
             clean_norm = self.encoder_model.preprocess(clean)
             reconstructed = self.encoder_model(noisy_norm)
             target = self.encoder_model._get_target(clean_norm)
-            return F.mse_loss(reconstructed, target)
+            # --- TEMP: target-scale check. Comment out once verified. ---
+            if not getattr(self, "_target_scale_printed", False):
+                print(
+                    f"[AE-scale] whiten={self.encoder_model.whiten}  "
+                    f"target.abs().mean()={target.abs().mean().item():.3e}  "
+                    f"target.abs().max()={target.abs().max().item():.3e}  "
+                    f"noisy.abs().mean(complex)={noisy.abs().mean().item():.3e}",
+                    flush=True,
+                )
+                self._target_scale_printed = True
+            loss =  F.mse_loss(reconstructed, target)
+            return loss
 
     def _calc_ae_loss(self, batch):
         """Deprecated alias for ``_calc_encoder_loss``."""
@@ -1765,6 +1776,9 @@ class JointAEInferenceNetwork(LightningModule):
                 freq_split_idx=ae_conf.get("freq_split_idx", 2048),
                 idx_lowerbound=ae_conf.get("idx_lowerbound", None),
                 idx_upperbound=ae_conf.get("idx_upperbound", None),
+                whiten=ae_conf.get("whiten", True),
+                amplitude_normalise=ae_conf.get("amplitude_normalise", False),
+                subtract_mean_whitened=ae_conf.get("subtract_mean_whitened", False)
             )
 
         norm = hp["normalisation"]
@@ -1783,7 +1797,21 @@ class JointAEInferenceNetwork(LightningModule):
             nre_scheduler=hp.get("nre_scheduler"),
             periodic_bc_params=hp["train_conf"].get("periodic_bc_params"),
         )
-        model.load_state_dict(state_dict)
+        # i added a branch so that the whiten:False restores a behaviour where
+        # mean_vec and global_scale_factor are used. 
+        # these buffers are now registered in the model by default, but old checkpoints dont store them. 
+        # hence, we need to ignore their absence when loading old checkpoints. 
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        # Old checkpoints predate the baseline-pipeline buffers; their identity-init
+        # defaults (mean_vec=0, global_scale_factor=1) are correct for whiten=True.
+        allowed_missing = {"encoder_model.mean_vec", "encoder_model.global_scale_factor", "encoder_model.mean_whitened"}
+        unexpected_real = set(unexpected)
+        missing_real = set(missing) - allowed_missing
+        if missing_real or unexpected_real:
+            raise RuntimeError(
+                f"Unexpected state_dict mismatch. missing={missing_real}, "
+                f"unexpected={unexpected_real}"
+            )        
         model.to(device)
         model.eval()
         return model

@@ -714,6 +714,15 @@ def plot_1d_prior_evolution(
         tref_true_sec = duration_sec + final_inj * _SECONDS_PER_DAY
         nre_to_x  = lambda v: (np.asarray(v, dtype=float) - final_inj) * _SECONDS_PER_DAY
         mcmc_to_x = lambda v: np.asarray(v, dtype=float) - tref_true_sec
+        # --- BRUTAL PATCH: mcmc_coppa/5D_linear_freq*.h5 stores Deltat in
+        # pembhb's native convention (days from end of observation), not
+        # seconds-from-start like logf_samples_5D_copparoni.h5.  Detect by
+        # filename and reuse the NRE transform.  Remove once unified.
+        if (
+            mcmc_samples_path is not None
+            and "5D_linear_freq" in os.path.basename(mcmc_samples_path)
+        ):
+            mcmc_to_x = nre_to_x
         x_label = r"$\Delta t - \Delta t_{\rm true}$ [s]"
         # Density rescale so that ∫ p dx_new = 1 when x is in seconds
         # (NRE norm1d was computed per day; MCMC KDE will be evaluated

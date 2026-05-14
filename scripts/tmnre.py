@@ -313,15 +313,19 @@ class SequentialTrainer:
                 idx_upperbound=ae_conf.get("idx_upperbound", None),
                 amplitude_normalise=ae_conf.get("amplitude_normalise", False),
                 prior_bounds=prior_bounds,
+                whiten=ae_conf.get("whiten", True),
+                subtract_mean_whitened=ae_conf.get("subtract_mean_whitened", False)
             )
             autoencoder = autoencoder.to(device)
 
             if ae_conf.get("whiten", True):
                 autoencoder.set_whitening(self.data_module.get_noise_scale())
-            if autoencoder.amplitude_normalise:
-                norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
-                autoencoder.fit_amplitude_normalisation(norm_loader)
-
+                if autoencoder.amplitude_normalise:
+                    norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
+                    autoencoder.fit_white_normalisation(norm_loader)
+            else:
+                norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=4)
+                autoencoder.fit_normalisation(norm_loader)
         else:
             autoencoder = self.data_summary.autoencoder
             self.data_summary.unfreeze_parameters()
@@ -332,9 +336,12 @@ class SequentialTrainer:
             # new round's dataset has different noise settings.
             if ae_conf.get("whiten", True):
                 autoencoder.set_whitening(self.data_module.get_noise_scale())
-            if autoencoder.amplitude_normalise:
-                norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
-                autoencoder.fit_amplitude_normalisation(norm_loader)
+                if autoencoder.amplitude_normalise:
+                    norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
+                    autoencoder.fit_white_normalisation(norm_loader)
+            else:
+                norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=4)
+                autoencoder.fit_normalisation(norm_loader)
         # --- callbacks ----------------------------------------------------
         checkpoint_cb = ModelCheckpoint(
             monitor="val_loss",

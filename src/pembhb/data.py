@@ -28,22 +28,23 @@ class MBHBDataset(Dataset):
             # Load ASD (Amplitude Spectral Density) for noise-weighting.
             # Shape: (n_channels, n_freq).  This is the same for all samples.
             if "asd" in f:
-                self.asd = torch.tensor(f["asd"][()], device="cpu", dtype=get_torch_dtype())
-            else:
-                self.asd = None
-
-            # Pre-compute noise_scale = ASD / sqrt(4 * df) for on-the-fly noise
-            # generation. The simulator's frequency grid starts at
-            # ``max(FMIN_FLOOR, 1/T_obs)``, so no low-frequency masking is
-            # needed here.
-            if "asd" in f and "frequencies" in f:
                 asd_np = f["asd"][()]
+                self.asd = torch.tensor(asd_np, device="cpu", dtype=get_torch_dtype())
+                # Pre-compute noise_scale = ASD / sqrt(4 * df) for on-the-fly noise
+                # generation.
                 T_obs_total = f.attrs["observation_duration_SI"]
+                psd_fmin_mask = float(f.attrs.get("psd_fmin_mask", 0.0))
+                if psd_fmin_mask > 0:
+                    freqs_np = f["frequencies"][()]
+                    asd_for_noise = asd_np.copy()
+                    asd_for_noise[:, freqs_np < psd_fmin_mask] = 0.0
+                else:
+                    asd_for_noise = asd_np
                 self.noise_scale = torch.tensor(
-                    asd_np / np.sqrt(4.0 / T_obs_total), dtype=get_torch_dtype()
+                    asd_for_noise / np.sqrt(4.0 / T_obs_total), dtype=get_torch_dtype()
                 )
             else:
-                self.noise_scale = None
+                raise ValueError("Dataset file must contain 'asd', but doesn't.")
 
             # TD params (dt, n_time) needed for on-the-fly TD noise via IFFT
             if self.has_td and "times_SI" in f:
@@ -255,16 +256,9 @@ class MBHBDataModule( L.LightningDataModule ):
         Shape ``(n_channels, n_freq)``. Computed on disk if the dataset
         isn't yet set up.
         """
-        if hasattr(self, 'full_dataset') and self.full_dataset.noise_scale is not None:
-            return self.full_dataset.noise_scale
-        with h5py.File(self.filename, "r") as f:
-            if "asd" not in f or "frequencies" not in f:
-                return None
-            asd_np = f["asd"][()]
-            T_obs_total = f.attrs["observation_duration_SI"]
-            return torch.tensor(
-                asd_np / np.sqrt(4.0 / T_obs_total), dtype=get_torch_dtype()
-            )
+        if not hasattr(self, 'full_dataset'): 
+            raise RuntimeError("Dataset not set up yet. Call setup() before get_noise_scale().")
+        return self.full_dataset.noise_scale
 
     def get_freqs(self):
         """Get the frequency bins from the dataset."""

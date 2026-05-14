@@ -12,7 +12,8 @@ waveform_params:
   # Defaults to FMIN_FLOOR (1e-4) when omitted. Use 1.0e-5 to reproduce
   # the pre-60db969 baseline grid.
   fmin: 1.0e-5
-
+  psd_fmin_mask: 5.0e-5 # restore the low freq cutoff. 
+  
 prior:
   "logMchirp": [5.249960881397025, 5.250039118602975]
   "q":         [2.996074595121879, 3.003925404878121]

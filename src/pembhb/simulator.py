@@ -475,6 +475,15 @@ class MBHBSimulatorFD:
         noise_model = conf["waveform_params"]["noise"]
         self.asd = build_asd(self.freqs, self.channels, noise_model)
         self.filtered_asd = self.asd.copy()
+        self.psd_fmin_mask = conf["waveform_params"].get("psd_fmin_mask", None)
+        if self.psd_fmin_mask is not None:
+            n_masked = int((self.freqs < self.psd_fmin_mask).sum())
+            self.filtered_asd[:, self.freqs < self.psd_fmin_mask] = 0
+            print(
+                f"[MBHBSimulatorFD] PSD mask active: zeroed ASD in "
+                f"{n_masked} bins below {self.psd_fmin_mask:.3e} Hz "
+                f"(out of {len(self.freqs)} total)."
+            )
 
         # BBHx waveform generator
         self.wfd = setup_bbhx(self.backend_name)
@@ -507,6 +516,7 @@ class MBHBSimulatorFD:
             "fmin": float(self.fmin),
             "fmax": float(self.fmax),
         }
+        
 
     # -----------------------------------------
     def generate(self, inj):
@@ -578,6 +588,7 @@ class MBHBSimulatorFD:
             wave_fd = f.create_dataset("wave_fd", shape=(N, self.n_channels, self.n_freq_bins), dtype=_np_complex)
             snr = f.create_dataset("snr", shape=(N,), dtype=_np_real)
             f.create_dataset("asd", data=self.asd, dtype=_np_real)
+            
             if store_noise:
                 noise_fd_ds = f.create_dataset(
                     "noise_fd",
@@ -591,6 +602,7 @@ class MBHBSimulatorFD:
             f.attrs["n_freq_bins"] = self.n_freq_bins
             f.attrs["fmin"] = self.fmin
             f.attrs["fmax"] = self.fmax
+            f.attrs["psd_fmin_mask"] = self.psd_fmin_mask if self.psd_fmin_mask is not None else 0.0
             f.attrs["observation_duration_SI"] = self.obs_length
             print("Sampling and storing FD-only simulations to", filename)
             for i in tqdm(range(0, N, batch_size)):

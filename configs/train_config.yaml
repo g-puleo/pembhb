@@ -77,6 +77,7 @@ architecture:
       dropout: 0.0
       residual: False              
       decoder_post_fc_bn: False   
+      subtract_mean_whitened: True
       #high_freq_only: False
       idx_lowerbound: 2048
       # idx_upperbound: None
@@ -85,6 +86,7 @@ architecture:
       # When false, the AE sees raw (un-whitened) FD amplitudes — the
       # pre-204be7a baseline behaviour. Default true.
       whiten: False
+      amplitude_normalise: True
       # --- Reference training hyper-parameters ---
       lr: 0.001
       weight_decay: 1.0e-5
