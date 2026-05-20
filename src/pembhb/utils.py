@@ -1099,7 +1099,10 @@ def mbhb_collate_fn(batch, noise_scale, noise_factor, noise_shuffling=True, td_p
 
     :param batch: list of sample dicts from MBHBDataset.__getitem__
     :param noise_scale: real tensor of shape (n_channels, n_freqs) equal to
-        ``filtered_asd / sqrt(4 * df)``; multiplied against unit CN(0,1) draws.
+        ``filtered_asd / sqrt(4 * df)``; multiplied bin-wise by complex draws
+        ``re + j im`` with ``re, im ~ N(0, 1)`` i.i.d. (Re and Im of the
+        whitened noise then each have unit variance — the convention used
+        throughout the codebase).
         Unused when the batch already carries a stored ``noise_fd`` per sample.
     :param noise_factor: scalar multiplier applied to the noise amplitude
         (works for both freshly-generated and stored noise)
@@ -1120,7 +1123,8 @@ def mbhb_collate_fn(batch, noise_scale, noise_factor, noise_shuffling=True, td_p
         # with post-hoc visualisation scripts.
         noise_fd = noise_factor * torch.stack([b["noise_fd"] for b in batch])
     else:
-        # Generate coloured complex Gaussian noise: z ~ CN(0,1) * noise_scale
+        # Generate coloured complex Gaussian noise:
+        # z = (re + j im) * noise_scale, with re, im ~ N(0, 1) i.i.d.
         C, F = noise_scale.shape
         re = torch.randn(B, C, F, dtype=noise_scale.dtype)
         im = torch.randn(B, C, F, dtype=noise_scale.dtype)

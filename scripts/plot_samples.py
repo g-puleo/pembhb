@@ -18,11 +18,12 @@ with h5py.File(filename, 'r') as f:
     frequencies = f['frequencies'][:]
     parameters = f["source_parameters"][:]
     asd = f['asd'][:]
+    f_isco = f['f_ISCO'][:]
     if 'noise_fd' in f:
         noise_fd = f['noise_fd'][:]
     else:
         # No stored noise — draw a fresh realisation matching mbhb_collate_fn:
-        # noise_fd = CN(0, 1) * (asd / sqrt(4 / T_obs)).
+        # noise_fd = (re + j im) * (asd / sqrt(4 / T_obs)) with re, im ~ N(0, 1).
         T_obs_total = f.attrs['observation_duration_SI']
         noise_scale = asd / np.sqrt(4.0 / T_obs_total)            # (C, F)
         rng = np.random.default_rng()
@@ -85,3 +86,14 @@ for i in indices:
     fig_fd.savefig(f'plots/{filename_only}/data_fd_event_{i}.png', dpi=600)
     plt.close(fig_fd)
     print(f"Saved plot for sample {i+1} to plots/{filename_only}/data_fd_event_{i}.png")
+
+fig_isco, ax_isco = plt.subplots(figsize=(7, 5))
+ax_isco.hist(f_isco, bins=50, color='C0', edgecolor='black')
+ax_isco.set_xlabel(r'$f_{\rm ISCO}$ (Hz)')
+ax_isco.set_ylabel('Count')
+ax_isco.set_title(f'$f_{{\\rm ISCO}}$ distribution (N={len(f_isco)})')
+ax_isco.set_xscale('log')
+fig_isco.tight_layout()
+fig_isco.savefig(f'plots/{filename_only}/f_isco_hist.png', dpi=300)
+plt.close(fig_isco)
+print(f"Saved f_ISCO histogram to plots/{filename_only}/f_isco_hist.png")

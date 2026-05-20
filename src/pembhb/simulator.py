@@ -587,6 +587,7 @@ class MBHBSimulatorFD:
             f.create_dataset("df", data=self.df, dtype=_np_real)
             wave_fd = f.create_dataset("wave_fd", shape=(N, self.n_channels, self.n_freq_bins), dtype=_np_complex)
             snr = f.create_dataset("snr", shape=(N,), dtype=_np_real)
+            f_isco = f.create_dataset("f_ISCO", shape=(N,), dtype=_np_real)
             f.create_dataset("asd", data=self.asd, dtype=_np_real)
             
             if store_noise:
@@ -609,11 +610,14 @@ class MBHBSimulatorFD:
                 batch_end = min(i + batch_size, N)
                 batch_size_actual = batch_end - i
                 out = self.sample(batch_size_actual)
+                bbhx_params_batch = out["bbhx_parameters"].T
                 source_params[i:batch_end] = out["parameters"].T
-                bbhx_params[i:batch_end] = out["bbhx_parameters"].T
+                bbhx_params[i:batch_end] = bbhx_params_batch
                 wave_fd[i:batch_end] = out["wave_fd"]
                 # SNR is matched-filter (waveform-only) rather than noisy-data SNR
                 snr[i:batch_end] = self.get_SNR_FD(out["wave_fd"])
+                M_tot = bbhx_params_batch[:, 0] + bbhx_params_batch[:, 1]
+                f_isco[i:batch_end] = (1.0 / np.pi) * np.sqrt(1.0 / 216.0) * 203025.44672808357 / M_tot
                 if store_noise:
                     z = (noise_rng.normal(size=(batch_size_actual, self.n_channels, self.n_freq_bins))
                          + 1j * noise_rng.normal(size=(batch_size_actual, self.n_channels, self.n_freq_bins)))
@@ -621,7 +625,7 @@ class MBHBSimulatorFD:
 
             print("HDF5 dataset shapes (current state):")
             for dname in ["source_parameters", "frequencies", "df",
-                          "wave_fd", "noise_fd", "snr", "asd"]:
+                          "wave_fd", "noise_fd", "snr", "f_ISCO", "asd"]:
                 if dname in f:
                     ds = f[dname]
                     print(f"  {dname}: shape={tuple(ds.shape)}, dtype={ds.dtype}")
