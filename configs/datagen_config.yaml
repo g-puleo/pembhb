@@ -6,12 +6,16 @@ waveform_params:
   dt: 100 # seconds
   # FD-only settings (used when domain="fd"; ignored for "fd_td")
   domain: "fd"          # "fd" for FD-only simulator, "fd_td" for FD+TD (default)
-  n_freq_bins: 4096        # number of frequency bins (FD-only)
+  n_freq_bins: 4096        # number of frequency bins (FD-only; used for freq_spacing="log" only)
   freq_spacing: "linear"   # "linear" or "log" (FD-only)
   # Lower edge of the FD grid (Hz). Effective fmin is max(this, 1/T_obs).
   # Defaults to FMIN_FLOOR (1e-4) when omitted. Use 1.0e-5 to reproduce
   # the pre-60db969 baseline grid.
   fmin: 1.0e-4
+  # Upper edge of the FD grid (Hz). When freq_spacing="linear", the grid is
+  # np.arange(fmin, fmax, downsamplefactor / T_obs).
+  fmax: 2.0e-2
+  downsamplefactor: 3      # thin the linear grid; step becomes downsamplefactor/T_obs ( ~4012 bins for T_obs=1week, fmin=1e-4, fmax=2e-2)
   #psd_fmin_mask: 5.0e-5 # restore the low freq cutoff. 
   
 prior:

@@ -17,6 +17,7 @@ from pembhb.rom import ReducedOrderModel, ROMWrapper
 from pembhb.autoencoder import (
     DenoisingAutoencoder, AutoencoderWrapper,
     MarginalEncoderTrainer, MarginalEncoderWrapper,
+    resolve_loss_band,
 )
 from pembhb.data import MBHBDataModule, MBHBDataset, mbhb_collate_fn
 from pembhb import ROOT_DIR, DATA_ROOT_DIR, set_precision
@@ -292,9 +293,32 @@ class SequentialTrainer:
         # --- if finetune_previous , then do not reinitialise the autoencoder and use the one from the previous round
 
         if not finetune_previous or round_idx == 1:
+            # Auto-derive n_freqs from the HDF5 grid; resolve fmin_loss/fmax_loss
+            # (Hz) → idx_lowerbound/idx_upperbound. See tmnre_joint._build_autoencoder
+            # for the rationale on mutating ae_conf with resolved values.
+            try:
+                freqs = self.data_module.get_freqs()
+                n_freqs = len(freqs)
+                if "n_freqs" in ae_conf and ae_conf["n_freqs"] != n_freqs:
+                    print(f"[autoencoder] auto-derived n_freqs={n_freqs} from HDF5 "
+                          f"(config had {ae_conf['n_freqs']}); using HDF5 value.")
+            except Exception as e:
+                freqs = None
+                n_freqs = ae_conf.get("n_freqs", 4096)
+                print(f"[autoencoder] warning: failed to read freqs from data module "
+                      f"({e}); falling back to ae_conf.n_freqs={n_freqs}.")
+            if freqs is not None:
+                idx_lo, idx_hi = resolve_loss_band(freqs, ae_conf)
+            else:
+                idx_lo = ae_conf.get("idx_lowerbound", None)
+                idx_hi = ae_conf.get("idx_upperbound", None)
+            ae_conf["n_freqs"] = n_freqs
+            ae_conf["idx_lowerbound"] = idx_lo
+            ae_conf["idx_upperbound"] = idx_hi
+
             autoencoder = DenoisingAutoencoder(
                 n_channels=ae_conf.get("n_channels", 2),
-                n_freqs=ae_conf.get("n_freqs", 4096),
+                n_freqs=n_freqs,
                 architecture=ae_conf.get("architecture", "conv"),
                 bottleneck_dim=ae_conf.get("bottleneck_dim", 128),
                 hidden_channels=hidden_channels,
@@ -309,8 +333,8 @@ class SequentialTrainer:
                 representation=ae_conf.get("representation", "amp_phase"),
                 high_freq_only=ae_conf.get("high_freq_only", False),
                 freq_split_idx=ae_conf.get("freq_split_idx", 2048),
-                idx_lowerbound=ae_conf.get("idx_lowerbound", None),
-                idx_upperbound=ae_conf.get("idx_upperbound", None),
+                idx_lowerbound=idx_lo,
+                idx_upperbound=idx_hi,
                 amplitude_normalise=ae_conf.get("amplitude_normalise", False),
                 prior_bounds=prior_bounds,
                 whiten=ae_conf.get("whiten", True),

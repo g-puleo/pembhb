@@ -445,15 +445,22 @@ class MBHBSimulatorFD:
         # 1/T_obs; whichever is *larger* wins, so the grid never extends below
         # max(requested_fmin, 1/T_obs) and there are no PSD-masked dead bins
         # to worry about downstream.
-        self.fmax = 1.0 / (2.0 * dt)
+        self.fmax = conf["waveform_params"].get("fmax", 1.0 / (2.0 * dt))
         fmin_request = conf["waveform_params"].get("fmin", FMIN_FLOOR)
         self.fmin = max(fmin_request, 1.0 / self.obs_length)
-        self.n_freq_bins = n_freq_bins
         self.freq_spacing = freq_spacing
 
         if freq_spacing == "linear":
-            self.freqs = np.linspace(self.fmin, self.fmax, n_freq_bins)
+            # df = 1/T_obs is the natural FFT spacing; downsamplefactor lets
+            # the user thin the grid when df would otherwise produce too many
+            # bins. n_freq_bins becomes a consequence of the grid, not an input.
+            downsamplefactor = conf["waveform_params"].get("downsamplefactor", 1)
+            df = 1.0 / self.obs_length
+            step = downsamplefactor * df
+            self.freqs = np.arange(self.fmin, self.fmax, step)
+            self.n_freq_bins = len(self.freqs)
         elif freq_spacing == "log":
+            self.n_freq_bins = n_freq_bins
             self.freqs = np.logspace(
                 np.log10(self.fmin), np.log10(self.fmax), n_freq_bins
             )
@@ -464,7 +471,7 @@ class MBHBSimulatorFD:
         # Length n_freq_bins: use midpoint rule so each bin has a width.
         df_diff = np.diff(self.freqs)
         # Assign each bin a width: average of adjacent diffs, endpoints get half-width
-        self.df = np.empty(n_freq_bins)
+        self.df = np.empty(self.n_freq_bins)
         self.df[0] = df_diff[0]
         self.df[-1] = df_diff[-1]
         self.df[1:-1] = 0.5 * (df_diff[:-1] + df_diff[1:])
@@ -512,7 +519,7 @@ class MBHBSimulatorFD:
             "channels": list(self.channels),
             "n_channels": self.n_channels,
             "freq_spacing": freq_spacing,
-            "n_freq_bins": n_freq_bins,
+            "n_freq_bins": self.n_freq_bins,
             "fmin": float(self.fmin),
             "fmax": float(self.fmax),
         }

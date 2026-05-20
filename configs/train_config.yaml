@@ -29,7 +29,7 @@ device: "cuda"
 
 architecture:
   gradnorm:
-    enabled: False
+    enabled: False/data/gpuleo/mbhb/obs_fmin1e-4_fmax2e-2_newdf.h5
     alpha: 1
     learning_rate: 0.0005
     common_params: "linear_f"
@@ -69,18 +69,24 @@ architecture:
       architecture: "conv"         # "conv" or "unet"
       representation: "real_imag"  # "amp_phase" or "real_imag"
       n_channels: 2                # TDI channels (AE→2, AET→3)
+      # n_freqs is now auto-derived from the HDF5 grid; the value below is
+      # a fallback used only if the data module can't be read.
       n_freqs: 4096
       bottleneck_dim: 128
       hidden_channels: [32, 64, 128, 256, 256]
       kernel_size: 3
       stride: 2
       dropout: 0.0
-      residual: False              
-      decoder_post_fc_bn: True   
-      subtract_mean_whitened: False
+      residual: False
+      decoder_post_fc_bn: True
+      subtract_mean_whitened: True
       #high_freq_only: False
-      idx_lowerbound: 2048
-      # idx_upperbound: None
+      # Reconstruction-loss band (Hz). Encoder still sees the full input;
+      # the decoder/loss are restricted to [fmin_loss, fmax_loss]. Omit
+      # either side for "no cut on that side". Legacy keys
+      # idx_lowerbound/idx_upperbound (bin indices) still work as a fallback.
+      # fmin_loss: 2.55e-3   # was idx_lowerbound: 2048 on the old 4096-bin grid
+      # fmax_loss: 1.0e-2
       #freq_split_idx: 2048
       # Apply ASD whitening before feeding the AE.
       # When false, the AE sees raw (un-whitened) FD amplitudes — the

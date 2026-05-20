@@ -13,6 +13,7 @@ Two architectures are supported:
 
 import warnings
 
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -21,6 +22,39 @@ from torch.utils.data import DataLoader
 
 from pembhb.model import DoubleConv, Down, Up, OutConv
 from pembhb import get_torch_dtype
+
+
+def resolve_loss_band(freqs, ae_conf):
+    """Resolve the autoencoder loss-mask band from an autoencoder config dict.
+
+    Reads ``fmin_loss`` / ``fmax_loss`` (Hz) from ``ae_conf`` and converts
+    them to bin indices via the supplied ``freqs`` grid. Falls back to the
+    legacy ``idx_lowerbound`` / ``idx_upperbound`` (raw indices) when the
+    Hz keys are absent. Warns if both forms are present.
+
+    :param freqs: 1D numpy array of frequencies (the simulator's grid).
+    :param ae_conf: autoencoder sub-config dict from train_config.yaml.
+    :return: ``(idx_lo, idx_hi)`` — either may be ``None`` to mean no bound.
+    """
+    fmin_loss = ae_conf.get("fmin_loss", None)
+    fmax_loss = ae_conf.get("fmax_loss", None)
+    idx_lo_legacy = ae_conf.get("idx_lowerbound", None)
+    idx_hi_legacy = ae_conf.get("idx_upperbound", None)
+
+    has_hz = fmin_loss is not None or fmax_loss is not None
+    has_legacy = idx_lo_legacy is not None or idx_hi_legacy is not None
+
+    if has_hz:
+        if has_legacy:
+            warnings.warn(
+                "ae_conf has both fmin_loss/fmax_loss (Hz) and "
+                "idx_lowerbound/idx_upperbound (bin idx); using fmin_loss/fmax_loss."
+            )
+        idx_lo = int(np.searchsorted(freqs, fmin_loss)) if fmin_loss is not None else None
+        idx_hi = int(np.searchsorted(freqs, fmax_loss)) if fmax_loss is not None else None
+        return idx_lo, idx_hi
+
+    return idx_lo_legacy, idx_hi_legacy
 
 
 # ---------------------------------------------------------------------------
