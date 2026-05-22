@@ -29,7 +29,7 @@ from glob import glob
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Rectangle, Patch
 import torch
 import yaml
 from torch.utils.data import DataLoader, Subset
@@ -47,6 +47,19 @@ from pembhb.utils import (
     contour_levels,
     posterior_contours_2d,
     mbhb_collate_fn,
+)
+
+# Local helpers (kept in a sibling module to keep this script trim).
+from viz_helpers import (
+    SECONDS_PER_DAY as _SECONDS_PER_DAY,
+    load_mcmc_samples,
+    deltat_axis_transforms,
+    hpd_interval_1d as _hpd_interval_1d,
+    differential_entropy_1d as _differential_entropy_1d,
+    differential_entropy_2d as _differential_entropy_2d,
+    eval_nre_1d,
+    marginalise_2d_to_1d,
+    eval_mcmc_kde_1d,
 )
 
 # ---------------------------------------------------------------------------
@@ -335,60 +348,6 @@ def connect_box_to_next_axes(
 # 1-D prior-window evolution
 # ---------------------------------------------------------------------------
 
-def _hpd_interval_1d(norm1d: np.ndarray, grid: np.ndarray, level: float):
-    """Return the highest-posterior-density interval at credibility *level*.
-
-    Uses the same cumulative-sum approach as ``get_widest_interval_1d`` in
-    tmnre.py.  The tail probability outside the interval is ``1 - level``.
-
-    Parameters
-    ----------
-    norm1d : 1-D array
-        Normalised posterior density evaluated at *grid* points.
-    grid : 1-D array
-        Parameter values corresponding to *norm1d*.
-    level : float
-        Target credibility (e.g. 0.50, 0.90).
-
-    Returns
-    -------
-    (low, high) : float, float
-    """
-    dp = grid[1] - grid[0]
-    eps = 1.0 - level
-    cumsum = np.cumsum(norm1d * dp)
-    idx_low  = np.searchsorted(cumsum, eps / 2)
-    idx_high = np.searchsorted(cumsum, 1.0 - eps / 2)
-    idx_high = min(idx_high, len(grid) - 1)
-    return float(grid[idx_low]), float(grid[idx_high])
-
-
-def _differential_entropy_1d(norm1d: np.ndarray, dp: float) -> float:
-    """Differential entropy H = -∫ p log p dx via Riemann sum (nats).
-
-    The convention 0 · log 0 = 0 is applied so that zero-density bins
-    contribute nothing to the sum.
-    """
-    with np.errstate(divide="ignore"):
-        log_p = np.where(norm1d > 0, np.log(norm1d), 0.0)
-    return -float(np.sum(norm1d * log_p * dp))
-
-
-def _differential_entropy_2d(norm2d: np.ndarray, dp0: float, dp1: float) -> float:
-    """Joint differential entropy H = -∫∫ p log p dx dy via Riemann sum (nats).
-
-    Parameters
-    ----------
-    norm2d : 2-D array, shape (ngrid, ngrid)
-        Normalised posterior density (single observation, no batch dim).
-    dp0, dp1 : float
-        Grid spacings along each axis.
-    """
-    with np.errstate(divide="ignore"):
-        log_p = np.where(norm2d > 0, np.log(norm2d), 0.0)
-    return -float(np.sum(norm2d * log_p * dp0 * dp1))
-
-
 def read_final_volume_ratio(round_dir: str, tb_key: str) -> float:
     """Read the last logged value of *tb_key* from the TensorBoard events file.
 
@@ -665,24 +624,16 @@ def plot_1d_prior_evolution(
         # Use higher resolution for the final round if requested
         _ngrid = ngrid_points_1d if (i == n_rounds - 1) else ngrid_points
 
-        logratios, inj_params, grid = get_logratios_grid(
-            dataloader,
-            model,
-            ngrid_points=_ngrid,
-            in_param_idx=in_param_idx,
-            out_param_idx=_out_param_idx,
-            low=prior_lows[i],
-            high=prior_highs[i],
+        grid_1d, norm1d, _inj = eval_nre_1d(
+            model, dataloader, in_param_idx, _out_param_idx,
+            prior_lows[i], prior_highs[i], _ngrid,
         )
         del model
-        ratios = np.exp(logratios[0])
-        dp = grid[1, 0] - grid[0, 0]
-        norm1d = ratios / np.sum(ratios * dp)
-        grid_1d = grid[:, 0]
+        dp = grid_1d[1] - grid_1d[0]
 
         # Store injection value from the first available round (same obs every round)
         if final_inj is None:
-            final_inj = float(inj_params[0])
+            final_inj = _inj
 
         # HPD intervals (use the ngrid_points resolution for consistency
         # when this is not the final round; for the final round the higher
@@ -710,24 +661,9 @@ def plot_1d_prior_evolution(
                 "duration_weeks must be provided when plotting Deltat "
                 "(needed to bridge the pembhb and MCMC time conventions)."
             )
-        duration_sec = duration_weeks * 7.0 * _SECONDS_PER_DAY
-        tref_true_sec = duration_sec + final_inj * _SECONDS_PER_DAY
-        nre_to_x  = lambda v: (np.asarray(v, dtype=float) - final_inj) * _SECONDS_PER_DAY
-        mcmc_to_x = lambda v: np.asarray(v, dtype=float) - tref_true_sec
-        # --- BRUTAL PATCH: mcmc_coppa/5D_linear_freq*.h5 stores Deltat in
-        # pembhb's native convention (days from end of observation), not
-        # seconds-from-start like logf_samples_5D_copparoni.h5.  Detect by
-        # filename and reuse the NRE transform.  Remove once unified.
-        if (
-            mcmc_samples_path is not None
-            and "5D_linear_freq" in os.path.basename(mcmc_samples_path)
-        ):
-            mcmc_to_x = nre_to_x
-        x_label = r"$\Delta t - \Delta t_{\rm true}$ [s]"
-        # Density rescale so that ∫ p dx_new = 1 when x is in seconds
-        # (NRE norm1d was computed per day; MCMC KDE will be evaluated
-        # on the seconds-offset grid and is already in sec⁻¹).
-        nre_density_scale = 1.0 / _SECONDS_PER_DAY
+        nre_to_x, mcmc_to_x, x_label, nre_density_scale = deltat_axis_transforms(
+            final_inj, duration_weeks, mcmc_samples_path,
+        )
     else:
         nre_to_x  = lambda v: np.asarray(v, dtype=float)
         mcmc_to_x = lambda v: np.asarray(v, dtype=float)
@@ -877,77 +813,12 @@ def plot_1d_prior_evolution(
 
 
 # ---------------------------------------------------------------------------
-# MCMC overlay helpers
+# MCMC overlay
 # ---------------------------------------------------------------------------
-
-# Mapping from MCMC-file key → internal parameter name used by the model.
-# The MCMC samples file uses a slightly different naming convention than
-# the pembhb datagen config (``_ORDERED_PRIOR_KEYS``); we rename on load
-# so all downstream logic (``param_names.index(...)``, ``key in param_names``)
-# can use the pembhb names consistently.
-_MCMC_KEY_TO_INTERNAL = {
-    "tref":     "Deltat",
-    "dist_Gpc": "dist",
-    "cosinc":   "inc",
-    "sinbeta":  "beta",
-}
-
-# Constants used by the Deltat-axis transform (seconds offset from the
-# true merger time).  See ``plot_1d_prior_evolution`` for the transform.
-_SECONDS_PER_DAY = 86400.0
-
-# NOTE on Deltat units:
-# ---------------------
-# The MCMC file stores ``tref`` in seconds-from-start-of-observation, while
-# pembhb stores ``Deltat`` in days-from-end-of-observation.  Rather than
-# pre-converting one to the other (which still leaves an offset because the
-# reference points differ), we keep ``tref`` in raw seconds here and apply
-# the full transform (shift + rescale) at plot time, where we know the
-# injection value and the observation duration.  Both NRE and MCMC are then
-# displayed in the same coordinate: seconds offset from the true merger.
-
-
-def load_mcmc_samples(samples_path: str):
-    """Load flat MCMC samples from a single HDF5 file.
-
-    The file is expected to contain one top-level dataset per parameter,
-    with keys drawn from a subset of::
-
-        ['chi1', 'chi2', 'cosinc', 'dist_Gpc', 'lambda', 'logMchirp',
-         'phi', 'psi', 'q', 'sinbeta', 'tref']
-
-    Keys are renamed to the pembhb internal convention on load
-    (``tref → Deltat``, ``dist_Gpc → dist``, ``cosinc → inc``,
-    ``sinbeta → beta``).  Note that ``cosinc`` and ``sinbeta`` hold the
-    same quantities as ``inc`` and ``beta`` (cos and sin, respectively) —
-    only the names differ.
-
-    Parameters
-    ----------
-    samples_path : str
-        Path to the ``.h5`` file containing the flat MCMC samples.
-
-    Returns
-    -------
-    flat_samples : ndarray of shape (N_samples, N_params_present)
-        Samples stacked column-wise, ordered to match ``param_names``.
-    param_names : list of str
-        Parameter names in the pembhb internal convention.  Only the
-        subset actually present in the file is returned.
-    """
-    import h5py
-
-    with h5py.File(samples_path, "r") as f:
-        file_keys = list(f.keys())
-        param_names = [_MCMC_KEY_TO_INTERNAL.get(k, k) for k in file_keys]
-        columns = [np.asarray(f[k][()]).ravel() for k in file_keys]
-
-    flat_samples = np.column_stack(columns)
-    # NOTE: ``Deltat`` here is still in raw MCMC units (seconds from start of
-    # observation).  The plotting code converts it to ``seconds offset from
-    # true merger`` at display time so that NRE (days from end) and MCMC
-    # (seconds from start) end up in the same coordinate system.
-    return flat_samples, param_names
+# Note on Deltat units: the MCMC file stores ``tref`` in seconds-from-start
+# while pembhb stores ``Deltat`` in days-from-end.  See
+# ``viz_helpers.deltat_axis_transforms`` for the shift+rescale applied at
+# plot time so the two coordinate systems can be compared.
 
 
 def overlay_mcmc_contours(
@@ -1941,6 +1812,147 @@ def _plot_last_round_standalone(
 
 
 # ---------------------------------------------------------------------------
+# Cross-parameter violin summary (final round)
+# ---------------------------------------------------------------------------
+
+def plot_violin_summary(
+    round_dirs: list,
+    dataloader,
+    mcmc_samples_path: str = None,
+    ngrid: int = 300,
+    figsize_per_param: tuple = (1.8, 4.5),
+):
+    """One figure summarising every 1-D marginal as a half-and-half violin.
+
+    For each parameter the final-round NRE marginal occupies the left half
+    of the violin and the MCMC marginal the right half.  Both are
+    peak-normalised so each violin has unit width.  Per parameter the
+    source is, in order:
+
+    1. the direct 1-D head when present,
+    2. otherwise the marginal of a 2-D head containing the parameter,
+    3. otherwise the panel is skipped (parameter not trained).
+
+    Only the final round's model is loaded.  Returns the figure (or
+    ``None`` when no marginals are available).
+    """
+    final_idx = len(round_dirs)
+    final_dir = round_dirs[-1]
+    print(f"\n=== Building violin summary from final round ({final_idx}) ===")
+
+    model = load_model(os.path.join(final_dir, "checkpoints"))
+    box_final = load_prior_box(final_dir, final_idx)
+    duration_weeks = load_duration_weeks(round_dirs[0], 1)
+
+    heads_1d, heads_2d = {}, {}
+    for out_idx, marg in enumerate(model.marginals_list):
+        if len(marg) == 1:
+            heads_1d[int(marg[0])] = out_idx
+        elif len(marg) == 2:
+            heads_2d[tuple(int(x) for x in marg)] = out_idx
+
+    params_in_2d = {p for pair in heads_2d for p in pair}
+    available = sorted(set(heads_1d) | params_in_2d)
+    if not available:
+        print("  No 1-D or 2-D marginals — skipping violin summary.")
+        del model
+        return None
+
+    if mcmc_samples_path is not None:
+        flat_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_path)
+    else:
+        flat_samples, mcmc_param_names = None, None
+
+    n = len(available)
+    fig, axes = plt.subplots(
+        1, n, figsize=(figsize_per_param[0] * n, figsize_per_param[1]),
+        squeeze=False,
+    )
+    axes = axes[0]
+
+    HALF = 0.4  # half-width of a unit-peak violin
+
+    for k, in_idx in enumerate(available):
+        ax = axes[k]
+        key = _ORDERED_PRIOR_KEYS[in_idx]
+        low, high = box_final[key]
+
+        # NRE: prefer the dedicated 1-D head; else marginalise a 2-D head.
+        if in_idx in heads_1d:
+            grid_1d, norm1d, inj = eval_nre_1d(
+                model, dataloader, in_idx, heads_1d[in_idx], low, high, ngrid,
+            )
+            source = "1D head"
+        else:
+            pair = next(p for p in heads_2d if in_idx in p)
+            out_idx = heads_2d[pair]
+            keep = 0 if pair[0] == in_idx else 1
+            bounds_0 = box_final[_ORDERED_PRIOR_KEYS[pair[0]]]
+            bounds_1 = box_final[_ORDERED_PRIOR_KEYS[pair[1]]]
+            norm2d, inj_params, gx, gy = compute_normalised_posterior(
+                dataloader, model, pair, out_idx, bounds_0, bounds_1, ngrid,
+            )
+            grid_1d, norm1d, inj = marginalise_2d_to_1d(
+                norm2d[0], gx, gy, keep, inj_params[0],
+            )
+            other = _ORDERED_PRIOR_KEYS[pair[1 - keep]]
+            source = f"2D∖{other}"
+
+        # Deltat → seconds-offset-from-true axis (both NRE and MCMC).
+        if key == "Deltat":
+            nre_to_x, mcmc_to_x, y_label, _ = deltat_axis_transforms(
+                inj, duration_weeks, mcmc_samples_path,
+            )
+            grid_y = nre_to_x(grid_1d)
+            inj_y  = float(nre_to_x(np.array([inj]))[0])
+            mcmc_xform = mcmc_to_x
+        else:
+            grid_y, inj_y, mcmc_xform, y_label = grid_1d, inj, None, key
+
+        peak = float(np.max(norm1d))
+        nre_w = (norm1d / peak) * HALF if peak > 0 else np.zeros_like(norm1d)
+        ax.fill_betweenx(grid_y, -nre_w, 0, color="steelblue", alpha=0.55)
+        ax.plot(-nre_w, grid_y, color="steelblue", linewidth=1.0)
+
+        if flat_samples is not None:
+            mcmc_pdf = eval_mcmc_kde_1d(
+                flat_samples, mcmc_param_names, key, grid_y,
+                sample_transform=mcmc_xform,
+            )
+            if mcmc_pdf is not None:
+                mc_peak = float(np.max(mcmc_pdf))
+                if mc_peak > 0:
+                    mcmc_w = (mcmc_pdf / mc_peak) * HALF
+                    ax.fill_betweenx(grid_y, 0, mcmc_w, color="darkorange", alpha=0.55)
+                    ax.plot(mcmc_w, grid_y, color="darkorange", linewidth=1.0)
+
+        ax.axhline(inj_y, color="red", linestyle="--", linewidth=1.2)
+        ax.axvline(0, color="black", linewidth=0.6, alpha=0.4)
+        ax.set_xlim(-0.5, 0.5)
+        ax.set_xticks([])
+        ax.set_title(f"{key}\n({source})", fontsize=9)
+        ax.set_ylabel(y_label, fontsize=9)
+        ax.grid(True, axis="y", linestyle=":", alpha=0.4)
+
+    handles = [
+        Patch(facecolor="steelblue", alpha=0.55, label="NRE"),
+        Patch(facecolor="darkorange", alpha=0.55, label="MCMC"),
+        Line2D([0], [0], color="red", linestyle="--", linewidth=1.2, label="True"),
+    ]
+    fig.suptitle(
+        f"Final-round 1-D marginals: NRE (left half) vs MCMC (right half)",
+        fontsize=12,
+    )
+    fig.tight_layout(rect=(0, 0.04, 1, 0.96))
+    fig.legend(
+        handles=handles, loc="lower center",
+        bbox_to_anchor=(0.5, 0.0), ncol=3, fontsize=10, frameon=True,
+    )
+    del model
+    return fig
+
+
+# ---------------------------------------------------------------------------
 # Top-level dispatcher: all marginals
 # ---------------------------------------------------------------------------
 
@@ -2148,6 +2160,23 @@ def plot_all_marginals(
                 None if outdir is not None else fig_vol,
                 None,
             )
+
+    # ---- Cross-parameter violin summary (one figure for everything) ----
+    fig_violin = plot_violin_summary(
+        round_dirs=round_dirs,
+        dataloader=dataloader,
+        mcmc_samples_path=mcmc_samples_path,
+        ngrid=ngrid_points_1d,
+    )
+    if fig_violin is not None:
+        if outdir is not None:
+            out_path = os.path.join(outdir, "violin_summary.png")
+            fig_violin.savefig(out_path, dpi=save_dpi, bbox_inches="tight")
+            print(f"  Saved violin summary to {out_path}")
+            plt.close(fig_violin)
+        results["__violin_summary__"] = (
+            None if outdir is not None else fig_violin, None, {}, None, None, None,
+        )
 
     return results
 

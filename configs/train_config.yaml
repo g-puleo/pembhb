@@ -78,14 +78,14 @@ architecture:
       stride: 2
       dropout: 0.0
       residual: False
-      decoder_post_fc_bn: True
+      decoder_post_fc_bn: False
       subtract_mean_whitened: True
       #high_freq_only: False
       # Reconstruction-loss band (Hz). Encoder still sees the full input;
       # the decoder/loss are restricted to [fmin_loss, fmax_loss]. Omit
       # either side for "no cut on that side". Legacy keys
       # idx_lowerbound/idx_upperbound (bin indices) still work as a fallback.
-      # fmin_loss: 2.55e-3   # was idx_lowerbound: 2048 on the old 4096-bin grid
+      fmin_loss: 2.55e-3   # was idx_lowerbound: 2048 on the old 4096-bin grid
       # fmax_loss: 1.0e-2
       #freq_split_idx: 2048
       # Apply ASD whitening before feeding the AE.
@@ -163,11 +163,11 @@ sequential_training:
 # JOINT AE + NRE training  (scripts/tmnre_joint.py only)
 # =========================================================================
 joint_training:
-  ae_warmup_epochs: 270         # matches reference round-1 AE training duration (best ckpt at 256, ran to 270)
+  ae_warmup_epochs: 150         # matches reference round-1 AE training duration (best ckpt at 256, ran to 270)
   lr_ae: 0.001                  # matches reference AE lr
   lr_nre: 0.0001                # matches reference NRE learning_rate
   ae_weight_decay: 1.0e-5       # matches reference AE weight_decay
-  freeze_ae_after_warmup: true  # mimics tmnre.py's frozen-encoder NRE training
+  freeze_ae_after_warmup: false  # mimics tmnre.py's frozen-encoder NRE training
   transfer_enabled: true        # retain the previously trained classifier for the next round
   checkpoint_every_n_epochs: 10
   # -----------------------------------------------------------------------
@@ -190,7 +190,7 @@ joint_training:
     monitor: "val_ae_loss"
     mode: "min"
     factor: 0.3            # matches autoencoder.py @ cb948642 (scheduler_factor=0.3)
-    patience: 10           # matches autoencoder.py @ cb948642 (scheduler_patience=10)
+    patience: 20           # matches autoencoder.py @ cb948642 (scheduler_patience=10)
     min_lr: 1.0e-7
     start_epoch: 0
 

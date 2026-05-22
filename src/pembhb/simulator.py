@@ -23,6 +23,31 @@ from pembhb.sampler import UniformSampler
 WEEK_SI = 7 * 24 * 3600
 DAY_SI = 24 * 3600
 
+
+# Ajith+ 2008 (arXiv:0710.2335) phenomenological IMR coefficients for the
+# non-spinning amplitude transition frequencies (Eqs. 4.18--4.19).
+# Each frequency is f = (a*eta^2 + b*eta + c) / (pi * G M / c^3).
+_AJITH_COEFFS = {
+    "f_merger": (2.9740e-1, 4.4810e-2, 9.5560e-2),
+    "f_ring":   (5.9411e-1, 8.9794e-2, 1.9111e-1),
+    "sigma":    (5.0801e-1, 7.7515e-2, 2.2369e-2),
+    "f_cut":    (8.4845e-1, 1.2848e-1, 2.7299e-1),
+}
+
+
+def ajith_transition_frequencies(m1_msun, m2_msun):
+    """Return f_merger, f_ring, sigma, f_cut [Hz] for total mass M = m1+m2 [Msun]
+    and symmetric mass ratio eta = m1*m2 / M^2. Vectorised over the inputs."""
+    m1 = np.asarray(m1_msun)
+    m2 = np.asarray(m2_msun)
+    M = m1 + m2
+    eta = (m1 * m2) / (M * M)
+    denom = np.pi * MTSUN_SI * M  # = pi * G * M / c^3, in seconds
+    out = {}
+    for name, (a, b, c) in _AJITH_COEFFS.items():
+        out[name] = (a * eta**2 + b * eta + c) / denom
+    return out
+
 class MBHBSimulatorFD_TD:
 
     def __init__(self, conf, sampler_init_kwargs, seed=0, sampler=None):
@@ -595,6 +620,10 @@ class MBHBSimulatorFD:
             wave_fd = f.create_dataset("wave_fd", shape=(N, self.n_channels, self.n_freq_bins), dtype=_np_complex)
             snr = f.create_dataset("snr", shape=(N,), dtype=_np_real)
             f_isco = f.create_dataset("f_ISCO", shape=(N,), dtype=_np_real)
+            f_merger_ds = f.create_dataset("f_merger", shape=(N,), dtype=_np_real)
+            f_ring_ds = f.create_dataset("f_ring", shape=(N,), dtype=_np_real)
+            sigma_ds = f.create_dataset("sigma", shape=(N,), dtype=_np_real)
+            f_cut_ds = f.create_dataset("f_cut", shape=(N,), dtype=_np_real)
             f.create_dataset("asd", data=self.asd, dtype=_np_real)
             
             if store_noise:
@@ -625,6 +654,13 @@ class MBHBSimulatorFD:
                 snr[i:batch_end] = self.get_SNR_FD(out["wave_fd"])
                 M_tot = bbhx_params_batch[:, 0] + bbhx_params_batch[:, 1]
                 f_isco[i:batch_end] = (1.0 / np.pi) * np.sqrt(1.0 / 216.0) * 203025.44672808357 / M_tot
+                trans = ajith_transition_frequencies(
+                    bbhx_params_batch[:, 0], bbhx_params_batch[:, 1]
+                )
+                f_merger_ds[i:batch_end] = trans["f_merger"]
+                f_ring_ds[i:batch_end] = trans["f_ring"]
+                sigma_ds[i:batch_end] = trans["sigma"]
+                f_cut_ds[i:batch_end] = trans["f_cut"]
                 if store_noise:
                     z = (noise_rng.normal(size=(batch_size_actual, self.n_channels, self.n_freq_bins))
                          + 1j * noise_rng.normal(size=(batch_size_actual, self.n_channels, self.n_freq_bins)))
@@ -632,7 +668,8 @@ class MBHBSimulatorFD:
 
             print("HDF5 dataset shapes (current state):")
             for dname in ["source_parameters", "frequencies", "df",
-                          "wave_fd", "noise_fd", "snr", "f_ISCO", "asd"]:
+                          "wave_fd", "noise_fd", "snr", "f_ISCO",
+                          "f_merger", "f_ring", "sigma", "f_cut", "asd"]:
                 if dname in f:
                     ds = f[dname]
                     print(f"  {dname}: shape={tuple(ds.shape)}, dtype={ds.dtype}")

@@ -15,21 +15,21 @@ waveform_params:
   # Upper edge of the FD grid (Hz). When freq_spacing="linear", the grid is
   # np.arange(fmin, fmax, downsamplefactor / T_obs).
   fmax: 2.0e-2
-  downsamplefactor: 3      # thin the linear grid; step becomes downsamplefactor/T_obs ( ~4012 bins for T_obs=1week, fmin=1e-4, fmax=2e-2)
+  downsamplefactor: 1      # thin the linear grid; step becomes downsamplefactor/T_obs ( ~4012 bins for T_obs=1week, fmin=1e-4, fmax=2e-2)
   #psd_fmin_mask: 5.0e-5 # restore the low freq cutoff. 
   
 prior:
-  "logMchirp": [5.2, 5.3]
-  "q":         [1, 5]
+  "logMchirp": [5.249960881397025, 5.250039118602975]
+  "q":         [2.996074595121879, 3.003925404878121]
   "chi1":      [0.0, 0.0]
   "chi2":      [0.0, 0.0]
   "dist":      [10.0, 10.0]                                      # Gpc (sampled uniformly in dist^3)
   "phi":       [0.0, 0.0]                                        # phase at coalescence
   "inc":       [0.5, 0.5]                                        # cos inclination
-  "lambda":    [0, 6.283185307179586]            # ecliptic longitude
-  "beta":      [-1, 1]        # sin ecliptic latitude
+  "lambda":    [3.1124873962687998, 3.16751281353955]            # ecliptic longitude
+  "beta":      [0.18623696704815745, 0.21376303891230702]        # sin ecliptic latitude
   "psi":       [1.0,1.0]                                        # polarization angle in [0, pi]
-  "Deltat":    [-2.55, -2.45]        # t_merger from end of observation (days)
+  "Deltat":    [-2.5000186218908196, -2.4999813781091804]        # t_merger from end of observation (days)
 
   # "logMchirp": [5.25, 5.25]
   # "q":         [3.00, 3.00]
