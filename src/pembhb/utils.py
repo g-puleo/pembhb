@@ -1396,7 +1396,7 @@ def compute_fisher_prior_bounds(
     """
     import h5py  # h5py is already a project dependency
     # Lazy imports to avoid circular dependency with pembhb.simulator
-    from pembhb.simulator import MBHBSimulatorFD_TD
+    from pembhb.simulator import MBHBSimulatorFD
     from bbhx.likelihood import Likelihood as BBHXLikelihoodFn
 
     # Load observation first so we can use true values for fixed params.
@@ -1424,12 +1424,14 @@ def compute_fisher_prior_bounds(
         dummy_prior[key] = [val, val]
 
     print("[Fisher] Initializing simulator for FIM evaluation ...")
-    simulator = MBHBSimulatorFD_TD(
-        datagen_config,
+    fisher_config = copy.deepcopy(datagen_config)
+    fisher_config["backend"] = "cpu"  # likelihood is force_backend='cpu'; keep wfd/freqs consistent
+    simulator = MBHBSimulatorFD(
+        fisher_config,
         sampler_init_kwargs={"prior_bounds": dummy_prior},
         seed=42,
     )
-    frequencies = simulator.freqs_pos
+    frequencies = simulator.freqs
 
     assert np.allclose(freqs_obs, frequencies), (
         "[Fisher] Frequency mismatch between observation file and simulator!"

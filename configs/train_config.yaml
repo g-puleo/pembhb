@@ -11,7 +11,7 @@ classifier_hlayersizes: [64, 32, 16, 8]
 keep_ckpt: True
 marginals:
   #  f: [[,0]]
-  f: [[0,], [10,], [7,8]]
+  f: [[0,], [10,], [7,8], [9,], [5,], [6,], [4,], [2,], [3,]]
 
 
 # -------------------------------------------------------------------------
@@ -29,7 +29,7 @@ device: "cuda"
 
 architecture:
   gradnorm:
-    enabled: False/data/gpuleo/mbhb/obs_fmin1e-4_fmax2e-2_newdf.h5
+    enabled: False
     alpha: 1
     learning_rate: 0.0005
     common_params: "linear_f"
@@ -163,11 +163,11 @@ sequential_training:
 # JOINT AE + NRE training  (scripts/tmnre_joint.py only)
 # =========================================================================
 joint_training:
-  ae_warmup_epochs: 150         # matches reference round-1 AE training duration (best ckpt at 256, ran to 270)
+  ae_warmup_epochs: 150       # matches reference round-1 AE training duration (best ckpt at 256, ran to 270)
   lr_ae: 0.001                  # matches reference AE lr
   lr_nre: 0.0001                # matches reference NRE learning_rate
   ae_weight_decay: 1.0e-5       # matches reference AE weight_decay
-  freeze_ae_after_warmup: false  # mimics tmnre.py's frozen-encoder NRE training
+  freeze_ae_after_warmup: true  # mimics tmnre.py's frozen-encoder NRE training
   transfer_enabled: true        # retain the previously trained classifier for the next round
   checkpoint_every_n_epochs: 10
   # -----------------------------------------------------------------------
@@ -190,7 +190,7 @@ joint_training:
     monitor: "val_ae_loss"
     mode: "min"
     factor: 0.3            # matches autoencoder.py @ cb948642 (scheduler_factor=0.3)
-    patience: 20           # matches autoencoder.py @ cb948642 (scheduler_patience=10)
+    patience: 10           # matches autoencoder.py @ cb948642 (scheduler_patience=10)
     min_lr: 1.0e-7
     start_epoch: 0
 
@@ -249,7 +249,7 @@ rom_prefetch_batches: 4       # Increase to reduce Python overhead
 # the bounds in datagen_config.yaml.
 # -------------------------------------------------------------------------
 fisher_prior:
-  enabled: false
+  enabled: true
   event_idx: 0           # which event in the HDF5 file to use as expansion point
   varying_params:        # FIM-based bounds are computed for these parameters
     - "logMchirp"
@@ -257,12 +257,12 @@ fisher_prior:
     - "lambda"
     - "beta"
     - "Deltat"
-  fixed_params:          # these parameters are pinned to the value read from the observation file
-    - "chi1"
-    - "chi2"
-    - "dist"
+    - "psi"
     - "phi"
     - "inc"
-    - "psi"
+    - "dist"
+    - "chi1"
+    - "chi2"
+  fixed_params: []       # all 11 parameters are varying
   n_sigma: 10.0           # prior half-width in units of FIM sigma
-  delta_frac: 1.0e-4     # fractional step size for numerical derivatives
+  delta_frac: 1.0e-2     # fractional step size for numerical derivatives (1e-4 was in noise floor → NaN σ from negative eigenvalues at 8D+)
