@@ -9,13 +9,77 @@ import emcee
 import numpy as np
 import corner
 import matplotlib.pyplot as plt
+import bilby
 from bbhx.likelihood import Likelihood
 from pembhb.simulator import MBHBSimulatorFD_TD, MBHBSimulatorFD
-from pembhb.utils import read_config, _ORDERED_PRIOR_KEYS
+from pembhb.utils import read_config, _ORDERED_PRIOR_KEYS, compute_fisher_matrix_waveform_deriv
 from pembhb import ROOT_DIR
 import h5py
 import os
-from mcmc import BBHXLikelihood, load_observation, compute_fisher_information_matrix
+
+
+def load_observation(fname):
+    """Load observation data from an HDF5 file."""
+    with h5py.File(fname, "r") as f:
+        src = f["source_parameters"][:]        # (N, 11)
+        freqs = f["frequencies"][:]            # (n_freqs,)
+        wave_fd = f["wave_fd"][:]              # (N, ch, n_freqs)
+        noise_fd = f["noise_fd"][:]            # (N, ch, n_freqs)
+        snr = f["snr"][:]                      # (N,)
+    return {
+        "source_parameters": src,
+        "frequencies": freqs,
+        "wave_fd": wave_fd,
+        "noise_fd": noise_fd,
+        "snr": snr,
+    }
+
+
+class BBHXLikelihood(bilby.Likelihood):
+    """Bilby Likelihood wrapper around the BBHX likelihood.
+
+    Handles the transform from prior space (what the sampler explores) to the
+    BBHX input space, and exposes a vectorized evaluation for batched walkers.
+    """
+
+    def __init__(self, bbhx_likelihood, sampler, simulator, true_params=None, fixed_params=None):
+        super().__init__()
+        self.bbhx_likelihood = bbhx_likelihood
+        self.sampler = sampler
+        self.simulator = simulator
+        self.true_params = true_params
+        self.fixed_params = fixed_params or {}
+
+    def log_likelihood(self, parameters):
+        """Log likelihood for one parameter dict (keys in _ORDERED_PRIOR_KEYS)."""
+        tmnre_params = np.array(
+            [parameters[key] if key in parameters else self.fixed_params[key]
+             for key in _ORDERED_PRIOR_KEYS],
+            dtype=np.float64,
+        ).reshape(-1, 1)  # (11, 1)
+        bbhx_params = self.sampler.samples_to_bbhx_input(
+            tmnre_params, t_obs_end=self.simulator.t_obs_end_SI
+        )  # (12, 1)
+        waveform_kwargs = self.simulator.waveform_kwargs.copy()  # get_ll mutates in place
+        log_l = self.bbhx_likelihood.get_ll(bbhx_params, **waveform_kwargs)
+        return float(log_l[0])
+
+    def log_likelihood_vectorized(self, parameters_list):
+        """Log likelihood for many parameter dicts at once (batched get_ll)."""
+        tmnre_params_list = [
+            np.array(
+                [parameters[key] if key in parameters else self.fixed_params[key]
+                 for key in _ORDERED_PRIOR_KEYS],
+                dtype=np.float64,
+            )
+            for parameters in parameters_list
+        ]
+        tmnre_params_batch = np.stack(tmnre_params_list, axis=1)  # (11, n_walkers)
+        bbhx_params_batch = self.sampler.samples_to_bbhx_input(
+            tmnre_params_batch, t_obs_end=self.simulator.t_obs_end_SI
+        )  # (12, n_walkers)
+        waveform_kwargs = self.simulator.waveform_kwargs.copy()
+        return self.bbhx_likelihood.get_ll(bbhx_params_batch, **waveform_kwargs)
 
 
 def main():
@@ -157,11 +221,20 @@ def main():
     # Compute Fisher Information Matrix (optional — sets prior bounds + walker init scale).
     if fisher_conf.get("enabled", True):
         print("\\n=== Computing Fisher Information Matrix ===")
-        fisher_matrix, param_uncertainties = compute_fisher_information_matrix(
-            likelihood,
-            true_params_dict,
+        # Waveform-derivative Fisher. The routine generates on the simulator's
+        # own asd/df grid (immune to the in-place slicing above); when
+        # high_freq_only is on we pass the matching band mask so the Fisher
+        # inner product mirrors the sampling likelihood.
+        fisher_freq_mask = None
+        if high_freq_only:
+            fisher_freq_mask = np.zeros(simulator.freqs.shape[0], dtype=bool)
+            fisher_freq_mask[freq_split_idx:] = True
+        fisher_matrix, param_uncertainties = compute_fisher_matrix_waveform_deriv(
+            simulator,
+            true_tmnre_params,
             varying_params,
-            delta_frac=fisher_conf.get("delta_frac", 1.0e-6),
+            step_frac=fisher_conf.get("step_frac", 1.0e-3),
+            freq_mask=fisher_freq_mask,
         )
         n_sigma = fisher_conf.get("prior_n_sigma", 15.0)
         prior_mins = np.array([true_tmnre_params[i] - n_sigma * param_uncertainties[j]

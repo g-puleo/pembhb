@@ -163,11 +163,11 @@ sequential_training:
 # JOINT AE + NRE training  (scripts/tmnre_joint.py only)
 # =========================================================================
 joint_training:
-  ae_warmup_epochs: 150       # matches reference round-1 AE training duration (best ckpt at 256, ran to 270)
+  ae_warmup_epochs: 100       # reduced from 150 (AE plateaus early)
   lr_ae: 0.001                  # matches reference AE lr
   lr_nre: 0.0001                # matches reference NRE learning_rate
   ae_weight_decay: 1.0e-5       # matches reference AE weight_decay
-  freeze_ae_after_warmup: true  # mimics tmnre.py's frozen-encoder NRE training
+  freeze_ae_after_warmup: false  # keep training the AE jointly with NRE after warmup
   transfer_enabled: true        # retain the previously trained classifier for the next round
   checkpoint_every_n_epochs: 10
   # -----------------------------------------------------------------------
@@ -263,6 +263,9 @@ fisher_prior:
     - "dist"
     - "chi1"
     - "chi2"
-  fixed_params: []       # all 11 parameters are varying
-  n_sigma: 10.0           # prior half-width in units of FIM sigma
-  delta_frac: 1.0e-2     # fractional step size for numerical derivatives (1e-4 was in noise floor → NaN σ from negative eigenvalues at 8D+)
+  fixed_params: []
+
+  n_sigma: 5.0            # prior half-width in units of FIM sigma
+  param_n_sigma: {}       # per-parameter override of n_sigma (waveform-derivative Fisher
+                          # is PSD & noise-independent, so the old Deltat: 100 hack is gone)
+  step_frac: 1.0e-3       # central-difference step as a fraction of prior width

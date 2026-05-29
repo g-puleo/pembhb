@@ -2,7 +2,7 @@ import yaml
 import copy
 import torch
 import os 
-from pembhb import ROOT_DIR, get_torch_dtype
+from pembhb import ROOT_DIR, get_torch_dtype, FMIN_FLOOR
 import numpy as np
 # from pembhb.data import MBHBDataset, mbhb_collate_fn
 from glob import glob
@@ -1267,86 +1267,156 @@ def fd_norm(a, df):
 # Fisher Information Matrix utilities
 # ---------------------------------------------------------------------------
 
-def compute_fisher_information_matrix(
-    likelihood_fn,
-    true_params_dict: dict,
-    param_names: list,
-    delta_frac: float = 1e-4,
+def compute_fisher_matrix_waveform_deriv(
+    simulator,
+    true_tmnre_params,
+    varying_params: list,
+    step_frac: float = 1e-3,
+    prior_bounds: dict = None,
+    freq_mask=None,
 ):
-    """Compute the Fisher Information Matrix via numerical second derivatives.
+    """Waveform-derivative Fisher matrix ``F_ij = <∂_i h | ∂_j h>``.
 
-    Uses finite differences of the log-likelihood at *true_params_dict* to fill
-    the FIM, then returns the Cramér-Rao lower bounds on parameter
-    uncertainties as ``sqrt(diag(FIM^{-1}))``.
+    The *standard* GW Fisher matrix, built from first derivatives of the
+    **waveform** (not second derivatives of the log-likelihood). The inner
+    product is the noise-weighted overlap
+
+        ⟨a|b⟩ = 4·Re Σ_ch Σ_{f≥FMIN_FLOOR} a* b · df / S_n ,    S_n = asd² ,
+
+    identical to :func:`pembhb.simulator.compute_snr_fd`. Because
+    ``F = Jᵀ N⁻¹ J`` it is **positive semi-definite by construction** — no
+    negative eigenvalues, no dependence on the noise realisation, and far
+    better conditioned than the log-likelihood Hessian (so no small-step NaN
+    blow-up). Derivatives are taken in TMNRE parameter space, so the nonlinear
+    transform applied by ``simulator.sampler.samples_to_bbhx_input``
+    (logMc→m1m2, cos→inc, sin→beta, Deltat→t_ref) is differentiated
+    end-to-end — no explicit Jacobian needed.
 
     Parameters
     ----------
-    likelihood_fn : callable
-        Function ``(dict) -> float`` returning the log-likelihood for a dict of
-        ``{param_name: value}`` covering at least *param_names*.
-    true_params_dict : dict
-        Expansion-point parameter values (typically the injected / true values).
-    param_names : list of str
-        Names of the parameters to include in the FIM.
-    delta_frac : float
-        Fractional step size for finite differences
-        (``delta_i = |val_i| * delta_frac`` if ``val_i != 0``, else
-        ``delta_frac`` directly).
+    simulator : MBHBSimulatorFD
+        Simulator built *consistently with the observed data* (same frequency
+        grid, modes, ``waveform_kwargs``). Provides ``wfd``/``generate``,
+        ``sampler``, ``asd``, ``df``, ``freqs``, ``channels_idx`` and
+        ``t_obs_end_SI``.
+    true_tmnre_params : array-like, shape (11,)
+        Expansion point in ``_ORDERED_PRIOR_KEYS`` order.
+    varying_params : list of str
+        Parameters to include in the Fisher matrix.
+    step_frac : float
+        Central-difference step as a fraction of the prior width
+        (``ε_p = step_frac·(upper_p − lower_p)``). When *prior_bounds* is None,
+        falls back to ``step_frac·|value|`` (or ``step_frac`` if value == 0).
+    prior_bounds : dict, optional
+        ``{name: [lo, hi]}`` used to size per-parameter steps.
+    freq_mask : array-like of bool, optional
+        Boolean mask over ``simulator.freqs`` selecting which bins enter the
+        inner product. Use this to mirror an analysis that restricts the
+        likelihood to a sub-band (e.g. ``high_freq_only``). Combined (AND) with
+        the always-applied ``freqs ≥ FMIN_FLOOR`` / ``asd > 0`` mask.
 
     Returns
     -------
     fisher : np.ndarray, shape (n, n)
-        Fisher Information Matrix.
+        Fisher matrix (ordered as *varying_params*).
     param_uncertainties : np.ndarray, shape (n,)
-        1-sigma uncertainties from the Cramér-Rao bound
-        (``NaN`` if the FIM is singular).
+        ``sqrt(diag(F⁻¹))`` (NaN if singular; the eigenvalues are printed).
     """
-    n = len(param_names)
+    theta0 = np.asarray(true_tmnre_params, dtype=np.float64).reshape(-1)
+    assert theta0.shape[0] == len(_ORDERED_PRIOR_KEYS), (
+        f"[Fisher] expected {len(_ORDERED_PRIOR_KEYS)} params, got {theta0.shape[0]}"
+    )
+    idx = {name: _ORDERED_PRIOR_KEYS.index(name) for name in varying_params}
+    n = len(varying_params)
+
+    # Only inc/beta enter the waveform through arccos/arcsin, so their TMNRE
+    # coordinate (cos inc, sin beta) has a hard [-1, 1] domain; a step past the
+    # edge yields NaN. Everything else tolerates a small excursion fine.
+    DOMAIN = {"inc": (-1.0, 1.0), "beta": (-1.0, 1.0)}
+    SAFETY = 1e-6
+
+    eps = np.zeros(n)
+    for k, name in enumerate(varying_params):
+        v = theta0[idx[name]]
+        width = None
+        if prior_bounds is not None and name in prior_bounds:
+            lo, hi = prior_bounds[name]
+            width = hi - lo
+        if width and width > 0:  # prefer a prior-width-relative step
+            e = step_frac * width
+        else:  # zero-width / unknown prior → value-fractional (abs step for v==0)
+            e = step_frac * (abs(v) if v != 0 else 1.0)
+        dom = DOMAIN.get(name)
+        if dom is not None:  # keep both v±e strictly inside the domain
+            lo_d, hi_d = dom
+            e = min(e, (v - lo_d) * (1.0 - SAFETY), (hi_d - v) * (1.0 - SAFETY))
+        if e <= 0:
+            raise ValueError(
+                f"[Fisher] non-positive step for '{name}' (value {v} on a domain edge)."
+            )
+        eps[k] = e
+
+    # Batch: column 0 = baseline; then (plus, minus) per varying parameter.
+    n_cols = 1 + 2 * n
+    tmnre_batch = np.repeat(theta0[:, None], n_cols, axis=1)
+    for k, name in enumerate(varying_params):
+        p = idx[name]
+        tmnre_batch[p, 1 + 2 * k]     = theta0[p] + eps[k]
+        tmnre_batch[p, 1 + 2 * k + 1] = theta0[p] - eps[k]
+
+    bbhx_batch = simulator.sampler.samples_to_bbhx_input(
+        tmnre_batch, t_obs_end=simulator.t_obs_end_SI
+    )
+    # Generate on the simulator's own (asd/df) grid. We pin "freqs" explicitly
+    # rather than reuse simulator.generate so the result is immune to any
+    # in-place slicing of waveform_kwargs (e.g. high_freq_only in the emcee
+    # path) that would otherwise desync the waveform grid from asd/df.
+    wf_kw = dict(simulator.waveform_kwargs)
+    wf_kw["freqs"] = simulator.xp.asarray(np.asarray(simulator.freqs))
+    waves = simulator.wfd(*bbhx_batch, **wf_kw)
+    if hasattr(waves, "get"):
+        waves = waves.get()
+    waves = np.asarray(waves)[:, simulator.channels_idx, :]  # (n_cols, n_ch, n_freq)
+
+    # Central-difference Jacobian: J[k] = ∂h/∂θ_k, each (n_ch, n_freq).
+    J = np.empty((n,) + waves.shape[1:], dtype=waves.dtype)
+    for k in range(n):
+        J[k] = (waves[1 + 2 * k] - waves[1 + 2 * k + 1]) / (2.0 * eps[k])
+
+    # Noise weighting 4·df/asd² on high-passed, finite bins (matches compute_snr_fd).
+    freqs = np.asarray(simulator.freqs)
+    asd = np.asarray(simulator.asd)
+    df = simulator.df
+    df_arr = df if np.ndim(df) > 0 else np.full(freqs.shape, df)
+    mask = (freqs >= FMIN_FLOOR) & np.all(asd > 0, axis=0)
+    if freq_mask is not None:
+        mask &= np.asarray(freq_mask, dtype=bool)
+    weight = np.zeros_like(asd)
+    weight[:, mask] = 4.0 * df_arr[mask] / asd[:, mask] ** 2
+
     fisher = np.zeros((n, n))
+    for a in range(n):
+        for b in range(a, n):
+            val = float(np.sum((np.conj(J[a]) * J[b]) * weight).real)
+            fisher[a, b] = val
+            fisher[b, a] = val
 
-    logl_0 = likelihood_fn(true_params_dict)
-    print(f"[FIM] Log-likelihood at expansion point: {logl_0:.4f}")
-    print("[FIM] Computing Fisher Information Matrix ...")
-
-    for i, pi in enumerate(param_names):
-        for j, pj in enumerate(param_names):
-            if j < i:
-                fisher[i, j] = fisher[j, i]
-                continue
-
-            vi = true_params_dict[pi]
-            vj = true_params_dict[pj]
-            di = abs(vi) * delta_frac if vi != 0 else delta_frac
-            dj = abs(vj) * delta_frac if vj != 0 else delta_frac
-
-            if i == j:
-                p_plus  = {**true_params_dict, pi: vi + di}
-                p_minus = {**true_params_dict, pi: vi - di}
-                d2 = (likelihood_fn(p_plus) - 2.0 * logl_0 + likelihood_fn(p_minus)) / di ** 2
-            else:
-                p_pp = {**true_params_dict, pi: vi + di, pj: vj + dj}
-                p_pm = {**true_params_dict, pi: vi + di, pj: vj - dj}
-                p_mp = {**true_params_dict, pi: vi - di, pj: vj + dj}
-                p_mm = {**true_params_dict, pi: vi - di, pj: vj - dj}
-                d2 = (
-                    likelihood_fn(p_pp) - likelihood_fn(p_pm)
-                    - likelihood_fn(p_mp) + likelihood_fn(p_mm)
-                ) / (4.0 * di * dj)
-
-            fisher[i, j] = -d2
-            print(f"  F[{pi}, {pj}] = {fisher[i, j]:.3e}")
-
-    print("[FIM] Fisher Information Matrix:")
+    print("[Fisher] Waveform-derivative Fisher matrix:")
     print(fisher)
-
     try:
         fisher_inv = np.linalg.inv(fisher)
-        param_uncertainties = np.sqrt(np.diag(fisher_inv))
-        print("[FIM] Parameter uncertainties (Cramér-Rao lower bound):")
-        for name, sigma in zip(param_names, param_uncertainties):
+        diag = np.diag(fisher_inv)
+        param_uncertainties = np.sqrt(diag)
+        if np.any(diag < 0):
+            bad = [varying_params[i] for i in np.where(diag < 0)[0]]
+            print(f"[Fisher] WARNING: negative F⁻¹ diagonal for {bad} — "
+                  f"Fisher is ill-conditioned (eigenvalues {np.linalg.eigvalsh(fisher)}).")
+        print("[Fisher] Parameter uncertainties (Cramér-Rao lower bound):")
+        for name, sigma in zip(varying_params, param_uncertainties):
             print(f"  σ({name}) = {sigma:.6e}")
     except np.linalg.LinAlgError:
-        print("[FIM] WARNING: Fisher matrix is singular – cannot invert.")
+        evals = np.linalg.eigvalsh(fisher)
+        print(f"[Fisher] WARNING: Fisher matrix is singular – eigenvalues = {evals}")
         param_uncertainties = np.full(n, np.nan)
 
     return fisher, param_uncertainties
@@ -1359,7 +1429,8 @@ def compute_fisher_prior_bounds(
     varying_params: list,
     fixed_params: list,
     n_sigma: float = 5.0,
-    delta_frac: float = 1e-4,
+    step_frac: float = 1e-3,
+    param_n_sigma: dict = None,
 ) -> dict:
     """Build prior bounds for data generation using the Fisher Information Matrix.
 
@@ -1385,8 +1456,9 @@ def compute_fisher_prior_bounds(
         YAML config.
     n_sigma : float
         Half-width of the generated prior in units of the FIM σ.
-    delta_frac : float
-        Fractional step size passed to :func:`compute_fisher_information_matrix`.
+    step_frac : float
+        Central-difference step (fraction of prior width) passed to
+        :func:`compute_fisher_matrix_waveform_deriv`.
 
     Returns
     -------
@@ -1395,9 +1467,8 @@ def compute_fisher_prior_bounds(
         ``sampler_init_kwargs={"prior_bounds": ...}``.
     """
     import h5py  # h5py is already a project dependency
-    # Lazy imports to avoid circular dependency with pembhb.simulator
+    # Lazy import to avoid circular dependency with pembhb.simulator
     from pembhb.simulator import MBHBSimulatorFD
-    from bbhx.likelihood import Likelihood as BBHXLikelihoodFn
 
     # Load observation first so we can use true values for fixed params.
     print(f"[Fisher] Loading event {event_idx} from {observation_file} ...")
@@ -1405,8 +1476,7 @@ def compute_fisher_prior_bounds(
     with _h5.File(observation_file, "r") as f:
         freqs_obs       = f["frequencies"][:]
         true_params_arr = f["source_parameters"][event_idx]  # shape (11,)
-        wave_fd         = f["wave_fd"][event_idx]            # shape (n_ch, n_freqs)
-        noise_fd        = f["noise_fd"][event_idx]           # shape (n_ch, n_freqs)
+        wave_fd         = f["wave_fd"][event_idx]            # shape (n_ch, n_freqs), noise-free
 
     # Build fixed_values dict from the observation file.
     fixed_values = {
@@ -1425,11 +1495,14 @@ def compute_fisher_prior_bounds(
 
     print("[Fisher] Initializing simulator for FIM evaluation ...")
     fisher_config = copy.deepcopy(datagen_config)
-    fisher_config["backend"] = "cpu"  # likelihood is force_backend='cpu'; keep wfd/freqs consistent
+    fisher_config["backend"] = "cpu"  # CPU keeps wfd/freqs deterministic for the FIM
+    wp = fisher_config["waveform_params"]
     simulator = MBHBSimulatorFD(
         fisher_config,
         sampler_init_kwargs={"prior_bounds": dummy_prior},
         seed=42,
+        n_freq_bins=wp.get("n_freq_bins", 4096),
+        freq_spacing=wp.get("freq_spacing", "linear"),
     )
     frequencies = simulator.freqs
 
@@ -1437,50 +1510,34 @@ def compute_fisher_prior_bounds(
         "[Fisher] Frequency mismatch between observation file and simulator!"
     )
 
-    # Build AET data and PSD.
-    data_fd_complex = wave_fd + noise_fd
-    psd_AE  = simulator.asd ** 2
-    psd_T   = np.ones((1, psd_AE.shape[1]))
-    psd_AET = np.concatenate([psd_AE, psd_T], axis=0)
-    data_T  = np.zeros((1, data_fd_complex.shape[1]), dtype=np.complex128)
-    data_fd = np.concatenate([data_fd_complex, data_T], axis=0)
-
-    print("[Fisher] Creating BBHX likelihood ...")
-    bbhx_ll = BBHXLikelihoodFn(
-        simulator.wfd,
-        frequencies,
-        data_fd,
-        psd_AET,
-        force_backend="cpu",
+    # --- Hard consistency check: the waveform we differentiate must be the one
+    #     that generated the observation. wave_fd in the HDF5 is noise-free
+    #     (noise lives separately in noise_fd), so regenerating h(θ_true) with
+    #     the simulator's waveform_kwargs must reproduce it. A grid / modes /
+    #     length / t_obs mismatch produces an order-1 discrepancy here.
+    true_full = np.asarray(true_params_arr, dtype=np.float64).reshape(-1, 1)
+    bbhx_true = simulator.sampler.samples_to_bbhx_input(
+        true_full, t_obs_end=simulator.t_obs_end_SI
     )
-
-    # All parameters not in varying_params are fixed to the true observed value.
-    all_fixed = {
-        key: float(true_params_arr[_ORDERED_PRIOR_KEYS.index(key)])
-        for key in _ORDERED_PRIOR_KEYS
-        if key not in varying_params
-    }
-
-    def _log_likelihood(params_dict: dict) -> float:
-        """Evaluate BBHX log-likelihood for the varying parameters only."""
-        tmnre = np.array(
-            [params_dict[k] if k in params_dict else all_fixed[k]
-             for k in _ORDERED_PRIOR_KEYS],
-            dtype=np.float64,
-        ).reshape(-1, 1)
-        bbhx_p = simulator.sampler.samples_to_bbhx_input(
-            tmnre, t_obs_end=simulator.t_obs_end_SI
+    h_true = simulator.generate(bbhx_true)[0]  # (n_ch, n_freq)
+    rel_diff = np.linalg.norm(h_true - wave_fd) / (np.linalg.norm(wave_fd) + 1e-30)
+    if rel_diff > 1e-2:
+        raise AssertionError(
+            f"[Fisher] Regenerated waveform does not match stored wave_fd "
+            f"(relative diff {rel_diff:.2e} > 1e-2). The simulator's "
+            f"waveform_kwargs / grid / modes are inconsistent with how the "
+            f"observation was generated."
         )
-        wf_kw = simulator.waveform_kwargs.copy()
-        return float(bbhx_ll.get_ll(bbhx_p, **wf_kw)[0])
+    print(f"[Fisher] Consistency check passed: ‖h(θ_true) − wave_fd‖/‖wave_fd‖ "
+          f"= {rel_diff:.2e}.")
 
-    # FIM computation.
-    true_varying = {
-        k: float(true_params_arr[_ORDERED_PRIOR_KEYS.index(k)])
-        for k in varying_params
-    }
-    _, param_uncertainties = compute_fisher_information_matrix(
-        _log_likelihood, true_varying, varying_params, delta_frac=delta_frac
+    # FIM via waveform derivatives (noise-independent, PSD-by-construction).
+    _, param_uncertainties = compute_fisher_matrix_waveform_deriv(
+        simulator,
+        true_params_arr,
+        varying_params,
+        step_frac=step_frac,
+        prior_bounds=datagen_config["prior"],
     )
 
     # Assemble final prior bounds.
@@ -1491,16 +1548,18 @@ def compute_fisher_prior_bounds(
         prior_bounds[key] = [val, val]
 
     # FIM-based bounds for varying parameters.
+    param_n_sigma = param_n_sigma or {}
     for key, sigma in zip(varying_params, param_uncertainties):
         true_val = float(true_params_arr[_ORDERED_PRIOR_KEYS.index(key)])
+        n_sig_eff = param_n_sigma.get(key, n_sigma)
         if np.isfinite(sigma):
-            lo = float(true_val - n_sigma * sigma)
-            hi = float(true_val + n_sigma * sigma)
+            lo = float(true_val - n_sig_eff * sigma)
+            hi = float(true_val + n_sig_eff * sigma)
         else:
             print(f"[Fisher] WARNING: σ({key}) is NaN – keeping datagen_config bounds.")
             lo, hi = datagen_config["prior"][key]
         prior_bounds[key] = [lo, hi]
-        print(f"[Fisher] {key}: true={true_val:.6e}, σ={sigma:.3e} → [{lo:.6e}, {hi:.6e}]")
+        print(f"[Fisher] {key}: true={true_val:.6e}, σ={sigma:.3e}, n_sigma={n_sig_eff} → [{lo:.6e}, {hi:.6e}]")
 
     print(f"[Fisher] Final prior bounds: {prior_bounds}")
     return prior_bounds
