@@ -307,11 +307,15 @@ class SequentialTrainer:
                 n_freqs = ae_conf.get("n_freqs", 4096)
                 print(f"[autoencoder] warning: failed to read freqs from data module "
                       f"({e}); falling back to ae_conf.n_freqs={n_freqs}.")
-            if freqs is not None:
-                idx_lo, idx_hi = resolve_loss_band(freqs, ae_conf)
+            compressor_window = ae_conf.get("compressor_window", None)
+            if compressor_window is None:
+                if freqs is not None:
+                    idx_lo, idx_hi = resolve_loss_band(freqs, ae_conf)
+                else:
+                    idx_lo = ae_conf.get("idx_lowerbound", None)
+                    idx_hi = ae_conf.get("idx_upperbound", None)
             else:
-                idx_lo = ae_conf.get("idx_lowerbound", None)
-                idx_hi = ae_conf.get("idx_upperbound", None)
+                idx_lo, idx_hi = None, None
             ae_conf["n_freqs"] = n_freqs
             ae_conf["idx_lowerbound"] = idx_lo
             ae_conf["idx_upperbound"] = idx_hi
@@ -338,7 +342,8 @@ class SequentialTrainer:
                 amplitude_normalise=ae_conf.get("amplitude_normalise", False),
                 prior_bounds=prior_bounds,
                 whiten=ae_conf.get("whiten", True),
-                subtract_mean_whitened=ae_conf.get("subtract_mean_whitened", False)
+                subtract_mean_whitened=ae_conf.get("subtract_mean_whitened", False),
+                compressor_window=compressor_window,
             )
             autoencoder = autoencoder.to(device)
 

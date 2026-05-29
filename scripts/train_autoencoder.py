@@ -36,7 +36,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, Learning
 from pembhb import ROOT_DIR, DATA_ROOT_DIR, set_precision
 from pembhb import utils
 from pembhb.data import MBHBDataModule
-from pembhb.autoencoder import DenoisingAutoencoder
+from pembhb.autoencoder import DenoisingAutoencoder, resolve_loss_band
 
 
 def load_prior_bounds(dataset_path: str) -> dict:
@@ -94,13 +94,28 @@ def main():
     )
     data_module.setup(stage="fit")
 
+    # Auto-derive n_freqs from the HDF5 grid (same as tmnre.py does).
+    freqs = data_module.get_freqs()
+    n_freqs = len(freqs)
+    if "n_freqs" in ae_conf and ae_conf["n_freqs"] != n_freqs:
+        print(f"[train_autoencoder] auto-derived n_freqs={n_freqs} from HDF5 "
+              f"(config had {ae_conf['n_freqs']}); using HDF5 value.")
+
+    # Resolve fmin_loss / fmax_loss (Hz) → idx_lowerbound / idx_upperbound.
+    # Only relevant when compressor_window is None; ignored otherwise.
+    compressor_window = ae_conf.get("compressor_window", None)
+    if compressor_window is None:
+        idx_lo, idx_hi = resolve_loss_band(freqs, ae_conf)
+    else:
+        idx_lo, idx_hi = None, None
+
     hidden_channels = tuple(ae_conf.get("hidden_channels", [32, 64, 128, 256, 256]))
     sizes = tuple(ae_conf.get("sizes", [16, 32, 64, 128, 256]))
     down_sampling = tuple(ae_conf.get("down_sampling", [4, 8, 8, 8]))
 
     model = DenoisingAutoencoder(
         n_channels=ae_conf.get("n_channels", 2),
-        n_freqs=ae_conf.get("n_freqs", 4096),
+        n_freqs=n_freqs,
         architecture=ae_conf.get("architecture", "conv"),
         bottleneck_dim=ae_conf.get("bottleneck_dim", 128),
         hidden_channels=hidden_channels,
@@ -118,12 +133,13 @@ def main():
         representation=ae_conf.get("representation", "amp_phase"),
         high_freq_only=ae_conf.get("high_freq_only", False),
         freq_split_idx=ae_conf.get("freq_split_idx", 2048),
-        idx_lowerbound=ae_conf.get("idx_lowerbound", None),
-        idx_upperbound=ae_conf.get("idx_upperbound", None),
+        idx_lowerbound=idx_lo,
+        idx_upperbound=idx_hi,
         amplitude_normalise=ae_conf.get("amplitude_normalise", True),
         prior_bounds=prior_bounds,
         whiten=ae_conf.get("whiten", True),
-        subtract_mean_whitened=ae_conf.get("subtract_mean_whitened", False)
+        subtract_mean_whitened=ae_conf.get("subtract_mean_whitened", False),
+        compressor_window=compressor_window,
     )
     model = model.to(device)
 

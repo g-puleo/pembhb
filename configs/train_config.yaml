@@ -81,12 +81,15 @@ architecture:
       decoder_post_fc_bn: False
       subtract_mean_whitened: True
       #high_freq_only: False
+      compressor_window: 7 # defines the width of the moving average taken over freq bins
+      ae_output_target: "compressed"
       # Reconstruction-loss band (Hz). Encoder still sees the full input;
       # the decoder/loss are restricted to [fmin_loss, fmax_loss]. Omit
       # either side for "no cut on that side". Legacy keys
       # idx_lowerbound/idx_upperbound (bin indices) still work as a fallback.
-      fmin_loss: 2.55e-3   # was idx_lowerbound: 2048 on the old 4096-bin grid
+      # fmin_loss: 2.55e-3
       # fmax_loss: 1.0e-2
+
       #freq_split_idx: 2048
       # Apply ASD whitening before feeding the AE.
       # When false, the AE sees raw (un-whitened) FD amplitudes — the
