@@ -255,6 +255,30 @@ class ConvDecoder(nn.Module):
         return x
 
 
+
+class FreqBinCompressor(nn.Module): 
+
+    def __init__(self, n_window) : 
+        super().__init__() 
+        self.n_window = n_window
+        
+    def forward(self, x):
+
+        B, C, N = x.shape
+        n_in_freqs = N
+        n_out_freqs = N // self.n_window + (int(N % self.n_window != 0))  # ceil division
+        W = self.n_window
+        # Pad so N is a multiple of W
+        remainder = N % W
+        if remainder != 0:
+            x = F.pad(x, (0, W - remainder))  # zero-pad last dim
+        N_padded = x.shape[-1]
+        x = x.view(B, C, N_padded // W, W)   # (B, C, n_out, W)
+        mean = x.mean(dim=-1)                  # (B, C, n_out)
+        std  = x.std(dim=-1, correction=1)     # (B, C, n_out)
+        return torch.cat([mean, std], dim=1)   # (B, 2*C, n_out)
+
+
 # ---------------------------------------------------------------------------
 # Unet-based Encoder / Decoder (with skip connections) - LEGACY
 # ---------------------------------------------------------------------------
@@ -400,6 +424,10 @@ class DenoisingAutoencoder(LightningModule):
         amplitude_normalise: bool = False,
         subtract_mean_whitened: bool = False,
         whiten: bool = True,
+        # --- Frequency-bin compression ---
+        # Window width for non-overlapping block average+std before the encoder.
+        # None = disabled (backward compatible). When set, band masking is ignored.
+        compressor_window: int = None,
         # --- Prior bounds (for provenance tracking) ---
         prior_bounds: dict = None,
     ):
@@ -439,56 +467,75 @@ class DenoisingAutoencoder(LightningModule):
                 "subtract_mean_whitened=True requires amplitude_normalise=True "
                 "(the mean is fit alongside the max in fit_amplitude_normalisation)."
             )
-        # Resolve old (high_freq_only/freq_split_idx) and new
-        # (idx_lowerbound/idx_upperbound) APIs into a single internal
-        # representation. Old takes precedence only if explicitly enabled.
-        if high_freq_only:
-            if idx_lowerbound is not None or idx_upperbound is not None:
-                raise ValueError(
-                    "Cannot mix deprecated high_freq_only with new "
-                    "idx_lowerbound/idx_upperbound; use only the new API."
-                )
-            warnings.warn(
-                "high_freq_only/freq_split_idx are deprecated; "
-                "use idx_lowerbound/idx_upperbound instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            idx_lo = freq_split_idx
-            idx_hi = n_freqs
-        else:
-            idx_lo = 0 if idx_lowerbound is None else int(idx_lowerbound)
-            idx_hi = n_freqs if idx_upperbound is None else int(idx_upperbound)
-
-        if not (0 <= idx_lo < idx_hi <= n_freqs):
-            raise ValueError(
-                f"Invalid band mask: idx_lowerbound={idx_lo}, "
-                f"idx_upperbound={idx_hi}, n_freqs={n_freqs}. "
-                f"Required: 0 <= lo < hi <= n_freqs."
-            )
-
-        self.idx_lowerbound = idx_lo
-        self.idx_upperbound = idx_hi
-        self._mask_active = (idx_lo > 0) or (idx_hi < n_freqs)
-        # Back-compat attributes (read by diagnostic / visualisation scripts).
-        self.high_freq_only = self._mask_active
-        self.freq_split_idx = idx_lo
-
-        n_freqs_target = idx_hi - idx_lo
-        if self._mask_active:
-            print(
-                f"[AutoEncoder] Band mask active: reconstructing bins "
-                f"[{idx_lo}:{idx_hi}] ({n_freqs_target} bins out of {n_freqs})"
-            )
-
         # Complex → real representation doubles the channels
         n_real_channels = n_channels * 2
+        self.n_real_channels = n_real_channels
+
+        if compressor_window is not None:
+            self.compressor = FreqBinCompressor(compressor_window)
+            n_encoder_channels = n_real_channels * 2  # mean + std doubles channels
+            n_encoder_freqs = int(np.ceil(n_freqs / compressor_window))
+            n_freqs_target = n_encoder_freqs
+            self.idx_lowerbound = 0
+            self.idx_upperbound = n_encoder_freqs
+            self._mask_active = False
+            self.high_freq_only = False
+            self.freq_split_idx = 0
+            print(
+                f"[AutoEncoder] FreqBinCompressor active: {n_freqs} → "
+                f"{n_encoder_freqs} bins (window={compressor_window}), "
+                f"{n_real_channels} → {n_encoder_channels} channels"
+            )
+        else:
+            self.compressor = None
+            n_encoder_channels = n_real_channels
+            n_encoder_freqs = n_freqs
+            # Resolve old (high_freq_only/freq_split_idx) and new
+            # (idx_lowerbound/idx_upperbound) APIs into a single internal
+            # representation. Old takes precedence only if explicitly enabled.
+            if high_freq_only:
+                if idx_lowerbound is not None or idx_upperbound is not None:
+                    raise ValueError(
+                        "Cannot mix deprecated high_freq_only with new "
+                        "idx_lowerbound/idx_upperbound; use only the new API."
+                    )
+                warnings.warn(
+                    "high_freq_only/freq_split_idx are deprecated; "
+                    "use idx_lowerbound/idx_upperbound instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                idx_lo = freq_split_idx
+                idx_hi = n_freqs
+            else:
+                idx_lo = 0 if idx_lowerbound is None else int(idx_lowerbound)
+                idx_hi = n_freqs if idx_upperbound is None else int(idx_upperbound)
+
+            if not (0 <= idx_lo < idx_hi <= n_freqs):
+                raise ValueError(
+                    f"Invalid band mask: idx_lowerbound={idx_lo}, "
+                    f"idx_upperbound={idx_hi}, n_freqs={n_freqs}. "
+                    f"Required: 0 <= lo < hi <= n_freqs."
+                )
+
+            self.idx_lowerbound = idx_lo
+            self.idx_upperbound = idx_hi
+            self._mask_active = (idx_lo > 0) or (idx_hi < n_freqs)
+            self.high_freq_only = self._mask_active
+            self.freq_split_idx = idx_lo
+
+            n_freqs_target = idx_hi - idx_lo
+            if self._mask_active:
+                print(
+                    f"[AutoEncoder] Band mask active: reconstructing bins "
+                    f"[{idx_lo}:{idx_hi}] ({n_freqs_target} bins out of {n_freqs})"
+                )
 
         if architecture == "conv":
             # Pure convolutional autoencoder (no skip connections)
             self.encoder = ConvEncoder(
-                n_in_channels=n_real_channels,
-                n_freqs=n_freqs,  # encoder always sees full input
+                n_in_channels=n_encoder_channels,
+                n_freqs=n_encoder_freqs,
                 bottleneck_dim=bottleneck_dim,
                 hidden_channels=hidden_channels,
                 kernel_size=kernel_size,
@@ -497,8 +544,8 @@ class DenoisingAutoencoder(LightningModule):
                 residual=residual,
             )
             self.decoder = ConvDecoder(
-                n_out_channels=n_real_channels,
-                n_freqs=n_freqs_target,  # decoder outputs target size
+                n_out_channels=n_encoder_channels,
+                n_freqs=n_freqs_target,
                 bottleneck_dim=bottleneck_dim,
                 hidden_channels=hidden_channels,
                 kernel_size=kernel_size,
@@ -529,8 +576,11 @@ class DenoisingAutoencoder(LightningModule):
 
         # Optional global amplitude scale: scalar max over (samples, channels,
         # freqs) of the whitened clean training signal. Populated by
-        # fit_amplitude_normalisation(). Initialised to 1 (identity).
-        self.register_buffer("amplitude_scale", torch.tensor(1.0, dtype=get_torch_dtype()))
+        # fit_white_normalisation(). Initialised to 1 (identity).
+        # When compression is active, amplitude_scale covers the mean channels
+        # and amplitude_scale_std covers the std channels independently.
+        self.register_buffer("amplitude_scale",     torch.tensor(1.0, dtype=get_torch_dtype()))
+        self.register_buffer("amplitude_scale_std", torch.tensor(1.0, dtype=get_torch_dtype()))
         self.register_buffer("mean_whitened", torch.zeros(n_channels * 2, n_freqs, dtype=get_torch_dtype()))
         
         self.register_buffer(
@@ -704,22 +754,22 @@ class DenoisingAutoencoder(LightningModule):
                 "amplitude_normalise is only supported with representation='real_imag'."
             )
         device = next(self.parameters()).device
-        max_val = 0.0
         n_samples = 0
         running_sum = torch.zeros(
             self.n_channels * 2, self.n_freqs, device=device,
             dtype=self.mean_whitened.dtype,
         )
+
+        # --- Pass 1: accumulate mean_whitened on the full grid ---
         with torch.no_grad():
             for batch in dataloader:
                 wave_fd = batch["wave_fd"].to(device)
                 wave_w = wave_fd / self.whitening
                 real = self._complex_to_real(wave_w)  # (B, 2C, F)
-                max_val = max(max_val, real.abs().max().item())
                 n_samples += real.shape[0]
                 if self.subtract_mean_whitened:
                     running_sum += real.sum(dim=0)
-        
+
         if self.subtract_mean_whitened:
             self.mean_whitened.copy_(running_sum / n_samples)
             print(
@@ -727,10 +777,31 @@ class DenoisingAutoencoder(LightningModule):
                 f"clean samples: mean_whitened range=[{self.mean_whitened.min().item():.4e}, "
                 f"{self.mean_whitened.max().item():.4e}]"
             )
-        self.amplitude_scale.fill_(max_val)
+
+        # --- Pass 2: compute amplitude scale(s) after mean-subtraction and compression ---
+        max_mean = 0.0
+        max_std  = 0.0
+        with torch.no_grad():
+            for batch in dataloader:
+                wave_fd = batch["wave_fd"].to(device)
+                wave_w = wave_fd / self.whitening
+                real = self._complex_to_real(wave_w)  # (B, 2C, F)
+                if self.subtract_mean_whitened:
+                    real = real - self.mean_whitened
+                if self.compressor is not None:
+                    real = self.compressor(real)        # (B, 4C, n_compressed)
+                    C = self.n_real_channels
+                    max_mean = max(max_mean, real[:, :C, :].abs().max().item())
+                    max_std  = max(max_std,  real[:, C:, :].abs().max().item())
+                else:
+                    max_mean = max(max_mean, real.abs().max().item())
+
+        self.amplitude_scale.fill_(max_mean)
+        self.amplitude_scale_std.fill_(max_std if self.compressor is not None else 1.0)
         print(
-            f"[AutoEncoder] amplitude scale fitted on {n_samples} whitened "
-            f"clean samples: amplitude_scale={max_val:.4e}"
+            f"[AutoEncoder] amplitude scales fitted on {n_samples} whitened clean samples: "
+            f"amplitude_scale={max_mean:.4e}"
+            + (f", amplitude_scale_std={max_std:.4e}" if self.compressor is not None else "")
         )
 
     def _denormalize_amplitude(self, x_real: torch.Tensor) -> torch.Tensor:
@@ -793,18 +864,27 @@ class DenoisingAutoencoder(LightningModule):
         """
         if self.whiten:
             z_whitened = z / self.whitening
-
             real = self._complex_to_real(z_whitened)
             if self.amplitude_normalise:
                 if self.subtract_mean_whitened:
                     mean_whitened = self._get_mean_whitened_for(z.shape[-1])
                     real = real - mean_whitened
-                real = real / self.amplitude_scale
-            
+                if self.compressor is not None:
+                    real = self.compressor(real)   # (B, 2*n_real_channels, n_compressed)
+                    C = self.n_real_channels
+                    real = torch.cat([
+                        real[:, :C, :] / self.amplitude_scale,
+                        real[:, C:, :] / self.amplitude_scale_std,
+                    ], dim=1)
+                else:
+                    real = real / self.amplitude_scale
+            elif self.compressor is not None:
+                real = self.compressor(real)
             return real
-
-        else: 
+        else:
             real = self._complex_to_real(z)
+            if self.compressor is not None:
+                real = self.compressor(real)
             return self._normalize(real)
     # ------------------------------------------------------------------
     # Lightning training / validation steps
