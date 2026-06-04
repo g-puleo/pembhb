@@ -15,22 +15,24 @@ waveform_params:
   # Upper edge of the FD grid (Hz). When freq_spacing="linear", the grid is
   # np.arange(fmin, fmax, downsamplefactor / T_obs).
 
-  fmax: 1.0e-1         
-  downsamplefactor: 1    # thin the linear grid;
+  fmax: 2.0e-2
+  downsamplefactor: 3    # 4012 bins on 1-week T_obs (8D study)
   #psd_fmin_mask: 5.0e-5 # restore the low freq cutoff. 
   
 prior:
-  "logMchirp": [5.249960881397025, 5.250039118602975]
-  "q":         [2.996074595121879, 3.003925404878121]
+  # Pinned to the injection truth for observation generation (simulate_data.py).
+  # Fisher overrides these for the varying params at TMNRE round 1 anyway.
+  "logMchirp": [5.25, 5.25]
+  "q":         [3.00, 3.00]
   "chi1":      [0.0, 0.0]
   "chi2":      [0.0, 0.0]
   "dist":      [10.0, 10.0]                                      # Gpc (sampled uniformly in dist^3)
   "phi":       [0.0, 0.0]                                        # phase at coalescence
   "inc":       [0.5, 0.5]                                        # cos inclination
-  "lambda":    [3.1124873962687998, 3.16751281353955]            # ecliptic longitude
-  "beta":      [0.18623696704815745, 0.21376303891230702]        # sin ecliptic latitude
+  "lambda":    [3.14159265358979, 3.14159265358979]            # ecliptic longitude
+  "beta":      [0.2, 0.2]        # sin ecliptic latitude
   "psi":       [1.0,1.0]                                        # polarization angle in [0, pi]
-  "Deltat":    [-2.5000186218908196, -2.4999813781091804]        # t_merger from end of observation (days)
+  "Deltat":    [-2.50, -2.50]        # t_merger from end of observation (days)
 
   # "logMchirp": [5.25, 5.25]
   # "q":         [3.00, 3.00]

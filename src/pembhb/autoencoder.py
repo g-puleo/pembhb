@@ -428,6 +428,12 @@ class DenoisingAutoencoder(LightningModule):
         # Window width for non-overlapping block average+std before the encoder.
         # None = disabled (backward compatible). When set, band masking is ignored.
         compressor_window: int = None,
+        # When compression is active the encoder always sees both the per-block
+        # mean and std channels. ``reconstruct_std=False`` makes the decoder
+        # output (and the MSE target) only the mean channels, so the std is
+        # summarised by the bottleneck but never reconstructed. Requires
+        # compressor_window to be set.
+        reconstruct_std: bool = True,
         # --- Prior bounds (for provenance tracking) ---
         prior_bounds: dict = None,
     ):
@@ -462,6 +468,12 @@ class DenoisingAutoencoder(LightningModule):
         self.amplitude_normalise = amplitude_normalise
         self.whiten = whiten
         self.subtract_mean_whitened = subtract_mean_whitened
+        self.reconstruct_std = reconstruct_std
+        if not reconstruct_std and compressor_window is None:
+            raise ValueError(
+                "reconstruct_std=False requires compressor_window to be set "
+                "(there are no std channels to drop without compression)."
+            )
         if subtract_mean_whitened and not amplitude_normalise:
             raise ValueError(
                 "subtract_mean_whitened=True requires amplitude_normalise=True "
@@ -474,6 +486,9 @@ class DenoisingAutoencoder(LightningModule):
         if compressor_window is not None:
             self.compressor = FreqBinCompressor(compressor_window)
             n_encoder_channels = n_real_channels * 2  # mean + std doubles channels
+            # Decoder reconstructs all 4C channels, or only the 2C mean channels
+            # when reconstruct_std=False.
+            n_decoder_channels = n_encoder_channels if reconstruct_std else n_real_channels
             n_encoder_freqs = int(np.ceil(n_freqs / compressor_window))
             n_freqs_target = n_encoder_freqs
             self.idx_lowerbound = 0
@@ -484,11 +499,14 @@ class DenoisingAutoencoder(LightningModule):
             print(
                 f"[AutoEncoder] FreqBinCompressor active: {n_freqs} → "
                 f"{n_encoder_freqs} bins (window={compressor_window}), "
-                f"{n_real_channels} → {n_encoder_channels} channels"
+                f"{n_real_channels} → {n_encoder_channels} channels; "
+                f"decoder reconstructs {n_decoder_channels} channels "
+                f"(reconstruct_std={reconstruct_std})"
             )
         else:
             self.compressor = None
             n_encoder_channels = n_real_channels
+            n_decoder_channels = n_real_channels
             n_encoder_freqs = n_freqs
             # Resolve old (high_freq_only/freq_split_idx) and new
             # (idx_lowerbound/idx_upperbound) APIs into a single internal
@@ -544,7 +562,7 @@ class DenoisingAutoencoder(LightningModule):
                 residual=residual,
             )
             self.decoder = ConvDecoder(
-                n_out_channels=n_encoder_channels,
+                n_out_channels=n_decoder_channels,
                 n_freqs=n_freqs_target,
                 bottleneck_dim=bottleneck_dim,
                 hidden_channels=hidden_channels,
@@ -917,6 +935,10 @@ class DenoisingAutoencoder(LightningModule):
         """
         if self._mask_active:
             return clean_norm[:, :, self.idx_lowerbound:self.idx_upperbound]
+        if self.compressor is not None and not self.reconstruct_std:
+            # Drop the std channels (last n_real_channels) from the target so
+            # the MSE only penalises the per-block mean reconstruction.
+            return clean_norm[:, :self.n_real_channels, :]
         return clean_norm
 
     def _step(self, batch, prefix: str):
@@ -962,6 +984,114 @@ class DenoisingAutoencoder(LightningModule):
                 "monitor": "val_loss",
             },
         }
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic plot for the block-compression autoencoder
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def plot_compression_reconstruction(
+    ae: "DenoisingAutoencoder",
+    batch: dict,
+    sample_idx: int = 0,
+    freqs: np.ndarray = None,
+    save_path: str = None,
+):
+    """Overlay original / target / reconstruction for a block-compression AE.
+
+    Tailored to ``compressor_window`` runs (and especially
+    ``reconstruct_std=False``). Everything is shown in the **mean** channels,
+    in the exact normalised, block-averaged space the MSE loss is computed in
+    — i.e. ``preprocess`` output, no inversion to physical units:
+
+    * **original**       — encoder input ``preprocess(wave + noise)``, mean channels.
+                           This is the whitened, mean-subtracted, block-averaged
+                           signal that is fed to the encoder.
+    * **target**         — ``_get_target(preprocess(wave))``, mean channels
+                           (the clean signal the decoder is trained to match).
+    * **reconstruction** — decoder output ``ae(encoder_input)``, mean channels.
+
+    The std channels are not plotted: with ``reconstruct_std=False`` they are
+    not reconstructed, and with ``reconstruct_std=True`` they live in the
+    second half of the channel axis and are summarised separately.
+
+    :param ae: a trained :class:`DenoisingAutoencoder` with ``compressor`` active.
+    :param batch: dict with ``wave_fd`` and ``noise_fd`` complex tensors (B, C, F).
+    :param sample_idx: which sample in the batch to plot.
+    :param freqs: optional full positive-frequency array (length ``n_freqs``);
+        if given, the x-axis is the per-block mean frequency [Hz], else block index.
+    :param save_path: if given, the figure is written here (format inferred from
+        the extension) at dpi=150.
+    :return: the matplotlib Figure.
+    """
+    import matplotlib.pyplot as plt  # lazy: keep core import light
+
+    if ae.compressor is None:
+        raise ValueError(
+            "plot_compression_reconstruction requires an AE with an active "
+            "compressor (compressor_window set); got compressor=None."
+        )
+
+    ae.eval()
+    device = next(ae.parameters()).device
+    wave_fd = batch["wave_fd"].to(device)
+    noise_fd = batch["noise_fd"].to(device)
+
+    enc_in = ae.preprocess(wave_fd + noise_fd)      # (B, 4C, n_blk) — encoder input
+    target = ae._get_target(ae.preprocess(wave_fd))  # (B, 2C or 4C, n_blk)
+    rec = ae(enc_in)                                 # (B, 2C or 4C, n_blk)
+
+    n_mean = ae.n_real_channels                      # # of mean channels (= 2 * n_channels)
+    orig = enc_in[sample_idx, :n_mean].cpu().numpy()    # (n_mean, n_blk)
+    tgt = target[sample_idx, :n_mean].cpu().numpy()
+    recon = rec[sample_idx, :n_mean].cpu().numpy()
+    n_blk = orig.shape[-1]
+
+    # x-axis: per-block mean frequency if a freq grid is supplied, else block index.
+    if freqs is not None:
+        W = ae.compressor.n_window
+        freqs = np.asarray(freqs)
+        x = np.array([
+            freqs[j * W:(j + 1) * W].mean() if j * W < len(freqs) else np.nan
+            for j in range(n_blk)
+        ])
+        xlabel = "per-block mean frequency [Hz]"
+    else:
+        x = np.arange(n_blk)
+        xlabel = "block index"
+
+    # Channel layout: mean channels are [comp0_ch0..comp0_ch{nc-1}, comp1_ch0..].
+    n_phys = ae.n_channels
+    comp_names = ("Re", "Im") if ae.representation == "real_imag" else ("logAmp", "Phase")
+    phys_names = ["A", "E", "T"][:n_phys] if n_phys <= 3 else [f"ch{c}" for c in range(n_phys)]
+
+    fig, axes = plt.subplots(
+        2, n_phys, figsize=(5 * n_phys, 7), sharex=True, squeeze=False
+    )
+    for comp in range(2):           # 0 -> Re/logAmp, 1 -> Im/Phase
+        for c in range(n_phys):     # physical channel A/E/(T)
+            ch = comp * n_phys + c  # index into the mean-channel block
+            ax = axes[comp][c]
+            ax.plot(x, orig[ch], color="0.6", lw=1.0, label="original (encoder input)")
+            ax.plot(x, tgt[ch], color="tab:blue", lw=1.2, label="target")
+            ax.plot(x, recon[ch], color="tab:red", lw=1.0, ls="--", label="reconstruction")
+            ax.set_title(f"{comp_names[comp]}[{phys_names[c]}] (mean)")
+            ax.grid(alpha=0.3)
+            if comp == 1:
+                ax.set_xlabel(xlabel)
+            if c == 0:
+                ax.set_ylabel("normalised amplitude")
+    axes[0][0].legend(fontsize=8, loc="best")
+    fig.suptitle(
+        f"Block-compression AE — sample {sample_idx} "
+        f"(reconstruct_std={ae.reconstruct_std}, window={ae.compressor.n_window})",
+        fontsize=11,
+    )
+    fig.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150)
+    return fig
 
 
 # ---------------------------------------------------------------------------

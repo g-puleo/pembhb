@@ -1760,10 +1760,41 @@ class JointAEInferenceNetwork(LightningModule):
             decoder_post_fc_bn = any(
                 k.endswith("decoder.post_fc_norm.weight") for k in state_dict
             )
+            # Infer block-compression activity + reconstruct_std from the
+            # state dict (the config value can be stale, e.g. an old joint
+            # checkpoint whose train_conf lists compressor_window but whose
+            # weights predate compressor support). The compressor doubles the
+            # encoder's input channels (mean+std), so a compressed AE has
+            # encoder.conv.0 with 2*n_real_channels inputs; reconstruct_std is
+            # read off the decoder's final-conv output-channel count.
+            architecture = ae_conf.get("architecture", "conv")
+            compressor_window = None
+            reconstruct_std = True
+            if architecture == "conv":
+                n_real_channels = 2 * ae_conf["n_channels"]
+                enc_w = state_dict.get("encoder_model.encoder.conv.0.weight")
+                if enc_w is not None and enc_w.shape[1] == 2 * n_real_channels:
+                    compressor_window = ae_conf.get("compressor_window", None)
+                    if compressor_window is None:
+                        raise ValueError(
+                            "Checkpoint encoder expects compressed input "
+                            "(2*n_real_channels) but train_conf has no "
+                            "compressor_window to reconstruct the frequency grid."
+                        )
+                    dec_idxs = [
+                        int(k.split(".")[3])
+                        for k in state_dict
+                        if k.startswith("encoder_model.decoder.conv.")
+                        and k.endswith(".weight")
+                    ]
+                    dec_out = state_dict[
+                        f"encoder_model.decoder.conv.{max(dec_idxs)}.weight"
+                    ].shape[0]
+                    reconstruct_std = (dec_out == 2 * n_real_channels)
             dummy_encoder = DenoisingAutoencoder(
                 n_channels=ae_conf["n_channels"],
                 n_freqs=ae_conf["n_freqs"],
-                architecture=ae_conf.get("architecture", "conv"),
+                architecture=architecture,
                 bottleneck_dim=ae_conf["bottleneck_dim"],
                 hidden_channels=ae_conf["hidden_channels"],
                 kernel_size=ae_conf["kernel_size"],
@@ -1778,7 +1809,9 @@ class JointAEInferenceNetwork(LightningModule):
                 idx_upperbound=ae_conf.get("idx_upperbound", None),
                 whiten=ae_conf.get("whiten", True),
                 amplitude_normalise=ae_conf.get("amplitude_normalise", False),
-                subtract_mean_whitened=ae_conf.get("subtract_mean_whitened", False)
+                subtract_mean_whitened=ae_conf.get("subtract_mean_whitened", False),
+                compressor_window=compressor_window,
+                reconstruct_std=reconstruct_std,
             )
 
         norm = hp["normalisation"]
@@ -1804,7 +1837,8 @@ class JointAEInferenceNetwork(LightningModule):
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         # Old checkpoints predate the baseline-pipeline buffers; their identity-init
         # defaults (mean_vec=0, global_scale_factor=1) are correct for whiten=True.
-        allowed_missing = {"encoder_model.mean_vec", "encoder_model.global_scale_factor", "encoder_model.mean_whitened"}
+        allowed_missing = {"encoder_model.mean_vec", "encoder_model.global_scale_factor", "encoder_model.mean_whitened",
+                           "encoder_model.amplitude_scale_std"}
         unexpected_real = set(unexpected)
         missing_real = set(missing) - allowed_missing
         if missing_real or unexpected_real:

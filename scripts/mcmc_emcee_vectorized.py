@@ -122,6 +122,15 @@ def main():
     print("Initializing simulator...")
     wp = datagen_config["waveform_params"]
     datagen_config["backend"] = "cpu"  # CuPy JIT incompatible with CUDA 12.4
+    # Make the simulator grid consistent with the observation, independent of
+    # datagen_config's fmin/fmax/downsamplefactor (which may be set for a
+    # different experiment). The grid is fully determined by the obs frequencies.
+    _obs_freqs = np.asarray(loaded_dataset["frequencies"], dtype=np.float64)
+    _T = wp["duration"] * 7 * 86400
+    _df_obs = float(_obs_freqs[1] - _obs_freqs[0])
+    wp["fmin"] = float(_obs_freqs[0])
+    wp["fmax"] = float(_obs_freqs[-1]) + _df_obs   # +df so arange includes the last bin
+    wp["downsamplefactor"] = int(round(_df_obs * _T))
     simulator = MBHBSimulatorFD(
         datagen_config,
         sampler_init_kwargs={'prior_bounds': prior_bounds_dummy},

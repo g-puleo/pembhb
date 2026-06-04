@@ -1335,6 +1335,28 @@ def compute_fisher_matrix_waveform_deriv(
     DOMAIN = {"inc": (-1.0, 1.0), "beta": (-1.0, 1.0)}
     SAFETY = 1e-6
 
+    # Per-parameter absolute default step (TMNRE coords) used when no usable
+    # prior width is supplied. These are chosen small enough to stay in the
+    # linear-Taylor regime for a 1-week MBHB waveform, so the central-difference
+    # Jacobian is an actual derivative — independent of whatever the user's
+    # current `datagen_config["prior"]` happens to look like. Previously the
+    # fallback was `step_frac * |v|`, which produced grotesquely large steps
+    # (e.g. Deltat at -2.5 days → h=2.5e-3 days ≈ 216 s, hundreds of GW cycles
+    # in the band) and silently corrupted the Fisher diagonals.
+    ABSOLUTE_STEP_DEFAULTS = {
+        "logMchirp": 1.0e-7,   # log10(Mchirp[Msun])
+        "q":         1.0e-5,
+        "chi1":      1.0e-5,
+        "chi2":      1.0e-5,
+        "dist":      1.0e-4,   # Gpc
+        "phi":       1.0e-4,   # rad
+        "inc":       1.0e-4,   # cos(inc)
+        "lambda":    1.0e-4,   # rad
+        "beta":      1.0e-4,   # sin(beta)
+        "psi":       1.0e-4,   # rad (mod π)
+        "Deltat":    1.0e-7,   # days
+    }
+
     eps = np.zeros(n)
     for k, name in enumerate(varying_params):
         v = theta0[idx[name]]
@@ -1344,8 +1366,13 @@ def compute_fisher_matrix_waveform_deriv(
             width = hi - lo
         if width and width > 0:  # prefer a prior-width-relative step
             e = step_frac * width
-        else:  # zero-width / unknown prior → value-fractional (abs step for v==0)
-            e = step_frac * (abs(v) if v != 0 else 1.0)
+        else:                    # zero/missing prior width → absolute default
+            if name not in ABSOLUTE_STEP_DEFAULTS:
+                raise KeyError(
+                    f"[Fisher] no ABSOLUTE_STEP_DEFAULTS entry for '{name}'; "
+                    f"either add one or pass a prior_bounds with a positive width."
+                )
+            e = ABSOLUTE_STEP_DEFAULTS[name]
         dom = DOMAIN.get(name)
         if dom is not None:  # keep both v±e strictly inside the domain
             lo_d, hi_d = dom
@@ -1355,6 +1382,11 @@ def compute_fisher_matrix_waveform_deriv(
                 f"[Fisher] non-positive step for '{name}' (value {v} on a domain edge)."
             )
         eps[k] = e
+    # Show the actual finite-difference steps used — this is the variable most
+    # responsible for any Fisher mis-estimation, so make it visible.
+    print("[Fisher] Finite-difference steps (TMNRE coords):")
+    for name, e in zip(varying_params, eps):
+        print(f"  h({name}) = {e:.3e}")
 
     # Batch: column 0 = baseline; then (plus, minus) per varying parameter.
     n_cols = 1 + 2 * n

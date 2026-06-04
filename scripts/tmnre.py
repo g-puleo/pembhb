@@ -344,6 +344,7 @@ class SequentialTrainer:
                 whiten=ae_conf.get("whiten", True),
                 subtract_mean_whitened=ae_conf.get("subtract_mean_whitened", False),
                 compressor_window=compressor_window,
+                reconstruct_std=ae_conf.get("reconstruct_std", True),
             )
             autoencoder = autoencoder.to(device)
 
