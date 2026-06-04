@@ -141,7 +141,7 @@ class MBHBDataset(Dataset):
 
 class MBHBDataModule( L.LightningDataModule ): 
 
-    def __init__(self, filename: str, batch_size: int, num_workers: int = 15, cache_in_memory: bool = False, shuffle_data: bool = True, noise_factor=1.0, seed: int = 31415):
+    def __init__(self, filename: str, batch_size: int, num_workers: int = 15, cache_in_memory: bool = False, shuffle_data: bool = True, noise_factor=1.0, seed: int = 31415, n_train_noise_realisations: int = 1):
         """Initialize the data module.
 
         :param filename: Path to the HDF5 file.
@@ -150,6 +150,12 @@ class MBHBDataModule( L.LightningDataModule ):
         :type batch_size: int
         :param seed: RNG seed for the train/val/test split.
         :type seed: int
+        :param n_train_noise_realisations: number of distinct noise realisations
+            shown per waveform at **training time only**. When > 1 the training
+            batch is expanded from ``batch_size`` to
+            ``batch_size * n_train_noise_realisations`` waveform/noise pairs.
+            Validation and test loaders always use a single realisation.
+        :type n_train_noise_realisations: int
         """
         super().__init__()
         self.batch_size = batch_size
@@ -157,8 +163,9 @@ class MBHBDataModule( L.LightningDataModule ):
         self.filename = filename
         self.num_workers = num_workers
         self.cache_in_memory = cache_in_memory
-        self.shuffle_data = shuffle_data 
+        self.shuffle_data = shuffle_data
         self.noise_factor = noise_factor
+        self.n_train_noise_realisations = n_train_noise_realisations
 
         # read median snr from the dataset for safety checks: 
         with h5py.File(self.filename, "r") as f:
@@ -283,7 +290,8 @@ class MBHBDataModule( L.LightningDataModule ):
         return DataLoader(self.train, batch_size=self.batch_size, shuffle=shuffle, num_workers=num_workers,
                           pin_memory=pin_memory,
                           collate_fn=lambda b: mbhb_collate_fn(b, noise_scale, self.noise_factor,
-                                                                noise_shuffling=shuffle, td_params=td_params))
+                                                                noise_shuffling=shuffle, td_params=td_params,
+                                                                n_noise_realisations=self.n_train_noise_realisations))
 
     def val_dataloader(self, shuffle=True):
         noise_scale = self.full_dataset.noise_scale

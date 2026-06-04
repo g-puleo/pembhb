@@ -143,7 +143,8 @@ class SequentialTrainer:
                 print(f"Using existing dataset at {fname_h5}")
         self.data_fname_yaml = fname_h5.replace(".h5", ".yaml")
         self.datagen_info = utils.read_config(self.data_fname_yaml)
-        self.data_module = MBHBDataModule(fname_h5, self.train_conf["batch_size"], num_workers=4, cache_in_memory=True, noise_factor=self.train_conf["noise_factor"])
+        self.data_module = MBHBDataModule(fname_h5, self.train_conf["batch_size"], num_workers=4, cache_in_memory=True, noise_factor=self.train_conf["noise_factor"],
+                                          n_train_noise_realisations=self.train_conf.get("n_train_noise_realisations", 1))
         assert self.data_module.median_snr > 8, f"Median SNR lower than 8. Please make sure this is what you want. "
         self.data_module.setup(stage="fit")
         self.test_dataloader = self.data_module.test_dataloader()

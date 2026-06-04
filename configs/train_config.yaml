@@ -7,6 +7,11 @@ precision: "float32"  # "float32" (default) or "float64"
 #transform_td: "normalise_max" # options: "none", "logwhiten", "log", "whiten"
 transform_fd: "log" # options: "none", "logwhiten", "log", "whiten", "normalise_max"
 noise_factor: 1.0
+# Number of distinct noise realisations shown per waveform at TRAINING time
+# only. >1 expands each training batch by this factor (one waveform copy per
+# realisation; the realisation set is shared across waveforms in the batch).
+# Validation/test always use a single realisation.
+n_train_noise_realisations: 10
 classifier_hlayersizes: [64, 32, 16, 8]
 keep_ckpt: True
 marginals:

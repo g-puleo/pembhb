@@ -1094,7 +1094,8 @@ def posterior_contours_2d_imshow(grid_x: np.array, grid_y: np.array, ratios: np.
 
 
 
-def mbhb_collate_fn(batch, noise_scale, noise_factor, noise_shuffling=True, td_params=None):
+def mbhb_collate_fn(batch, noise_scale, noise_factor, noise_shuffling=True, td_params=None,
+                    n_noise_realisations=1):
     """Collate a batch, generating FD (and optionally TD) noise on the fly.
 
     :param batch: list of sample dicts from MBHBDataset.__getitem__
@@ -1110,6 +1111,18 @@ def mbhb_collate_fn(batch, noise_scale, noise_factor, noise_shuffling=True, td_p
         always freshly generated per call when not stored on disk
     :param td_params: tuple ``(dt, n_time)`` needed to derive TD noise via IFFT,
         or ``None`` when only FD data is required
+    :param n_noise_realisations: number of distinct noise realisations to draw
+        and show the model for *each* waveform. When > 1 the batch is expanded
+        from ``B`` to ``B * n_noise_realisations`` examples by stacking
+        ``n_noise_realisations`` copies of the original batch, one per
+        realisation: every waveform is therefore shown once with each of the
+        same ``n_noise_realisations`` realisations (the realisation set is
+        shared across all waveforms in the batch). Copies are tiled — i.e. the
+        expanded batch is ``[batch | batch | ...]`` so adjacent examples remain
+        distinct waveforms, which keeps the roll-by-1 contrastive scrambling in
+        the model valid. Defaults to 1 (no expansion). Ignored when the batch
+        carries stored noise, so observation/test data with persisted noise is
+        never expanded.
     """
     B = len(batch)
     wave_fd = torch.stack([b["wave_fd"] for b in batch])
@@ -1120,15 +1133,31 @@ def mbhb_collate_fn(batch, noise_scale, noise_factor, noise_shuffling=True, td_p
     if has_stored_noise:
         # Use the noise realisation persisted on disk (e.g. observation files).
         # This is what makes the obs deterministic across calls and consistent
-        # with post-hoc visualisation scripts.
+        # with post-hoc visualisation scripts. No expansion is applied here.
         noise_fd = noise_factor * torch.stack([b["noise_fd"] for b in batch])
+        wave_td = torch.stack([b["wave_td"] for b in batch]) if has_td else None
     else:
-        # Generate coloured complex Gaussian noise:
+        n = max(1, int(n_noise_realisations))
+        # Generate n shared coloured complex Gaussian noise realisations:
         # z = (re + j im) * noise_scale, with re, im ~ N(0, 1) i.i.d.
         C, F = noise_scale.shape
-        re = torch.randn(B, C, F, dtype=noise_scale.dtype)
-        im = torch.randn(B, C, F, dtype=noise_scale.dtype)
-        noise_fd = noise_factor * torch.complex(re, im) * noise_scale.unsqueeze(0)
+        re = torch.randn(n, C, F, dtype=noise_scale.dtype)
+        im = torch.randn(n, C, F, dtype=noise_scale.dtype)
+        noise_set = noise_factor * torch.complex(re, im) * noise_scale.unsqueeze(0)  # (n, C, F)
+
+        wave_td = torch.stack([b["wave_td"] for b in batch]) if has_td else None
+        if n > 1:
+            # Tile n copies of the batch ([batch | batch | ...]) and pair copy j
+            # with realisation j (broadcast over all B waveforms). Example
+            # k = j*B + i corresponds to (waveform_i, noise_j), so each waveform
+            # is seen once per shared realisation.
+            wave_fd = wave_fd.repeat(n, 1, 1)                       # (n*B, C, F)
+            params  = params.repeat(n, 1)                          # (n*B, P)
+            noise_fd = noise_set.repeat_interleave(B, dim=0)       # (n*B, C, F)
+            if has_td:
+                wave_td = wave_td.repeat(n, 1, 1)
+        else:
+            noise_fd = noise_set.repeat(B, 1, 1)                   # (B, C, F)
 
     out = {
         "source_parameters": params,
@@ -1137,11 +1166,13 @@ def mbhb_collate_fn(batch, noise_scale, noise_factor, noise_shuffling=True, td_p
     }
 
     if has_td:
-        out["wave_td"] = torch.stack([b["wave_td"] for b in batch])
+        out["wave_td"] = wave_td
         if td_params is not None:
             dt, n_time = td_params
-            # Reconstruct two-sided FD spectrum (DC + positive + conjugate-flipped negative)
-            dc = torch.zeros(B, C, 1, dtype=noise_fd.dtype)
+            # Reconstruct two-sided FD spectrum (DC + positive + conjugate-flipped negative).
+            # Derive shapes from noise_fd so this is correct after any expansion.
+            Bn, C = noise_fd.shape[0], noise_fd.shape[1]
+            dc = torch.zeros(Bn, C, 1, dtype=noise_fd.dtype)
             pos2 = torch.cat([dc, noise_fd], dim=2)
             neg = torch.flip(pos2[..., 1:].conj(), dims=[-1])
             two_sided = torch.cat([pos2, neg], dim=2)
