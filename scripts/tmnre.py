@@ -96,7 +96,6 @@ class SequentialTrainer:
                 varying_params=fp_conf["varying_params"],
                 fixed_params=fp_conf["fixed_params"],
                 n_sigma=fp_conf.get("n_sigma", 5.0),
-                step_frac=fp_conf.get("step_frac", 1e-3),
             )
 
     def _setup_plot(self):

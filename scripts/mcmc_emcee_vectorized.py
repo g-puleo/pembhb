@@ -129,7 +129,9 @@ def main():
     _T = wp["duration"] * 7 * 86400
     _df_obs = float(_obs_freqs[1] - _obs_freqs[0])
     wp["fmin"] = float(_obs_freqs[0])
-    wp["fmax"] = float(_obs_freqs[-1]) + _df_obs   # +df so arange includes the last bin
+    # +0.5*df_obs: np.arange must include the last obs bin without overshooting by one,
+    # regardless of FP rounding (full +df sometimes produces n_obs+1 bins).
+    wp["fmax"] = float(_obs_freqs[-1]) + 0.5 * _df_obs
     wp["downsamplefactor"] = int(round(_df_obs * _T))
     simulator = MBHBSimulatorFD(
         datagen_config,
@@ -242,7 +244,6 @@ def main():
             simulator,
             true_tmnre_params,
             varying_params,
-            step_frac=fisher_conf.get("step_frac", 1.0e-3),
             freq_mask=fisher_freq_mask,
         )
         n_sigma = fisher_conf.get("prior_n_sigma", 15.0)

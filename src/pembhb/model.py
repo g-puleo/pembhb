@@ -1170,6 +1170,7 @@ class JointAEInferenceNetwork(LightningModule):
         freeze_ae_after_warmup: bool = False,
         ae_scheduler: dict = None,
         nre_scheduler: dict = None,
+        encoder_trains_via_nre: bool = False,
     ):
         super().__init__()
 
@@ -1177,6 +1178,12 @@ class JointAEInferenceNetwork(LightningModule):
         from pembhb.autoencoder import MarginalEncoderTrainer
         self._is_me = isinstance(encoder_model, MarginalEncoderTrainer)
         self.encoder_model = encoder_model
+        # When True, the encoder has no reconstruction objective: the NRE BCE
+        # loss back-propagates through the encoder, the AE warmup is meaningless
+        # and the AE-loss term is zero. Used by ChannelizedMLPCompressor and
+        # similar decoder-less learned compressors. Backward-compat default is
+        # False, which preserves the original AE/ME behaviour exactly.
+        self.encoder_trains_via_nre = encoder_trains_via_nre
 
         # ---- Marginals / NRE setup (mirrors InferenceNetwork) -----------
         self.marginals_dict = train_conf["marginals"]
@@ -1336,6 +1343,7 @@ class JointAEInferenceNetwork(LightningModule):
                 # New per-group scheduler configs (authoritative)
                 "ae_scheduler": self.ae_scheduler_config,
                 "nre_scheduler": self.nre_scheduler_config,
+                "encoder_trains_via_nre": encoder_trains_via_nre,
             },
             logger=True,
         )
@@ -1381,6 +1389,8 @@ class JointAEInferenceNetwork(LightningModule):
             if self.encoder_model.architecture != "conv":
                 bottleneck, _ = bottleneck
                 bottleneck = bottleneck.reshape(bottleneck.shape[0], -1)
+            if self.encoder_trains_via_nre:
+                return bottleneck
             return bottleneck.detach()
 
     def _encode(self, d_f: torch.Tensor):
@@ -1477,7 +1487,12 @@ class JointAEInferenceNetwork(LightningModule):
         (Noise-weighted MSE caused bottleneck collapse with LISA ASD dynamic range.)
 
         ME mode: sum of per-parameter MSE regression losses on normalised targets.
+
+        Decoder-less encoders (``encoder_trains_via_nre=True``) report zero —
+        the NRE BCE loss is the only training signal for the encoder.
         """
+        if self.encoder_trains_via_nre:
+            return torch.tensor(0.0, device=self.device)
         if self._is_me:
             noisy = batch["wave_fd"] + batch["noise_fd"]
             params = batch["source_parameters"]
@@ -1703,6 +1718,7 @@ class JointAEInferenceNetwork(LightningModule):
         """
         from pembhb.autoencoder import (
             DenoisingAutoencoder, MarginalEncoderTrainer,
+            ChannelizedMLPCompressor,
         )
         device = map_location or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -1722,7 +1738,35 @@ class JointAEInferenceNetwork(LightningModule):
                 for k, v in state_dict.items()
             }
 
-        if ds_type == "MarginalEncoder":
+        if ds_type == "ChannelizedMLP":
+            cm_conf = hp["train_conf"]["architecture"]["data_summary"]["ChannelizedMLP"]
+            # Infer (n_freqs, hidden, out) per block directly from the state-dict
+            # so a config that drifted from the checkpoint can't break loading.
+            # Dropout adds an extra (no-weight) module inside each block, so the
+            # second Linear may sit at index 2 (no dropout) or 3 (with dropout).
+            # Locate it by enumerating all Linear weights inside block 0.
+            block0_weights = sorted(
+                int(k.split(".")[3]) for k in state_dict
+                if k.startswith("encoder_model.channel_blocks.0.")
+                and k.endswith(".weight")
+            )
+            w0 = state_dict[f"encoder_model.channel_blocks.0.{block0_weights[0]}.weight"]
+            w1 = state_dict[f"encoder_model.channel_blocks.0.{block0_weights[-1]}.weight"]
+            hidden_dim = w0.shape[0]
+            n_freqs = w0.shape[1]
+            out_dim = w1.shape[0]
+            dummy_encoder = ChannelizedMLPCompressor(
+                n_channels=cm_conf.get("n_channels", 2),
+                n_freqs=n_freqs,
+                hidden_dim_per_channel=hidden_dim,
+                out_dim_per_channel=out_dim,
+                representation=cm_conf.get("representation", "real_imag"),
+                whiten=cm_conf.get("whiten", True),
+                amplitude_normalise=cm_conf.get("amplitude_normalise", True),
+                subtract_mean_whitened=cm_conf.get("subtract_mean_whitened", True),
+                dropout=cm_conf.get("dropout", 0.0),
+            )
+        elif ds_type == "MarginalEncoder":
             me_conf = hp["train_conf"]["architecture"]["data_summary"]["MarginalEncoder"]
             marginals_flat = [
                 m for mlist in hp["train_conf"]["marginals"].values() for m in mlist
@@ -1829,6 +1873,7 @@ class JointAEInferenceNetwork(LightningModule):
             ae_scheduler=hp.get("ae_scheduler"),
             nre_scheduler=hp.get("nre_scheduler"),
             periodic_bc_params=hp["train_conf"].get("periodic_bc_params"),
+            encoder_trains_via_nre=hp.get("encoder_trains_via_nre", False),
         )
         # i added a branch so that the whiten:False restores a behaviour where
         # mean_vec and global_scale_factor are used. 

@@ -1113,11 +1113,12 @@ def mbhb_collate_fn(batch, noise_scale, noise_factor, noise_shuffling=True, td_p
         or ``None`` when only FD data is required
     :param n_noise_realisations: number of distinct noise realisations to draw
         and show the model for *each* waveform. When > 1 the batch is expanded
-        from ``B`` to ``B * n_noise_realisations`` examples by stacking
-        ``n_noise_realisations`` copies of the original batch, one per
-        realisation: every waveform is therefore shown once with each of the
-        same ``n_noise_realisations`` realisations (the realisation set is
-        shared across all waveforms in the batch). Copies are tiled — i.e. the
+        from ``B`` to ``B * n_noise_realisations`` examples by tiling
+        ``n_noise_realisations`` copies of the original batch and pairing each
+        of the ``B * n_noise_realisations`` slots with its own *independently
+        drawn* noise realisation: every waveform is therefore shown with
+        ``n_noise_realisations`` independent realisations unique to it (no
+        realisation is shared across waveforms). Copies are tiled — i.e. the
         expanded batch is ``[batch | batch | ...]`` so adjacent examples remain
         distinct waveforms, which keeps the roll-by-1 contrastive scrambling in
         the model valid. Defaults to 1 (no expansion). Ignored when the batch
@@ -1138,26 +1139,25 @@ def mbhb_collate_fn(batch, noise_scale, noise_factor, noise_shuffling=True, td_p
         wave_td = torch.stack([b["wave_td"] for b in batch]) if has_td else None
     else:
         n = max(1, int(n_noise_realisations))
-        # Generate n shared coloured complex Gaussian noise realisations:
+        # Draw an *independent* coloured complex Gaussian noise realisation for
+        # every (copy, waveform) slot in the expanded batch:
         # z = (re + j im) * noise_scale, with re, im ~ N(0, 1) i.i.d.
         C, F = noise_scale.shape
-        re = torch.randn(n, C, F, dtype=noise_scale.dtype)
-        im = torch.randn(n, C, F, dtype=noise_scale.dtype)
-        noise_set = noise_factor * torch.complex(re, im) * noise_scale.unsqueeze(0)  # (n, C, F)
+        re = torch.randn(n * B, C, F, dtype=noise_scale.dtype)
+        im = torch.randn(n * B, C, F, dtype=noise_scale.dtype)
+        noise_fd = noise_factor * torch.complex(re, im) * noise_scale.unsqueeze(0)  # (n*B, C, F)
 
         wave_td = torch.stack([b["wave_td"] for b in batch]) if has_td else None
-        if n > 1:
-            # Tile n copies of the batch ([batch | batch | ...]) and pair copy j
-            # with realisation j (broadcast over all B waveforms). Example
-            # k = j*B + i corresponds to (waveform_i, noise_j), so each waveform
-            # is seen once per shared realisation.
-            wave_fd = wave_fd.repeat(n, 1, 1)                       # (n*B, C, F)
-            params  = params.repeat(n, 1)                          # (n*B, P)
-            noise_fd = noise_set.repeat_interleave(B, dim=0)       # (n*B, C, F)
-            if has_td:
-                wave_td = wave_td.repeat(n, 1, 1)
-        else:
-            noise_fd = noise_set.repeat(B, 1, 1)                   # (B, C, F)
+        # Tile n copies of the batch ([batch | batch | ...]) so that example
+        # k = j*B + i corresponds to (waveform_i, noise_k). Each waveform is
+        # therefore paired with n *independent* realisations (its own, not a
+        # set shared across the batch). Tiling keeps adjacent examples
+        # distinct waveforms, so the roll-by-1 contrastive scrambling in the
+        # model stays valid.
+        wave_fd = wave_fd.repeat(n, 1, 1)                       # (n*B, C, F)
+        params  = params.repeat(n, 1)                          # (n*B, P)
+        if has_td:
+            wave_td = wave_td.repeat(n, 1, 1)
 
     out = {
         "source_parameters": params,
@@ -1298,13 +1298,121 @@ def fd_norm(a, df):
 # Fisher Information Matrix utilities
 # ---------------------------------------------------------------------------
 
+# Per-parameter finite-difference step (TMNRE coords) used by the Fisher matrix.
+# These are the steps RECOMMENDED by the convergence diagnostic
+# (test/test_fisher_derivative.py): for each parameter it sweeps dx, finds the
+# roundoff elbow, and recommends the point one ladder step into the clean dx²
+# truncation region (≈ 2× the elbow). The Fisher always uses these values — see
+# compute_fisher_matrix_waveform_deriv. Re-run the diagnostic and update here if
+# the simulator grid / waveform settings change. (Values for a 1-week MBHB on the
+# default datagen grid, seed 42 expansion point.)
+FISHER_ABSOLUTE_STEP_DEFAULTS = {
+    "logMchirp": 8.0e-7,   # log10(Mchirp[Msun])
+    "q":         8.0e-5,
+    "chi1":      2.0e-5,
+    "chi2":      8.0e-5,
+    "dist":      5.0e-5,   # Gpc
+    "phi":       6.25e-6,  # rad
+    "inc":       1.25e-5,  # cos(inc)
+    "lambda":    2.5e-5,   # rad
+    "beta":      1.25e-5,  # sin(beta)
+    "psi":       6.25e-6,  # rad (mod π)
+    "Deltat":    5.0e-8,   # days
+}
+
+
+def generate_waveforms_at(simulator, tmnre_batch):
+    """Generate FD waveforms for a batch of TMNRE parameter vectors.
+
+    Single source of truth for *how* a waveform is produced from TMNRE
+    coordinates — used both by the Fisher matrix and by the finite-difference
+    convergence test. The nonlinear TMNRE→bbhx transform
+    (``samples_to_bbhx_input``: logMc→m1m2, cos→inc, sin→beta, Deltat→t_ref) is
+    applied here, so derivatives taken via this function are end-to-end in TMNRE
+    space.
+
+    Parameters
+    ----------
+    simulator : MBHBSimulatorFD
+        Provides ``sampler``, ``wfd``, ``waveform_kwargs``, ``freqs``,
+        ``channels_idx``, ``t_obs_end_SI`` and ``xp``.
+    tmnre_batch : np.ndarray, shape (11, n_cols)
+        Columns are TMNRE parameter vectors in ``_ORDERED_PRIOR_KEYS`` order.
+
+    Returns
+    -------
+    np.ndarray, shape (n_cols, n_ch, n_freq), complex
+        Noise-free waveforms on the simulator's own frequency grid.
+    """
+    bbhx_batch = simulator.sampler.samples_to_bbhx_input(
+        tmnre_batch, t_obs_end=simulator.t_obs_end_SI
+    )
+    # Pin "freqs" explicitly rather than reuse simulator.generate so the result
+    # is immune to any in-place slicing of waveform_kwargs (e.g. high_freq_only
+    # in the emcee path) that would otherwise desync the grid from asd/df.
+    wf_kw = dict(simulator.waveform_kwargs)
+    wf_kw["freqs"] = simulator.xp.asarray(np.asarray(simulator.freqs))
+    waves = simulator.wfd(*bbhx_batch, **wf_kw)
+    if hasattr(waves, "get"):
+        waves = waves.get()
+    return np.asarray(waves)[:, simulator.channels_idx, :]
+
+
+def waveform_central_difference(simulator, true_tmnre_params, param_name, dx):
+    """Central-difference derivative ``∂h/∂θ`` of the waveform w.r.t. one param.
+
+    Computes ``f'_approx(x, dx) = (h(θ+dx) − h(θ−dx)) / (2·dx)`` where only the
+    TMNRE coordinate ``param_name`` is perturbed. This is exactly the quantity
+    that builds the Fisher Jacobian, factored out so its convergence in ``dx``
+    can be tested independently (see ``test/test_fisher_derivative.py``).
+
+    Parameters
+    ----------
+    simulator : MBHBSimulatorFD
+        Simulator built consistently with the analysis grid.
+    true_tmnre_params : array-like, shape (11,)
+        Expansion point in ``_ORDERED_PRIOR_KEYS`` order.
+    param_name : str
+        Name of the parameter to differentiate w.r.t.
+    dx : float
+        Central-difference step in TMNRE coordinates.
+
+    Returns
+    -------
+    np.ndarray, shape (n_ch, n_freq), complex
+        The central-difference derivative ``∂h/∂θ_{param_name}``.
+    """
+    theta0 = np.asarray(true_tmnre_params, dtype=np.float64).reshape(-1)
+    p = _ORDERED_PRIOR_KEYS.index(param_name)
+    batch = np.repeat(theta0[:, None], 2, axis=1)  # (11, 2): [plus, minus]
+    batch[p, 0] = theta0[p] + dx
+    batch[p, 1] = theta0[p] - dx
+    waves = generate_waveforms_at(simulator, batch)  # (2, n_ch, n_freq)
+    return (waves[0] - waves[1]) / (2.0 * dx)
+
+
+def waveform_richardson_derivative(simulator, true_tmnre_params, param_name, dx):
+    """Richardson-extrapolated waveform derivative, accurate to ``O(dx⁴)``.
+
+    Combines two central differences to cancel the leading ``dx²`` truncation
+    term (see the derivation in ``test/test_fisher_derivative.py``):
+
+        f'_gt(dx) = (4·f'_approx(dx) − f'_approx(2·dx)) / 3 = ∂h/∂θ + O(dx⁴) .
+
+    This is the "ground truth" derivative the convergence diagnostic recommends
+    evaluating at the per-parameter elbow step. Returns array (n_ch, n_freq).
+    """
+    f1 = waveform_central_difference(simulator, true_tmnre_params, param_name, dx)
+    f2 = waveform_central_difference(simulator, true_tmnre_params, param_name, 2.0 * dx)
+    return (4.0 * f1 - f2) / 3.0
+
+
 def compute_fisher_matrix_waveform_deriv(
     simulator,
     true_tmnre_params,
     varying_params: list,
-    step_frac: float = 1e-3,
-    prior_bounds: dict = None,
     freq_mask=None,
+    use_richardson: bool = True,
 ):
     """Waveform-derivative Fisher matrix ``F_ij = <∂_i h | ∂_j h>``.
 
@@ -1333,18 +1441,19 @@ def compute_fisher_matrix_waveform_deriv(
     true_tmnre_params : array-like, shape (11,)
         Expansion point in ``_ORDERED_PRIOR_KEYS`` order.
     varying_params : list of str
-        Parameters to include in the Fisher matrix.
-    step_frac : float
-        Central-difference step as a fraction of the prior width
-        (``ε_p = step_frac·(upper_p − lower_p)``). When *prior_bounds* is None,
-        falls back to ``step_frac·|value|`` (or ``step_frac`` if value == 0).
-    prior_bounds : dict, optional
-        ``{name: [lo, hi]}`` used to size per-parameter steps.
+        Parameters to include in the Fisher matrix. The finite-difference step
+        for each is taken from ``FISHER_ABSOLUTE_STEP_DEFAULTS`` (the convergence-
+        diagnostic recommendation); there is no prior-width-relative option.
     freq_mask : array-like of bool, optional
         Boolean mask over ``simulator.freqs`` selecting which bins enter the
         inner product. Use this to mirror an analysis that restricts the
         likelihood to a sub-band (e.g. ``high_freq_only``). Combined (AND) with
         the always-applied ``freqs ≥ FMIN_FLOOR`` / ``asd > 0`` mask.
+    use_richardson : bool
+        If True (default), build the Jacobian from the Richardson-extrapolated
+        derivative (``O(dx⁴)``, see :func:`waveform_richardson_derivative`)
+        rather than the plain ``O(dx²)`` central difference. Costs two extra
+        waveform evaluations per parameter; cancels the leading truncation term.
 
     Returns
     -------
@@ -1366,44 +1475,23 @@ def compute_fisher_matrix_waveform_deriv(
     DOMAIN = {"inc": (-1.0, 1.0), "beta": (-1.0, 1.0)}
     SAFETY = 1e-6
 
-    # Per-parameter absolute default step (TMNRE coords) used when no usable
-    # prior width is supplied. These are chosen small enough to stay in the
-    # linear-Taylor regime for a 1-week MBHB waveform, so the central-difference
-    # Jacobian is an actual derivative — independent of whatever the user's
-    # current `datagen_config["prior"]` happens to look like. Previously the
-    # fallback was `step_frac * |v|`, which produced grotesquely large steps
-    # (e.g. Deltat at -2.5 days → h=2.5e-3 days ≈ 216 s, hundreds of GW cycles
-    # in the band) and silently corrupted the Fisher diagonals.
-    ABSOLUTE_STEP_DEFAULTS = {
-        "logMchirp": 1.0e-7,   # log10(Mchirp[Msun])
-        "q":         1.0e-5,
-        "chi1":      1.0e-5,
-        "chi2":      1.0e-5,
-        "dist":      1.0e-4,   # Gpc
-        "phi":       1.0e-4,   # rad
-        "inc":       1.0e-4,   # cos(inc)
-        "lambda":    1.0e-4,   # rad
-        "beta":      1.0e-4,   # sin(beta)
-        "psi":       1.0e-4,   # rad (mod π)
-        "Deltat":    1.0e-7,   # days
-    }
-
+    # Per-parameter finite-difference step (TMNRE coords). We ALWAYS use the
+    # diagnostic-recommended absolute steps in FISHER_ABSOLUTE_STEP_DEFAULTS —
+    # never `step_frac * prior_width`. Those recommendations come from the
+    # convergence diagnostic (test/test_fisher_derivative.py), which places each
+    # step in the clean dx² truncation region (one ladder point above the
+    # roundoff elbow); a prior-width-relative step has no such guarantee and
+    # previously produced grotesquely large steps (e.g. Deltat → hundreds of GW
+    # cycles in the band) that silently corrupted the Fisher diagonals.
     eps = np.zeros(n)
     for k, name in enumerate(varying_params):
         v = theta0[idx[name]]
-        width = None
-        if prior_bounds is not None and name in prior_bounds:
-            lo, hi = prior_bounds[name]
-            width = hi - lo
-        if width and width > 0:  # prefer a prior-width-relative step
-            e = step_frac * width
-        else:                    # zero/missing prior width → absolute default
-            if name not in ABSOLUTE_STEP_DEFAULTS:
-                raise KeyError(
-                    f"[Fisher] no ABSOLUTE_STEP_DEFAULTS entry for '{name}'; "
-                    f"either add one or pass a prior_bounds with a positive width."
-                )
-            e = ABSOLUTE_STEP_DEFAULTS[name]
+        if name not in FISHER_ABSOLUTE_STEP_DEFAULTS:
+            raise KeyError(
+                f"[Fisher] no FISHER_ABSOLUTE_STEP_DEFAULTS entry for '{name}'; "
+                f"run the convergence diagnostic and add a recommended step."
+            )
+        e = FISHER_ABSOLUTE_STEP_DEFAULTS[name]
         dom = DOMAIN.get(name)
         if dom is not None:  # keep both v±e strictly inside the domain
             lo_d, hi_d = dom
@@ -1419,32 +1507,18 @@ def compute_fisher_matrix_waveform_deriv(
     for name, e in zip(varying_params, eps):
         print(f"  h({name}) = {e:.3e}")
 
-    # Batch: column 0 = baseline; then (plus, minus) per varying parameter.
-    n_cols = 1 + 2 * n
-    tmnre_batch = np.repeat(theta0[:, None], n_cols, axis=1)
-    for k, name in enumerate(varying_params):
-        p = idx[name]
-        tmnre_batch[p, 1 + 2 * k]     = theta0[p] + eps[k]
-        tmnre_batch[p, 1 + 2 * k + 1] = theta0[p] - eps[k]
-
-    bbhx_batch = simulator.sampler.samples_to_bbhx_input(
-        tmnre_batch, t_obs_end=simulator.t_obs_end_SI
+    # Jacobian: J[k] = ∂h/∂θ_k, each (n_ch, n_freq). By default uses the
+    # Richardson-extrapolated derivative (O(dx⁴), cancels the dx² truncation
+    # term) evaluated at the per-parameter step `eps`, which the convergence
+    # diagnostic (test/test_fisher_derivative.py) recommends placing at the
+    # error elbow. Set use_richardson=False for the plain O(dx²) central
+    # difference. Both share the exact derivative code path the diagnostic tests.
+    deriv_fn = waveform_richardson_derivative if use_richardson else waveform_central_difference
+    J = np.stack(
+        [deriv_fn(simulator, theta0, name, eps[k])
+         for k, name in enumerate(varying_params)],
+        axis=0,
     )
-    # Generate on the simulator's own (asd/df) grid. We pin "freqs" explicitly
-    # rather than reuse simulator.generate so the result is immune to any
-    # in-place slicing of waveform_kwargs (e.g. high_freq_only in the emcee
-    # path) that would otherwise desync the waveform grid from asd/df.
-    wf_kw = dict(simulator.waveform_kwargs)
-    wf_kw["freqs"] = simulator.xp.asarray(np.asarray(simulator.freqs))
-    waves = simulator.wfd(*bbhx_batch, **wf_kw)
-    if hasattr(waves, "get"):
-        waves = waves.get()
-    waves = np.asarray(waves)[:, simulator.channels_idx, :]  # (n_cols, n_ch, n_freq)
-
-    # Central-difference Jacobian: J[k] = ∂h/∂θ_k, each (n_ch, n_freq).
-    J = np.empty((n,) + waves.shape[1:], dtype=waves.dtype)
-    for k in range(n):
-        J[k] = (waves[1 + 2 * k] - waves[1 + 2 * k + 1]) / (2.0 * eps[k])
 
     # Noise weighting 4·df/asd² on high-passed, finite bins (matches compute_snr_fd).
     freqs = np.asarray(simulator.freqs)
@@ -1492,7 +1566,6 @@ def compute_fisher_prior_bounds(
     varying_params: list,
     fixed_params: list,
     n_sigma: float = 5.0,
-    step_frac: float = 1e-3,
     param_n_sigma: dict = None,
 ) -> dict:
     """Build prior bounds for data generation using the Fisher Information Matrix.
@@ -1519,9 +1592,6 @@ def compute_fisher_prior_bounds(
         YAML config.
     n_sigma : float
         Half-width of the generated prior in units of the FIM σ.
-    step_frac : float
-        Central-difference step (fraction of prior width) passed to
-        :func:`compute_fisher_matrix_waveform_deriv`.
 
     Returns
     -------
@@ -1599,8 +1669,6 @@ def compute_fisher_prior_bounds(
         simulator,
         true_params_arr,
         varying_params,
-        step_frac=step_frac,
-        prior_bounds=datagen_config["prior"],
     )
 
     # Assemble final prior bounds.

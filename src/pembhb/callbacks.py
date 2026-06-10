@@ -8,6 +8,7 @@ from pembhb.utils import (
     get_widest_box_2d,
     get_logratios_grid,
     get_logratios_grid_2d,
+    get_pvalues_1d,
     eval_posterior_2d,
     contour_levels,
     posterior_contours_2d,
@@ -830,3 +831,168 @@ class WarmupEarlyStopping(EarlyStopping):
         if trainer.current_epoch < self._warmup_epochs:
             return
         super()._run_early_stopping_check(trainer)
+
+
+class PPKSTestEarlyStopping(Callback):
+    """Per-marginal PP-plot KS test + tail-mass overconfidence detector.
+
+    Every ``run_every_n_epochs`` epochs (default 1) the callback evaluates the
+    1-D marginal posteriors on a small held-out subset of the test split. For
+    each 1-D marginal it computes two scalars from the rank distribution
+    ``r_i = F̂_post(θ_true^i)``:
+
+    * ``D_t`` — one-sample Kolmogorov-Smirnov statistic against ``Uniform(0,1)``
+      (any miscalibration direction).
+    * ``T_t`` — tail mass ``P[r ∈ [0, q] ∪ [1-q, 1]]``. Expected value under
+      perfect calibration is ``2q``. Overconfident (undercovered) posteriors
+      pile ranks at the extremes → ``T_t`` rises above ``2q``. Overcovered
+      posteriors push ranks centrally → ``T_t`` falls below ``2q``. Combining
+      ``D_t`` (deviation) with ``T_t`` (direction) isolates overconfidence
+      specifically, not generic miscalibration.
+
+    Both are EMA-smoothed per marginal. When ``trigger_on_overconfidence`` is
+    true, ``trainer.should_stop`` is set as soon as the EMA-smoothed ``D`` and
+    ``T`` exceed ``d_threshold`` and ``t_threshold`` for ``patience``
+    consecutive evaluations on **any** marginal. With the default
+    ``trigger_on_overconfidence=False`` (monitoring mode) the callback only
+    logs ``pp_ks/D/{label}`` and ``pp_ks/T/{label}`` to TensorBoard.
+
+    The ``stop_reason`` attribute records which marginal triggered the stop.
+    """
+
+    def __init__(
+        self,
+        test_loader: DataLoader,
+        marginals_1d_info: list,
+        ngrid_points: int = 50,
+        warmup_epochs: int = 50,
+        run_every_n_epochs: int = 1,
+        patience: int = 20,
+        ema_alpha: float = 0.3,
+        d_threshold: float = 0.15,
+        t_threshold: float = 0.15,
+        t_quantile: float = 0.05,
+        trigger_on_overconfidence: bool = False,
+        print_every: int = 20,
+    ):
+        super().__init__()
+        # ``test_loader`` is built once by the caller (typically wrapping a
+        # ``Subset`` of the data module's test split) and reused every epoch
+        # so the rank distributions are comparable across time.
+        self.test_loader = test_loader
+        self.marginals_1d_info = marginals_1d_info
+        self.ngrid_points = ngrid_points
+        self.warmup_epochs = warmup_epochs
+        self.run_every_n_epochs = max(1, int(run_every_n_epochs))
+        self.patience = patience
+        self.ema_alpha = ema_alpha
+        self.d_threshold = d_threshold
+        self.t_threshold = t_threshold
+        self.t_quantile = t_quantile
+        self.trigger_on_overconfidence = trigger_on_overconfidence
+        self.print_every = print_every
+
+        self._ema_d: dict[str, float] = {}
+        self._ema_t: dict[str, float] = {}
+        self._stall: dict[str, int] = {}
+        self.history: list[dict] = []
+        self.stop_reason: str = ""
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.current_epoch < self.warmup_epochs:
+            return
+        if trainer.current_epoch % self.run_every_n_epochs != 0:
+            return
+
+        # Local imports keep the module light at import time.
+        from scipy.stats import kstest
+
+        was_training = pl_module.training
+        try:
+            pl_module.eval()
+            self._evaluate_and_maybe_stop(trainer, pl_module, kstest)
+        finally:
+            if was_training:
+                pl_module.train()
+
+    def _evaluate_and_maybe_stop(self, trainer, pl_module, kstest):
+        per_marginal: dict[str, dict] = {}
+        triggered_label = None
+        triggered_reason = ""
+
+        for label, in_idx, out_idx in self.marginals_1d_info:
+            logratios, inj_params, grid = get_logratios_grid(
+                self.test_loader, pl_module, self.ngrid_points,
+                in_param_idx=in_idx, out_param_idx=out_idx,
+            )
+            # get_pvalues_1d expects grid shape (ngrid, 1) (as returned by
+            # get_logratios_grid).  Pass through unchanged.
+            ranks = get_pvalues_1d(logratios, grid, inj_params)
+
+            D = float(kstest(ranks, "uniform").statistic)
+            q = self.t_quantile
+            T = float(np.mean((ranks < q) | (ranks > 1.0 - q)))
+
+            if label not in self._ema_d:
+                self._ema_d[label] = D
+                self._ema_t[label] = T
+                self._stall[label] = 0
+            else:
+                a = self.ema_alpha
+                self._ema_d[label] = a * D + (1.0 - a) * self._ema_d[label]
+                self._ema_t[label] = a * T + (1.0 - a) * self._ema_t[label]
+
+            d_ema = self._ema_d[label]
+            t_ema = self._ema_t[label]
+
+            if d_ema > self.d_threshold and t_ema > self.t_threshold:
+                self._stall[label] += 1
+            else:
+                self._stall[label] = 0
+
+            per_marginal[label] = {
+                "D": D, "T": T, "D_ema": d_ema, "T_ema": t_ema,
+                "stall": self._stall[label],
+            }
+
+            if (self.trigger_on_overconfidence
+                    and triggered_label is None
+                    and self._stall[label] >= self.patience):
+                triggered_label = label
+                triggered_reason = (
+                    f"pp_ks_overconfidence: {label} D_ema={d_ema:.4f} "
+                    f"(>{self.d_threshold}) T_ema={t_ema:.4f} "
+                    f"(>{self.t_threshold}) stall={self._stall[label]}"
+                    f"/{self.patience}"
+                )
+
+        # Snapshot for offline analysis.
+        self.history.append({
+            "epoch": trainer.current_epoch,
+            "per_marginal": per_marginal,
+        })
+
+        if trainer.logger is not None and per_marginal:
+            metrics = {}
+            for label, v in per_marginal.items():
+                metrics[f"pp_ks/D/{label}"] = v["D"]
+                metrics[f"pp_ks/T/{label}"] = v["T"]
+                metrics[f"pp_ks/D_ema/{label}"] = v["D_ema"]
+                metrics[f"pp_ks/T_ema/{label}"] = v["T_ema"]
+            trainer.logger.log_metrics(metrics, step=trainer.current_epoch)
+
+        if trainer.current_epoch % self.print_every == 0 and per_marginal:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            parts = [
+                f"{label}(D={v['D']:.3f},T={v['T']:.3f},s={v['stall']})"
+                for label, v in sorted(per_marginal.items())
+            ]
+            mode = "trigger" if self.trigger_on_overconfidence else "monitor"
+            print(f"[{ts}] [PPKS-{mode}] epoch {trainer.current_epoch}: "
+                  f"{', '.join(parts)}", flush=True)
+
+        if triggered_label is not None:
+            self.stop_reason = triggered_reason
+            print(f"[PPKS] Stopping at epoch {trainer.current_epoch}: "
+                  f"{triggered_reason}")
+            trainer.should_stop = True

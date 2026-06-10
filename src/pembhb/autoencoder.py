@@ -1504,5 +1504,225 @@ class AutoencoderWrapper(nn.Module):
             # unet returns (bottleneck, skips), flatten the bottleneck
             bottleneck, _skips = bottleneck
             bottleneck_flat = bottleneck.reshape(bottleneck.shape[0], -1)
-        
+
         return bottleneck_flat, d_t
+
+
+# ---------------------------------------------------------------------------
+# ChannelizedMLPCompressor — no-AE learned front-end for joint NRE training
+# ---------------------------------------------------------------------------
+
+class ChannelizedMLPCompressor(nn.Module):
+    """Learned channelized-MLP compressor that replaces a ``DenoisingAutoencoder``
+    in :class:`pembhb.model.JointAEInferenceNetwork`.
+
+    Per real channel (= real or imaginary part of each TDI channel) a small MLP
+    ``Linear(n_freqs → hidden) → ReLU → Linear(hidden → out_per_channel)`` is
+    applied independently; the per-channel outputs are then concatenated into a
+    single ``bottleneck_dim = n_real_channels * out_per_channel`` summary that
+    every NRE classifier head consumes.
+
+    There is no decoder.  The module is trained end-to-end with the NRE BCE
+    loss; the joint module must therefore be constructed with
+    ``encoder_trains_via_nre=True`` so the bottleneck is not detached and the
+    AE reconstruction loss term is zeroed out.
+
+    The whitening / mean-subtraction / amplitude-normalisation pipeline mirrors
+    :class:`DenoisingAutoencoder` so the comparison against an AE-based run is
+    apples-to-apples on identical normalised inputs.
+    """
+
+    def __init__(
+        self,
+        n_channels: int,
+        n_freqs: int,
+        hidden_dim_per_channel: int = 256,
+        out_dim_per_channel: int = 64,
+        representation: str = "real_imag",
+        whiten: bool = True,
+        amplitude_normalise: bool = True,
+        subtract_mean_whitened: bool = True,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if representation != "real_imag":
+            raise NotImplementedError(
+                "ChannelizedMLPCompressor only supports representation='real_imag'."
+            )
+        self.n_channels = n_channels
+        self.n_freqs = n_freqs
+        self.representation = representation
+        self.whiten = whiten
+        self.amplitude_normalise = amplitude_normalise
+        self.subtract_mean_whitened = subtract_mean_whitened
+        self.dropout = float(dropout)
+
+        self.n_real_channels = n_channels * 2  # re + im per TDI channel
+        self.hidden_dim_per_channel = hidden_dim_per_channel
+        self.out_dim_per_channel = out_dim_per_channel
+        # Mark as "conv" so JointAEInferenceNetwork's "conv" code path (which
+        # treats encode() output as the bottleneck tensor) is used.
+        self.architecture = "conv"
+        self.bottleneck_dim = self.n_real_channels * out_dim_per_channel
+        # Disable AE features the joint pipeline may query.
+        self.compressor = None
+        self._mask_active = False
+        self.idx_lowerbound = 0
+        self.idx_upperbound = n_freqs
+
+        def _make_block():
+            layers = [
+                nn.Linear(n_freqs, hidden_dim_per_channel),
+                nn.ReLU(),
+            ]
+            if self.dropout > 0.0:
+                layers.append(nn.Dropout(self.dropout))
+            layers.append(nn.Linear(hidden_dim_per_channel, out_dim_per_channel))
+            return nn.Sequential(*layers)
+
+        self.channel_blocks = nn.ModuleList(
+            _make_block() for _ in range(self.n_real_channels)
+        )
+
+        # Normalisation buffers (same shapes/semantics as DenoisingAutoencoder)
+        self.register_buffer(
+            "whitening", torch.ones(n_channels, n_freqs, dtype=get_torch_dtype())
+        )
+        self.register_buffer(
+            "amplitude_scale", torch.tensor(1.0, dtype=get_torch_dtype())
+        )
+        self.register_buffer(
+            "amplitude_scale_std", torch.tensor(1.0, dtype=get_torch_dtype())
+        )
+        self.register_buffer(
+            "mean_whitened",
+            torch.zeros(self.n_real_channels, n_freqs, dtype=get_torch_dtype()),
+        )
+        self.register_buffer(
+            "mean_vec",
+            torch.zeros(self.n_real_channels, n_freqs, dtype=get_torch_dtype()),
+        )
+        self.register_buffer(
+            "global_scale_factor", torch.tensor(1.0, dtype=get_torch_dtype())
+        )
+
+    # ------------------------------------------------------------------
+    # Complex → real conversion (real_imag only)
+    # ------------------------------------------------------------------
+    def _complex_to_real(self, z: torch.Tensor) -> torch.Tensor:
+        return torch.cat([z.real, z.imag], dim=1)
+
+    # ------------------------------------------------------------------
+    # Whitening
+    # ------------------------------------------------------------------
+    def set_whitening(self, noise_scale: torch.Tensor) -> None:
+        whitening_safe = noise_scale.to(self.whitening.dtype).clone()
+        whitening_safe[noise_scale == 0] = float("inf")
+        self.whitening.copy_(whitening_safe)
+        nonzero = noise_scale[noise_scale > 0]
+        print(
+            f"[ChannelizedMLP] whitening set (shape={tuple(self.whitening.shape)}, "
+            f"range=[{nonzero.min().item():.4e}, {nonzero.max().item():.4e}])"
+        )
+
+    # ------------------------------------------------------------------
+    # Amplitude / mean-whitened normalisation (whiten=True path)
+    # ------------------------------------------------------------------
+    def fit_white_normalisation(self, dataloader: DataLoader) -> None:
+        if not self.amplitude_normalise:
+            raise RuntimeError(
+                "fit_white_normalisation called but amplitude_normalise=False."
+            )
+        device = next(self.parameters()).device
+        running_sum = torch.zeros(
+            self.n_real_channels, self.n_freqs, device=device,
+            dtype=self.mean_whitened.dtype,
+        )
+        n_samples = 0
+        with torch.no_grad():
+            for batch in dataloader:
+                wave_fd = batch["wave_fd"].to(device)
+                wave_w = wave_fd / self.whitening
+                real = self._complex_to_real(wave_w)
+                n_samples += real.shape[0]
+                if self.subtract_mean_whitened:
+                    running_sum += real.sum(dim=0)
+        if self.subtract_mean_whitened:
+            self.mean_whitened.copy_(running_sum / n_samples)
+            print(
+                f"[ChannelizedMLP] mean_whitened fitted on {n_samples} samples"
+            )
+
+        max_mean = 0.0
+        with torch.no_grad():
+            for batch in dataloader:
+                wave_fd = batch["wave_fd"].to(device)
+                wave_w = wave_fd / self.whitening
+                real = self._complex_to_real(wave_w)
+                if self.subtract_mean_whitened:
+                    real = real - self.mean_whitened
+                max_mean = max(max_mean, real.abs().max().item())
+        self.amplitude_scale.fill_(max_mean)
+        print(f"[ChannelizedMLP] amplitude_scale={max_mean:.4e}")
+
+    # ------------------------------------------------------------------
+    # Non-whitening normalisation (whiten=False path)
+    # ------------------------------------------------------------------
+    def fit_normalisation(self, dataloader: DataLoader) -> None:
+        if self.whiten:
+            raise RuntimeError(
+                "fit_normalisation called but whiten=True. Use set_whitening "
+                "(+ optional fit_white_normalisation) for the whitening path."
+            )
+        device = next(self.parameters()).device
+        running_sum = torch.zeros(
+            self.n_real_channels, self.n_freqs, device=device,
+            dtype=self.mean_vec.dtype,
+        )
+        n_samples = 0
+        max_val = 0.0
+        with torch.no_grad():
+            for batch in dataloader:
+                wave_fd = batch["wave_fd"].to(device)
+                real = self._complex_to_real(wave_fd)
+                running_sum += real.sum(dim=0)
+                n_samples += real.shape[0]
+                max_val = max(max_val, real.abs().max().item())
+        self.mean_vec.copy_(running_sum / n_samples)
+        self.global_scale_factor.fill_(max_val)
+        print(
+            f"[ChannelizedMLP] normalisation fitted on {n_samples} samples "
+            f"(global_scale={self.global_scale_factor.item():.4e})"
+        )
+
+    # ------------------------------------------------------------------
+    # Preprocess (mirrors DenoisingAutoencoder.preprocess, no compressor)
+    # ------------------------------------------------------------------
+    def preprocess(self, z: torch.Tensor) -> torch.Tensor:
+        if self.whiten:
+            z_whitened = z / self.whitening
+            real = self._complex_to_real(z_whitened)
+            if self.amplitude_normalise:
+                if self.subtract_mean_whitened:
+                    real = real - self.mean_whitened
+                real = real / self.amplitude_scale
+            return real
+        else:
+            real = self._complex_to_real(z)
+            return (real - self.mean_vec) / self.global_scale_factor
+
+    # ------------------------------------------------------------------
+    # Channelized MLP (encoder)
+    # ------------------------------------------------------------------
+    def encode(self, x_norm: torch.Tensor) -> torch.Tensor:
+        """Apply per-channel MLP, concat across real channels.
+
+        :param x_norm: ``(B, n_real_channels, n_freqs)`` normalised input.
+        :return:       ``(B, bottleneck_dim)`` summary.
+        """
+        outputs = [block(x_norm[:, c, :]) for c, block in enumerate(self.channel_blocks)]
+        return torch.cat(outputs, dim=-1)
+
+    def forward(self, x_norm: torch.Tensor) -> torch.Tensor:
+        """Same as :meth:`encode`; kept for API parity with DenoisingAutoencoder."""
+        return self.encode(x_norm)
