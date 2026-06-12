@@ -178,7 +178,7 @@ class GradnormHandler :
 
 class MarginalClassifierHead(nn.Module):
 
-    def __init__(self, n_data_features: int | list[int], marginals: list[list], hlayersizes: Iterable[int]):
+    def __init__(self, n_data_features: int | list[int], marginals: list[list], hlayersizes: Iterable[int], dropout: float = 0.0):
         """Classifier head for multiple marginals.
         Performs a binary classification for each marginal in the list of marginals. Used for TMNRE.
 
@@ -192,9 +192,15 @@ class MarginalClassifierHead(nn.Module):
         :type marginals: list[list]
         :param hidden_size: sizes of the hidden layers in the classifier
         :type hidden_size: iterable[int]
+        :param dropout: dropout probability inserted after every ``ReLU`` in
+            each per-marginal head.  ``0.0`` (default) disables it — the
+            head is then byte-identical to the pre-dropout version, so old
+            checkpoints load with no special handling.
+        :type dropout: float
         """
         super().__init__()
         self.marginals_dict = marginals
+        self.dropout = float(dropout)
         if isinstance(n_data_features, int):
             n_data_features_list = [n_data_features] * len(marginals)
         else:
@@ -212,6 +218,8 @@ class MarginalClassifierHead(nn.Module):
 
                 classifier.add_module(f"fc_{i}", nn.Linear(input_size, output_size))
                 classifier.add_module(f"relu_{i}", nn.ReLU())
+                if self.dropout > 0.0:
+                    classifier.add_module(f"drop_{i}", nn.Dropout(self.dropout))
 
             classifier.add_module("output", nn.Linear(output_size, 1))
             self.classifiers.append(classifier)
@@ -387,8 +395,9 @@ class InferenceNetwork(LightningModule):
         for key in self.marginals_dict_remapped.keys():
             self.logratios_model_dict[key] = MarginalClassifierHead(
                 n_data_features=self.n_features_summary*len(key),
-                marginals=self.marginals_dict_remapped[key], 
-                hlayersizes=train_conf.get("classifier_hlayersizes", (64, 32, 16, 8))
+                marginals=self.marginals_dict_remapped[key],
+                hlayersizes=train_conf.get("classifier_hlayersizes", (64, 32, 16, 8)),
+                dropout=float(train_conf.get("classifier_dropout", 0.0)),
             ).to(train_conf["device"])
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
@@ -637,6 +646,7 @@ class PerMarginalInferenceNetwork(InferenceNetwork):
                 n_data_features=n_data_features_list,
                 marginals=self.marginals_dict_remapped[domain],
                 hlayersizes=train_conf.get("classifier_hlayersizes", (64, 32, 16, 8)),
+                dropout=float(train_conf.get("classifier_dropout", 0.0)),
             ).to(train_conf["device"])
 
         # Build a flat ordered list of (domain, pos, remapped_indices, original_marginal)
@@ -1185,6 +1195,16 @@ class JointAEInferenceNetwork(LightningModule):
         # False, which preserves the original AE/ME behaviour exactly.
         self.encoder_trains_via_nre = encoder_trains_via_nre
 
+        # BNRE (Delaunoy et al. 2022): adds (J + M - 1)^2 per marginal head
+        # to penalise miscalibration.  Off by default; turn on with
+        # ``bnre.enabled: true`` and a positive ``bnre.lambda`` in the YAML.
+        bnre_conf = train_conf.get("bnre") or {}
+        self.bnre_lambda = (
+            float(bnre_conf.get("lambda", 0.0))
+            if bnre_conf.get("enabled", False)
+            else 0.0
+        )
+
         # ---- Marginals / NRE setup (mirrors InferenceNetwork) -----------
         self.marginals_dict = train_conf["marginals"]
         self.loss = nn.BCEWithLogitsLoss(reduction="none")
@@ -1308,6 +1328,7 @@ class JointAEInferenceNetwork(LightningModule):
                     n_data_features=n_data_features_list,
                     marginals=self.marginals_dict_remapped[domain],
                     hlayersizes=train_conf.get("classifier_hlayersizes", (64, 32, 16, 8)),
+                    dropout=float(train_conf.get("classifier_dropout", 0.0)),
                 )
             # Ordered list for forward(): (domain, pos, remapped_marginal, original_marginal)
             self._marginal_order = []
@@ -1322,6 +1343,7 @@ class JointAEInferenceNetwork(LightningModule):
                     n_data_features=self.n_features_summary * len(key),
                     marginals=self.marginals_dict_remapped[key],
                     hlayersizes=train_conf.get("classifier_hlayersizes", (64, 32, 16, 8)),
+                    dropout=float(train_conf.get("classifier_dropout", 0.0)),
                 )
 
         # ---- Save hyper-parameters for checkpoint / utils compat --------
@@ -1474,6 +1496,30 @@ class JointAEInferenceNetwork(LightningModule):
         all_loss = self.loss(all_logits, labels)
         task_losses = torch.mean(all_loss, dim=0)
         nre_loss = torch.mean(task_losses)
+
+        # BNRE balancing penalty (per-marginal): forces J_k + M_k → 1, which
+        # holds exactly at the calibrated discriminator.  Opposite-direction
+        # errors across marginals don't cancel because the sum-of-squares is
+        # taken before averaging.
+        if self.bnre_lambda > 0.0:
+            B = all_logits.shape[0] // 2
+            sig = torch.sigmoid(all_logits)
+            J = sig[:B].mean(dim=0)        # (n_marg,) — joint half
+            M = sig[B:].mean(dim=0)        # (n_marg,) — marginal half
+            bnre_term = ((J + M - 1.0) ** 2).sum()
+            nre_loss = nre_loss + self.bnre_lambda * bnre_term
+
+            # Log to TensorBoard.  ``self.training`` distinguishes the train
+            # call site from the validation one, so we get separate traces.
+            prefix = "train" if self.training else "val"
+            self.log(f"{prefix}_bnre_term", bnre_term,
+                     on_step=False, on_epoch=True, logger=True)
+            for k, name in enumerate(self.output_names):
+                self.log(f"{prefix}_bnre_J/{name}", J[k],
+                         on_step=False, on_epoch=True, logger=True)
+                self.log(f"{prefix}_bnre_M/{name}", M[k],
+                         on_step=False, on_epoch=True, logger=True)
+
         return all_logits, task_losses, nre_loss
 
     # ------------------------------------------------------------------

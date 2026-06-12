@@ -333,6 +333,77 @@ def get_pvalues_2d(logratios: np.array, grid_0: np.array , grid_1: np.array, inj
     return pvalues  # shape (batch_size,)
 
 
+def grid_posterior_moments_1d(logratios: np.array, grid: np.array):
+    """First two moments of a 1D NRE marginal posterior on its grid.
+
+    The grid posterior is ``p(θ) ∝ exp(logratios)`` under the uniform-prior
+    convention used throughout (see :func:`get_pvalues_1d`). Because the grid
+    is uniformly spaced, normalising the discrete weights to sum to 1 gives the
+    correct discrete moment estimates (the spacing Δθ cancels in the ratio).
+
+    :param logratios: log-ratios on the grid, shape ``(batch, ngrid)``
+    :type logratios: np.array
+    :param grid: grid values, shape ``(ngrid,)`` or ``(ngrid, 1)``
+    :type grid: np.array
+    :return: ``(mean, std)`` each of shape ``(batch,)``
+    :rtype: tuple[np.array, np.array]
+    """
+    g = np.asarray(grid, dtype=np.float64).reshape(-1)            # (ngrid,)
+    lr = np.asarray(logratios, dtype=np.float64)                  # (batch, ngrid)
+    # Posterior weights on the grid. Subtracting the per-row max is a pure
+    # numerical-stability trick: it cancels in the normalisation, so the
+    # moments are unchanged.
+    w = np.exp(lr - lr.max(axis=1, keepdims=True))
+    w /= w.sum(axis=1, keepdims=True)                             # (batch, ngrid)
+
+    mean = (w * g[None, :]).sum(axis=1)                           # (batch,)
+    var = (w * g[None, :] ** 2).sum(axis=1) - mean ** 2
+    # var is E[θ²]-E[θ]² ≥ 0 in exact arithmetic; for a very narrow posterior
+    # the subtraction of two large near-equal numbers can land slightly
+    # negative in float, which would make sqrt return nan. Floor it at 0.
+    var = np.maximum(var, 0.0)
+    return mean, np.sqrt(var)
+
+
+def grid_posterior_moments_2d(logratios: np.array, grid_0: np.array, grid_1: np.array):
+    """Per-axis (marginal) moments of a 2D NRE posterior on its grid.
+
+    Returns the mean and standard deviation of *each* parameter — i.e. the
+    ``sqrt`` of the diagonal entries of the 2D covariance — which is what the
+    per-parameter λ / τ statistics need. Axis order matches
+    :func:`get_logratios_grid_2d`: ``grid_0`` carries the ``in_param_idx[0]``
+    value at every cell, ``grid_1`` the ``in_param_idx[1]`` value.
+
+    The marginal mean of θ₀ is its joint-posterior-weighted average over the
+    whole grid, ``Σ_cells w·θ₀``. Summing over both grid axes already performs
+    the marginalisation over θ₁ (the weights of every cell sharing a θ₀ value
+    add up to that value's marginal weight), so no explicit axis-collapse is
+    needed. Using ``grid_0``/``grid_1`` — which hold the value per cell — keeps
+    this independent of the meshgrid orientation.
+
+    :param logratios: log-ratios on the grid, shape ``(batch, ngrid, ngrid)``
+    :type logratios: np.array
+    :param grid_0: parameter-0 value at each cell, shape ``(ngrid, ngrid)``
+    :type grid_0: np.array
+    :param grid_1: parameter-1 value at each cell, shape ``(ngrid, ngrid)``
+    :type grid_1: np.array
+    :return: ``(mean_0, std_0, mean_1, std_1)`` each of shape ``(batch,)``
+    :rtype: tuple[np.array, np.array, np.array, np.array]
+    """
+    g0 = np.asarray(grid_0, dtype=np.float64)[None, ...]          # (1, ngrid, ngrid)
+    g1 = np.asarray(grid_1, dtype=np.float64)[None, ...]
+    lr = np.asarray(logratios, dtype=np.float64)                 # (batch, ngrid, ngrid)
+
+    w = np.exp(lr - lr.max(axis=(1, 2), keepdims=True))
+    w /= w.sum(axis=(1, 2), keepdims=True)                       # normalise per batch
+
+    # Weighted average of each parameter's per-cell value over the joint
+    # posterior == its marginal mean/variance (see docstring).
+    mean_0 = (w * g0).sum(axis=(1, 2))
+    mean_1 = (w * g1).sum(axis=(1, 2))
+    var_0 = np.maximum((w * g0 ** 2).sum(axis=(1, 2)) - mean_0 ** 2, 0.0)
+    var_1 = np.maximum((w * g1 ** 2).sum(axis=(1, 2)) - mean_1 ** 2, 0.0)
+    return mean_0, np.sqrt(var_0), mean_1, np.sqrt(var_1)
 
 
 
@@ -389,6 +460,21 @@ def update_bounds_2d(model: 'InferenceNetwork', observation_loader: DataLoader, 
 
     # get the grid of 
 
+def _pp_curve(ax, ranks: np.ndarray, label: str | None = None, **plot_kw):
+    """Draw one P-P curve from a 1-D rank array onto an existing Axes.
+
+    Sorted ranks on x (HPD level), normalised empirical CDF on y (always
+    ``(0, 1]``).  Used by both :func:`pp_plot` (single-curve, per-marginal
+    file) and :func:`pp_plot_overlay` (multi-curve overlay).
+    """
+    ranks = np.asarray(ranks)
+    if ranks.size == 0:
+        return
+    sorted_p = np.sort(ranks)
+    empirical = np.arange(1, sorted_p.size + 1) / sorted_p.size
+    ax.plot(sorted_p, empirical, label=label, **plot_kw)
+
+
 def pp_plot( dataloader, model , in_param_idx: int, name: str, out_param_idx: int, output_dir: str = None, device: torch.device = None):
     """Generate a pp plot using the examples in dataset, and the posteriors obtained by the model .
     :param dataset: dataset used to make the pp plot
@@ -411,10 +497,11 @@ def pp_plot( dataloader, model , in_param_idx: int, name: str, out_param_idx: in
     print(f"Making pp plot for {name}...")
     logratios, injection_params, grid = get_logratios_grid(dataloader, model, ngrid_points=100, in_param_idx=in_param_idx, out_param_idx=out_param_idx, device=device)
     p_values = get_pvalues_1d(logratios, grid, injection_params)
-    sorted_pvalues = np.sort(p_values)
-    sorted_rank = np.arange(sorted_pvalues.shape[0])
     fig, ax  = plt.subplots(figsize=(10, 6))
-    ax.plot( sorted_pvalues, sorted_rank, marker='o', linestyle='-', markersize=3)
+    _pp_curve(ax, p_values, marker='o', linestyle='-', markersize=3)
+    ax.plot([0, 1], [0, 1], color="black", lw=0.6, ls="--", alpha=0.6)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
     ax.set_xlabel('HPD level')
     ax.set_ylabel('empirical coverage')
     ax.set_title(f'P-P plot, {name}')
@@ -425,6 +512,33 @@ def pp_plot( dataloader, model , in_param_idx: int, name: str, out_param_idx: in
         os.makedirs(output_dir, exist_ok=True)
         fig.savefig(os.path.join(output_dir, f"{name}_pp_plot.png"))
     plt.close()
+
+
+def pp_plot_overlay(ranks_per_marginal: dict, output_path: str, title: str = ""):
+    """Overlay 1-D P-P curves for several marginals on a single figure.
+
+    Each entry of ``ranks_per_marginal`` is ``{label: ranks_1d_array}`` —
+    typically collected by the PP-KS callback after one ``get_pvalues_1d``
+    call per marginal.  The figure shows one color-cycled curve per marginal
+    plus a ``y = x`` reference (perfect calibration).  The parent directory
+    of ``output_path`` is created if missing.
+    """
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig, ax = plt.subplots(figsize=(7, 7))
+    for label, ranks in sorted(ranks_per_marginal.items()):
+        _pp_curve(ax, ranks, label=label, lw=1.0)
+    ax.plot([0, 1], [0, 1], color="black", lw=0.6, ls="--", alpha=0.6,
+            label="ideal")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("HPD level")
+    ax.set_ylabel("empirical coverage")
+    ax.set_title(title or "P-P overlay")
+    ax.grid(visible=True, alpha=0.3)
+    ax.legend(fontsize=8, loc="lower right")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=110)
+    plt.close(fig)
 
 def pp_plot_2d(dataloader, model,  in_param_idx: tuple, out_idx: int, name: str, output_dir: str = None, device: torch.device = None):
     print(f"Making pp plot for {name}...")
@@ -1694,6 +1808,177 @@ def compute_fisher_prior_bounds(
 
     print(f"[Fisher] Final prior bounds: {prior_bounds}")
     return prior_bounds
+
+
+def compute_fisher_sigmas_for_testset(
+    datagen_config: dict,
+    true_params: np.ndarray,
+    varying_params: list,
+    wave_fd_check: np.ndarray = None,
+    chunk_size: int = 25,
+    backend: str = "cpu",
+):
+    """Cramér-Rao 1-σ per parameter for a *set* of expansion points (batched).
+
+    Builds one CPU simulator (consistent with ``datagen_config``) and evaluates
+    the waveform-derivative Fisher matrix at every row of *true_params*. The
+    numerics are identical to looping :func:`compute_fisher_matrix_waveform_deriv`
+    — same per-parameter steps (``FISHER_ABSOLUTE_STEP_DEFAULTS`` with the same
+    inc/beta domain clamp), same Richardson ``O(dx⁴)`` derivative, same
+    nominal-PSD inner product — but all the waveform evaluations are assembled
+    into one ``(11, n_test·n·4)`` batch and handed to
+    :func:`generate_waveforms_at` (which bbhx vectorises over binaries) in
+    memory-bounded chunks, instead of issuing ``2n`` tiny calls per point. The
+    Fisher matrices are then formed with a single ``einsum`` and inverted in a
+    batch. For each point it returns ``sqrt(diag(F⁻¹))`` — the marginal 1-σ for
+    every parameter (marginalised over the others through the matrix inverse).
+
+    This is the epoch-independent denominator of the τ statistic: it depends
+    only on the true parameter point and the noise PSD, never on the NRE, so the
+    caller computes it once per round and caches it.
+
+    :param datagen_config: datagen configuration (as :func:`read_config` returns)
+    :type datagen_config: dict
+    :param true_params: expansion points, shape ``(n_test, 11)`` in
+        ``_ORDERED_PRIOR_KEYS`` order
+    :type true_params: np.ndarray
+    :param varying_params: parameters to include in the Fisher matrix (the full
+        inferred set for the round); σ is read off the diagonal of ``F⁻¹``
+    :type varying_params: list of str
+    :param wave_fd_check: optional noise-free ``wave_fd`` (shape ``(n_ch,
+        n_freq)``) for the *first* expansion point; if given, the simulator's
+        regenerated ``h(θ_true[0])`` is asserted to match it (grid/modes guard,
+        as in :func:`compute_fisher_prior_bounds`).
+    :type wave_fd_check: np.ndarray, optional
+    :param chunk_size: number of expansion points whose waveforms are generated
+        per bbhx call (each call produces ``chunk_size·n·4`` waveforms); bounds
+        peak memory. Does not affect the result.
+    :type chunk_size: int
+    :param backend: bbhx backend for the throwaway Fisher simulator. ``"cpu"``
+        (default) matches :func:`compute_fisher_prior_bounds` and needs no GPU;
+        ``"cuda12x"`` is ~10× faster on the batched generation and agrees with
+        the CPU result to ~1e-8 relative, so the τ callback can opt into it
+        during training (the GPU is already resident).
+    :type backend: str
+    :return: ``(sigmas, varying_params)`` where ``sigmas`` has shape
+        ``(n_test, len(varying_params))`` (NaN where the Fisher is singular)
+    :rtype: tuple[np.ndarray, list]
+    """
+    from pembhb.simulator import MBHBSimulatorFD  # lazy: avoid circular import
+
+    true_params = np.asarray(true_params, dtype=np.float64)
+    assert true_params.ndim == 2 and true_params.shape[1] == len(_ORDERED_PRIOR_KEYS), (
+        f"[Fisher-τ] expected (n_test, {len(_ORDERED_PRIOR_KEYS)}), got {true_params.shape}"
+    )
+    n_test = true_params.shape[0]
+    n = len(varying_params)
+
+    fisher_config = copy.deepcopy(datagen_config)
+    fisher_config["backend"] = backend
+    wp = fisher_config["waveform_params"]
+    simulator = MBHBSimulatorFD(
+        fisher_config,
+        sampler_init_kwargs={"prior_bounds": copy.deepcopy(datagen_config["prior"])},
+        seed=42,
+        n_freq_bins=wp.get("n_freq_bins", 4096),
+        freq_spacing=wp.get("freq_spacing", "linear"),
+    )
+
+    # One-off consistency guard: the waveform we differentiate must be the one
+    # that generated the test data. A grid/modes/length mismatch shows up here.
+    if wave_fd_check is not None:
+        theta0 = true_params[0].reshape(-1, 1)
+        bbhx_true = simulator.sampler.samples_to_bbhx_input(
+            theta0, t_obs_end=simulator.t_obs_end_SI
+        )
+        h_true = simulator.generate(bbhx_true)[0]
+        rel = np.linalg.norm(h_true - wave_fd_check) / (np.linalg.norm(wave_fd_check) + 1e-30)
+        if rel > 1e-2:
+            raise AssertionError(
+                f"[Fisher-τ] regenerated waveform mismatch (rel diff {rel:.2e} > 1e-2): "
+                f"simulator grid/modes inconsistent with the test data."
+            )
+        print(f"[Fisher-τ] consistency check passed (rel diff {rel:.2e}).")
+
+    # Per-(point, param) steps, mirroring compute_fisher_matrix_waveform_deriv:
+    # the diagnostic step, clamped for inc/beta whose cos/sin coord lives on
+    # [-1, 1] (clamp is per-point, so eps is (n_test, n)).
+    DOMAIN = {"inc": (-1.0, 1.0), "beta": (-1.0, 1.0)}
+    SAFETY = 1e-6
+    col_of = {name: _ORDERED_PRIOR_KEYS.index(name) for name in varying_params}
+    eps = np.zeros((n_test, n), dtype=np.float64)
+    for k, name in enumerate(varying_params):
+        if name not in FISHER_ABSOLUTE_STEP_DEFAULTS:
+            raise KeyError(
+                f"[Fisher-τ] no FISHER_ABSOLUTE_STEP_DEFAULTS entry for '{name}'; "
+                f"run the convergence diagnostic and add a recommended step."
+            )
+        e = np.full(n_test, FISHER_ABSOLUTE_STEP_DEFAULTS[name], dtype=np.float64)
+        if name in DOMAIN:
+            lo_d, hi_d = DOMAIN[name]
+            v = true_params[:, col_of[name]]
+            e = np.minimum.reduce([
+                e, (v - lo_d) * (1.0 - SAFETY), (hi_d - v) * (1.0 - SAFETY),
+            ])
+        if np.any(e <= 0):
+            bad = np.where(e <= 0)[0]
+            raise ValueError(
+                f"[Fisher-τ] non-positive step for '{name}' at points {bad.tolist()} "
+                f"(value on a domain edge)."
+            )
+        eps[:, k] = e
+
+    # Noise weighting 4·df/asd² on high-passed bins (as in compute_snr_fd);
+    # nominal PSD, so one weight serves all points.
+    freqs = np.asarray(simulator.freqs)
+    asd = np.asarray(simulator.asd)
+    df = simulator.df
+    df_arr = df if np.ndim(df) > 0 else np.full(freqs.shape, df)
+    mask = (freqs >= FMIN_FLOOR) & np.all(asd > 0, axis=0)
+    weight = np.zeros_like(asd)
+    weight[:, mask] = 4.0 * df_arr[mask] / asd[:, mask] ** 2     # (n_ch, n_freq)
+
+    # Batched Richardson Jacobian + Fisher, chunked over points. Stencil
+    # columns per (point, param): [+dx, -dx, +2dx, -2dx].
+    sigmas = np.full((n_test, n), np.nan, dtype=np.float64)
+    for start in range(0, n_test, chunk_size):
+        end = min(start + chunk_size, n_test)
+        c = end - start
+        base = true_params[start:end]                            # (c, 11)
+        batch = np.broadcast_to(base[:, None, None, :], (c, n, 4, 11)).copy()
+        e_chunk = eps[start:end]                                 # (c, n)
+        for k, name in enumerate(varying_params):
+            col = col_of[name]
+            ek = e_chunk[:, k]                                   # (c,)
+            batch[:, k, 0, col] = base[:, col] + ek
+            batch[:, k, 1, col] = base[:, col] - ek
+            batch[:, k, 2, col] = base[:, col] + 2.0 * ek
+            batch[:, k, 3, col] = base[:, col] - 2.0 * ek
+
+        tmnre_batch = batch.reshape(-1, 11).T                    # (11, c·n·4)
+        waves = generate_waveforms_at(simulator, tmnre_batch)    # (c·n·4, n_ch, n_freq)
+        n_ch, n_freq = waves.shape[1], waves.shape[2]
+        waves = waves.reshape(c, n, 4, n_ch, n_freq)
+
+        e_b = e_chunk[:, :, None, None]                          # (c, n, 1, 1)
+        # Central differences at dx and 2dx, then Richardson O(dx⁴):
+        f1 = (waves[:, :, 0] - waves[:, :, 1]) / (2.0 * e_b)
+        f2 = (waves[:, :, 2] - waves[:, :, 3]) / (4.0 * e_b)
+        J = (4.0 * f1 - f2) / 3.0                                # (c, n, n_ch, n_freq)
+
+        # F[p, a, b] = Re Σ_ch Σ_f conj(J[p,a]) · J[p,b] · weight
+        F = np.real(np.einsum("pahf,pbhf,hf->pab", np.conj(J), J, weight))
+
+        # Batched inverse; flag singular blocks individually.
+        for j in range(c):
+            try:
+                diag = np.diag(np.linalg.inv(F[j]))
+                sigmas[start + j] = np.sqrt(np.where(diag >= 0, diag, np.nan))
+            except np.linalg.LinAlgError:
+                pass  # leave NaN row
+        print(f"[Fisher-τ] {end}/{n_test} expansion points done.")
+
+    return sigmas, list(varying_params)
 
 
 def transfer_classifier_weights(old_model, new_model):

@@ -1,4 +1,5 @@
 import os
+import yaml
 import numpy as np
 import torch
 from pembhb import ROOT_DIR, get_numpy_dtype
@@ -9,11 +10,15 @@ from pembhb.utils import (
     get_logratios_grid,
     get_logratios_grid_2d,
     get_pvalues_1d,
+    grid_posterior_moments_1d,
+    grid_posterior_moments_2d,
+    compute_fisher_sigmas_for_testset,
     eval_posterior_2d,
     contour_levels,
     posterior_contours_2d,
     posterior_heatmap_2d,
-    contour_boxes
+    contour_boxes,
+    pp_plot_overlay,
 )
 # from pembhb.data import MBHBDataset, mbhb_collate_fn
 from torch.utils.data import DataLoader
@@ -331,7 +336,14 @@ class PlotPosteriorCallback(Callback):
             return
 
         if self.epochs_elapsed == 0:
-            os.makedirs(os.path.join(ROOT_DIR, "plots", self.timestamp), exist_ok=True)
+            # Posterior-evolution PDFs go in a subfolder so the run's plots
+            # root stays scannable when the cadence (call_every_n_epochs)
+            # produces many figures.
+            os.makedirs(
+                os.path.join(ROOT_DIR, "plots", self.timestamp,
+                             "posterior_evolution"),
+                exist_ok=True,
+            )
 
         self.epochs_elapsed += 1
         if (self.epochs_elapsed-2) % self.call_every_n_epochs == 0:
@@ -423,7 +435,8 @@ class PlotPosteriorCallback(Callback):
                                   f"(post={posterior_width:.3e}, prior={prior_width:.3e}), "
                                   f"H={entropy:.4f} nats", flush=True)
                         
-                        out = os.path.join(ROOT_DIR, "plots", self.timestamp, 
+                        out = os.path.join(ROOT_DIR, "plots", self.timestamp,
+                                          "posterior_evolution",
                                           f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{_ORDERED_PRIOR_KEYS[param_idx]}.pdf")
                         fig.savefig(out, bbox_inches="tight")
                     except Exception as e:
@@ -441,6 +454,7 @@ class PlotPosteriorCallback(Callback):
                     )
 
                     out = os.path.join(ROOT_DIR, "plots", self.timestamp,
+                                      "posterior_evolution",
                                       f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{_ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{_ORDERED_PRIOR_KEYS[in_param_idx[1]]}.pdf")
                     param_names = [_ORDERED_PRIOR_KEYS[in_param_idx[0]], _ORDERED_PRIOR_KEYS[in_param_idx[1]]]
                     param_label = f"{_ORDERED_PRIOR_KEYS[in_param_idx[0]]}-{_ORDERED_PRIOR_KEYS[in_param_idx[1]]}"
@@ -541,6 +555,7 @@ class VolumeRatioEarlyStopping(Callback):
         rel_tol: float = 0.02,
         ema_alpha: float = 0.3,
         min_ratio_threshold: float = 0.5,
+        plateau_grace_epochs: int = 0,
         print_every: int = 20,
     ):
         super().__init__()
@@ -549,6 +564,11 @@ class VolumeRatioEarlyStopping(Callback):
         self.rel_tol = rel_tol
         self.ema_alpha = ema_alpha
         self.min_ratio_threshold = min_ratio_threshold
+        # The plateau (stabilisation) stop is the FALLBACK: it may fire only
+        # after the 0.5 fast-truncation threshold has had this many epochs past
+        # warmup to trigger and didn't. In the search phase the threshold wins;
+        # the plateau only takes over once the prior can no longer be halved.
+        self.plateau_grace_epochs = plateau_grace_epochs
         self.print_every = print_every
 
         # per-marginal state: keyed by marginal_key (tuple)
@@ -557,6 +577,10 @@ class VolumeRatioEarlyStopping(Callback):
         self._stall_count: dict[tuple, int] = {}
         self.ema_history: list[dict] = []
         self.stop_reason: str = ""
+        # "threshold" (fast 0.5 path) or "plateau" (saturated fallback) — read
+        # by the campaign monitor: consecutive "plateau" rounds signal that
+        # truncation has stopped shrinking the prior.
+        self.stopped_via: str = ""
 
     def _find_plot_callback(self, trainer) -> "PlotPosteriorCallback | None":
         for cb in trainer.callbacks:
@@ -592,9 +616,10 @@ class VolumeRatioEarlyStopping(Callback):
         for mkey, ratio in current.items():
             label = self._marginal_label(mkey)
 
-            # Hard threshold
+            # Fast path: hard 0.5 truncation threshold.
             if ratio <= self.min_ratio_threshold:
                 triggered_key = mkey
+                self.stopped_via = "threshold"
                 triggered_reason = (
                     f"volume_ratio_threshold: {label} ratio={ratio:.4f} "
                     f"<= {self.min_ratio_threshold}"
@@ -618,8 +643,13 @@ class VolumeRatioEarlyStopping(Callback):
 
             self._prev_ema[mkey] = self._ema[mkey]
 
-            if self._stall_count.get(mkey, 0) >= self.patience:
+            plateau_allowed = (
+                trainer.current_epoch
+                >= self.warmup_epochs + self.plateau_grace_epochs
+            )
+            if plateau_allowed and self._stall_count.get(mkey, 0) >= self.patience:
                 triggered_key = mkey
+                self.stopped_via = "plateau"
                 triggered_reason = (
                     f"volume_ratio_plateau: {label} ema={self._ema[mkey]:.4f}, "
                     f"stall={self._stall_count[mkey]}/{self.patience}"
@@ -812,6 +842,89 @@ class DifferentialEntropyEarlyStopping(Callback):
             trainer.should_stop = True
 
 
+class ChainConvergenceMonitor:
+    """Across-round (campaign) convergence on the absolute joint entropy.
+
+    Not a Lightning callback — a plain helper the trainer carries across rounds
+    and queries at each round boundary. The chain is declared converged when the
+    round-final joint differential entropy ``H_n = Σ_marginals H`` has flattened:
+
+        |H_{n-1} − H_n| < eps_nats   for ``patience`` consecutive *candidate* rounds.
+
+    Because H is a log-volume, ``eps_nats`` is a *relative* per-round width
+    change, so the test is scale-free. A round counts as a candidate only if it
+    did NOT stop via the within-round 0.5 volume threshold (``stopped_via ==
+    "threshold"`` means the prior just halved — still actively shrinking, so the
+    stall counter resets). An optional Fisher gate additionally requires the
+    round's median τ to sit inside ``tau_gate`` (posterior at the CR floor).
+
+    State (entropy series + stall + converged flag) is persisted to ``state_path``
+    so a ``--resume`` continues the campaign-level decision.
+    """
+
+    def __init__(self, eps_nats: float = 0.05, patience: int = 2,
+                 state_path: str | None = None,
+                 tau_gate: tuple | None = None,
+                 require_not_threshold: bool = True):
+        self.eps_nats = eps_nats
+        self.patience = patience
+        self.state_path = state_path
+        self.tau_gate = tau_gate
+        self.require_not_threshold = require_not_threshold
+        self.history: list[dict] = []
+        self.stall = 0
+        self.converged = False
+        self.stop_reason = ""
+        self._load()
+
+    def _load(self):
+        if self.state_path and os.path.exists(self.state_path):
+            with open(self.state_path) as f:
+                s = yaml.safe_load(f) or {}
+            self.history = s.get("history", []) or []
+            self.stall = int(s.get("stall", 0))
+            self.converged = bool(s.get("converged", False))
+
+    def _save(self):
+        if not self.state_path:
+            return
+        os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+        tmp = self.state_path + ".tmp"
+        with open(tmp, "w") as f:
+            yaml.safe_dump({"history": self.history, "stall": int(self.stall),
+                            "converged": bool(self.converged)}, f, sort_keys=False)
+        os.replace(tmp, self.state_path)
+
+    def update(self, round_idx, joint_H, stopped_via="", median_tau=None):
+        """Record this round; return True if the chain has converged."""
+        prev_H = self.history[-1]["H"] if self.history else None
+        dH = None if prev_H is None else abs(prev_H - joint_H)
+
+        candidate = (not self.require_not_threshold) or (stopped_via != "threshold")
+        tau_ok = self.tau_gate is None or (
+            median_tau is not None
+            and self.tau_gate[0] <= median_tau <= self.tau_gate[1]
+        )
+        flat = dH is not None and dH < self.eps_nats
+        self.stall = self.stall + 1 if (candidate and flat and tau_ok) else 0
+
+        self.history.append({
+            "round": int(round_idx), "H": float(joint_H),
+            "stopped_via": stopped_via,
+            "median_tau": None if median_tau is None else float(median_tau),
+            "dH": None if dH is None else float(dH),
+        })
+        if self.stall >= self.patience:
+            self.converged = True
+            self.stop_reason = (
+                f"joint entropy flattened: |ΔH|<{self.eps_nats} for {self.stall} "
+                f"candidate rounds (H={joint_H:.4f}"
+                + ("" if median_tau is None else f", median_τ={median_tau:.3f}") + ")"
+            )
+        self._save()
+        return self.converged
+
+
 class WarmupEarlyStopping(EarlyStopping):
     """EarlyStopping that ignores the first ``warmup_epochs`` epochs.
 
@@ -867,13 +980,22 @@ class PPKSTestEarlyStopping(Callback):
         ngrid_points: int = 50,
         warmup_epochs: int = 50,
         run_every_n_epochs: int = 1,
-        patience: int = 20,
+        patience: int = 40,
         ema_alpha: float = 0.3,
         d_threshold: float = 0.15,
         t_threshold: float = 0.15,
         t_quantile: float = 0.05,
         trigger_on_overconfidence: bool = False,
         print_every: int = 20,
+        state_path: str | None = None,
+        round_idx: int | None = None,
+        plots_dir: str | None = None,
+        compute_lambda_tau: bool = False,
+        marginals_2d_info: list | None = None,
+        datagen_conf: dict | None = None,
+        fisher_varying_params: list | None = None,
+        fisher_backend: str = "cpu",
+        lt_h5_path: str | None = None,
     ):
         super().__init__()
         # ``test_loader`` is built once by the caller (typically wrapping a
@@ -892,16 +1014,95 @@ class PPKSTestEarlyStopping(Callback):
         self.trigger_on_overconfidence = trigger_on_overconfidence
         self.print_every = print_every
 
+        # Per-marginal EMA and stall buffers are seeded from ``state_path`` if
+        # present (multi-round TMNRE), else fresh.  ``cumulative_epoch_offset``
+        # holds the sum of ``trainer.current_epoch + 1`` across all previously
+        # completed rounds — it is what makes warmup and patience meaningful
+        # across the campaign rather than reset per round.
+        self.state_path = state_path
+        # ``plots_dir`` is the run's plots root (typically
+        # ``ROOT_DIR/plots/{TIME_OF_EXECUTION}``).  Overlay PP plots land in
+        # the ``ppks_traces`` subdirectory; at trigger time a TRIGGER copy is
+        # additionally placed at ``plots_dir`` for visibility.  None disables
+        # PP-plot output (state/log only).
+        self.plots_dir = plots_dir
         self._ema_d: dict[str, float] = {}
         self._ema_t: dict[str, float] = {}
         self._stall: dict[str, int] = {}
         self.history: list[dict] = []
         self.stop_reason: str = ""
+        self.cumulative_epoch_offset: int = 0
+        self.triggered: bool = False
+        self.trigger_metadata: dict | None = None
+        # ``round_idx`` is human-readable bookkeeping only — it's the current
+        # round number the callback is attached to.  Saved state can carry a
+        # stale value from the previous round, so the ctor arg always wins
+        # when explicitly provided.
+        self._round_idx: int | None = round_idx
+        self._load_state()
+        if round_idx is not None:
+            self._round_idx = round_idx
+
+        # λ_i / τ_i statistics (optional). When enabled, every evaluation
+        # appends per-test-sample posterior moments to an HDF5 (one per round);
+        # the Fisher denominator of τ is epoch-independent, computed once.
+        self.compute_lambda_tau = bool(compute_lambda_tau)
+        self.marginals_2d_info = marginals_2d_info or []
+        self.datagen_conf = datagen_conf
+        self.fisher_varying_params = fisher_varying_params or []
+        self.fisher_backend = fisher_backend
+        self.lt_h5_path = lt_h5_path
+        self._lt_truth_full = None        # (n_test, 11) true params, lazy
+        self._lt_fisher_sigmas = None     # (n_test, n_varying), lazy
+        self._lt_fisher_order = None      # varying-param name order
+        self._lt_means: dict = {}         # {label: {param: [per-eval (n_test,)]}}
+        self._lt_stds: dict = {}
+        self._lt_cum_eps: list = []
+
+    # ------------------------------------------------------------------ state
+    def _load_state(self) -> None:
+        """Seed cross-round state from ``self.state_path`` (if present)."""
+        if not self.state_path or not os.path.exists(self.state_path):
+            return
+        with open(self.state_path) as f:
+            s = yaml.safe_load(f) or {}
+        self._ema_d = dict(s.get("ema_d", {}) or {})
+        self._ema_t = dict(s.get("ema_t", {}) or {})
+        self._stall = {k: int(v) for k, v in (s.get("stall", {}) or {}).items()}
+        self.cumulative_epoch_offset = int(s.get("cumulative_epoch_offset", 0))
+        self.triggered = bool(s.get("triggered", False))
+        self.trigger_metadata = s.get("trigger_metadata") or None
+        self._round_idx = s.get("round_idx")
+
+    def _save_state(self) -> None:
+        if not self.state_path:
+            return
+        os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+        payload = {
+            "ema_d": {k: float(v) for k, v in self._ema_d.items()},
+            "ema_t": {k: float(v) for k, v in self._ema_t.items()},
+            "stall": {k: int(v) for k, v in self._stall.items()},
+            "cumulative_epoch_offset": int(self.cumulative_epoch_offset),
+            "triggered": bool(self.triggered),
+            "trigger_metadata": self.trigger_metadata,
+            "round_idx": self._round_idx,
+        }
+        # Atomic write: tmp + rename so a kill mid-write can't corrupt state.
+        tmp = self.state_path + ".tmp"
+        with open(tmp, "w") as f:
+            yaml.safe_dump(payload, f, sort_keys=False)
+        os.replace(tmp, self.state_path)
+
+    def _cum_ep(self, trainer) -> int:
+        return int(trainer.current_epoch) + int(self.cumulative_epoch_offset)
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        if trainer.current_epoch < self.warmup_epochs:
+        cum_ep = self._cum_ep(trainer)
+        if cum_ep < self.warmup_epochs:
             return
-        if trainer.current_epoch % self.run_every_n_epochs != 0:
+        # ``run_every_n_epochs`` is keyed off the cumulative axis so the
+        # cadence is stable across rounds.
+        if cum_ep % self.run_every_n_epochs != 0:
             return
 
         # Local imports keep the module light at import time.
@@ -917,8 +1118,13 @@ class PPKSTestEarlyStopping(Callback):
 
     def _evaluate_and_maybe_stop(self, trainer, pl_module, kstest):
         per_marginal: dict[str, dict] = {}
-        triggered_label = None
-        triggered_reason = ""
+        # All marginals whose stall counter has reached patience this
+        # evaluation — we record every one of them, not just the first.
+        triggered_labels: list[str] = []
+        # Collected for the overlay PP plot at end of the evaluation.
+        ranks_per_marginal: dict[str, np.ndarray] = {}
+        # {label: (param_name, mean (n_test,), std (n_test,))} for λ/τ.
+        moments_1d: dict = {}
 
         for label, in_idx, out_idx in self.marginals_1d_info:
             logratios, inj_params, grid = get_logratios_grid(
@@ -928,6 +1134,11 @@ class PPKSTestEarlyStopping(Callback):
             # get_pvalues_1d expects grid shape (ngrid, 1) (as returned by
             # get_logratios_grid).  Pass through unchanged.
             ranks = get_pvalues_1d(logratios, grid, inj_params)
+            ranks_per_marginal[label] = np.asarray(ranks)
+
+            if self.compute_lambda_tau:
+                mean, std = grid_posterior_moments_1d(logratios, grid)
+                moments_1d[label] = (_ORDERED_PRIOR_KEYS[in_idx], mean, std)
 
             D = float(kstest(ranks, "uniform").statistic)
             q = self.t_quantile
@@ -945,32 +1156,46 @@ class PPKSTestEarlyStopping(Callback):
             d_ema = self._ema_d[label]
             t_ema = self._ema_t[label]
 
-            if d_ema > self.d_threshold and t_ema > self.t_threshold:
+            # Symmetric tail-mass deviation: |T - 2q| > t_threshold catches
+            # narrow-biased (T → 1) AND narrow-unbiased (T → 0) overconfidence,
+            # not just the high-T direction.
+            t_baseline = 2.0 * self.t_quantile
+            d_violates = d_ema > self.d_threshold
+            t_violates = abs(t_ema - t_baseline) > self.t_threshold
+            if d_violates or t_violates:
                 self._stall[label] += 1
+                violations = []
+                if d_violates:
+                    violations.append("D")
+                if t_violates:
+                    violations.append("T")
+                violation_str = "|".join(violations)
             else:
                 self._stall[label] = 0
+                violation_str = ""
 
             per_marginal[label] = {
                 "D": D, "T": T, "D_ema": d_ema, "T_ema": t_ema,
                 "stall": self._stall[label],
+                "violation": violation_str,
             }
 
             if (self.trigger_on_overconfidence
-                    and triggered_label is None
                     and self._stall[label] >= self.patience):
-                triggered_label = label
-                triggered_reason = (
-                    f"pp_ks_overconfidence: {label} D_ema={d_ema:.4f} "
-                    f"(>{self.d_threshold}) T_ema={t_ema:.4f} "
-                    f"(>{self.t_threshold}) stall={self._stall[label]}"
-                    f"/{self.patience}"
-                )
+                triggered_labels.append(label)
 
-        # Snapshot for offline analysis.
+        cum_ep = self._cum_ep(trainer)
+
+        # Snapshot for offline analysis (cumulative axis).
         self.history.append({
-            "epoch": trainer.current_epoch,
+            "cum_ep": cum_ep,
+            "round": self._round_idx,
+            "epoch_in_round": int(trainer.current_epoch),
             "per_marginal": per_marginal,
         })
+
+        if self.compute_lambda_tau:
+            self._update_lambda_tau(cum_ep, moments_1d, pl_module)
 
         if trainer.logger is not None and per_marginal:
             metrics = {}
@@ -979,20 +1204,196 @@ class PPKSTestEarlyStopping(Callback):
                 metrics[f"pp_ks/T/{label}"] = v["T"]
                 metrics[f"pp_ks/D_ema/{label}"] = v["D_ema"]
                 metrics[f"pp_ks/T_ema/{label}"] = v["T_ema"]
-            trainer.logger.log_metrics(metrics, step=trainer.current_epoch)
+            metrics["pp_ks/cumulative_epoch"] = float(cum_ep)
+            trainer.logger.log_metrics(metrics, step=cum_ep)
 
-        if trainer.current_epoch % self.print_every == 0 and per_marginal:
+        if cum_ep % self.print_every == 0 and per_marginal:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             parts = [
                 f"{label}(D={v['D']:.3f},T={v['T']:.3f},s={v['stall']})"
                 for label, v in sorted(per_marginal.items())
             ]
             mode = "trigger" if self.trigger_on_overconfidence else "monitor"
-            print(f"[{ts}] [PPKS-{mode}] epoch {trainer.current_epoch}: "
+            print(f"[{ts}] [PPKS-{mode}] cumep {cum_ep} "
+                  f"(round={self._round_idx}, epoch_in_round="
+                  f"{int(trainer.current_epoch)}): "
                   f"{', '.join(parts)}", flush=True)
 
-        if triggered_label is not None:
+        # Persist state at every evaluation so a kill mid-round still leaves
+        # a coherent record of EMA / stall on the cumulative axis.
+        self._save_state()
+
+        # Overlay PP plot: one figure per evaluation, all 1D marginals on
+        # the same axes.  Filename keyed by the cumulative-epoch axis so a
+        # single sorted listing reads chronologically across the campaign.
+        overlay_path = None
+        if self.plots_dir and ranks_per_marginal:
+            overlay_path = os.path.join(
+                self.plots_dir, "ppks_traces",
+                f"cumep_{cum_ep:04d}_pp.png",
+            )
+            title = (f"P-P overlay — cum_ep={cum_ep} "
+                     f"round={self._round_idx} "
+                     f"epoch_in_round={int(trainer.current_epoch)}")
+            pp_plot_overlay(ranks_per_marginal, overlay_path, title=title)
+
+        # MONITOR + CHECKPOINT mode: when ``trigger_on_overconfidence`` is
+        # true and at least one marginal reaches patience, we DO NOT stop
+        # training (the user's other early-stop criteria — volume_ratio,
+        # truth-missed — own the actual termination decision).  Instead we:
+        #   * write a checkpoint at the trigger point so the model state is
+        #     preserved for post-hoc inspection,
+        #   * record structured trigger metadata,
+        #   * log one clear line to stdout,
+        #   * set ``self.triggered = True`` to gate against re-firing.
+        if triggered_labels and not self.triggered:
+            t_baseline = 2.0 * self.t_quantile
+            parts = []
+            marginal_records = []
+            for lbl in triggered_labels:
+                v = per_marginal[lbl]
+                parts.append(
+                    f"{lbl}(violation={v['violation']}, "
+                    f"D_ema={v['D_ema']:.4f}/thr={self.d_threshold}, "
+                    f"T_ema={v['T_ema']:.4f} (|T-{t_baseline:.2f}|="
+                    f"{abs(v['T_ema'] - t_baseline):.4f})/thr={self.t_threshold}, "
+                    f"stall={v['stall']}/{self.patience})"
+                )
+                marginal_records.append({
+                    "name": lbl,
+                    "violation": v["violation"],
+                    "D_ema": float(v["D_ema"]),
+                    "T_ema": float(v["T_ema"]),
+                    "stall": int(v["stall"]),
+                })
+            triggered_reason = "; ".join(parts)
             self.stop_reason = triggered_reason
-            print(f"[PPKS] Stopping at epoch {trainer.current_epoch}: "
-                  f"{triggered_reason}")
-            trainer.should_stop = True
+            self.triggered = True
+            self.trigger_metadata = {
+                "cumulative_epoch": int(cum_ep),
+                "round": self._round_idx,
+                "epoch_in_round": int(trainer.current_epoch),
+                "d_threshold": float(self.d_threshold),
+                "t_threshold": float(self.t_threshold),
+                "t_baseline": float(t_baseline),
+                "patience": int(self.patience),
+                "marginals": marginal_records,
+            }
+            # Save the model exactly at the would-stop point.  Path lives
+            # next to the regular round checkpoints so it surfaces in any
+            # standard checkpoint scan.
+            ckpt_dir = None
+            if trainer.checkpoint_callback is not None:
+                ckpt_dir = getattr(trainer.checkpoint_callback, "dirpath", None)
+            if ckpt_dir is None and trainer.logger is not None:
+                ckpt_dir = os.path.join(trainer.logger.log_dir, "checkpoints")
+            if ckpt_dir is not None:
+                ckpt_path = os.path.join(
+                    ckpt_dir, f"ppks_trigger_cumep_{cum_ep}.ckpt",
+                )
+                os.makedirs(ckpt_dir, exist_ok=True)
+                trainer.save_checkpoint(ckpt_path)
+                self.trigger_metadata["checkpoint_path"] = ckpt_path
+            # At trigger time, also drop a TRIGGER-named copy of the overlay
+            # PP plot at the plots root (not buried in ppks_traces/).
+            if self.plots_dir and ranks_per_marginal:
+                trigger_overlay_path = os.path.join(
+                    self.plots_dir,
+                    f"TRIGGER_cumep_{cum_ep:04d}_pp.png",
+                )
+                title = (f"P-P overlay at PPKS trigger — cum_ep={cum_ep} "
+                         f"round={self._round_idx} "
+                         f"epoch_in_round={int(trainer.current_epoch)}")
+                pp_plot_overlay(ranks_per_marginal, trigger_overlay_path,
+                                title=title)
+                self.trigger_metadata["overlay_path"] = trigger_overlay_path
+            print(f"[PPKS-TRIGGER] cumep={cum_ep} round={self._round_idx} "
+                  f"epoch_in_round={int(trainer.current_epoch)} — "
+                  f"would-stop reasons: {triggered_reason}", flush=True)
+            # Persist now so the trigger info is on disk before any further
+            # training churn.
+            self._save_state()
+
+    # ------------------------------------------------------------ λ / τ stats
+    def _lt_ensure_fisher(self):
+        """Gather the test-set truths and the epoch-independent Fisher σ once."""
+        if self._lt_truth_full is not None:
+            return
+        truths, wave0 = [], None
+        for batch in self.test_loader:
+            truths.append(np.asarray(batch["source_parameters"], dtype=np.float64))
+            if wave0 is None:
+                wave0 = np.asarray(batch["wave_fd"][0])
+        self._lt_truth_full = np.concatenate(truths, axis=0)   # (n_test, 11)
+
+        if self.fisher_varying_params and self.datagen_conf is not None:
+            print(f"[λτ] computing Fisher σ for {self._lt_truth_full.shape[0]} "
+                  f"test points (backend={self.fisher_backend}) ...", flush=True)
+            self._lt_fisher_sigmas, self._lt_fisher_order = (
+                compute_fisher_sigmas_for_testset(
+                    self.datagen_conf, self._lt_truth_full,
+                    self.fisher_varying_params, wave_fd_check=wave0,
+                    backend=self.fisher_backend,
+                )
+            )
+        else:
+            self._lt_fisher_order = []
+
+    def _lt_fisher_sigma_for(self, param):
+        """Fisher σ column for *param* (NaN if it was not in the Fisher set)."""
+        n_test = self._lt_truth_full.shape[0]
+        if self._lt_fisher_sigmas is not None and param in self._lt_fisher_order:
+            return self._lt_fisher_sigmas[:, self._lt_fisher_order.index(param)]
+        return np.full(n_test, np.nan)
+
+    def _lt_append(self, label, param, mean, std):
+        self._lt_means.setdefault(label, {}).setdefault(param, []).append(mean)
+        self._lt_stds.setdefault(label, {}).setdefault(param, []).append(std)
+
+    def _update_lambda_tau(self, cum_ep, moments_1d, pl_module):
+        self._lt_ensure_fisher()
+        self._lt_cum_eps.append(int(cum_ep))
+
+        for label, (param, mean, std) in moments_1d.items():
+            self._lt_append(label, param, mean, std)
+
+        for label, in_idx, out_idx in self.marginals_2d_info:
+            logratios, _, gx, gy = get_logratios_grid_2d(
+                self.test_loader, pl_module, self.ngrid_points,
+                out_param_idx=out_idx, in_param_idx=in_idx,
+            )
+            m0, s0, m1, s1 = grid_posterior_moments_2d(logratios, gx, gy)
+            self._lt_append(label, _ORDERED_PRIOR_KEYS[in_idx[0]], m0, s0)
+            self._lt_append(label, _ORDERED_PRIOR_KEYS[in_idx[1]], m1, s1)
+
+        if self.lt_h5_path:
+            self._write_lt_h5()
+
+    def _write_lt_h5(self):
+        import h5py
+        os.makedirs(os.path.dirname(self.lt_h5_path), exist_ok=True)
+        tmp = self.lt_h5_path + ".tmp"
+        with h5py.File(tmp, "w") as f:
+            f.attrs["round"] = -1 if self._round_idx is None else int(self._round_idx)
+            f.create_dataset("cum_ep", data=np.asarray(self._lt_cum_eps))
+            for label, params in self._lt_means.items():
+                g = f.create_group(label)
+                for param, mean_list in params.items():
+                    pg = g.create_group(param)
+                    pg.create_dataset("posterior_mean", data=np.stack(mean_list))
+                    pg.create_dataset("posterior_std",
+                                      data=np.stack(self._lt_stds[label][param]))
+                    idx = _ORDERED_PRIOR_KEYS.index(param)
+                    pg.create_dataset("ground_truth", data=self._lt_truth_full[:, idx])
+                    pg.create_dataset("fisher_sigma",
+                                      data=self._lt_fisher_sigma_for(param))
+        os.replace(tmp, self.lt_h5_path)
+
+    # --------------------------------------------------------- round-boundary
+    def on_train_end(self, trainer, pl_module):
+        """Bump the cumulative offset by this round's epoch count and save."""
+        # Lightning sets ``trainer.current_epoch`` to the last completed epoch
+        # before ``on_train_end``, so we add +1 to convert "last index" to
+        # "epoch count" (matches what _cum_ep would have returned next round).
+        self.cumulative_epoch_offset += int(trainer.current_epoch) + 1
+        self._save_state()

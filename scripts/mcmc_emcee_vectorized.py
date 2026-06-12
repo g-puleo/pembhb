@@ -138,7 +138,7 @@ def main():
         sampler_init_kwargs={'prior_bounds': prior_bounds_dummy},
         seed=42,
         n_freq_bins=wp.get("n_freq_bins", 4096),
-        freq_spacing=wp.get("freq_spacing", "log"),
+        freq_spacing=wp.get("freq_spacing", "linear"),
     )
     sampler = simulator.sampler
     frequencies = simulator.freqs

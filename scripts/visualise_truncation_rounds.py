@@ -198,20 +198,37 @@ def load_prior_box(round_dir: str, round_number: int) -> dict:
     return {k: tuple(v) for k, v in prior.items()}
 
 
-def load_model(ckpt_dir: str) -> InferenceNetwork:
-    """Load the first ``*.ckpt`` checkpoint found inside *ckpt_dir*.
+# ``_CKPT_OVERRIDES`` maps a normalised ``ckpt_dir`` (the path passed to
+# ``load_model``) to an explicit checkpoint file path.  When present, the
+# override wins over the default ``truncation.ckpt`` lookup.  Populated by
+# ``main`` from the ``--ckpt-final-round`` CLI flag so the user can replace
+# the final-round model with, e.g., a ``ppks_trigger_cumep_*.ckpt`` from the
+# PP-KS callback.
+_CKPT_OVERRIDES: dict[str, str] = {}
 
-    Delegates to :func:`pembhb.model.load_inference_network` which
-    inspects the checkpoint hparams to select the correct model class
-    (e.g. :class:`PerMarginalInferenceNetwork` for marginal-encoder runs).
+
+def load_model(ckpt_dir: str) -> InferenceNetwork:
+    """Load the checkpoint associated with *ckpt_dir*.
+
+    Resolution order:
+      1. ``_CKPT_OVERRIDES[normalised(ckpt_dir)]`` if set (final-round
+         override path supplied by the CLI).
+      2. ``{ckpt_dir}/../truncation.ckpt`` (the end-of-round model written
+         by ``tmnre_joint.py``).
+      3. The first ``*.ckpt`` file in ``ckpt_dir`` as a last resort.
     """
+    norm = os.path.realpath(ckpt_dir)
+    override = _CKPT_OVERRIDES.get(norm)
+    if override is not None and os.path.exists(override):
+        print(f"[load_model] override: loading {override}")
+        return load_inference_network(override)
 
     ckpt_trunc = os.path.join(ckpt_dir, "../truncation.ckpt")
     if os.path.exists(ckpt_trunc):
         model = load_inference_network(ckpt_trunc)
         return model
     else:
-        
+
         print(f"WARNING: truncation checkpoint {ckpt_trunc} not found. this model may not match what was used at truncation time!")
 
     ckpt_files = glob(os.path.join(ckpt_dir, "*.ckpt"))
@@ -1821,6 +1838,7 @@ def plot_violin_summary(
     mcmc_samples_path: str = None,
     ngrid: int = 300,
     figsize_per_param: tuple = (1.8, 4.5),
+    reason: str = "truncation",
 ):
     """One figure summarising every 1-D marginal as a half-and-half violin.
 
@@ -1940,7 +1958,8 @@ def plot_violin_summary(
         Line2D([0], [0], color="red", linestyle="--", linewidth=1.2, label="True"),
     ]
     fig.suptitle(
-        f"Final-round 1-D marginals: NRE (left half) vs MCMC (right half)",
+        f"Round {final_idx} 1-D marginals — reason: {reason} "
+        f"— NRE (left half) vs MCMC (right half)",
         fontsize=12,
     )
     fig.tight_layout(rect=(0, 0.04, 1, 0.96))
@@ -1970,6 +1989,7 @@ def plot_all_marginals(
     mcmc_samples_path: str = None,
     outdir: str = None,
     save_dpi: int = 150,
+    reason: str = "truncation",
 ):
     """Produce one figure per model marginal, dispatching by dimensionality.
 
@@ -2167,10 +2187,14 @@ def plot_all_marginals(
         dataloader=dataloader,
         mcmc_samples_path=mcmc_samples_path,
         ngrid=ngrid_points_1d,
+        reason=reason,
     )
     if fig_violin is not None:
         if outdir is not None:
-            out_path = os.path.join(outdir, "violin_summary.png")
+            out_path = os.path.join(
+                outdir,
+                f"violin_summary_round{len(round_dirs)}_{reason}.png",
+            )
             fig_violin.savefig(out_path, dpi=save_dpi, bbox_inches="tight")
             print(f"  Saved violin summary to {out_path}")
             plt.close(fig_violin)
@@ -2230,7 +2254,29 @@ if __name__ == "__main__":
             "all available rounds."
         ),
     )
+    parser.add_argument(
+        "--ckpt-final-round", default=None,
+        help=(
+            "Path to a checkpoint that overrides the final round's "
+            "``truncation.ckpt``.  Used to visualise the model state at, "
+            "e.g., a PP-KS trigger point (path "
+            "``.../checkpoints/ppks_trigger_cumep_<N>.ckpt``) rather than "
+            "the end-of-round model.  Affects only the final round "
+            "(typically combined with ``--last-round``)."
+        ),
+    )
+    parser.add_argument(
+        "--reason", default="auto",
+        help=(
+            "Label for the violin figure (suptitle + filename), describing "
+            "what the final-round model represents.  ``auto`` (default) "
+            "becomes ``trigger`` when ``--ckpt-final-round`` is given, "
+            "``truncation`` otherwise.  Free-form values are accepted."
+        ),
+    )
     args = parser.parse_args()
+    if args.reason == "auto":
+        args.reason = "trigger" if args.ckpt_final_round else "truncation"
 
     name = args.name
     round_dirs = find_round_dirs(name)
@@ -2255,6 +2301,20 @@ if __name__ == "__main__":
             )
         round_dirs = round_dirs[: args.last_round]
         print(f"Truncated to first {args.last_round} round(s) (--last-round).")
+
+    # Final-round checkpoint override (e.g. a PP-KS trigger ckpt).  Stash the
+    # mapping into the module-level dict that ``load_model`` reads.
+    if args.ckpt_final_round is not None:
+        if not os.path.exists(args.ckpt_final_round):
+            raise FileNotFoundError(
+                f"--ckpt-final-round={args.ckpt_final_round!r} does not exist."
+            )
+        final_ckpt_dir = os.path.realpath(
+            os.path.join(round_dirs[-1], "checkpoints")
+        )
+        _CKPT_OVERRIDES[final_ckpt_dir] = args.ckpt_final_round
+        print(f"Final-round checkpoint override: {final_ckpt_dir} ← "
+              f"{args.ckpt_final_round}")
 
     dataset_observation = MBHBDataset(args.data_path, cache_in_memory=False)
     dataset_subset = Subset(dataset_observation, indices=[0])
@@ -2290,6 +2350,7 @@ if __name__ == "__main__":
         ngrid_points_1d=args.ngrid_1d,
         mcmc_samples_path=args.mcmc_file,
         outdir=outdir,
+        reason=args.reason,
     )
 
     plt.show()
