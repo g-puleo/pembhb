@@ -25,20 +25,26 @@ def lMcq_m1m2(x: np.array):
 
 class UniformSampler ():
 
-    def __init__(self, prior_bounds: dict = None, rng: np.random.Generator = None):
+    def __init__(self, prior_bounds: dict = None, rng: np.random.Generator = None,
+                 dist_uniform_in_volume: bool = True):
         """Initialise sampler with given prior bounds.
 
         :param prior_bounds: dict of prior bounds
         :type prior_bounds: dict
         :param rng: NumPy random Generator. If None, uses the global np.random state.
         :type rng: np.random.Generator or None
+        :param dist_uniform_in_volume: if True (default), sample distance uniformly in d^3
+            (i.e. uniform-in-volume); if False, sample distance uniformly in d.
+        :type dist_uniform_in_volume: bool
         """
-        print("init of uniform sampler")
+        print(f"init of uniform sampler (dist_uniform_in_volume={dist_uniform_in_volume})")
         self.rng = rng
         self.prior_bounds = copy.deepcopy(prior_bounds)
-        ## value is in Gpc^3
-        self.prior_bounds["dist"][0]   = self.prior_bounds["dist"][0]**3
-        self.prior_bounds["dist"][1]   = self.prior_bounds["dist"][1]**3
+        self.dist_uniform_in_volume = dist_uniform_in_volume
+        if self.dist_uniform_in_volume:
+            ## value is in Gpc^3
+            self.prior_bounds["dist"][0]   = self.prior_bounds["dist"][0]**3
+            self.prior_bounds["dist"][1]   = self.prior_bounds["dist"][1]**3
         self.lower_bounds = np.array([self.prior_bounds[key][0] for key in _ORDERED_PRIOR_KEYS]).reshape(-1,1)
         self.upper_bounds = np.array([self.prior_bounds[key][1] for key in _ORDERED_PRIOR_KEYS]).reshape(-1,1)
         self.n_params = self.lower_bounds.shape[0]
@@ -64,8 +70,9 @@ class UniformSampler ():
             # find which parameters have non-monotonic bounds and raise an error
             idxs = np.argwhere(~is_monotonic)
             raise ValueError(f"All upper bounds must be greater than lower bounds, but this was violated by params at positions {idxs.flatten()}")
-        # take cube root of tmnre input for distance to get back to Gpc units
-        tmnre_input[4] = np.cbrt(tmnre_input[4])
+        if self.dist_uniform_in_volume:
+            # take cube root of tmnre input for distance to get back to Gpc units
+            tmnre_input[4] = np.cbrt(tmnre_input[4])
         #NB IT IS VERY IMPORTANT TO USE .copy() OTHERWISE THE OPERATIONS WILL BE PERFORMED IN-PLACE
         bbhx_input = self.samples_to_bbhx_input(tmnre_input.copy(), t_obs_end)
         ## insert f_ref=0
@@ -121,9 +128,11 @@ class MaskRejectSampler:
 
     def __init__(self, prior_bounds: dict, sky_mask: np.ndarray,
                  grid_lam: np.ndarray, grid_beta: np.ndarray,
-                 rng: np.random.Generator = None):
+                 rng: np.random.Generator = None,
+                 dist_uniform_in_volume: bool = True):
         print("init of MaskRejectSampler")
-        self.base_sampler = UniformSampler(prior_bounds, rng=rng)
+        self.base_sampler = UniformSampler(prior_bounds, rng=rng,
+                                           dist_uniform_in_volume=dist_uniform_in_volume)
         self.sky_mask = sky_mask
         self.grid_lam = grid_lam
         self.grid_beta = grid_beta

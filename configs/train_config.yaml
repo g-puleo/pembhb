@@ -218,7 +218,7 @@ joint_training:
   # "accuracy" is implemented in tmnre_joint.py via WarmupEarlyStopping that
   # ignores epochs before ae_warmup_epochs (where val_accuracy is constant 0.5).
   # -----------------------------------------------------------------------
-  early_stop_criterion: "accuracy"
+  early_stop_criterion: "volume_ratio"
 
   # accuracy-based early-stopping parameters (used when
   # early_stop_criterion == "accuracy"); values from reference sequential_training.
@@ -245,7 +245,41 @@ volume_ratio_early_stop:
   patience: 20            # consecutive stalled evaluations before stopping
   rel_tol: 0.02           # relative EMA change threshold for "stalled"
   ema_alpha: 0.3          # EMA smoothing factor (higher = more reactive)
-  min_ratio_threshold: 0.5  # stop immediately if any marginal ratio drops here
+  min_ratio_threshold: 0.5  # fast path: stop immediately if any marginal ratio drops here
+  plateau_grace_epochs: 40  # plateau fallback only allowed after warmup+this many epochs
+                            # (i.e. once the 0.5 threshold has failed to fire that long)
+
+# =========================================================================
+# Campaign-level (across-round) convergence — stops the whole TMNRE chain.
+# Per marginal: a marginal converges when its round-final absolute differential
+# entropy flattens (|ΔH| < eps_nats, a relative width change since H = log-volume)
+# for `patience` consecutive candidate rounds; the chain stops when ALL marginals
+# have converged. Rounds that stopped via the 0.5 volume threshold reset stalls.
+# =========================================================================
+chain_convergence:
+  enabled: true
+  eps_nats: 0.05          # per-round entropy change tolerance (~5% width change)
+  patience: 2             # consecutive flattened rounds required, per marginal
+  require_not_threshold: true  # a 0.5-threshold round resets all stalls
+  # tau_gate: [0.8, 1.25]  # optional Fisher floor gate (needs pp_ks_early_stop.lambda_tau)
+
+# =========================================================================
+# PP-KS rank monitor (P-P / KS overconfidence) + λ/τ per-sample diagnostics.
+# trigger_on_overconfidence: false -> MONITOR only (logs P-P overlays and,
+# with lambda_tau.enabled, writes lambda_tau_stats_round_{i}.h5); it does NOT
+# early-stop, so it does not interfere with the volume_ratio criterion.
+# =========================================================================
+pp_ks_early_stop:
+  enabled: true
+  trigger_on_overconfidence: false
+  test_n: 100
+  ngrid_points: 50
+  warmup_epochs: 0          # log ranks + λ/τ from epoch 0 (trigger is off anyway)
+  run_every_n_epochs: 1
+  print_every: 20
+  lambda_tau:
+    enabled: true            # write λ_i / τ_i ingredients to per-round HDF5
+    # fisher_backend: cuda12x  # default: datagen backend
 
 rom_use_pinned_memory: false  # Only set true for single-session usage
 rom_prefetch_batches: 4       # Increase to reduce Python overhead

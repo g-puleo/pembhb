@@ -90,8 +90,31 @@ The primary training entry point. Run from the repo root:
 /data/gpuleo/envs/lisa_pip/bin/python scripts/tmnre_joint.py \
     [--train-config FILENAME] \   # default: train_config.yaml (inside configs/)
     [--n_rounds N]            \   # default: 10
+    --obs-path /path/to/obs_*_withnoise.h5 \   # MUST contain stored noise_fd
     NAME                          # unique run name (e.g. joint_v1)
 ```
+
+### Observation file: stored noise is **mandatory**
+
+`--obs-path` must point to an HDF5 with a stored `noise_fd` dataset. The
+script **aborts immediately** if it doesn't (assertion in
+`SequentialTrainerJoint.__init__`). The reason: when `noise_fd` is absent
+the collate function (`mbhb_collate_fn`, `utils.py:1260-1262`) draws a
+fresh `torch.randn` realisation on **every** forward pass, including
+training, posterior eval, the PP-KS test set, and the round-end truncation
+read. **Truncation under fresh noise is non-reproducible** — the proposal
+window drifts with each evaluation, defeating the purpose of TMNRE.
+
+To produce a usable obs file:
+
+```bash
+python scripts/add_noise_to_obs.py /path/to/obs_*.h5
+# → writes obs_*_withnoise.h5 (same waveform, with stored noise_fd)
+```
+
+The obs path used for each run is auto-logged to
+`{DATA_ROOT_DIR}/{TIME_OF_EXECUTION}/observation_used.yaml` so it can be
+recovered later without parsing stdout.
 
 To **resume** a previous run (auto-detects last completed round from checkpoints):
 

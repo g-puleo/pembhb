@@ -58,16 +58,16 @@ def get_timestamp():
     return datetime.now().strftime("%Y/%m/%d")
 
 
-def _joint_final_entropy(plot_cb):
-    """Round-final absolute joint entropy: Σ last per-marginal differential H."""
+def _round_marginal_entropies(plot_cb):
+    """Round-final absolute differential entropy per marginal: ``{label: H}``."""
     if plot_cb is None or not getattr(plot_cb, "differential_entropies", None):
-        return None
-    total, n = 0.0, 0
-    for hist in plot_cb.differential_entropies.values():
+        return {}
+    out = {}
+    for key, hist in plot_cb.differential_entropies.items():
         if hist:
-            total += hist[-1]["entropy"]
-            n += 1
-    return total if n else None
+            label = "-".join(_PPKS_ORDERED_PRIOR_KEYS[i] for i in key)
+            out[label] = hist[-1]["entropy"]
+    return out
 
 
 def _round_median_tau(lt_h5_path):
@@ -173,18 +173,41 @@ class SequentialTrainerJoint:
         )
         obs_noise_scale = self.dataset_observation.dataset.noise_scale
         obs_td_params = self.dataset_observation.dataset.td_params
-        # The obs HDF5 file is expected to contain a stored ``noise_fd``
-        # dataset (see scripts/add_noise_to_obs.py).  When present, the
-        # collate fn ignores ``noise_scale`` and uses the stored noise as-is,
-        # so the observation is identical across every call.  ``noise_factor``
-        # remains a multiplier (1.0 = full noise, 0.0 = pure signal).
+        # The obs HDF5 file MUST contain a stored ``noise_fd`` dataset
+        # (see scripts/add_noise_to_obs.py).  Without it, the collate fn
+        # draws a fresh torch.randn() realisation on every forward pass,
+        # which makes PP-KS, posterior eval, and truncation non-reproducible.
         if not self.dataset_observation.dataset.has_stored_noise:
-            print(
-                "[Obs] WARNING: observation file does not contain a stored "
-                "'noise_fd' dataset.  Posteriors will use freshly-drawn random "
-                "noise on every call, which makes truncation bounds non-reproducible. "
-                "Run scripts/add_noise_to_obs.py first."
+            raise RuntimeError(
+                f"[Obs] '{dataset_obs_path}' has no stored 'noise_fd' dataset. "
+                f"Training would draw fresh random noise on every call, which "
+                f"breaks reproducibility of PP-KS, posterior eval and truncation. "
+                f"Run scripts/add_noise_to_obs.py first, then point --obs-path "
+                f"at the *_withnoise.h5 file."
             )
+
+        # Persist the obs file used for this run so it can be recovered later
+        # (the path is otherwise only in the launch command's stdout).
+        try:
+            import yaml as _yaml
+            _obs_log_dir = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION)
+            os.makedirs(_obs_log_dir, exist_ok=True)
+            _obs_sidecar = (
+                dataset_obs_path[:-3] + ".yaml"
+                if dataset_obs_path.endswith(".h5") else dataset_obs_path + ".yaml"
+            )
+            with open(os.path.join(_obs_log_dir, "observation_used.yaml"), "w") as _f:
+                _yaml.safe_dump(
+                    {
+                        "obs_path": os.path.abspath(dataset_obs_path),
+                        "obs_sidecar": os.path.abspath(_obs_sidecar),
+                        "has_stored_noise": True,
+                    },
+                    _f,
+                )
+            print(f"[Obs] recorded obs path → {_obs_log_dir}/observation_used.yaml")
+        except Exception as _exc:
+            print(f"[Obs] WARNING: could not write observation_used.yaml: {_exc}")
         self.dataloader_obs = DataLoader(
             self.dataset_observation,
             batch_size=1,
@@ -249,7 +272,7 @@ class SequentialTrainerJoint:
         # ---- Campaign-level convergence monitor (optional) --------------
         # Round-final signals captured at the end of each _train_joint, read by
         # the chain monitor in run() to decide when to stop the whole chain.
-        self._last_joint_entropy = None
+        self._last_marginal_entropies = {}
         self._last_stopped_via = ""
         self._last_median_tau = None
         cc_conf = self.train_conf.get("chain_convergence", {})
@@ -1048,7 +1071,7 @@ class SequentialTrainerJoint:
         for cb in callbacks_list:
             if isinstance(cb, VolumeRatioEarlyStopping):
                 self._last_stopped_via = cb.stopped_via
-        self._last_joint_entropy = _joint_final_entropy(plot_posterior_callback)
+        self._last_marginal_entropies = _round_marginal_entropies(plot_posterior_callback)
         self._last_median_tau = _round_median_tau(locals().get("lt_h5_path"))
         opt = self.model.optimizers()
         if isinstance(opt, list):
@@ -1101,9 +1124,11 @@ class SequentialTrainerJoint:
             validate_marginals(active_marginals)
             print(f"Active marginals for round {i}: {active_marginals}")
 
+            dist_uniform_in_volume = self.datagen_conf.get("prior_dist_volumetric", True)
             if i == 1 and self.fisher_prior_bounds is not None:
                 self.datagen_conf["prior"].update(copy.deepcopy(self.fisher_prior_bounds))
-                sampler_kwargs = {"prior_bounds": self.fisher_prior_bounds}
+                sampler_kwargs = {"prior_bounds": self.fisher_prior_bounds,
+                                  "dist_uniform_in_volume": dist_uniform_in_volume}
                 print("[Fisher] Using Fisher-based prior for round 1.")
                 import yaml as _yaml
                 _out = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION, "fisher_prior_round_1.yaml")
@@ -1112,7 +1137,8 @@ class SequentialTrainerJoint:
                     _yaml.safe_dump({"fisher_prior_bounds": self.fisher_prior_bounds}, _f)
                 print(f"[Fisher] Saved Fisher prior bounds to {_out}")
             else:
-                sampler_kwargs = {"prior_bounds": self.datagen_conf["prior"]}
+                sampler_kwargs = {"prior_bounds": self.datagen_conf["prior"],
+                                  "dist_uniform_in_volume": dist_uniform_in_volume}
 
             self.round(idx=i, sampler_init_kwargs=sampler_kwargs)
 
@@ -1211,20 +1237,27 @@ class SequentialTrainerJoint:
                 torch.cuda.empty_cache()
 
             # ---- Campaign-level convergence: stop the whole chain? ----------
-            if self.chain_monitor is not None and self._last_joint_entropy is not None:
+            if self.chain_monitor is not None and self._last_marginal_entropies:
                 stop_chain = self.chain_monitor.update(
-                    i, self._last_joint_entropy,
+                    i, self._last_marginal_entropies,
                     stopped_via=self._last_stopped_via,
                     median_tau=self._last_median_tau,
                 )
-                print(f"[ChainConv] round {i}: H={self._last_joint_entropy:.4f}, "
-                      f"stopped_via='{self._last_stopped_via}', "
+                n_conv = len(self.chain_monitor.converged_at)
+                n_tot = len(self._last_marginal_entropies)
+                print(f"[ChainConv] round {i}: stopped_via='{self._last_stopped_via}', "
                       f"median_tau={self._last_median_tau}, "
-                      f"stall={self.chain_monitor.stall}/{self.chain_monitor.patience}")
+                      f"converged {n_conv}/{n_tot} marginals")
                 if stop_chain:
                     print(f"[ChainConv] STOP chain after round {i}: "
                           f"{self.chain_monitor.stop_reason}")
+                    print(self.chain_monitor.summary())
                     break
+
+        # Per-marginal convergence record at end of the campaign (converged or
+        # simply out of rounds).
+        if self.chain_monitor is not None:
+            print(self.chain_monitor.summary())
 
 
 # -------------------------------------------------------------------------

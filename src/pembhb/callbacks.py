@@ -843,23 +843,30 @@ class DifferentialEntropyEarlyStopping(Callback):
 
 
 class ChainConvergenceMonitor:
-    """Across-round (campaign) convergence on the absolute joint entropy.
+    """Across-round (campaign) convergence, tracked **per marginal**.
 
     Not a Lightning callback — a plain helper the trainer carries across rounds
-    and queries at each round boundary. The chain is declared converged when the
-    round-final joint differential entropy ``H_n = Σ_marginals H`` has flattened:
+    and queries at each round boundary. Each marginal carries its own absolute
+    differential-entropy series and stall counter; a marginal is *converged*
+    once its round-over-round change has flattened,
 
-        |H_{n-1} − H_n| < eps_nats   for ``patience`` consecutive *candidate* rounds.
+        |H_{n-1} − H_n| < eps_nats   for ``patience`` consecutive candidate rounds,
 
-    Because H is a log-volume, ``eps_nats`` is a *relative* per-round width
-    change, so the test is scale-free. A round counts as a candidate only if it
-    did NOT stop via the within-round 0.5 volume threshold (``stopped_via ==
-    "threshold"`` means the prior just halved — still actively shrinking, so the
-    stall counter resets). An optional Fisher gate additionally requires the
-    round's median τ to sit inside ``tau_gate`` (posterior at the CR floor).
+    and the **chain stops only when every reported marginal is converged**
+    (AND-reduction). Summing the marginals would be wrong — a flat sum can hide
+    one marginal still shrinking while another drifts up. Because H is a
+    log-volume, ``eps_nats`` is a *relative* per-round width change, so the test
+    is scale-free.
 
-    State (entropy series + stall + converged flag) is persisted to ``state_path``
-    so a ``--resume`` continues the campaign-level decision.
+    A round is a candidate only if it did NOT stop via the within-round 0.5
+    volume threshold (``stopped_via == "threshold"`` means the prior just halved
+    — still actively shrinking, so every stall resets). An optional Fisher gate
+    additionally requires the round's median τ to sit inside ``tau_gate``.
+
+    ``converged_at`` records, per marginal, the round at which it first reached
+    ``patience`` — surfaced at chain end so you can see when each marginal
+    settled. State is persisted to ``state_path`` so ``--resume`` continues the
+    decision.
     """
 
     def __init__(self, eps_nats: float = 0.05, patience: int = 2,
@@ -872,7 +879,9 @@ class ChainConvergenceMonitor:
         self.tau_gate = tau_gate
         self.require_not_threshold = require_not_threshold
         self.history: list[dict] = []
-        self.stall = 0
+        self._prev_H: dict[str, float] = {}
+        self._stall: dict[str, int] = {}
+        self.converged_at: dict[str, int] = {}   # marginal -> round first converged
         self.converged = False
         self.stop_reason = ""
         self._load()
@@ -882,7 +891,9 @@ class ChainConvergenceMonitor:
             with open(self.state_path) as f:
                 s = yaml.safe_load(f) or {}
             self.history = s.get("history", []) or []
-            self.stall = int(s.get("stall", 0))
+            self._prev_H = dict(s.get("prev_H", {}) or {})
+            self._stall = {k: int(v) for k, v in (s.get("stall", {}) or {}).items()}
+            self.converged_at = {k: int(v) for k, v in (s.get("converged_at", {}) or {}).items()}
             self.converged = bool(s.get("converged", False))
 
     def _save(self):
@@ -891,38 +902,71 @@ class ChainConvergenceMonitor:
         os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
         tmp = self.state_path + ".tmp"
         with open(tmp, "w") as f:
-            yaml.safe_dump({"history": self.history, "stall": int(self.stall),
-                            "converged": bool(self.converged)}, f, sort_keys=False)
+            yaml.safe_dump({
+                "history": self.history,
+                "prev_H": {k: float(v) for k, v in self._prev_H.items()},
+                "stall": {k: int(v) for k, v in self._stall.items()},
+                "converged_at": {k: int(v) for k, v in self.converged_at.items()},
+                "converged": bool(self.converged),
+            }, f, sort_keys=False)
         os.replace(tmp, self.state_path)
 
-    def update(self, round_idx, joint_H, stopped_via="", median_tau=None):
-        """Record this round; return True if the chain has converged."""
-        prev_H = self.history[-1]["H"] if self.history else None
-        dH = None if prev_H is None else abs(prev_H - joint_H)
-
+    def update(self, round_idx, entropies: dict, stopped_via="", median_tau=None):
+        """Record a round given ``{marginal_label: H}``; return chain-converged."""
         candidate = (not self.require_not_threshold) or (stopped_via != "threshold")
         tau_ok = self.tau_gate is None or (
             median_tau is not None
             and self.tau_gate[0] <= median_tau <= self.tau_gate[1]
         )
-        flat = dH is not None and dH < self.eps_nats
-        self.stall = self.stall + 1 if (candidate and flat and tau_ok) else 0
+
+        per = {}
+        for label, H in entropies.items():
+            prev = self._prev_H.get(label)
+            dH = None if prev is None else abs(prev - H)
+            flat = dH is not None and dH < self.eps_nats
+            if candidate and flat and tau_ok:
+                self._stall[label] = self._stall.get(label, 0) + 1
+            else:
+                self._stall[label] = 0
+            self._prev_H[label] = float(H)
+            # First time this marginal reaches patience: stamp the round.
+            if self._stall[label] >= self.patience and label not in self.converged_at:
+                self.converged_at[label] = int(round_idx)
+                print(f"[ChainConv] marginal '{label}' CONVERGED at round {round_idx} "
+                      f"(H={H:.4f}, |ΔH|={dH:.2e} < {self.eps_nats})", flush=True)
+            per[label] = {"H": float(H), "dH": None if dH is None else float(dH),
+                          "stall": self._stall[label]}
 
         self.history.append({
-            "round": int(round_idx), "H": float(joint_H),
-            "stopped_via": stopped_via,
+            "round": int(round_idx), "stopped_via": stopped_via,
             "median_tau": None if median_tau is None else float(median_tau),
-            "dH": None if dH is None else float(dH),
+            "per_marginal": per,
         })
-        if self.stall >= self.patience:
+
+        all_converged = bool(entropies) and all(
+            self._stall.get(l, 0) >= self.patience for l in entropies
+        )
+        if all_converged:
             self.converged = True
             self.stop_reason = (
-                f"joint entropy flattened: |ΔH|<{self.eps_nats} for {self.stall} "
-                f"candidate rounds (H={joint_H:.4f}"
-                + ("" if median_tau is None else f", median_τ={median_tau:.3f}") + ")"
+                f"all {len(entropies)} marginals flattened (|ΔH|<{self.eps_nats}, "
+                f"patience={self.patience}); converged_at={self.converged_at}"
             )
         self._save()
         return self.converged
+
+    def summary(self) -> str:
+        """One-line-per-marginal record of when each marginal converged."""
+        if not self.converged_at:
+            return "[ChainConv] no marginal reached convergence."
+        lines = ["[ChainConv] per-marginal convergence rounds:"]
+        for label in sorted(self.converged_at):
+            lines.append(f"    {label}: converged at round {self.converged_at[label]}")
+        never = sorted(set(self._stall) - set(self.converged_at))
+        for label in never:
+            lines.append(f"    {label}: never converged "
+                         f"(final stall {self._stall.get(label, 0)}/{self.patience})")
+        return "\n".join(lines)
 
 
 class WarmupEarlyStopping(EarlyStopping):

@@ -1803,8 +1803,17 @@ def compute_fisher_prior_bounds(
         else:
             print(f"[Fisher] WARNING: σ({key}) is NaN – keeping datagen_config bounds.")
             lo, hi = datagen_config["prior"][key]
-        prior_bounds[key] = [lo, hi]
-        print(f"[Fisher] {key}: true={true_val:.6e}, σ={sigma:.3e}, n_sigma={n_sig_eff} → [{lo:.6e}, {hi:.6e}]")
+        # Clip to the physical prior range — those are hard constraints
+        # (e.g. cos(inc) ∈ [-1, 1], chi ∈ [-1, 1]). Fisher tails beyond them
+        # would produce NaN waveforms via downstream arcsin/arccos.
+        phys_lo, phys_hi = datagen_config["prior"][key]
+        lo_c = max(lo, float(phys_lo))
+        hi_c = min(hi, float(phys_hi))
+        if (lo_c, hi_c) != (lo, hi):
+            print(f"[Fisher] {key}: clipped to physical prior [{phys_lo}, {phys_hi}] "
+                  f"(was [{lo:.6e}, {hi:.6e}])")
+        prior_bounds[key] = [lo_c, hi_c]
+        print(f"[Fisher] {key}: true={true_val:.6e}, σ={sigma:.3e}, n_sigma={n_sig_eff} → [{lo_c:.6e}, {hi_c:.6e}]")
 
     print(f"[Fisher] Final prior bounds: {prior_bounds}")
     return prior_bounds
@@ -2222,16 +2231,31 @@ def get_widest_box_sky(model, dataloader, in_param_idx, out_param_idx,
     return widest_box, inj_params, sky_analysis
 
 
-def eval_posterior_2d(model, dataloader, in_param_idx, out_param_idx, ngrid_points=100):
-    """Evaluate and normalize a 2D marginal posterior on a grid."""
+def eval_posterior_2d(model, dataloader, in_param_idx, out_param_idx, ngrid_points=100,
+                      bounds_0=None, bounds_1=None, keep_batch_dim=False):
+    """Evaluate and normalize a 2D marginal posterior on a grid.
+
+    When *bounds_0* / *bounds_1* are provided, the grid spans those ranges
+    instead of using the model's stored bounds (useful for plotting on a
+    round-specific prior box).
+
+    *keep_batch_dim* controls the shape of the returned ``norm2d``: ``False``
+    drops the batch axis (returns ``(ngrid, ngrid)``), ``True`` keeps it
+    (returns ``(batch, ngrid, ngrid)``).  ``dp0`` and ``dp1`` are NOT returned
+    when the batch axis is kept, since callers in that mode (visualisation)
+    can compute them from ``gx``/``gy``.
+    """
     logratios, inj_params, gx, gy = get_logratios_grid_2d(
         dataloader, model,
         ngrid_points=ngrid_points,
         in_param_idx=in_param_idx,
         out_param_idx=out_param_idx,
+        bounds_0=bounds_0, bounds_1=bounds_1,
     )
     ratios = np.exp(logratios)
     dp0 = float(gx[0, 1] - gx[0, 0])
     dp1 = float(gy[1, 0] - gy[0, 0])
     norm2d = ratios / np.sum(ratios * dp0 * dp1, axis=(1, 2), keepdims=True)
+    if keep_batch_dim:
+        return norm2d, inj_params, gx, gy
     return norm2d[0], inj_params, gx, gy, dp0, dp1
