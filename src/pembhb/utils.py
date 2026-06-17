@@ -124,6 +124,7 @@ def get_logratios_grid(dataloader: torch.utils.data.DataLoader, model: 'Inferenc
     grid_padded = torch.cat((zero_pad1d[:, :in_param_idx], grid, zero_pad1d[:, in_param_idx:]), dim=1)  # Shape: [ngrid_points, 11]
     with torch.no_grad():
         for batch in dataloader:
+            batch = materialize_gpu_noise(batch)
             data_fd = (batch["wave_fd"]+batch["noise_fd"]).to(device)  # Shape: [batchsize, n_channels, n_datapoints]
             source_parameters = batch["source_parameters"]  # Shape: [batchsize, 11]
             has_td = "wave_td" in batch and "noise_td" in batch
@@ -225,6 +226,7 @@ def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'Infer
         grid_padded_input[:, in_param_idx[1]] = grid[:, 1]
 
         for batch in dataloader:
+            batch = materialize_gpu_noise(batch)
             data_fd = (batch["wave_fd"] + batch["noise_fd"]).to(device)
             source_parameters = batch["source_parameters"]
             has_td = "wave_td" in batch and "noise_td" in batch
@@ -1208,8 +1210,63 @@ def posterior_contours_2d_imshow(grid_x: np.array, grid_y: np.array, ratios: np.
 
 
 
+def materialize_gpu_noise(batch):
+    """Complete a deferred (``gpu_noise``) batch: tile + draw coloured noise.
+
+    When the data module runs with ``gpu_noise=True`` the collate fn ships only
+    the ``B`` distinct waveforms + the ``(C, F)`` ``noise_scale`` plus the marker
+    keys ``_gpu_noise`` / ``_n_noise`` / ``_noise_factor`` (see
+    :func:`mbhb_collate_fn`).  This expands the batch to the ``n*B`` effective
+    size (matching the collate's ``[batch | batch | ...]`` tiling, with a per-slot
+    independent realisation) and draws the noise on the tensors' **current
+    device** -- so it works both in Lightning's ``on_after_batch_transfer`` (GPU)
+    and in manual CPU loops (e.g. encoder normalisation fits).
+
+    Idempotent: returns ``batch`` unchanged for stored-noise or already
+    materialised batches.  No TD noise is generated (FD-only pipelines); a
+    present ``wave_td`` is tiled for consistency.
+    """
+    if not (isinstance(batch, dict) and batch.get("_gpu_noise", False)
+            and "noise_fd" not in batch):
+        return batch
+    n = int(batch["_n_noise"])
+    nf = float(batch["_noise_factor"])
+    ns = batch["noise_scale"]                   # (C, F)
+    wave = batch["wave_fd"]                      # (B, C, F) distinct
+    params = batch["source_parameters"]          # (B, P) distinct
+    if n > 1:
+        wave = wave.repeat(n, 1, 1)
+        params = params.repeat(n, 1)
+        if "wave_td" in batch:
+            batch["wave_td"] = batch["wave_td"].repeat(n, 1, 1)
+    Bn, C, Fr = wave.shape
+    re = torch.randn(Bn, C, Fr, device=wave.device, dtype=ns.dtype)
+    im = torch.randn(Bn, C, Fr, device=wave.device, dtype=ns.dtype)
+    batch["noise_fd"] = nf * torch.complex(re, im) * ns.unsqueeze(0)
+    batch["wave_fd"] = wave
+    batch["source_parameters"] = params
+    return batch
+
+
+class GPUNoiseMixin:
+    """Mixin for LightningModules trained on MBHB batches.
+
+    Materialises the coloured noise + tiling on-device after the host->device
+    transfer (see :func:`materialize_gpu_noise`).  Mix in *before* ``LightningModule``
+    so this hook overrides the framework default::
+
+        class MyNet(GPUNoiseMixin, LightningModule): ...
+
+    No-op when the data module runs with ``gpu_noise=False`` or for stored-noise
+    batches, so it is always safe to add.
+    """
+
+    def on_after_batch_transfer(self, batch, dataloader_idx):
+        return materialize_gpu_noise(batch)
+
+
 def mbhb_collate_fn(batch, noise_scale, noise_factor, noise_shuffling=True, td_params=None,
-                    n_noise_realisations=1):
+                    n_noise_realisations=1, gpu_noise=False):
     """Collate a batch, generating FD (and optionally TD) noise on the fly.
 
     :param batch: list of sample dicts from MBHBDataset.__getitem__
@@ -1225,6 +1282,15 @@ def mbhb_collate_fn(batch, noise_scale, noise_factor, noise_shuffling=True, td_p
         always freshly generated per call when not stored on disk
     :param td_params: tuple ``(dt, n_time)`` needed to derive TD noise via IFFT,
         or ``None`` when only FD data is required
+    :param gpu_noise: when True (and the batch carries no stored noise), defer
+        both the noise generation and the ``n_noise_realisations`` batch tiling
+        to the GPU.  Only the ``B`` distinct waveforms, the params and the
+        ``(C, F)`` ``noise_scale`` are returned, together with the marker keys
+        ``_gpu_noise`` / ``_n_noise`` / ``_noise_factor``; the actual coloured
+        noise + tiling are produced in
+        ``FMPEInferenceNetwork.on_after_batch_transfer``.  This slashes the
+        per-batch CPU ``randn`` cost and the host->device transfer volume.
+        Ignored when the batch carries a stored ``noise_fd``.
     :param n_noise_realisations: number of distinct noise realisations to draw
         and show the model for *each* waveform. When > 1 the batch is expanded
         from ``B`` to ``B * n_noise_realisations`` examples by tiling
@@ -1253,6 +1319,25 @@ def mbhb_collate_fn(batch, noise_scale, noise_factor, noise_shuffling=True, td_p
         wave_td = torch.stack([b["wave_td"] for b in batch]) if has_td else None
     else:
         n = max(1, int(n_noise_realisations))
+        if gpu_noise:
+            # Defer noise draw + tiling to the GPU. Ship only the B distinct
+            # waveforms + the (C, F) noise_scale (~96 KB) instead of the tiled
+            # waveforms + noise (~hundreds of MB). The expansion to (n*B) and
+            # the coloured-noise draw happen in
+            # FMPEInferenceNetwork.on_after_batch_transfer.
+            out = {
+                "source_parameters": params,            # (B, P) distinct
+                "wave_fd": wave_fd,                      # (B, C, F) distinct
+                "noise_scale": noise_scale,              # (C, F)
+                "_gpu_noise": True,
+                "_n_noise": n,
+                "_noise_factor": float(noise_factor),
+            }
+            if has_td:
+                # FD-only pipelines (FMPE) don't use this, but keep it untiled
+                # for completeness; TD noise is not generated in this path.
+                out["wave_td"] = torch.stack([b["wave_td"] for b in batch])
+            return out
         # Draw an *independent* coloured complex Gaussian noise realisation for
         # every (copy, waveform) slot in the expanded batch:
         # z = (re + j im) * noise_scale, with re, im ~ N(0, 1) i.i.d.

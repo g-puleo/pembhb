@@ -320,7 +320,9 @@ class AutoencoderDiagnosticsCallback(Callback):
         except StopIteration:
             return
 
+        from pembhb.utils import materialize_gpu_noise
         device = next(ae.parameters()).device
+        batch = materialize_gpu_noise(batch)
         with torch.no_grad():
             noisy = batch["wave_fd"].to(device) + batch["noise_fd"].to(device)
             x_norm = ae.preprocess(noisy)

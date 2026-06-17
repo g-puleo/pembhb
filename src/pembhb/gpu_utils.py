@@ -62,6 +62,11 @@ def reserve_gpu_memory(model, dataloader, safety_factor=1.25, device=None):
         else:
             batch_gpu[k] = v
 
+    # Mirror Lightning's post-transfer hook so a deferred (gpu_noise) batch is
+    # materialised (noise drawn + tiled on-device) exactly as in real training.
+    if hasattr(model, "on_after_batch_transfer"):
+        batch_gpu = model.on_after_batch_transfer(batch_gpu, 0)
+
     loss = model.training_step(batch_gpu, batch_idx=0)
     if isinstance(loss, dict):
         loss = loss["loss"]

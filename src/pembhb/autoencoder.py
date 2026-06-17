@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader
 
 from pembhb.model import DoubleConv, Down, Up, OutConv
 from pembhb import get_torch_dtype
+from pembhb.utils import materialize_gpu_noise, GPUNoiseMixin
 
 
 def resolve_loss_band(freqs, ae_conf):
@@ -346,7 +347,7 @@ class UnetDecoder(nn.Module):
 # Denoising Autoencoder (LightningModule)
 # ---------------------------------------------------------------------------
 
-class DenoisingAutoencoder(LightningModule):
+class DenoisingAutoencoder(GPUNoiseMixin, LightningModule):
     """Convolutional denoising autoencoder for frequency-domain gravitational-wave data.
 
     Training
@@ -633,6 +634,7 @@ class DenoisingAutoencoder(LightningModule):
         max_val = 0.0
         with torch.no_grad():
             for batch in dataloader:
+                batch = materialize_gpu_noise(batch)
                 wave_fd = batch["wave_fd"].to(device)
                 real = self._complex_to_real(wave_fd)  # (B, 2C, F)
                 running_sum += real.sum(dim=0)
@@ -781,6 +783,7 @@ class DenoisingAutoencoder(LightningModule):
         # --- Pass 1: accumulate mean_whitened on the full grid ---
         with torch.no_grad():
             for batch in dataloader:
+                batch = materialize_gpu_noise(batch)
                 wave_fd = batch["wave_fd"].to(device)
                 wave_w = wave_fd / self.whitening
                 real = self._complex_to_real(wave_w)  # (B, 2C, F)
@@ -801,6 +804,7 @@ class DenoisingAutoencoder(LightningModule):
         max_std  = 0.0
         with torch.no_grad():
             for batch in dataloader:
+                batch = materialize_gpu_noise(batch)
                 wave_fd = batch["wave_fd"].to(device)
                 wave_w = wave_fd / self.whitening
                 real = self._complex_to_real(wave_w)  # (B, 2C, F)
@@ -1139,7 +1143,7 @@ class RegressionHead(nn.Module):
 # Per-Marginal Encoder Trainer (LightningModule)
 # ---------------------------------------------------------------------------
 
-class MarginalEncoderTrainer(LightningModule):
+class MarginalEncoderTrainer(GPUNoiseMixin, LightningModule):
     """Trains one ConvEncoder + RegressionHead per marginal.
 
     Each encoder compresses noisy FD data to a bottleneck, and each
@@ -1316,6 +1320,7 @@ class MarginalEncoderTrainer(LightningModule):
         n_samples = 0
         with torch.no_grad():
             for batch in dataloader:
+                batch = materialize_gpu_noise(batch)
                 wave_fd = batch["wave_fd"].to(device)
                 wave_w = wave_fd / self.whitening
                 real = self._complex_to_real(wave_w)
@@ -1641,6 +1646,7 @@ class ChannelizedMLPCompressor(nn.Module):
         n_samples = 0
         with torch.no_grad():
             for batch in dataloader:
+                batch = materialize_gpu_noise(batch)
                 wave_fd = batch["wave_fd"].to(device)
                 wave_w = wave_fd / self.whitening
                 real = self._complex_to_real(wave_w)
@@ -1656,6 +1662,7 @@ class ChannelizedMLPCompressor(nn.Module):
         max_mean = 0.0
         with torch.no_grad():
             for batch in dataloader:
+                batch = materialize_gpu_noise(batch)
                 wave_fd = batch["wave_fd"].to(device)
                 wave_w = wave_fd / self.whitening
                 real = self._complex_to_real(wave_w)
@@ -1683,6 +1690,7 @@ class ChannelizedMLPCompressor(nn.Module):
         max_val = 0.0
         with torch.no_grad():
             for batch in dataloader:
+                batch = materialize_gpu_noise(batch)
                 wave_fd = batch["wave_fd"].to(device)
                 real = self._complex_to_real(wave_fd)
                 running_sum += real.sum(dim=0)
