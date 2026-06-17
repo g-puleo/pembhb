@@ -141,7 +141,7 @@ class MBHBDataset(Dataset):
 
 class MBHBDataModule( L.LightningDataModule ): 
 
-    def __init__(self, filename: str, batch_size: int, num_workers: int = 15, cache_in_memory: bool = False, shuffle_data: bool = True, noise_factor=1.0, seed: int = 31415, n_train_noise_realisations: int = 1):
+    def __init__(self, filename: str, batch_size: int, num_workers: int = 15, cache_in_memory: bool = False, shuffle_data: bool = True, noise_factor=1.0, seed: int = 31415, n_train_noise_realisations: int = 1, gpu_noise: bool = True):
         """Initialize the data module.
 
         :param filename: Path to the HDF5 file.
@@ -166,6 +166,12 @@ class MBHBDataModule( L.LightningDataModule ):
         self.shuffle_data = shuffle_data
         self.noise_factor = noise_factor
         self.n_train_noise_realisations = n_train_noise_realisations
+        # When True (default), the collate fn ships un-tiled, noise-free batches
+        # and the coloured noise + tiling are produced on-device by the
+        # GPUNoiseMixin.on_after_batch_transfer hook (and by materialize_gpu_noise
+        # in manual loops). Also turns on pinned memory + persistent workers.
+        # Set False to fall back to CPU-side noise generation in the collate fn.
+        self.gpu_noise = gpu_noise
 
         # read median snr from the dataset for safety checks: 
         with h5py.File(self.filename, "r") as f:
@@ -282,30 +288,50 @@ class MBHBDataModule( L.LightningDataModule ):
             times = f["times_SI"][()]
         return times
 
+    def _loader_extra_kwargs(self, num_workers, pin_memory):
+        """Pinned-memory + persistent-worker kwargs, enabled only for gpu_noise."""
+        extra = {}
+        if self.gpu_noise:
+            pin_memory = True
+            if num_workers > 0:
+                extra = {"persistent_workers": True, "prefetch_factor": 4}
+        return pin_memory, extra
+
     def train_dataloader(self, shuffle=True, num_workers=None, pin_memory=False):
         if num_workers is None:
             num_workers = self.num_workers
         noise_scale = self.full_dataset.noise_scale
         td_params = self.full_dataset.td_params
+        pin_memory, extra = self._loader_extra_kwargs(num_workers, pin_memory)
         return DataLoader(self.train, batch_size=self.batch_size, shuffle=shuffle, num_workers=num_workers,
                           pin_memory=pin_memory,
                           collate_fn=lambda b: mbhb_collate_fn(b, noise_scale, self.noise_factor,
                                                                 noise_shuffling=shuffle, td_params=td_params,
-                                                                n_noise_realisations=self.n_train_noise_realisations))
+                                                                n_noise_realisations=self.n_train_noise_realisations,
+                                                                gpu_noise=self.gpu_noise),
+                          **extra)
 
     def val_dataloader(self, shuffle=True):
         noise_scale = self.full_dataset.noise_scale
         td_params = self.full_dataset.td_params
+        pin_memory, extra = self._loader_extra_kwargs(self.num_workers, False)
         return DataLoader(self.val, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers,
+                          pin_memory=pin_memory,
                           collate_fn=lambda b: mbhb_collate_fn(b, noise_scale, self.noise_factor,
-                                                                noise_shuffling=False, td_params=td_params))
+                                                                noise_shuffling=False, td_params=td_params,
+                                                                gpu_noise=self.gpu_noise),
+                          **extra)
 
     def test_dataloader(self):
         noise_scale = self.full_dataset.noise_scale
         td_params = self.full_dataset.td_params
+        pin_memory, extra = self._loader_extra_kwargs(self.num_workers, False)
         return DataLoader(self.test, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers,
+                          pin_memory=pin_memory,
                           collate_fn=lambda b: mbhb_collate_fn(b, noise_scale, self.noise_factor,
-                                                                noise_shuffling=False, td_params=td_params))
+                                                                noise_shuffling=False, td_params=td_params,
+                                                                gpu_noise=self.gpu_noise),
+                          **extra)
 
 class DummyDataset(Dataset):
     def __init__(self, params, data):

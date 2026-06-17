@@ -12,7 +12,7 @@ from typing import Iterable
 from pembhb.data import MBHBDataset
 from torch.utils.data import DataLoader
 
-from pembhb.utils import _ORDERED_PRIOR_KEYS, mbhb_collate_fn
+from pembhb.utils import _ORDERED_PRIOR_KEYS, mbhb_collate_fn, GPUNoiseMixin
 from pembhb import ROOT_DIR, get_torch_dtype
 import numpy as np
 # class GWTransformer(LightningModule):
@@ -296,7 +296,7 @@ def normalise_sincos_cols(params_expanded, periodic_bc_params, param_index_remap
     return params_out
 
 
-class InferenceNetwork(LightningModule):
+class InferenceNetwork(GPUNoiseMixin, LightningModule):
     """ 
     Basic FC network for TMNRE of MBHB data. 
     """
@@ -1117,7 +1117,7 @@ class SingleGroupReduceLROnPlateau(torch.optim.lr_scheduler.ReduceLROnPlateau):
             pg["lr"] = new_lr
 
 
-class JointAEInferenceNetwork(LightningModule):
+class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
     """Joint training of an encoder (AE or ME) and NRE classifier heads.
 
     Supports two encoder types via ``encoder_model``:
