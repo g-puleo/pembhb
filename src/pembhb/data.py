@@ -1,6 +1,6 @@
 from torch.utils.data import Dataset, random_split, DataLoader, Subset 
 import lightning as L
-from pembhb.utils import mbhb_collate_fn
+from pembhb.utils import mbhb_collate_fn, append_derived_params
 from pembhb import get_torch_dtype, get_torch_complex_dtype
 import torch
 import numpy as np
@@ -55,7 +55,10 @@ class MBHBDataset(Dataset):
 
             if cache_in_memory:
                 self.wave_fd = torch.tensor(f["wave_fd"][()], device="cpu", dtype=get_torch_complex_dtype())
-                self.source_parameters = torch.tensor(f["source_parameters"][()], device="cpu", dtype=get_torch_dtype())
+                # HDF5 stores the 11 sampled params; append derived params
+                # (chi_eff) here so the cached tensor is the full 12-wide vector.
+                self.source_parameters = append_derived_params(
+                    torch.tensor(f["source_parameters"][()], device="cpu", dtype=get_torch_dtype()))
                 if self.has_td:
                     self.wave_td = torch.tensor(f["wave_td"][()], device="cpu", dtype=get_torch_dtype())
                 else:
@@ -78,7 +81,11 @@ class MBHBDataset(Dataset):
         return data[idx]
     def _load_from_disk(self, key, idx):
         with h5py.File(self.filename, "r") as f:
-            return torch.tensor(f[key][idx], device="cpu")
+            data = torch.tensor(f[key][idx], device="cpu")
+        if key == "source_parameters":
+            # append derived params (chi_eff) to the 11-wide stored vector
+            data = append_derived_params(data)
+        return data
 
     def _transform_identity(self, data):
         return data
@@ -210,12 +217,32 @@ class MBHBDataModule( L.LightningDataModule ):
         params = self._load_train_params()
         return params.mean(dim=0), params.std(dim=0)
 
+    def get_derived_param_bounds(self):
+        """Empirical prior box for derived params, from the training split.
+
+        Derived params (chi_eff) are not sampled from a rectangular prior, so
+        their "prior box" is the realised min/max over the training data.
+        Returns a dict {name: [min, max]} keyed by _DERIVED_PARAM_KEYS, with the
+        derived columns occupying positions len(_ORDERED_PRIOR_KEYS).. in the
+        12-wide vector returned by _load_train_params.
+        """
+        from pembhb.utils import _ORDERED_PRIOR_KEYS, _DERIVED_PARAM_KEYS
+        params = self._load_train_params()
+        bounds = {}
+        n_sampled = len(_ORDERED_PRIOR_KEYS)
+        for j, name in enumerate(_DERIVED_PARAM_KEYS):
+            col = params[:, n_sampled + j]
+            bounds[name] = [col.min().item(), col.max().item()]
+        return bounds
+
     def _load_train_params(self):
         """Load only source_parameters for the training subset, bypassing __getitem__."""
         if self.full_dataset.cache_in_memory:
+            # cached tensor is already 12-wide (derived params appended on load)
             return self.full_dataset.source_parameters[self.train_indices]
         with h5py.File(self.filename, "r") as f:
-            return torch.tensor(f["source_parameters"][self.train_indices], dtype=get_torch_dtype())
+            params = torch.tensor(f["source_parameters"][self.train_indices], dtype=get_torch_dtype())
+        return append_derived_params(params)
 
     def get_sincos_mean_std(self, periodic_bc_params: list):
         """Return mean and std of sin and cos for each periodic parameter.

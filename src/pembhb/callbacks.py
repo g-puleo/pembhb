@@ -1373,9 +1373,13 @@ class PPKSTestEarlyStopping(Callback):
         if self.fisher_varying_params and self.datagen_conf is not None:
             print(f"[λτ] computing Fisher σ for {self._lt_truth_full.shape[0]} "
                   f"test points (backend={self.fisher_backend}) ...", flush=True)
+            # Fisher operates on the 11 sampled params (mapped to bbhx input);
+            # _lt_truth_full carries appended derived params (chi_eff) which it
+            # must not see, so slice to the sampled columns.
             self._lt_fisher_sigmas, self._lt_fisher_order = (
                 compute_fisher_sigmas_for_testset(
-                    self.datagen_conf, self._lt_truth_full,
+                    self.datagen_conf,
+                    self._lt_truth_full[:, :len(_ORDERED_PRIOR_KEYS)],
                     self.fisher_varying_params, wave_fd_check=wave0,
                     backend=self.fisher_backend,
                 )

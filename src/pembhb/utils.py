@@ -29,6 +29,41 @@ _ORDERED_PRIOR_KEYS = [
         "Deltat"
     ]
 
+# Derived (non-sampled) parameters. These are deterministic functions of the
+# sampled parameters above; they are NOT drawn by the sampler and NOT stored in
+# the HDF5 source_parameters (which stays 11-wide). They are appended on-load
+# (see data.MBHBDataset / append_derived_params) so the inference network can
+# place marginals on them. The sampler keeps using _ORDERED_PRIOR_KEYS only.
+_DERIVED_PARAM_KEYS = [
+        "chi_eff",
+    ]
+
+# Full parameter vector seen by the inference network: sampled + derived.
+_ALL_PARAM_KEYS = _ORDERED_PRIOR_KEYS + _DERIVED_PARAM_KEYS
+
+
+def compute_chi_eff(params):
+    """Effective aligned spin from a (..., 11) parameter tensor/array.
+
+    chi_eff = (m1*chi1 + m2*chi2)/(m1+m2). With m1 = M*q/(1+q), m2 = M/(1+q)
+    this reduces to (q*chi1 + chi2)/(1+q) — independent of total mass/logMchirp.
+    Expects columns in _ORDERED_PRIOR_KEYS order (q at 1, chi1 at 2, chi2 at 3).
+    """
+    q = params[..., 1]
+    chi1 = params[..., 2]
+    chi2 = params[..., 3]
+    return (q * chi1 + chi2) / (1.0 + q)
+
+
+def append_derived_params(params):
+    """Append derived-parameter columns to a (..., 11) torch tensor → (..., 12).
+
+    Currently appends chi_eff. Order matches _ALL_PARAM_KEYS[11:].
+    """
+    chi_eff = compute_chi_eff(params)
+    return torch.cat([params, chi_eff.unsqueeze(-1)], dim=-1)
+
+
 def print_params(params: np.array):
     for idx, param in enumerate(params):
         print(f"{_ORDERED_PRIOR_KEYS[idx]}: {params[param]}")

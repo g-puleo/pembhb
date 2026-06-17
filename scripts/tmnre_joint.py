@@ -808,6 +808,9 @@ class SequentialTrainerJoint:
             periodic_bc_params=self.train_conf.get("periodic_bc_params", []),
             freeze_ae_after_warmup=joint_conf.get("freeze_ae_after_warmup", False),
             encoder_trains_via_nre=(ds_type == "ChannelizedMLP"),
+            # Empirical prior box for derived params (chi_eff), recomputed each
+            # round from the current (possibly truncated) training split.
+            derived_param_bounds=self.data_module.get_derived_param_bounds(),
         )
         self.model.to(device)
         if transfer_enabled and old_model is not None:
