@@ -1240,6 +1240,7 @@ class PPKSTestEarlyStopping(Callback):
 
         if self.compute_lambda_tau:
             self._update_lambda_tau(cum_ep, moments_1d, pl_module)
+            self._check_tau_trigger(cum_ep, trainer=trainer)
 
         if trainer.logger is not None and per_marginal:
             metrics = {}
@@ -1357,7 +1358,16 @@ class PPKSTestEarlyStopping(Callback):
             # Persist now so the trigger info is on disk before any further
             # training churn.
             self._save_state()
-
+    
+    def _check_tau_trigger(self, cum_ep, trainer):
+        for label, params in self._lt_stds.items():
+            for param, std_list in params.items():
+                std = std_list[-1]                       # this eval, (n_test,)
+                fis = self._lt_fisher_sigma_for(param)   # (n_test,) maybe NaN
+                tau = np.abs(std / fis)                          # or std**2/fis**2
+                # fraction below 1 → stall → marker
+                frac_below_1 = np.mean(tau<1)
+                
     # ------------------------------------------------------------ λ / τ stats
     def _lt_ensure_fisher(self):
         """Gather the test-set truths and the epoch-independent Fisher σ once."""
@@ -1391,6 +1401,7 @@ class PPKSTestEarlyStopping(Callback):
         return np.full(n_test, np.nan)
 
     def _lt_append(self, label, param, mean, std):
+        # equivalent to self._lt_means[label][param].append(mean|std) , but include key existence checks. 
         self._lt_means.setdefault(label, {}).setdefault(param, []).append(mean)
         self._lt_stds.setdefault(label, {}).setdefault(param, []).append(std)
 
