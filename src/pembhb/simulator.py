@@ -551,16 +551,33 @@ class MBHBSimulatorFD:
         
 
     # -----------------------------------------
-    def generate(self, inj):
+    def generate(self, inj, keep_on_gpu=False):
         """Generate FD waveform for a batch of injections.
 
         :param inj: injection parameters, shape (n_params, n_obs)
-        :return: wave_fd — shape (n_obs, n_channels, n_freq_bins)
+        :param keep_on_gpu: if True, skip the device->host copy and return a
+            torch CUDA tensor (zero-copy from the cupy result via dlpack).
+            Requires a CUDA backend. Used by the streaming producer.
+        :return: wave_fd — shape (n_obs, n_channels, n_freq_bins); numpy array
+            (``keep_on_gpu=False``) or torch CUDA tensor (``keep_on_gpu=True``).
         """
         inj = inj.copy()
         n_obs = inj.shape[1]
 
         wave = self.wfd(*inj, **self.waveform_kwargs)
+
+        if keep_on_gpu:
+            if not hasattr(wave, "get"):
+                raise RuntimeError(
+                    "keep_on_gpu=True requires a CUDA backend, but waveform "
+                    f"generator on backend '{self.backend_name}' returned a host array."
+                )
+            import torch
+            from pembhb import get_torch_complex_dtype
+            wave = torch.from_dlpack(wave)  # zero-copy cupy -> torch (stays on GPU)
+            wave = wave.to(get_torch_complex_dtype())
+            return wave[:, self.channels_idx, :]
+
         if hasattr(wave, "get"):
             wave = wave.get()
         wave = wave.astype(get_numpy_complex_dtype())
@@ -569,14 +586,16 @@ class MBHBSimulatorFD:
         return wave
 
     # -----------------------------------------
-    def sample(self, N):
+    def sample(self, N, keep_on_gpu=False):
         """Draw N samples from the prior and simulate FD data.
 
         :param N: number of samples
+        :param keep_on_gpu: forwarded to :meth:`generate`; when True the
+            returned ``wave_fd`` is a torch CUDA tensor.
         :return: dict with keys 'parameters', 'bbhx_parameters', 'wave_fd'
         """
         z, inj = self.sampler.sample(N, self.t_obs_end_SI)
-        wave_fd = self.generate(z)
+        wave_fd = self.generate(z, keep_on_gpu=keep_on_gpu)
         return {
             "parameters": inj,
             "bbhx_parameters": z,

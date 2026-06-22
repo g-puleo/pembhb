@@ -341,6 +341,9 @@ class SequentialTrainerJoint:
     # -----------------------------------------------------------------
 
     def _generate_data(self, round_idx, sampler_init_kwargs):
+        if self.train_conf.get("streaming", {}).get("enabled", False):
+            self._setup_streaming(round_idx, sampler_init_kwargs)
+            return
         fname_base = f"simulation_round_{round_idx}"
         fname_h5 = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION, f"{fname_base}.h5")
         os.makedirs(os.path.dirname(fname_h5), exist_ok=True)
@@ -417,6 +420,90 @@ class SequentialTrainerJoint:
         assert self.data_module.median_snr > 8, "Median SNR lower than 8."
         self.data_module.setup(stage="fit")
         self.test_dataloader = self.data_module.test_dataloader()
+
+    # -----------------------------------------------------------------
+    # Streaming data generation (producer thread + GPU ring buffer)
+    # -----------------------------------------------------------------
+
+    def _setup_streaming(self, round_idx, sampler_init_kwargs):
+        """Round-start setup for the streaming path: build the simulator for
+        this round's box, allocate + seed-fill the GPU ring buffer, generate a
+        frozen validation pool, start the background producer, and expose a
+        :class:`StreamingDataModule` as ``self.data_module``.
+
+        The producer keeps refreshing the ring during ``trainer.fit``; it is
+        stopped and joined at the end of ``_train_joint``.
+        """
+        import torch
+        import yaml
+        from pembhb import get_torch_complex_dtype, get_torch_dtype
+        from pembhb.streaming import RingBuffer, Producer, StreamingDataModule
+
+        sconf = self.train_conf["streaming"]
+        n_buffers = int(sconf.get("n_buffers", 5))
+        M = int(sconf.get("buffer_size", 10000))
+        val_size = int(sconf.get("val_size", 2000))
+        device = self.train_conf["device"]
+
+        wp = self.datagen_conf["waveform_params"]
+        assert wp.get("domain", "fd_td") == "fd", (
+            "streaming requires the FD simulator (set waveform_params.domain='fd')"
+        )
+        round_seed = self.seed + round_idx
+        sim = MBHBSimulatorFD(
+            self.datagen_conf, sampler_init_kwargs=sampler_init_kwargs, seed=round_seed,
+            n_freq_bins=wp.get("n_freq_bins", 4096),
+            freq_spacing=wp.get("freq_spacing", "linear"),
+        )
+
+        # Discover per-sample shapes from a tiny probe.
+        probe = sim.sample(2, keep_on_gpu=True)
+        C, F = probe["wave_fd"].shape[1], probe["wave_fd"].shape[2]
+        n_params = probe["parameters"].shape[0]
+
+        ring = RingBuffer(
+            n_buffers=n_buffers, buffer_size=M,
+            sample_shapes={"wave_fd": (C, F), "params": (n_params,)},
+            dtypes={"wave_fd": get_torch_complex_dtype(), "params": get_torch_dtype()},
+            device=device,
+            host_fields=("params",),  # keep params on CPU (matches HDF5 path)
+        )
+        producer = Producer(ring, sim)
+        producer.seed_fill_all()  # blocking: give the trainer data on step 0
+
+        # Frozen validation pool (generated once, never refreshed this round).
+        vs = sim.sample(val_size, keep_on_gpu=True)
+        # Frozen val/test pool on CPU (small; matches HDF5 raw-batch semantics
+        # so callbacks reading it via np.asarray work unchanged).
+        val_pool = {
+            "wave_fd": vs["wave_fd"].cpu(),
+            "params": torch.as_tensor(vs["parameters"]).t().contiguous().to(get_torch_dtype()),
+        }
+
+        producer.start()
+        self._ring = ring
+        self._producer = producer
+        self.data_module = StreamingDataModule(
+            ring, sim, val_pool,
+            batch_size=self.train_conf["batch_size"],
+            noise_factor=self.train_conf["noise_factor"],
+            n_train_noise_realisations=self.train_conf.get("n_train_noise_realisations", 1),
+            device=device,
+        )
+        self.data_module.setup(stage="fit")
+        self.test_dataloader = self.data_module.test_dataloader()
+
+        # Audit sidecar (same path the HDF5 path writes) so the round-end
+        # shutil.copy and resume bookkeeping keep working.
+        self.data_fname_yaml = os.path.join(
+            DATA_ROOT_DIR, TIME_OF_EXECUTION, f"simulation_round_{round_idx}.yaml")
+        os.makedirs(os.path.dirname(self.data_fname_yaml), exist_ok=True)
+        with open(self.data_fname_yaml, "w") as _f:
+            yaml.safe_dump(
+                {"conf": self.datagen_conf, "sampler_init_kwargs": sampler_init_kwargs,
+                 "streaming": dict(sconf)}, _f)
+        self.datagen_info = utils.read_config(self.data_fname_yaml)
+        assert self.data_module.median_snr > 8, "Median SNR lower than 8."
 
     # -----------------------------------------------------------------
     # Build or update autoencoder
@@ -1043,6 +1130,7 @@ class SequentialTrainerJoint:
                   f"cumulative_warmup={ppks_warmup}, "
                   f"state={ppks_state_path})")
 
+        streaming = self.train_conf.get("streaming", {}).get("enabled", False)
         trainer = Trainer(
             logger=logger,
             max_epochs=self.train_conf["epochs"],
@@ -1051,11 +1139,15 @@ class SequentialTrainerJoint:
             enable_progress_bar=False,
             callbacks=callbacks_list,
             gradient_clip_val=enc_conf.get("gradient_clip_val", None),
+            # Streaming reads one ring buffer per epoch: reload the dataloader
+            # every epoch so StreamingDataModule can rotate to the next buffer.
+            reload_dataloaders_every_n_epochs=1 if streaming else 0,
         )
 
         # Reserve GPU memory on the first round so other processes cannot
-        # steal it during the overnight run.
-        if device == "cuda" and not getattr(self, "_gpu_reserved", False):
+        # steal it during the overnight run. Skipped under streaming: the probe
+        # loader would claim a ring buffer without releasing it.
+        if device == "cuda" and not streaming and not getattr(self, "_gpu_reserved", False):
             from pembhb.gpu_utils import reserve_gpu_memory
             safety = self.train_conf.get("gpu_reserve_safety_factor", 1.25)
             reserve_gpu_memory(self.model, self.data_module.train_dataloader(),
@@ -1063,6 +1155,15 @@ class SequentialTrainerJoint:
             self._gpu_reserved = True
 
         trainer.fit(self.model, self.data_module)
+
+        # Stop the background producer and free the ring buffers before the
+        # round-end bookkeeping/truncation read.
+        if streaming:
+            self.data_module.release_active()
+            self._ring.stop()
+            self._producer.join(timeout=60)
+            if self._producer.error is not None:
+                raise RuntimeError(f"streaming data producer failed: {self._producer.error!r}")
 
         trunc_path = os.path.join(logger.log_dir, "truncation.ckpt")
         os.makedirs(os.path.dirname(trunc_path), exist_ok=True)
@@ -1112,8 +1213,9 @@ class SequentialTrainerJoint:
         # Update the persisted autoencoder reference for next round
         self._autoencoder = self.model.autoencoder
 
-        # Free cached data
-        self.data_module.full_dataset.clear_cache()
+        # Free cached data (HDF5 path only; streaming has no full_dataset)
+        if hasattr(self.data_module, "full_dataset"):
+            self.data_module.full_dataset.clear_cache()
 
     # -----------------------------------------------------------------
     # Round  (data generation + joint training)

@@ -13,6 +13,19 @@ noise_factor: 1.0
 # Validation/test always use a single realisation.
 n_train_noise_realisations: 10
 classifier_hlayersizes: [64, 32, 16, 8]
+
+# -------------------------------------------------------------------------
+# Streaming data generation (experimental). When enabled, each round skips
+# the blocking 50k-sample HDF5 generation: a background producer thread
+# continuously generates waveforms on the GPU (bbhx, keep_on_gpu) into a pool
+# of `n_buffers` GPU-resident ring buffers, while the trainer consumes one
+# buffer per epoch. Truncation stays a separate round-end step. Requires the
+# FD simulator (datagen waveform_params.domain: "fd").
+streaming:
+  enabled: false       # default off -> existing HDF5 pipeline is unchanged
+  n_buffers: 5         # buffers in the pool (>=2). pool size = n_buffers*buffer_size
+  buffer_size: 10000   # samples per buffer (one buffer = one training epoch)
+  val_size: 2000       # frozen validation pool, generated once per round
 keep_ckpt: True
 marginals:
   #  f: [[,0]]
