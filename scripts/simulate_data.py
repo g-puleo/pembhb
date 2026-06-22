@@ -16,6 +16,7 @@ with open(config_path, "r") as file:
     conf = yaml.safe_load(file) 
 args = parser.parse_args()
 print(type(args.n))
-sampler_init_kwargs={'prior_bounds': conf["prior"]}
+sampler_init_kwargs={'prior_bounds': conf["prior"],
+                     'spin_param_basis': conf.get("spin_param_basis", "chi1chi2")}
 sim = MBHBSimulatorFD(conf, sampler_init_kwargs=sampler_init_kwargs, seed=int(args.seed), n_freq_bins=conf["waveform_params"]["n_freq_bins"], freq_spacing=conf["waveform_params"]["freq_spacing"])
 sim.sample_and_store(filename=args.fname, N=int(args.n), batch_size=int(args.batch_size) if args.batch_size is not None else None)

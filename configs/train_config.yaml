@@ -302,13 +302,13 @@ fisher_prior:
     - "Deltat"
     - "psi"
   fixed_params:
-    - "chi1"
-    - "chi2"
+    - "chi_eff"
+    - "chi_diff"
     - "dist"
     - "phi"
     - "inc"
 
-  n_sigma: 5.0            # prior half-width in units of FIM sigma
+  n_sigma: 10.0           # prior half-width in units of FIM sigma
   param_n_sigma: {}       # per-parameter override of n_sigma (waveform-derivative Fisher
                           # is PSD & noise-independent, so the old Deltat: 100 hack is gone)
   step_frac: 1.0e-3       # central-difference step as a fraction of prior width

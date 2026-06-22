@@ -16,7 +16,7 @@ waveform_params:
   # np.arange(fmin, fmax, downsamplefactor / T_obs).
 
   fmax: 2.0e-2
-  downsamplefactor: 3    # 4012 bins on 1-week T_obs (8D study)
+  downsamplefactor: 1    # match obs_fmin1e-4_fmax2e-2_ds1 grid (12036 bins, 1-week T_obs)
   #psd_fmin_mask: 5.0e-5 # restore the low freq cutoff. 
   
 prior:
@@ -24,10 +24,10 @@ prior:
   # Fisher overrides these for the varying params at TMNRE round 1 anyway.
   "logMchirp": [5.25, 5.25]
   "q":         [3.00, 3.00]
-  "chi1":      [0.0, 0.0]
-  "chi2":      [0.0, 0.0]
+  "chi_eff":   [0.0, 0.0]        # effective aligned spin (slot 2; basis chieff_chidiff)
+  "chi_diff":  [0.0, 0.0]        # differential spin (chi1-chi2)/2 (slot 3)
   "dist":      [10.0, 10.0]                                      # Gpc (sampled uniformly in dist^3)
-  "phi":       [0.0, 0.0]                                        # phase at coalescence
+  "phi":       [3.1415, 3.1415]                                  # phase at coalescence (phimid, matches obs)
   "inc":       [0.5, 0.5]                                        # cos inclination
   "lambda":    [3.14159265358979, 3.14159265358979]            # ecliptic longitude
   "beta":      [0.2, 0.2]        # sin ecliptic latitude
@@ -45,6 +45,13 @@ prior:
   # "beta":      [0.2, 0.2]        # sin ecliptic latitude
   # "psi":       [1.0,1.0]                                        # polarization angle in [0, pi]
   # "Deltat":    [-2.50, -2.50]        # t_merger from end of observation (days)
+
+# Spin sampling basis (slots 2,3 of the prior).
+#   "chi1chi2"        (legacy): prior keys are "chi1","chi2".
+#   "chieff_chidiff"  : prior keys are "chi_eff","chi_diff"; the sampler inverts
+#                       to (chi1,chi2) for bbhx and rejects draws with |chi|>1.
+# The two spin bounds in the prior block above must be keyed to match this.
+spin_param_basis: "chieff_chidiff"
 
 backend: "cuda12x"
 

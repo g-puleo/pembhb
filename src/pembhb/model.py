@@ -11,8 +11,7 @@ from torch.nn import functional as F
 from typing import Iterable
 from pembhb.data import MBHBDataset
 from torch.utils.data import DataLoader
-
-from pembhb.utils import _ORDERED_PRIOR_KEYS, mbhb_collate_fn, GPUNoiseMixin
+from pembhb.utils import _ORDERED_PRIOR_KEYS, ordered_prior_keys, GPUNoiseMixin
 from pembhb import ROOT_DIR, get_torch_dtype
 import numpy as np
 # class GWTransformer(LightningModule):
@@ -321,14 +320,15 @@ class InferenceNetwork(GPUNoiseMixin, LightningModule):
             self.bounds_trained = dataset_info["conf"]["prior"]
         self.scheduler_patience = train_conf["scheduler_patience"]
         self.scheduler_factor = train_conf["scheduler_factor"]
+        _param_keys = ordered_prior_keys(_sik.get("spin_param_basis", "chi1chi2"))
         self.output_names = []
         self.marginals_list = []
         for d_idx, domain in enumerate(self.marginals_dict):
             for i, marginal in enumerate(self.marginals_dict[domain]):
-                # create a nice string for the marginal 
+                # create a nice string for the marginal
                 name_output = ""
-                for idx in marginal: 
-                    name_output += str(_ORDERED_PRIOR_KEYS[idx]) + "_"
+                for idx in marginal:
+                    name_output += str(_param_keys[idx]) + "_"
                 name_output = name_output[:-1]  # remove trailing underscore
                 self.output_names.append(name_output)
                 self.marginals_list.append(marginal)
@@ -1247,11 +1247,12 @@ class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
         else:
             self.bounds_trained = dataset_info["conf"]["prior"]
 
+        _param_keys = ordered_prior_keys(_sik.get("spin_param_basis", "chi1chi2"))
         self.output_names = []
         self.marginals_list = []
         for domain in self.marginals_dict:
             for marginal in self.marginals_dict[domain]:
-                name_output = "_".join(_ORDERED_PRIOR_KEYS[idx] for idx in marginal)
+                name_output = "_".join(_param_keys[idx] for idx in marginal)
                 self.output_names.append(name_output)
                 self.marginals_list.append(marginal)
 

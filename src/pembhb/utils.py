@@ -29,6 +29,36 @@ _ORDERED_PRIOR_KEYS = [
         "Deltat"
     ]
 
+# Spin-slot names (positions 2,3 of _ORDERED_PRIOR_KEYS) per sampling basis.
+# "chi1chi2" is the default/legacy basis; "chieff_chidiff" samples and truncates
+# the effective/differential spins instead, inverting to (chi1,chi2) only at
+# bbhx-input time (see sampler.UniformSampler).
+#
+# There is deliberately NO module-level "active basis" global: a config-driven
+# global mutated at startup can silently fall back to the wrong basis if the
+# setter is never called. Instead the basis is passed explicitly wherever names
+# are needed, via ordered_prior_keys(basis).
+_SPIN_KEYS_BY_BASIS = {
+    "chi1chi2":       ["chi1", "chi2"],
+    "chieff_chidiff": ["chi_eff", "chi_diff"],
+}
+
+
+def ordered_prior_keys(basis: str = "chi1chi2"):
+    """Return the 11 parameter names for a given spin sampling *basis*.
+
+    Pure function (no global state): slots 2,3 are filled from the basis. The
+    default reproduces the legacy chi1/chi2 ordering exactly.
+    """
+    if basis not in _SPIN_KEYS_BY_BASIS:
+        raise ValueError(
+            f"Unknown spin_param_basis {basis!r}; expected one of "
+            f"{list(_SPIN_KEYS_BY_BASIS)}")
+    keys = list(_ORDERED_PRIOR_KEYS)
+    keys[2:4] = _SPIN_KEYS_BY_BASIS[basis]
+    return keys
+
+
 def print_params(params: np.array):
     for idx, param in enumerate(params):
         print(f"{_ORDERED_PRIOR_KEYS[idx]}: {params[param]}")
@@ -116,7 +146,8 @@ def get_logratios_grid(dataloader: torch.utils.data.DataLoader, model: 'Inferenc
         prior_trained_dict = _sik["prior_bounds"]
     else:
         prior_trained_dict = model.hparams["dataset_info"]["conf"]["prior"]
-    prior_bounds = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx]]
+    _keys = ordered_prior_keys(_sik.get("spin_param_basis", "chi1chi2"))
+    prior_bounds = prior_trained_dict[_keys[in_param_idx]]
     low = low if low is not None else prior_bounds[0]
     high = high if high is not None else prior_bounds[1]
     grid = torch.linspace(low, high, ngrid_points).to(device).reshape(-1, 1)
@@ -205,10 +236,11 @@ def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'Infer
             prior_trained_dict = _sik["prior_bounds"]
         else:
             prior_trained_dict = model.hparams["dataset_info"]["conf"]["prior"]
+        _keys = ordered_prior_keys(_sik.get("spin_param_basis", "chi1chi2"))
         if bounds_0 is None:
-            bounds_0 = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx[0]]]
+            bounds_0 = prior_trained_dict[_keys[in_param_idx[0]]]
         if bounds_1 is None:
-            bounds_1 = prior_trained_dict[_ORDERED_PRIOR_KEYS[in_param_idx[1]]]
+            bounds_1 = prior_trained_dict[_keys[in_param_idx[1]]]
 
         lows = [bounds_0[0], bounds_1[0]]
         highs = [bounds_0[1], bounds_1[1]]
@@ -1758,6 +1790,30 @@ def compute_fisher_matrix_waveform_deriv(
     return fisher, param_uncertainties
 
 
+def _spin_fisher_jacobian(varying_params, q):
+    """Jacobian J[i,j] = d(theta_chi12)_i / d(theta_chieff)_j over *varying_params*.
+
+    Identity everywhere except the spin 2x2 block (chi1/chi2 rows vs
+    chi_eff/chi_diff cols), so that F_chieff = J^T F_chi12 J rotates a Fisher
+    matrix computed with chi1/chi2 derivatives into the (chi_eff, chi_diff)
+    basis. *varying_params* are given in the chi12-translated order (i.e. the
+    spin slots are named "chi1"/"chi2"); the chieff columns occupy the same
+    slots. From chi1 = chi_eff + 2*chi_diff/(1+q),
+    chi2 = chi_eff - 2*q*chi_diff/(1+q):
+        dchi1/dchi_eff = 1,  dchi1/dchi_diff =  2/(1+q)
+        dchi2/dchi_eff = 1,  dchi2/dchi_diff = -2q/(1+q)
+    """
+    n = len(varying_params)
+    J = np.eye(n)
+    if "chi1" in varying_params and "chi2" in varying_params:
+        i1 = varying_params.index("chi1")
+        i2 = varying_params.index("chi2")
+        # columns i1 <-> chi_eff, i2 <-> chi_diff (same slots, chieff basis)
+        J[i1, i1] = 1.0;            J[i1, i2] = 2.0 / (1.0 + q)
+        J[i2, i1] = 1.0;            J[i2, i2] = -2.0 * q / (1.0 + q)
+    return J
+
+
 def compute_fisher_prior_bounds(
     datagen_config: dict,
     observation_file: str,
@@ -1766,6 +1822,7 @@ def compute_fisher_prior_bounds(
     fixed_params: list,
     n_sigma: float = 5.0,
     param_n_sigma: dict = None,
+    spin_param_basis: str = "chi1chi2",
 ) -> dict:
     """Build prior bounds for data generation using the Fisher Information Matrix.
 
@@ -1810,24 +1867,68 @@ def compute_fisher_prior_bounds(
         true_params_arr = f["source_parameters"][event_idx]  # shape (11,)
         wave_fd         = f["wave_fd"][event_idx]            # shape (n_ch, n_freqs), noise-free
 
-    # Build fixed_values dict from the observation file.
+    # ---- Spin basis handling -------------------------------------------------
+    # The simulator and the waveform-derivative code operate in the chi1/chi2
+    # basis. When the run samples in (chi_eff, chi_diff) we (a) translate the
+    # parameter NAMES to chi1/chi2 for differentiation, (b) convert the stored
+    # expansion point's spin slots to (chi1, chi2), and (c) rotate the resulting
+    # Fisher matrix back into the (chi_eff, chi_diff) basis via the constant
+    # Jacobian. The returned prior_bounds stay keyed in the run's basis.
+    true_params_arr = np.asarray(true_params_arr, dtype=np.float64)
+    if spin_param_basis == "chieff_chidiff":
+        from pembhb.sampler import chieff_chidiff_to_chi12
+        # both spins must share status (both varying or both fixed) — a mixed
+        # case is not a simple sub-block rotation and is rejected.
+        ve = "chi_eff" in varying_params; vd = "chi_diff" in varying_params
+        if ve != vd:
+            raise NotImplementedError(
+                "[Fisher] chieff basis requires chi_eff and chi_diff to share "
+                "status (both in varying_params or both in fixed_params); "
+                "a mixed varying/fixed spin pair is not supported.")
+        q_true = float(true_params_arr[1])
+        chi1_true, chi2_true = chieff_chidiff_to_chi12(
+            q_true, true_params_arr[2], true_params_arr[3])
+        # chi12 expansion point used by the simulator / derivatives.
+        true_params_chi12 = true_params_arr.copy()
+        true_params_chi12[2] = chi1_true
+        true_params_chi12[3] = chi2_true
+        # translate spin names to chi1/chi2 for the chi12 Fisher computation.
+        _xlate = {"chi_eff": "chi1", "chi_diff": "chi2"}
+        varying_chi12 = [_xlate.get(p, p) for p in varying_params]
+        fixed_chi12 = [_xlate.get(p, p) for p in fixed_params]
+    else:
+        true_params_chi12 = true_params_arr.copy()
+        varying_chi12 = list(varying_params)
+        fixed_chi12 = list(fixed_params)
+
+    # Build fixed_values dict (chi12 names) from the chi12 expansion point.
     fixed_values = {
-        key: float(true_params_arr[_ORDERED_PRIOR_KEYS.index(key)])
-        for key in fixed_params
+        key: float(true_params_chi12[_ORDERED_PRIOR_KEYS.index(key)])
+        for key in fixed_chi12
     }
     print("[Fisher] Fixed parameter values read from observation file:")
     for k, v in fixed_values.items():
         print(f"  {k} = {v:.6e}")
 
-    # Build simulator-friendly dummy prior (correct shape, no crash).
-    # We only need the simulator for its waveform generator and frequency array.
+    # Build simulator-friendly dummy prior (correct shape, no crash). The FIM
+    # simulator runs in the chi1/chi2 basis, so the dummy prior must be keyed by
+    # chi1/chi2 (not chi_eff/chi_diff). We only need correct shape + a valid
+    # expansion point; pin the spin slots to the chi12 true values.
     dummy_prior = copy.deepcopy(datagen_config["prior"])
+    dummy_prior.pop("chi_eff", None)
+    dummy_prior.pop("chi_diff", None)
+    dummy_prior["chi1"] = [float(true_params_chi12[2]), float(true_params_chi12[2])]
+    dummy_prior["chi2"] = [float(true_params_chi12[3]), float(true_params_chi12[3])]
     for key, val in fixed_values.items():
         dummy_prior[key] = [val, val]
 
     print("[Fisher] Initializing simulator for FIM evaluation ...")
     fisher_config = copy.deepcopy(datagen_config)
     fisher_config["backend"] = "cpu"  # CPU keeps wfd/freqs deterministic for the FIM
+    # The FIM simulator always runs in the chi1/chi2 basis (we differentiate
+    # there and rotate afterwards), so its prior must be chi1/chi2-keyed.
+    fisher_config["prior"] = dummy_prior
+    fisher_config["spin_param_basis"] = "chi1chi2"
     wp = fisher_config["waveform_params"]
     simulator = MBHBSimulatorFD(
         fisher_config,
@@ -1847,7 +1948,7 @@ def compute_fisher_prior_bounds(
     #     (noise lives separately in noise_fd), so regenerating h(θ_true) with
     #     the simulator's waveform_kwargs must reproduce it. A grid / modes /
     #     length / t_obs mismatch produces an order-1 discrepancy here.
-    true_full = np.asarray(true_params_arr, dtype=np.float64).reshape(-1, 1)
+    true_full = np.asarray(true_params_chi12, dtype=np.float64).reshape(-1, 1)
     bbhx_true = simulator.sampler.samples_to_bbhx_input(
         true_full, t_obs_end=simulator.t_obs_end_SI
     )
@@ -1864,23 +1965,42 @@ def compute_fisher_prior_bounds(
           f"= {rel_diff:.2e}.")
 
     # FIM via waveform derivatives (noise-independent, PSD-by-construction).
-    _, param_uncertainties = compute_fisher_matrix_waveform_deriv(
+    # Computed in the chi1/chi2 basis (translated names, chi12 expansion point).
+    fisher_chi12, param_uncertainties = compute_fisher_matrix_waveform_deriv(
         simulator,
-        true_params_arr,
-        varying_params,
+        true_params_chi12,
+        varying_chi12,
     )
 
-    # Assemble final prior bounds.
-    prior_bounds = copy.deepcopy(datagen_config["prior"])
+    if spin_param_basis == "chieff_chidiff":
+        # Rotate the chi12 Fisher into the (chi_eff, chi_diff) basis:
+        #   F_chieff = J^T F_chi12 J,  J = d theta_chi12 / d theta_chieff.
+        # J is identity except the spin 2x2 block (only when both spins vary).
+        Jac = _spin_fisher_jacobian(varying_chi12, float(true_params_chi12[1]))
+        fisher_chieff = Jac.T @ fisher_chi12 @ Jac
+        try:
+            diag = np.diag(np.linalg.inv(fisher_chieff))
+            param_uncertainties = np.sqrt(diag)
+        except np.linalg.LinAlgError:
+            param_uncertainties = np.full(len(varying_chi12), np.nan)
+        print("[Fisher] Rotated to (chi_eff, chi_diff) basis; uncertainties:")
+        for name, sigma in zip(varying_params, param_uncertainties):
+            print(f"  σ({name}) = {sigma:.6e}")
 
-    # Pin fixed parameters to the true values from the observation file.
-    for key, val in fixed_values.items():
+    # Assemble final prior bounds (keyed in the run's basis).
+    prior_bounds = copy.deepcopy(datagen_config["prior"])
+    basis_keys = ordered_prior_keys(spin_param_basis)
+
+    # Pin fixed parameters to the true values from the observation file. Use the
+    # basis names (chi_eff/chi_diff) and the basis-coordinate true values.
+    for key in fixed_params:
+        val = float(true_params_arr[basis_keys.index(key)])
         prior_bounds[key] = [val, val]
 
     # FIM-based bounds for varying parameters.
     param_n_sigma = param_n_sigma or {}
     for key, sigma in zip(varying_params, param_uncertainties):
-        true_val = float(true_params_arr[_ORDERED_PRIOR_KEYS.index(key)])
+        true_val = float(true_params_arr[basis_keys.index(key)])
         n_sig_eff = param_n_sigma.get(key, n_sigma)
         if np.isfinite(sigma):
             lo = float(true_val - n_sig_eff * sigma)

@@ -5,6 +5,7 @@ import torch
 from pembhb import ROOT_DIR, get_numpy_dtype
 from pembhb.utils import (
     _ORDERED_PRIOR_KEYS,
+    ordered_prior_keys,
     get_widest_interval_1d,
     get_widest_box_2d,
     get_logratios_grid,
@@ -28,6 +29,16 @@ from pembhb.sky_truncation import get_main_mode_box
 from datetime import datetime, timedelta
 
 import matplotlib.pyplot as plt
+
+
+def _param_keys(pl_module):
+    """Parameter names for the run's spin basis (slots 2,3), from dataset_info.
+
+    Reads ``sampler_init_kwargs["spin_param_basis"]`` (persisted in the sidecar);
+    falls back to the legacy chi1/chi2 basis when absent.
+    """
+    sik = pl_module.hparams["dataset_info"].get("sampler_init_kwargs", {})
+    return ordered_prior_keys(sik.get("spin_param_basis", "chi1chi2"))
 
 
 class PeriodicProgressCallback(Callback):
@@ -215,8 +226,9 @@ class PlotPosteriorCallback(Callback):
             prior_dict = pl_module.hparams["dataset_info"]["conf"]["prior"]
         
         # Get bounds for each parameter
-        param_name_0 = _ORDERED_PRIOR_KEYS[in_param_idx[0]]
-        param_name_1 = _ORDERED_PRIOR_KEYS[in_param_idx[1]]
+        keys = _param_keys(pl_module)
+        param_name_0 = keys[in_param_idx[0]]
+        param_name_1 = keys[in_param_idx[1]]
         
         prior_bounds_0 = prior_dict[param_name_0]
         prior_bounds_1 = prior_dict[param_name_1]
@@ -263,7 +275,7 @@ class PlotPosteriorCallback(Callback):
             prior_dict = _sik["prior_bounds"]
         else:
             prior_dict = pl_module.hparams["dataset_info"]["conf"]["prior"]
-        param_name = _ORDERED_PRIOR_KEYS[in_param_idx]
+        param_name = _param_keys(pl_module)[in_param_idx]
         prior_bounds = prior_dict[param_name]
         return prior_bounds[1] - prior_bounds[0]
 
@@ -351,6 +363,7 @@ class PlotPosteriorCallback(Callback):
             train_time = datetime.now() - self.training_start_time
             td_trunc = train_time - timedelta(microseconds=train_time.microseconds)
             title_plot = f"training time={td_trunc}s"
+            keys = _param_keys(pl_module)  # basis-aware parameter names
             # plot the posterior on the observed data , using the current model
             for i in range(self.n_marginals):
                 in_param_idx = self.input_idx_list[i]
@@ -388,7 +401,7 @@ class PlotPosteriorCallback(Callback):
                         ax.fill_between(grid.flatten(), 0, norm1d, 
                                        where=(grid.flatten() >= widest_interval[0]) & (grid.flatten() <= widest_interval[1]),
                                        alpha=0.3, color='green')
-                        ax.set_xlabel(_ORDERED_PRIOR_KEYS[param_idx])
+                        ax.set_xlabel(keys[param_idx])
                         ax.set_ylabel('Posterior density')
                         ax.legend()
                         
@@ -422,13 +435,13 @@ class PlotPosteriorCallback(Callback):
 
                         # Log metrics to tensorboard if logger exists
                         if trainer.logger is not None:
-                            metric_name = f"volume_ratio/{_ORDERED_PRIOR_KEYS[param_idx]}"
+                            metric_name = f"volume_ratio/{keys[param_idx]}"
                             trainer.logger.log_metrics({metric_name: volume_ratio}, step=trainer.current_epoch)
-                            entropy_metric = f"diff_entropy/{_ORDERED_PRIOR_KEYS[param_idx]}"
+                            entropy_metric = f"diff_entropy/{keys[param_idx]}"
                             trainer.logger.log_metrics({entropy_metric: entropy}, step=trainer.current_epoch)
 
                         # Print diagnostic
-                        param_name = _ORDERED_PRIOR_KEYS[param_idx]
+                        param_name = keys[param_idx]
                         if trainer.current_epoch % self.print_every == 0:
                             print(f"Round {self.round_idx}, Epoch {trainer.current_epoch}, {param_name}: "
                                   f"vol_ratio={volume_ratio:.4f} "
@@ -437,10 +450,10 @@ class PlotPosteriorCallback(Callback):
                         
                         out = os.path.join(ROOT_DIR, "plots", self.timestamp,
                                           "posterior_evolution",
-                                          f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{_ORDERED_PRIOR_KEYS[param_idx]}.pdf")
+                                          f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{keys[param_idx]}.pdf")
                         fig.savefig(out, bbox_inches="tight")
                     except Exception as e:
-                        print(f"Error plotting 1D marginal for {_ORDERED_PRIOR_KEYS[param_idx]}: {e}")
+                        print(f"Error plotting 1D marginal for {keys[param_idx]}: {e}")
                     finally:
                         plt.close(fig)
 
@@ -455,9 +468,9 @@ class PlotPosteriorCallback(Callback):
 
                     out = os.path.join(ROOT_DIR, "plots", self.timestamp,
                                       "posterior_evolution",
-                                      f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{_ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{_ORDERED_PRIOR_KEYS[in_param_idx[1]]}.pdf")
-                    param_names = [_ORDERED_PRIOR_KEYS[in_param_idx[0]], _ORDERED_PRIOR_KEYS[in_param_idx[1]]]
-                    param_label = f"{_ORDERED_PRIOR_KEYS[in_param_idx[0]]}-{_ORDERED_PRIOR_KEYS[in_param_idx[1]]}"
+                                      f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{keys[in_param_idx[0]]}_{keys[in_param_idx[1]]}.pdf")
+                    param_names = [keys[in_param_idx[0]], keys[in_param_idx[1]]]
+                    param_label = f"{keys[in_param_idx[0]]}-{keys[in_param_idx[1]]}"
 
                     try:
                         # Baseline heatmap — always produced, independent of contour levels.
@@ -505,7 +518,7 @@ class PlotPosteriorCallback(Callback):
                                 'entropy': entropy,
                             })
 
-                            param_tag = f"{_ORDERED_PRIOR_KEYS[in_param_idx[0]]}_{_ORDERED_PRIOR_KEYS[in_param_idx[1]]}"
+                            param_tag = f"{keys[in_param_idx[0]]}_{keys[in_param_idx[1]]}"
                             if trainer.logger is not None:
                                 trainer.logger.log_metrics({f"volume_ratio/{param_tag}": volume_ratio}, step=trainer.current_epoch)
                                 trainer.logger.log_metrics({f"diff_entropy/{param_tag}": entropy}, step=trainer.current_epoch)
@@ -589,8 +602,8 @@ class VolumeRatioEarlyStopping(Callback):
         return None
 
     @staticmethod
-    def _marginal_label(key):
-        names = [_ORDERED_PRIOR_KEYS[i] for i in key]
+    def _marginal_label(key, keys):
+        names = [keys[i] for i in key]
         return "-".join(names)
 
     def on_validation_epoch_end(self, trainer, pl_module):
@@ -600,6 +613,8 @@ class VolumeRatioEarlyStopping(Callback):
         plot_cb = self._find_plot_callback(trainer)
         if plot_cb is None or not plot_cb.volume_ratios:
             return
+
+        keys = _param_keys(pl_module)  # basis-aware parameter names
 
         # Collect the latest volume ratio for each marginal at this epoch
         current = {}  # marginal_key -> ratio
@@ -614,7 +629,7 @@ class VolumeRatioEarlyStopping(Callback):
         triggered_reason = ""
 
         for mkey, ratio in current.items():
-            label = self._marginal_label(mkey)
+            label = self._marginal_label(mkey, keys)
 
             # Fast path: hard 0.5 truncation threshold.
             if ratio <= self.min_ratio_threshold:
@@ -659,7 +674,7 @@ class VolumeRatioEarlyStopping(Callback):
         if trainer.logger is not None:
             metrics = {}
             for mkey in current:
-                label = self._marginal_label(mkey)
+                label = self._marginal_label(mkey, keys)
                 metrics[f"volume_ratio_ema/{label}"] = self._ema.get(mkey, current[mkey])
             trainer.logger.log_metrics(metrics, step=trainer.current_epoch)
 
@@ -668,7 +683,7 @@ class VolumeRatioEarlyStopping(Callback):
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             parts = []
             for mkey in sorted(current):
-                label = self._marginal_label(mkey)
+                label = self._marginal_label(mkey, keys)
                 ema_val = self._ema.get(mkey, current[mkey])
                 stall = self._stall_count.get(mkey, 0)
                 parts.append(f"{label}(r={current[mkey]:.4f},ema={ema_val:.4f},s={stall})")
@@ -731,8 +746,8 @@ class DifferentialEntropyEarlyStopping(Callback):
         return None
 
     @staticmethod
-    def _marginal_label(key):
-        names = [_ORDERED_PRIOR_KEYS[i] for i in key]
+    def _marginal_label(key, keys):
+        names = [keys[i] for i in key]
         return "-".join(names)
 
     def _get_threshold(self, pl_module, marginal_key):
@@ -750,10 +765,11 @@ class DifferentialEntropyEarlyStopping(Callback):
         else:
             prior_dict = pl_module.hparams["dataset_info"]["conf"]["prior"]
 
+        keys = _param_keys(pl_module)
         d = len(marginal_key)
         h = 0.0
         for idx in marginal_key:
-            pname = _ORDERED_PRIOR_KEYS[idx]
+            pname = keys[idx]
             lo, hi = prior_dict[pname]
             h += np.log(hi - lo)
         h /= (2 * d)
@@ -768,6 +784,7 @@ class DifferentialEntropyEarlyStopping(Callback):
         if plot_cb is None or not plot_cb.differential_entropies:
             return
 
+        keys = _param_keys(pl_module)  # basis-aware parameter names
         current = {}
         for marginal_key, history in plot_cb.differential_entropies.items():
             if history and history[-1]["epoch"] == trainer.current_epoch:
@@ -780,7 +797,7 @@ class DifferentialEntropyEarlyStopping(Callback):
         triggered_reason = ""
 
         for mkey, entropy in current.items():
-            label = self._marginal_label(mkey)
+            label = self._marginal_label(mkey, keys)
             threshold = self._get_threshold(pl_module, mkey)
 
             # Hard threshold
@@ -820,7 +837,7 @@ class DifferentialEntropyEarlyStopping(Callback):
         if trainer.logger is not None:
             metrics = {}
             for mkey in current:
-                label = self._marginal_label(mkey)
+                label = self._marginal_label(mkey, keys)
                 metrics[f"diff_entropy_ema/{label}"] = self._ema.get(mkey, current[mkey])
             trainer.logger.log_metrics(metrics, step=trainer.current_epoch)
 
@@ -829,7 +846,7 @@ class DifferentialEntropyEarlyStopping(Callback):
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             parts = []
             for mkey in sorted(current):
-                label = self._marginal_label(mkey)
+                label = self._marginal_label(mkey, keys)
                 ema_val = self._ema.get(mkey, current[mkey])
                 stall = self._stall_count.get(mkey, 0)
                 thresh = self._get_threshold(pl_module, mkey)
@@ -1096,6 +1113,7 @@ class PPKSTestEarlyStopping(Callback):
         self.fisher_varying_params = fisher_varying_params or []
         self.fisher_backend = fisher_backend
         self.lt_h5_path = lt_h5_path
+        self._lt_keys = _ORDERED_PRIOR_KEYS  # basis-aware names, set on first eval
         self._lt_truth_full = None        # (n_test, 11) true params, lazy
         self._lt_fisher_sigmas = None     # (n_test, n_varying), lazy
         self._lt_fisher_order = None      # varying-param name order
@@ -1161,6 +1179,8 @@ class PPKSTestEarlyStopping(Callback):
                 pl_module.train()
 
     def _evaluate_and_maybe_stop(self, trainer, pl_module, kstest):
+        keys = _param_keys(pl_module)  # basis-aware parameter names
+        self._lt_keys = keys  # cache for _write_lt_h5 (has no pl_module)
         per_marginal: dict[str, dict] = {}
         # All marginals whose stall counter has reached patience this
         # evaluation — we record every one of them, not just the first.
@@ -1182,7 +1202,7 @@ class PPKSTestEarlyStopping(Callback):
 
             if self.compute_lambda_tau:
                 mean, std = grid_posterior_moments_1d(logratios, grid)
-                moments_1d[label] = (_ORDERED_PRIOR_KEYS[in_idx], mean, std)
+                moments_1d[label] = (keys[in_idx], mean, std)
 
             D = float(kstest(ranks, "uniform").statistic)
             q = self.t_quantile
@@ -1408,6 +1428,7 @@ class PPKSTestEarlyStopping(Callback):
     def _update_lambda_tau(self, cum_ep, moments_1d, pl_module):
         self._lt_ensure_fisher()
         self._lt_cum_eps.append(int(cum_ep))
+        keys = _param_keys(pl_module)  # basis-aware parameter names
 
         for label, (param, mean, std) in moments_1d.items():
             self._lt_append(label, param, mean, std)
@@ -1418,8 +1439,8 @@ class PPKSTestEarlyStopping(Callback):
                 out_param_idx=out_idx, in_param_idx=in_idx,
             )
             m0, s0, m1, s1 = grid_posterior_moments_2d(logratios, gx, gy)
-            self._lt_append(label, _ORDERED_PRIOR_KEYS[in_idx[0]], m0, s0)
-            self._lt_append(label, _ORDERED_PRIOR_KEYS[in_idx[1]], m1, s1)
+            self._lt_append(label, keys[in_idx[0]], m0, s0)
+            self._lt_append(label, keys[in_idx[1]], m1, s1)
 
         if self.lt_h5_path:
             self._write_lt_h5()
@@ -1438,7 +1459,7 @@ class PPKSTestEarlyStopping(Callback):
                     pg.create_dataset("posterior_mean", data=np.stack(mean_list))
                     pg.create_dataset("posterior_std",
                                       data=np.stack(self._lt_stds[label][param]))
-                    idx = _ORDERED_PRIOR_KEYS.index(param)
+                    idx = self._lt_keys.index(param)
                     pg.create_dataset("ground_truth", data=self._lt_truth_full[:, idx])
                     pg.create_dataset("fisher_sigma",
                                       data=self._lt_fisher_sigma_for(param))

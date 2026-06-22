@@ -24,6 +24,9 @@ class MBHBDataset(Dataset):
             # Stored noise (e.g. for observation files): when present, the
             # collate fn will use it as-is rather than drawing fresh noise.
             self.has_stored_noise = "noise_fd" in f
+            # Spin sampling basis of the stored source_parameters (slots 2,3).
+            # Older datasets predate this attr -> fall back to the legacy basis.
+            self.spin_param_basis = f.attrs.get("spin_param_basis", "chi1chi2")
 
             # Load ASD (Amplitude Spectral Density) for noise-weighting.
             # Shape: (n_channels, n_freq).  This is the same for all samples.
