@@ -58,14 +58,17 @@ def get_timestamp():
     return datetime.now().strftime("%Y/%m/%d")
 
 
-def _round_marginal_entropies(plot_cb):
-    """Round-final absolute differential entropy per marginal: ``{label: H}``."""
+def _round_marginal_entropies(plot_cb, keys=_PPKS_ORDERED_PRIOR_KEYS):
+    """Round-final absolute differential entropy per marginal: ``{label: H}``.
+
+    ``keys`` is the basis-aware parameter-name list for the run.
+    """
     if plot_cb is None or not getattr(plot_cb, "differential_entropies", None):
         return {}
     out = {}
     for key, hist in plot_cb.differential_entropies.items():
         if hist:
-            label = "-".join(_PPKS_ORDERED_PRIOR_KEYS[i] for i in key)
+            label = "-".join(keys[i] for i in key)
             out[label] = hist[-1]["entropy"]
     return out
 
@@ -232,6 +235,8 @@ class SequentialTrainerJoint:
                 self.train_conf["baseline_model"]["filename"]
             )
             out_idx = 0
+            prior_keys = utils.ordered_prior_keys(
+                self.datagen_conf.get("spin_param_basis", "chi1chi2"))
             for key, marginal_list in self.train_conf["marginals"].items():
                 for marginal in marginal_list:
                     if len(marginal) == 1:
@@ -239,15 +244,15 @@ class SequentialTrainerJoint:
                             self.model, self.dataloader_obs,
                             in_param_idx=marginal[0], out_param_idx=out_idx, eps=1e-4,
                         )
-                        param_name = utils._ORDERED_PRIOR_KEYS[marginal[0]]
+                        param_name = prior_keys[marginal[0]]
                         self.datagen_conf["prior"][param_name] = widest_interval
                     elif len(marginal) == 2:
                         widest_box, _ = get_widest_box_2d(
                             self.model, self.dataloader_obs,
                             in_param_idx=tuple(marginal), out_param_idx=out_idx,
                         )
-                        self.datagen_conf["prior"][utils._ORDERED_PRIOR_KEYS[marginal[0]]] = [widest_box[0], widest_box[1]]
-                        self.datagen_conf["prior"][utils._ORDERED_PRIOR_KEYS[marginal[1]]] = [widest_box[2], widest_box[3]]
+                        self.datagen_conf["prior"][prior_keys[marginal[0]]] = [widest_box[0], widest_box[1]]
+                        self.datagen_conf["prior"][prior_keys[marginal[1]]] = [widest_box[2], widest_box[3]]
                     out_idx += 1
             print(f"Updated prior after baseline model: {self.datagen_conf['prior']}")
 
@@ -264,6 +269,7 @@ class SequentialTrainerJoint:
                 fixed_params=fp_conf["fixed_params"],
                 n_sigma=fp_conf.get("n_sigma", 5.0),
                 param_n_sigma=fp_conf.get("param_n_sigma", None),
+                spin_param_basis=self.datagen_conf.get("spin_param_basis", "chi1chi2"),
             )
 
         # ---- Autoencoder instance (persists across rounds) --------------
@@ -808,9 +814,6 @@ class SequentialTrainerJoint:
             periodic_bc_params=self.train_conf.get("periodic_bc_params", []),
             freeze_ae_after_warmup=joint_conf.get("freeze_ae_after_warmup", False),
             encoder_trains_via_nre=(ds_type == "ChannelizedMLP"),
-            # Empirical prior box for derived params (chi_eff), recomputed each
-            # round from the current (possibly truncated) training split.
-            derived_param_bounds=self.data_module.get_derived_param_bounds(),
         )
         self.model.to(device)
         if transfer_enabled and old_model is not None:
@@ -962,6 +965,9 @@ class SequentialTrainerJoint:
                 num_workers=0, collate_fn=base_loader.collate_fn,
             )
 
+            # Parameter names follow the run's spin basis (slots 2,3).
+            ppks_keys = utils.ordered_prior_keys(
+                self.datagen_conf.get("spin_param_basis", "chi1chi2"))
             # 1-D marginals only — label, in_param_idx (model input), out_idx
             # (column in model output).
             marginals_1d_info = []
@@ -970,11 +976,11 @@ class SequentialTrainerJoint:
                 if len(marginal) == 1:
                     in_idx = marginal[0]
                     marginals_1d_info.append(
-                        (_PPKS_ORDERED_PRIOR_KEYS[in_idx], in_idx, out_idx)
+                        (ppks_keys[in_idx], in_idx, out_idx)
                     )
                 elif len(marginal) == 2:
                     i0, i1 = marginal[0], marginal[1]
-                    label = f"{_PPKS_ORDERED_PRIOR_KEYS[i0]}__{_PPKS_ORDERED_PRIOR_KEYS[i1]}"
+                    label = f"{ppks_keys[i0]}__{ppks_keys[i1]}"
                     marginals_2d_info.append((label, (i0, i1), out_idx))
 
             # λ/τ statistics config. Fisher set = every non-fixed (inferred)
@@ -982,7 +988,7 @@ class SequentialTrainerJoint:
             lt_conf = pp_conf.get("lambda_tau", {})
             lt_enabled = bool(lt_conf.get("enabled", False))
             fisher_varying_params = [
-                k for k in _PPKS_ORDERED_PRIOR_KEYS
+                k for k in ppks_keys
                 if self.datagen_conf["prior"][k][0] != self.datagen_conf["prior"][k][1]
             ]
             lt_h5_path = os.path.join(
@@ -1074,7 +1080,10 @@ class SequentialTrainerJoint:
         for cb in callbacks_list:
             if isinstance(cb, VolumeRatioEarlyStopping):
                 self._last_stopped_via = cb.stopped_via
-        self._last_marginal_entropies = _round_marginal_entropies(plot_posterior_callback)
+        self._last_marginal_entropies = _round_marginal_entropies(
+            plot_posterior_callback,
+            keys=utils.ordered_prior_keys(
+                self.datagen_conf.get("spin_param_basis", "chi1chi2")))
         self._last_median_tau = _round_median_tau(locals().get("lt_h5_path"))
         opt = self.model.optimizers()
         if isinstance(opt, list):
@@ -1128,10 +1137,12 @@ class SequentialTrainerJoint:
             print(f"Active marginals for round {i}: {active_marginals}")
 
             dist_uniform_in_volume = self.datagen_conf.get("prior_dist_volumetric", True)
+            spin_param_basis = self.datagen_conf.get("spin_param_basis", "chi1chi2")
             if i == 1 and self.fisher_prior_bounds is not None:
                 self.datagen_conf["prior"].update(copy.deepcopy(self.fisher_prior_bounds))
                 sampler_kwargs = {"prior_bounds": self.fisher_prior_bounds,
-                                  "dist_uniform_in_volume": dist_uniform_in_volume}
+                                  "dist_uniform_in_volume": dist_uniform_in_volume,
+                                  "spin_param_basis": spin_param_basis}
                 print("[Fisher] Using Fisher-based prior for round 1.")
                 import yaml as _yaml
                 _out = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION, "fisher_prior_round_1.yaml")
@@ -1141,7 +1152,8 @@ class SequentialTrainerJoint:
                 print(f"[Fisher] Saved Fisher prior bounds to {_out}")
             else:
                 sampler_kwargs = {"prior_bounds": self.datagen_conf["prior"],
-                                  "dist_uniform_in_volume": dist_uniform_in_volume}
+                                  "dist_uniform_in_volume": dist_uniform_in_volume,
+                                  "spin_param_basis": spin_param_basis}
 
             self.round(idx=i, sampler_init_kwargs=sampler_kwargs)
 
@@ -1152,12 +1164,16 @@ class SequentialTrainerJoint:
             # but is now produced by the PPKS callback as an overlay every
             # ``run_every_n_epochs`` cumulative epochs.
             out_idx = 0
+            # Parameter names follow the run's spin basis (slots 2,3). The prior
+            # dict is keyed with these names, so truncation must write the same.
+            prior_keys = utils.ordered_prior_keys(
+                self.datagen_conf.get("spin_param_basis", "chi1chi2"))
             for key, marginal_list in self.train_conf["marginals"].items():
                 for marginal in marginal_list:
                     marginal_key = tuple(marginal)
 
                     if len(marginal) == 1:
-                        param_name = utils._ORDERED_PRIOR_KEYS[marginal[0]]
+                        param_name = prior_keys[marginal[0]]
                         if hasattr(self.model, "widest_boxes") and marginal_key in self.model.widest_boxes:
                             widest_interval = self.model.widest_boxes[marginal_key]
                             tmp = copy.deepcopy(self.datagen_conf["prior"])
@@ -1181,8 +1197,8 @@ class SequentialTrainerJoint:
                             print(f"Updating prior for 2D marginal {marginal_key} using widest box from model ...")
                             widest_box = self.model.widest_boxes[marginal_key]
                             tmp = copy.deepcopy(self.datagen_conf["prior"])
-                            tmp[utils._ORDERED_PRIOR_KEYS[inj1]] = [widest_box[0], widest_box[1]]
-                            tmp[utils._ORDERED_PRIOR_KEYS[inj2]] = [widest_box[2], widest_box[3]]
+                            tmp[prior_keys[inj1]] = [widest_box[0], widest_box[1]]
+                            tmp[prior_keys[inj2]] = [widest_box[2], widest_box[3]]
                             self.datagen_conf["prior"] = tmp
                         else:
                             print(f"Warning: No widest_box for 2D marginal {marginal_key}")
@@ -1216,9 +1232,14 @@ class SequentialTrainerJoint:
                     truncated_idxs.update(marginal)
 
             true_params = self.dataset_observation[0]["params"]
+            # Names follow the obs dataset's own recorded spin basis, so slots
+            # 2,3 truth values are interpreted in the same coordinates as the
+            # prior dict (which is keyed by the run's basis).
+            obs_keys = utils.ordered_prior_keys(
+                getattr(self.dataset_observation.dataset, "spin_param_basis", "chi1chi2"))
             violations = []
             for idx in sorted(truncated_idxs):
-                param_name = utils._ORDERED_PRIOR_KEYS[idx]
+                param_name = obs_keys[idx]
                 lo, hi = self.datagen_conf["prior"][param_name]
                 true_val = float(true_params[idx])
                 if not (lo <= true_val <= hi):

@@ -641,6 +641,11 @@ class MBHBSimulatorFD:
             f.attrs["fmax"] = self.fmax
             f.attrs["psd_fmin_mask"] = self.psd_fmin_mask if self.psd_fmin_mask is not None else 0.0
             f.attrs["observation_duration_SI"] = self.obs_length
+            # Record the spin sampling basis so the meaning of source_parameters
+            # slots 2,3 is self-describing (chi1/chi2 vs chi_eff/chi_diff).
+            # MaskRejectSampler wraps the real sampler in .base_sampler.
+            _spin_sampler = getattr(self.sampler, "base_sampler", self.sampler)
+            f.attrs["spin_param_basis"] = getattr(_spin_sampler, "spin_param_basis", "chi1chi2")
             print("Sampling and storing FD-only simulations to", filename)
             for i in tqdm(range(0, N, batch_size)):
                 batch_end = min(i + batch_size, N)

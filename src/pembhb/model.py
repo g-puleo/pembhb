@@ -12,7 +12,7 @@ from typing import Iterable
 from pembhb.data import MBHBDataset
 from torch.utils.data import DataLoader
 
-from pembhb.utils import _ORDERED_PRIOR_KEYS, _ALL_PARAM_KEYS, mbhb_collate_fn
+from pembhb.utils import _ORDERED_PRIOR_KEYS, ordered_prior_keys, mbhb_collate_fn
 from pembhb import ROOT_DIR, get_torch_dtype
 import numpy as np
 # class GWTransformer(LightningModule):
@@ -321,14 +321,15 @@ class InferenceNetwork(LightningModule):
             self.bounds_trained = dataset_info["conf"]["prior"]
         self.scheduler_patience = train_conf["scheduler_patience"]
         self.scheduler_factor = train_conf["scheduler_factor"]
+        _param_keys = ordered_prior_keys(_sik.get("spin_param_basis", "chi1chi2"))
         self.output_names = []
         self.marginals_list = []
         for d_idx, domain in enumerate(self.marginals_dict):
             for i, marginal in enumerate(self.marginals_dict[domain]):
-                # create a nice string for the marginal 
+                # create a nice string for the marginal
                 name_output = ""
-                for idx in marginal: 
-                    name_output += str(_ALL_PARAM_KEYS[idx]) + "_"
+                for idx in marginal:
+                    name_output += str(_param_keys[idx]) + "_"
                 name_output = name_output[:-1]  # remove trailing underscore
                 self.output_names.append(name_output)
                 self.marginals_list.append(marginal)
@@ -365,7 +366,7 @@ class InferenceNetwork(LightningModule):
 
         self.param_index_remapping = {}
         offset = 0
-        for idx in range(len(_ALL_PARAM_KEYS)):
+        for idx in range(len(_ORDERED_PRIOR_KEYS)):
             # when a parameter is passed 
             if idx in self.periodic_bc_params:
                 self.param_index_remapping[idx] = [idx + offset, idx + offset + 1]  # map to the two new columns
@@ -1181,7 +1182,6 @@ class JointAEInferenceNetwork(LightningModule):
         ae_scheduler: dict = None,
         nre_scheduler: dict = None,
         encoder_trains_via_nre: bool = False,
-        derived_param_bounds: dict = None,
     ):
         super().__init__()
 
@@ -1244,19 +1244,16 @@ class JointAEInferenceNetwork(LightningModule):
         # Use the actual sampling prior as authoritative source
         _sik = dataset_info.get("sampler_init_kwargs", {})
         if "prior_bounds" in _sik:
-            self.bounds_trained = dict(_sik["prior_bounds"])
+            self.bounds_trained = _sik["prior_bounds"]
         else:
-            self.bounds_trained = dict(dataset_info["conf"]["prior"])
-        # Derived params (chi_eff) have no sampled prior; their box is the
-        # empirical min/max over the training split, supplied by the trainer.
-        if derived_param_bounds:
-            self.bounds_trained.update(derived_param_bounds)
+            self.bounds_trained = dataset_info["conf"]["prior"]
 
+        _param_keys = ordered_prior_keys(_sik.get("spin_param_basis", "chi1chi2"))
         self.output_names = []
         self.marginals_list = []
         for domain in self.marginals_dict:
             for marginal in self.marginals_dict[domain]:
-                name_output = "_".join(_ALL_PARAM_KEYS[idx] for idx in marginal)
+                name_output = "_".join(_param_keys[idx] for idx in marginal)
                 self.output_names.append(name_output)
                 self.marginals_list.append(marginal)
 
@@ -1287,7 +1284,7 @@ class JointAEInferenceNetwork(LightningModule):
 
         self.param_index_remapping = {}
         offset = 0
-        for idx in range(len(_ALL_PARAM_KEYS)):
+        for idx in range(len(_ORDERED_PRIOR_KEYS)):
             if idx in self.periodic_bc_params:
                 self.param_index_remapping[idx] = [idx + offset, idx + offset + 1]
                 offset += 1

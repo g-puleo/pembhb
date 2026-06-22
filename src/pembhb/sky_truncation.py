@@ -655,6 +655,7 @@ def truncate_sky_prior(model, obs_loader, out_param_idx,
             sky_mask=analysis['mask'],
             grid_lam=gx,
             grid_beta=gy,
+            spin_param_basis=datagen_conf.get("spin_param_basis", "chi1chi2"),
         )
         return sampler, info
 
