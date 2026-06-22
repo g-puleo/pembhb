@@ -157,7 +157,14 @@ class Producer:
         self.ring = ring
         self.sim = sim
         self.error = None
+        self.n_seed = 0    # buffers filled by the blocking seed_fill_all()
+        self.n_chunks = 0  # buffers refreshed by the running producer loop
         self._thread = threading.Thread(target=self._run, daemon=True)
+
+    @property
+    def samples_generated(self):
+        """Total waveforms generated this round = (seed + running) * M."""
+        return (self.n_seed + self.n_chunks) * self.ring.M
 
     def _chunk(self, sample):
         """Map one ``sim.sample`` output onto the ring's field tensors."""
@@ -178,6 +185,7 @@ class Producer:
         for j in range(self.ring.n):
             sample = self.sim.sample(self.ring.M, keep_on_gpu=True)
             self.ring.seed_fill(j, self._chunk(sample))
+            self.n_seed += 1
 
     def start(self):
         self._thread.start()
@@ -193,6 +201,7 @@ class Producer:
                     return
                 sample = self.sim.sample(self.ring.M, keep_on_gpu=True)
                 self.ring.write(j, self._chunk(sample))
+                self.n_chunks += 1
         except Exception as e:  # noqa: BLE001 - surface to the main thread
             self.error = e
             self.ring.stop()

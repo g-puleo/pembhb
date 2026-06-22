@@ -434,10 +434,13 @@ class SequentialTrainerJoint:
         The producer keeps refreshing the ring during ``trainer.fit``; it is
         stopped and joined at the end of ``_train_joint``.
         """
+        import time
         import torch
         import yaml
         from pembhb import get_torch_complex_dtype, get_torch_dtype
         from pembhb.streaming import RingBuffer, Producer, StreamingDataModule
+
+        self._stream_t0 = time.time()
 
         sconf = self.train_conf["streaming"]
         n_buffers = int(sconf.get("n_buffers", 5))
@@ -1159,11 +1162,28 @@ class SequentialTrainerJoint:
         # Stop the background producer and free the ring buffers before the
         # round-end bookkeeping/truncation read.
         if streaming:
+            import time
             self.data_module.release_active()
             self._ring.stop()
             self._producer.join(timeout=60)
             if self._producer.error is not None:
                 raise RuntimeError(f"streaming data producer failed: {self._producer.error!r}")
+            elapsed = time.time() - self._stream_t0
+            M = self._ring.M
+            n_seed = self._producer.n_seed
+            n_chunks = self._producer.n_chunks
+            total = self._producer.samples_generated
+            stream_msg = (
+                f"[Round {round_idx}][streaming] effective sims: {total} "
+                f"({n_seed} seed buffers + {n_chunks} refresh chunks x {M} samples); "
+                f"round wall-time {elapsed:.1f}s "
+                f"({elapsed/60:.1f} min); gen rate ~{total/max(elapsed,1):.0f} samples/s"
+            )
+            print(stream_msg)
+            _slog = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION, "round_summary.log")
+            os.makedirs(os.path.dirname(_slog), exist_ok=True)
+            with open(_slog, "a") as _lf:
+                _lf.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  {stream_msg}\n")
 
         trunc_path = os.path.join(logger.log_dir, "truncation.ckpt")
         os.makedirs(os.path.dirname(trunc_path), exist_ok=True)
@@ -1395,6 +1415,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-config", default="train_config.yaml",
                         help="Train config filename inside configs/")
+    parser.add_argument("--datagen-config", default="datagen_config.yaml",
+                        help="Datagen config filename inside configs/ (default: datagen_config.yaml)")
     parser.add_argument("--resume", default=None,
                         help="Resume a previous run: pass the exact TIME_OF_EXECUTION string "
                              "(e.g. 2026/03/31/autoencoder_joint_v1). The last completed round "
@@ -1415,7 +1437,7 @@ if __name__ == "__main__":
 
     train_config_filename = args.train_config
     run_name = args.name
-    datagen_config_filename = "datagen_config.yaml"
+    datagen_config_filename = args.datagen_config
 
     train_config = utils.read_config(os.path.join(ROOT_DIR, "configs", train_config_filename))
     datagen_config = utils.read_config(os.path.join(ROOT_DIR, "configs", datagen_config_filename))
