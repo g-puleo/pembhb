@@ -84,7 +84,14 @@ class BBHXLikelihood(bilby.Likelihood):
 
 def main():
     # ---- Load MCMC settings ----
-    mcmc_config_file = os.path.join(ROOT_DIR, "configs", "mcmc_config.yaml")
+    import sys
+    if len(sys.argv) > 1:
+        mcmc_config_file = sys.argv[1]
+        if not os.path.isabs(mcmc_config_file):
+            mcmc_config_file = os.path.join(ROOT_DIR, "configs", mcmc_config_file)
+    else:
+        mcmc_config_file = os.path.join(ROOT_DIR, "configs", "mcmc_config.yaml")
+    print(f"[mcmc] Using config: {mcmc_config_file}")
     mcmc_conf = read_config(mcmc_config_file)
     event_idx        = mcmc_conf["event_idx"]
     high_freq_only   = mcmc_conf["high_freq_only"]
@@ -341,11 +348,41 @@ def main():
         vectorize=True  # Enable vectorized likelihood evaluation!
     )
 
+    # Resolve outdir + progress-log path now (need it during the run, not only after).
+    if "output_name" not in mcmc_conf or not mcmc_conf["output_name"]:
+        raise KeyError("mcmc_config.yaml: 'output_name' is required (refusing to "
+                       "default — would risk overwriting a previous run).")
+    _run_name = mcmc_conf["output_name"]
+    outdir = os.path.join(ROOT_DIR, "mc_results_emcee_vec", _run_name)
+    os.makedirs(outdir, exist_ok=True)
+    progress_log = os.path.join(outdir, "mcmc_progress.log")
+
     # Run MCMC
     nsteps = emcee_conf.get("nsteps", 1000)
-    print(f"\\n=== Running MCMC for {nsteps} steps ===")
-    state = sampler_emcee.run_mcmc(pos, nsteps, progress=True)
-    
+    log_every = int(emcee_conf.get("log_every", 100))
+    print(f"\\n=== Running MCMC for {nsteps} steps (progress log every {log_every}) ===")
+    print(f"Progress log: {progress_log}")
+
+    import time as _time
+    with open(progress_log, "w") as _lf:
+        _lf.write(f"# MCMC progress for {_run_name}\n")
+        _lf.write(f"# nwalkers={nwalkers} ndim={ndim} nsteps={nsteps}\n")
+        _lf.write("# step    acc_mean   acc_min   acc_max   logp_mean   logp_max   wall_s\n")
+        _lf.flush()
+        _t0 = _time.time()
+        state = None
+        for i, state in enumerate(
+            sampler_emcee.sample(pos, iterations=nsteps, progress=True), start=1
+        ):
+            if i % log_every == 0 or i == nsteps:
+                acc = sampler_emcee.acceptance_fraction
+                lp = state.log_prob
+                _lf.write(
+                    f"{i:6d} {acc.mean():9.4f} {acc.min():9.4f} {acc.max():9.4f} "
+                    f"{lp.mean():11.3f} {lp.max():11.3f} {_time.time() - _t0:8.1f}\n"
+                )
+                _lf.flush()
+
     # Get samples
     print("\\n=== Processing results ===")
     samples = sampler_emcee.get_chain()
@@ -369,7 +406,31 @@ def main():
     
     print(f"Burned {burnin} steps, thinned by {thin}")
     print(f"Final samples: {flat_samples.shape[0]}")
-    
+
+    # --- Chain diagnostics ---
+    acc = sampler_emcee.acceptance_fraction
+    print(f"Acceptance fraction: mean={acc.mean():.3f} "
+          f"min={acc.min():.3f} max={acc.max():.3f} "
+          f"(target ~0.2-0.5 for stretch move)")
+
+    try:
+        n_eff = (nsteps - burnin) * sampler_emcee.nwalkers / float(np.mean(tau))
+        print(f"N_eff ≈ {n_eff:.0f} "
+              f"(nsteps_post_burn={nsteps - burnin}, nwalkers={sampler_emcee.nwalkers}, mean_tau={np.mean(tau):.1f})")
+    except NameError:
+        print("N_eff: skipped (tau unavailable)")
+
+    max_lp = float(np.max(log_probs))
+    argmax = np.unravel_index(int(np.argmax(log_probs)), log_probs.shape)
+    print(f"Max log-prob found: {max_lp:.3f} at step={argmax[0]}, walker={argmax[1]}")
+
+    q16, q50, q84 = np.quantile(flat_samples, [0.16, 0.5, 0.84], axis=0)
+    print("Per-parameter quantiles (16% / 50% / 84%):")
+    for i, name in enumerate(varying_params):
+        sig_minus = q50[i] - q16[i]
+        sig_plus = q84[i] - q50[i]
+        print(f"  {name:>12s}: {q50[i]:+.4e}  -{sig_minus:.3e} / +{sig_plus:.3e}")
+
     # Plot results
     print("\\nGenerating plots...")
     
@@ -382,12 +443,7 @@ def main():
         show_titles=True,
         title_kwargs={"fontsize": 12}
     )
-    if "output_name" not in mcmc_conf or not mcmc_conf["output_name"]:
-        raise KeyError("mcmc_config.yaml: 'output_name' is required (refusing to "
-                       "default — would risk overwriting a previous run).")
-    name = mcmc_conf["output_name"]
-    outdir = os.path.join(ROOT_DIR, "mc_results_emcee_vec", name)
-    os.makedirs(outdir, exist_ok=True)
+    name = _run_name  # set above, before the run loop
     npy_file = os.path.join(outdir, "flat_samples.npy")
     npy_logprobs_file = os.path.join(outdir, "loglikelihoods_samples.npy")
     np.save(npy_file, flat_samples)

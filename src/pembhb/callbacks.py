@@ -41,6 +41,30 @@ def _param_keys(pl_module):
     return ordered_prior_keys(sik.get("spin_param_basis", "chi1chi2"))
 
 
+class _StepCadence:
+    """Fire at most once per ``interval`` global steps.
+
+    ``interval=None`` -> disabled (the caller keeps its epoch logic). Driven from
+    ``on_train_batch_end`` with ``trainer.global_step`` so the cadence is honoured
+    exactly, independent of epoch size (small streaming buffers no longer inflate
+    callback frequency).
+    """
+
+    def __init__(self, interval):
+        self.interval = interval
+        self._last = None
+
+    @property
+    def enabled(self):
+        return self.interval is not None
+
+    def should_fire(self, global_step):
+        if self._last is None or global_step - self._last >= self.interval:
+            self._last = global_step
+            return True
+        return False
+
+
 class PeriodicProgressCallback(Callback):
     """Print a one-line training status every *print_every* epochs.
 
@@ -49,10 +73,31 @@ class PeriodicProgressCallback(Callback):
     only the most essential scalars are printed here.
     """
 
-    def __init__(self, print_every: int = 20, label: str = ""):
+    def __init__(self, print_every: int = 20, label: str = "", print_every_n_steps=None):
         super().__init__()
         self.print_every = print_every
         self.label = label
+        # Opt-in global-step cadence; None -> unchanged epoch behaviour.
+        self._step = _StepCadence(print_every_n_steps)
+
+    def _log_lrs(self, trainer, pl_module, step):
+        """Log learning rates to TensorBoard at the given x-axis ``step``."""
+        try:
+            opt = pl_module.optimizers()
+            if isinstance(opt, list):
+                opt = opt[0]
+            if trainer.logger is not None:
+                if len(opt.param_groups) >= 2:
+                    trainer.logger.log_metrics({
+                        "lr/autoencoder": opt.param_groups[0]["lr"],
+                        "lr/nre": opt.param_groups[1]["lr"],
+                    }, step=step)
+                else:
+                    trainer.logger.log_metrics({
+                        "lr": opt.param_groups[0]["lr"],
+                    }, step=step)
+        except Exception:
+            pass
 
     def _print_status(self, trainer, pl_module, suffix: str = ""):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -91,35 +136,31 @@ class PeriodicProgressCallback(Callback):
         print(" | ".join(parts), flush=True)
 
     def on_validation_epoch_end(self, trainer, pl_module):
+        if self._step.enabled:
+            return  # step-mode: handled in on_train_batch_end
         # Log learning rates to TensorBoard every epoch
-        try:
-            opt = pl_module.optimizers()
-            if isinstance(opt, list):
-                opt = opt[0]
-            if trainer.logger is not None:
-                if len(opt.param_groups) >= 2:
-                    trainer.logger.log_metrics({
-                        "lr/autoencoder": opt.param_groups[0]["lr"],
-                        "lr/nre": opt.param_groups[1]["lr"],
-                    }, step=trainer.current_epoch)
-                else:
-                    trainer.logger.log_metrics({
-                        "lr": opt.param_groups[0]["lr"],
-                    }, step=trainer.current_epoch)
-        except Exception:
-            pass
-
+        self._log_lrs(trainer, pl_module, trainer.current_epoch)
         if trainer.current_epoch % self.print_every == 0:
             self._print_status(trainer, pl_module)
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if not self._step.enabled:
+            return
+        if self._step.should_fire(trainer.global_step):
+            self._log_lrs(trainer, pl_module, trainer.global_step)
+            self._print_status(trainer, pl_module, suffix=f"step {trainer.global_step}")
 
     def on_train_end(self, trainer, pl_module):
         self._print_status(trainer, pl_module, suffix="[done]")
 
 
 class PlotPosteriorCallback(Callback):
-    def __init__(self, timestamp: str, obs_loader: DataLoader, input_idx_list: list, output_idx_list: list, round_idx: int , call_every_n_epochs=1, training_start_time: datetime = None, print_every: int = 20, warmup_epochs: int = 0):
+    def __init__(self, timestamp: str, obs_loader: DataLoader, input_idx_list: list, output_idx_list: list, round_idx: int , call_every_n_epochs=1, training_start_time: datetime = None, print_every: int = 20, warmup_epochs: int = 0, call_every_n_steps=None, warmup_steps=None):
         self.epochs_elapsed = 0
         self.call_every_n_epochs = call_every_n_epochs
+        # Opt-in global-step cadence; None -> unchanged epoch behaviour.
+        self._step = _StepCadence(call_every_n_steps)
+        self.warmup_steps = warmup_steps
         self.print_every = print_every
         self.timestamp = timestamp
         self.obs_loader = obs_loader
@@ -344,6 +385,8 @@ class PlotPosteriorCallback(Callback):
         return -float(np.sum(norm2d * log_p * dp0 * dp1))
 
     def on_validation_epoch_end(self, trainer, pl_module):
+        if self._step.enabled:
+            return  # step-mode: handled in on_train_batch_end
         if trainer.current_epoch < self.warmup_epochs:
             return
 
@@ -359,6 +402,37 @@ class PlotPosteriorCallback(Callback):
 
         self.epochs_elapsed += 1
         if (self.epochs_elapsed-2) % self.call_every_n_epochs == 0:
+            self._compute_and_plot(trainer, pl_module, trainer.current_epoch, False)
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if not self._step.enabled:
+            return
+        if self.warmup_steps is not None and trainer.global_step < self.warmup_steps:
+            return
+        if not self._step.should_fire(trainer.global_step):
+            return
+        os.makedirs(
+            os.path.join(ROOT_DIR, "plots", self.timestamp, "posterior_evolution"),
+            exist_ok=True,
+        )
+        # mid-batch the model is in train mode (dropout active) -> eval for the
+        # diagnostic forward passes, then restore.
+        was_training = pl_module.training
+        pl_module.eval()
+        try:
+            with torch.no_grad():
+                self._compute_and_plot(trainer, pl_module, trainer.global_step, True)
+        finally:
+            if was_training:
+                pl_module.train()
+
+    def _compute_and_plot(self, trainer, pl_module, tag, tag_is_step):
+        """Posterior diagnostics + plots on the observation, tagged by ``tag``
+        (epoch or global step). Sets ``pl_module.widest_boxes`` and appends
+        step/epoch-keyed entries to volume_ratios / differential_entropies."""
+        tag_kind = "step" if tag_is_step else "epoch"
+        do_print = tag_is_step or (trainer.current_epoch % self.print_every == 0)
+        if True:
             #print("plotting posteriors on observed data")
             train_time = datetime.now() - self.training_start_time
             td_trunc = train_time - timedelta(microseconds=train_time.microseconds)
@@ -379,7 +453,7 @@ class PlotPosteriorCallback(Callback):
                     param_idx = in_param_idx[0]
                     fig, ax = plt.subplots(1, 1, figsize=(6, 4))
                     fig.suptitle(
-                        f"Round {self.round_idx} - Epoch {trainer.current_epoch} - {title_plot}",
+                        f"Round {self.round_idx} - {tag_kind} {tag} - {title_plot}",
                         fontsize=10,
                     )
                     
@@ -418,6 +492,7 @@ class PlotPosteriorCallback(Callback):
                             self.volume_ratios[marginal_key] = []
                         self.volume_ratios[marginal_key].append({
                             'epoch': trainer.current_epoch,
+                            'step': trainer.global_step,
                             'ratio': volume_ratio,
                             'posterior_width': posterior_width,
                             'prior_width': prior_width
@@ -430,27 +505,28 @@ class PlotPosteriorCallback(Callback):
                             self.differential_entropies[marginal_key] = []
                         self.differential_entropies[marginal_key].append({
                             'epoch': trainer.current_epoch,
+                            'step': trainer.global_step,
                             'entropy': entropy,
                         })
 
                         # Log metrics to tensorboard if logger exists
                         if trainer.logger is not None:
                             metric_name = f"volume_ratio/{keys[param_idx]}"
-                            trainer.logger.log_metrics({metric_name: volume_ratio}, step=trainer.current_epoch)
+                            trainer.logger.log_metrics({metric_name: volume_ratio}, step=tag)
                             entropy_metric = f"diff_entropy/{keys[param_idx]}"
-                            trainer.logger.log_metrics({entropy_metric: entropy}, step=trainer.current_epoch)
+                            trainer.logger.log_metrics({entropy_metric: entropy}, step=tag)
 
                         # Print diagnostic
                         param_name = keys[param_idx]
-                        if trainer.current_epoch % self.print_every == 0:
-                            print(f"Round {self.round_idx}, Epoch {trainer.current_epoch}, {param_name}: "
+                        if do_print:
+                            print(f"Round {self.round_idx}, {tag_kind} {tag}, {param_name}: "
                                   f"vol_ratio={volume_ratio:.4f} "
                                   f"(post={posterior_width:.3e}, prior={prior_width:.3e}), "
                                   f"H={entropy:.4f} nats", flush=True)
                         
                         out = os.path.join(ROOT_DIR, "plots", self.timestamp,
                                           "posterior_evolution",
-                                          f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{keys[param_idx]}.pdf")
+                                          f"posterior_round_{self.round_idx}_{tag_kind}_{tag}_{keys[param_idx]}.pdf")
                         fig.savefig(out, bbox_inches="tight")
                     except Exception as e:
                         print(f"Error plotting 1D marginal for {keys[param_idx]}: {e}")
@@ -462,13 +538,13 @@ class PlotPosteriorCallback(Callback):
                     fig, ax = plt.subplots(1, 1, figsize=(4, 4))
                     fig.tight_layout()
                     fig.suptitle(
-                        f"Round {self.round_idx} - Epoch {trainer.current_epoch} - {title_plot}",
+                        f"Round {self.round_idx} - {tag_kind} {tag} - {title_plot}",
                         fontsize=10,
                     )
 
                     out = os.path.join(ROOT_DIR, "plots", self.timestamp,
                                       "posterior_evolution",
-                                      f"posterior_round_{self.round_idx}_epoch_{trainer.current_epoch}_{keys[in_param_idx[0]]}_{keys[in_param_idx[1]]}.pdf")
+                                      f"posterior_round_{self.round_idx}_{tag_kind}_{tag}_{keys[in_param_idx[0]]}_{keys[in_param_idx[1]]}.pdf")
                     param_names = [keys[in_param_idx[0]], keys[in_param_idx[1]]]
                     param_label = f"{keys[in_param_idx[0]]}-{keys[in_param_idx[1]]}"
 
@@ -505,6 +581,7 @@ class PlotPosteriorCallback(Callback):
                                 self.volume_ratios[marginal_key] = []
                             self.volume_ratios[marginal_key].append({
                                 'epoch': trainer.current_epoch,
+                                'step': trainer.global_step,
                                 'ratio': volume_ratio,
                                 'posterior_area': posterior_area,
                                 'prior_area': prior_area
@@ -515,13 +592,14 @@ class PlotPosteriorCallback(Callback):
                                 self.differential_entropies[marginal_key] = []
                             self.differential_entropies[marginal_key].append({
                                 'epoch': trainer.current_epoch,
+                                'step': trainer.global_step,
                                 'entropy': entropy,
                             })
 
                             param_tag = f"{keys[in_param_idx[0]]}_{keys[in_param_idx[1]]}"
                             if trainer.logger is not None:
-                                trainer.logger.log_metrics({f"volume_ratio/{param_tag}": volume_ratio}, step=trainer.current_epoch)
-                                trainer.logger.log_metrics({f"diff_entropy/{param_tag}": entropy}, step=trainer.current_epoch)
+                                trainer.logger.log_metrics({f"volume_ratio/{param_tag}": volume_ratio}, step=tag)
+                                trainer.logger.log_metrics({f"diff_entropy/{param_tag}": entropy}, step=tag)
 
                             if marginal_key == (7, 8):
                                 self._log_sky_contour_ratios(
@@ -529,13 +607,13 @@ class PlotPosteriorCallback(Callback):
                                     trainer, param_tag,
                                 )
 
-                            if trainer.current_epoch % self.print_every == 0:
-                                print(f"Round {self.round_idx}, Epoch {trainer.current_epoch}, {param_label}: "
+                            if do_print:
+                                print(f"Round {self.round_idx}, {tag_kind} {tag}, {param_label}: "
                                       f"vol_ratio={volume_ratio:.4f} "
                                       f"(post={posterior_area:.3e}, prior={prior_area:.3e}), "
                                       f"H={entropy:.4f} nats", flush=True)
                         except ValueError as ve:
-                            print(f"Round {self.round_idx}, Epoch {trainer.current_epoch}, {param_label}: "
+                            print(f"Round {self.round_idx}, {tag_kind} {tag}, {param_label}: "
                                   f"contour overlay failed ({ve}); saving heatmap without contours.",
                                   flush=True)
 
@@ -544,7 +622,19 @@ class PlotPosteriorCallback(Callback):
                         plt.close(fig)
 
     def on_train_end(self, trainer, pl_module):
-        self.on_validation_epoch_end(trainer, pl_module)
+        # Final diagnostic pass. In step-mode on_validation_epoch_end is a no-op,
+        # so compute directly (with the eval()/no_grad() wrap).
+        if self._step.enabled:
+            was_training = pl_module.training
+            pl_module.eval()
+            try:
+                with torch.no_grad():
+                    self._compute_and_plot(trainer, pl_module, trainer.global_step, True)
+            finally:
+                if was_training:
+                    pl_module.train()
+        else:
+            self.on_validation_epoch_end(trainer, pl_module)
         print(f"Total training time: {datetime.now() - self.init_time}")
 
 
@@ -570,9 +660,16 @@ class VolumeRatioEarlyStopping(Callback):
         min_ratio_threshold: float = 0.5,
         plateau_grace_epochs: int = 0,
         print_every: int = 20,
+        warmup_steps=None,
+        step_mode: bool = False,
     ):
         super().__init__()
         self.warmup_epochs = warmup_epochs
+        # Opt-in: consume plot-cb entries on a global-step cadence instead of
+        # matching the epoch. When step_mode is False, behaviour is unchanged.
+        self.warmup_steps = warmup_steps
+        self.step_mode = step_mode
+        self._last_seen_step = -1
         self.patience = patience
         self.rel_tol = rel_tol
         self.ema_alpha = ema_alpha
@@ -606,25 +703,61 @@ class VolumeRatioEarlyStopping(Callback):
         names = [keys[i] for i in key]
         return "-".join(names)
 
+    def _collect_current_by_step(self, plot_cb):
+        """Step-mode: return the newest unconsumed set of per-marginal ratios
+        (one plot-cb fire), advancing ``_last_seen_step``. Empty if nothing new."""
+        latest_step = -1
+        for history in plot_cb.volume_ratios.values():
+            if history:
+                latest_step = max(latest_step, history[-1].get("step", -1))
+        if latest_step <= self._last_seen_step:
+            return {}
+        self._last_seen_step = latest_step
+        current = {}
+        for mkey, history in plot_cb.volume_ratios.items():
+            if history and history[-1].get("step", -1) == latest_step:
+                current[mkey] = history[-1]["ratio"]
+        return current
+
     def on_validation_epoch_end(self, trainer, pl_module):
+        if self.step_mode:
+            return  # step-mode: handled in on_train_batch_end
         if trainer.current_epoch < self.warmup_epochs:
             return
-
         plot_cb = self._find_plot_callback(trainer)
         if plot_cb is None or not plot_cb.volume_ratios:
             return
-
-        keys = _param_keys(pl_module)  # basis-aware parameter names
-
-        # Collect the latest volume ratio for each marginal at this epoch
-        current = {}  # marginal_key -> ratio
+        keys = _param_keys(pl_module)
+        current = {}
         for marginal_key, history in plot_cb.volume_ratios.items():
             if history and history[-1]["epoch"] == trainer.current_epoch:
                 current[marginal_key] = history[-1]["ratio"]
-
         if not current:
             return
+        plateau_allowed = (
+            trainer.current_epoch >= self.warmup_epochs + self.plateau_grace_epochs
+        )
+        self._evaluate(trainer, pl_module, current, keys, plateau_allowed,
+                       trainer.current_epoch, "epoch")
 
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if not self.step_mode:
+            return
+        if self.warmup_steps is not None and trainer.global_step < self.warmup_steps:
+            return
+        plot_cb = self._find_plot_callback(trainer)
+        if plot_cb is None or not plot_cb.volume_ratios:
+            return
+        current = self._collect_current_by_step(plot_cb)
+        if not current:
+            return
+        keys = _param_keys(pl_module)
+        # plateau allowed once past warmup_steps (already gated above). patience
+        # now counts plot-cb fires (= patience * call_every_n_steps steps).
+        self._evaluate(trainer, pl_module, current, keys, True,
+                       trainer.global_step, "step")
+
+    def _evaluate(self, trainer, pl_module, current, keys, plateau_allowed, tag, tag_kind):
         triggered_key = None
         triggered_reason = ""
 
@@ -658,10 +791,6 @@ class VolumeRatioEarlyStopping(Callback):
 
             self._prev_ema[mkey] = self._ema[mkey]
 
-            plateau_allowed = (
-                trainer.current_epoch
-                >= self.warmup_epochs + self.plateau_grace_epochs
-            )
             if plateau_allowed and self._stall_count.get(mkey, 0) >= self.patience:
                 triggered_key = mkey
                 self.stopped_via = "plateau"
@@ -676,10 +805,10 @@ class VolumeRatioEarlyStopping(Callback):
             for mkey in current:
                 label = self._marginal_label(mkey, keys)
                 metrics[f"volume_ratio_ema/{label}"] = self._ema.get(mkey, current[mkey])
-            trainer.logger.log_metrics(metrics, step=trainer.current_epoch)
+            trainer.logger.log_metrics(metrics, step=tag)
 
         # Diagnostics printing
-        if trainer.current_epoch % self.print_every == 0:
+        if tag_kind == "step" or trainer.current_epoch % self.print_every == 0:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             parts = []
             for mkey in sorted(current):
@@ -687,11 +816,11 @@ class VolumeRatioEarlyStopping(Callback):
                 ema_val = self._ema.get(mkey, current[mkey])
                 stall = self._stall_count.get(mkey, 0)
                 parts.append(f"{label}(r={current[mkey]:.4f},ema={ema_val:.4f},s={stall})")
-            print(f"[{ts}] [VolumeRatioES] epoch {trainer.current_epoch}: {', '.join(parts)}", flush=True)
+            print(f"[{ts}] [VolumeRatioES] {tag_kind} {tag}: {', '.join(parts)}", flush=True)
 
         if triggered_key is not None:
             self.stop_reason = triggered_reason
-            print(f"[VolumeRatioES] Stopping at epoch {trainer.current_epoch}: {triggered_reason}")
+            print(f"[VolumeRatioES] Stopping at {tag_kind} {tag}: {triggered_reason}")
             trainer.should_stop = True
 
 
@@ -723,6 +852,8 @@ class DifferentialEntropyEarlyStopping(Callback):
         rel_tol: float = 0.02,
         ema_alpha: float = 0.3,
         print_every: int = 20,
+        warmup_steps=None,
+        step_mode: bool = False,
     ):
         super().__init__()
         self.warmup_epochs = warmup_epochs
@@ -730,6 +861,10 @@ class DifferentialEntropyEarlyStopping(Callback):
         self.rel_tol = rel_tol
         self.ema_alpha = ema_alpha
         self.print_every = print_every
+        # Opt-in step cadence (consume plot-cb entries by global step).
+        self.warmup_steps = warmup_steps
+        self.step_mode = step_mode
+        self._last_seen_step = -1
 
         # per-marginal state
         self._ema: dict[tuple, float] = {}
@@ -776,23 +911,53 @@ class DifferentialEntropyEarlyStopping(Callback):
         self._thresholds[marginal_key] = h
         return h
 
+    def _collect_current_by_step(self, plot_cb):
+        """Step-mode: newest unconsumed per-marginal entropies (one plot fire)."""
+        latest_step = -1
+        for history in plot_cb.differential_entropies.values():
+            if history:
+                latest_step = max(latest_step, history[-1].get("step", -1))
+        if latest_step <= self._last_seen_step:
+            return {}
+        self._last_seen_step = latest_step
+        current = {}
+        for mkey, history in plot_cb.differential_entropies.items():
+            if history and history[-1].get("step", -1) == latest_step:
+                current[mkey] = history[-1]["entropy"]
+        return current
+
     def on_validation_epoch_end(self, trainer, pl_module):
+        if self.step_mode:
+            return  # step-mode: handled in on_train_batch_end
         if trainer.current_epoch < self.warmup_epochs:
             return
-
         plot_cb = self._find_plot_callback(trainer)
         if plot_cb is None or not plot_cb.differential_entropies:
             return
-
-        keys = _param_keys(pl_module)  # basis-aware parameter names
+        keys = _param_keys(pl_module)
         current = {}
         for marginal_key, history in plot_cb.differential_entropies.items():
             if history and history[-1]["epoch"] == trainer.current_epoch:
                 current[marginal_key] = history[-1]["entropy"]
-
         if not current:
             return
+        self._evaluate(trainer, pl_module, current, keys, trainer.current_epoch, "epoch")
 
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if not self.step_mode:
+            return
+        if self.warmup_steps is not None and trainer.global_step < self.warmup_steps:
+            return
+        plot_cb = self._find_plot_callback(trainer)
+        if plot_cb is None or not plot_cb.differential_entropies:
+            return
+        current = self._collect_current_by_step(plot_cb)
+        if not current:
+            return
+        keys = _param_keys(pl_module)
+        self._evaluate(trainer, pl_module, current, keys, trainer.global_step, "step")
+
+    def _evaluate(self, trainer, pl_module, current, keys, tag, tag_kind):
         triggered_key = None
         triggered_reason = ""
 
@@ -839,10 +1004,10 @@ class DifferentialEntropyEarlyStopping(Callback):
             for mkey in current:
                 label = self._marginal_label(mkey, keys)
                 metrics[f"diff_entropy_ema/{label}"] = self._ema.get(mkey, current[mkey])
-            trainer.logger.log_metrics(metrics, step=trainer.current_epoch)
+            trainer.logger.log_metrics(metrics, step=tag)
 
         # Diagnostics printing
-        if trainer.current_epoch % self.print_every == 0:
+        if tag_kind == "step" or trainer.current_epoch % self.print_every == 0:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             parts = []
             for mkey in sorted(current):
@@ -851,11 +1016,11 @@ class DifferentialEntropyEarlyStopping(Callback):
                 stall = self._stall_count.get(mkey, 0)
                 thresh = self._get_threshold(pl_module, mkey)
                 parts.append(f"{label}(H={current[mkey]:.3f},ema={ema_val:.3f},s={stall},th={thresh:.3f})")
-            print(f"[{ts}] [EntropyES] epoch {trainer.current_epoch}: {', '.join(parts)}", flush=True)
+            print(f"[{ts}] [EntropyES] {tag_kind} {tag}: {', '.join(parts)}", flush=True)
 
         if triggered_key is not None:
             self.stop_reason = triggered_reason
-            print(f"[EntropyES] Stopping at epoch {trainer.current_epoch}: {triggered_reason}")
+            print(f"[EntropyES] Stopping at {tag_kind} {tag}: {triggered_reason}")
             trainer.should_stop = True
 
 

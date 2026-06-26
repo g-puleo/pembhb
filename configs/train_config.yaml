@@ -1,327 +1,220 @@
-# =========================================================================
-# SHARED settings (used by both scripts/tmnre.py and scripts/tmnre_joint.py)
-# =========================================================================
-batch_size: 128  # reduced from 250 for wide-band 60420-bin model (was OOM at 250 + 11GB external GPU process)
-epochs: 570  # ae_warmup_epochs (270) + NRE budget (300, reference best ckpt epoch=300-step=42140)
-precision: "float32"  # "float32" (default) or "float64"
-#transform_td: "normalise_max" # options: "none", "logwhiten", "log", "whiten"
-transform_fd: "log" # options: "none", "logwhiten", "log", "whiten", "normalise_max"
+batch_size: 25
+epochs: 570
+precision: float32
+transform_fd: log
 noise_factor: 1.0
-# Number of distinct noise realisations shown per waveform at TRAINING time
-# only. >1 expands each training batch by this factor (one waveform copy per
-# realisation; the realisation set is shared across waveforms in the batch).
-# Validation/test always use a single realisation.
 n_train_noise_realisations: 10
-classifier_hlayersizes: [64, 32, 16, 8]
-
-# -------------------------------------------------------------------------
-# Streaming data generation (experimental). When enabled, each round skips
-# the blocking 50k-sample HDF5 generation: a background producer thread
-# continuously generates waveforms on the GPU (bbhx, keep_on_gpu) into a pool
-# of `n_buffers` GPU-resident ring buffers, while the trainer consumes one
-# buffer per epoch. Truncation stays a separate round-end step. Requires the
-# FD simulator (datagen waveform_params.domain: "fd").
+classifier_hlayersizes:
+- 64
+- 32
+- 16
+- 8
 streaming:
-  enabled: false       # default off -> existing HDF5 pipeline is unchanged
-  n_buffers: 5         # buffers in the pool (>=2). pool size = n_buffers*buffer_size
-  buffer_size: 10000   # samples per buffer (one buffer = one training epoch)
-  val_size: 2000       # frozen validation pool, generated once per round
-keep_ckpt: True
+  enabled: true
+  n_buffers: 4
+  buffer_size: 2000
+  val_size: 1000
+  gen_batch_size: 150
+  samples_per_epoch: 35000
+keep_ckpt: true
 marginals:
-  #  f: [[,0]]
-  f: [[0,], [10,], [7,8], [9,]]
-
-
-# -------------------------------------------------------------------------
-# Marginal schedule (optional)
-# Train on different marginal sets depending on the round index.
-# Each entry has "from_round" (inclusive) and the "marginals" dict to use.
-# Entries are evaluated in order; the LAST matching entry wins.
-# If omitted or empty, "marginals" above is used for all rounds.
-# -----------------,--------------------------------------------------------
-marginal_schedule: []  # disabled — use the `marginals` block above for all rounds
-
-periodic_bc_params: [ 7, ]
-device: "cuda"
-
-
+  f:
+  - - 0
+  - - 1
+  - - 2
+  - - 3
+  - - 4
+  - - 5
+  - - 6
+  - - 7
+    - 8
+  - - 9
+  - - 10
+marginal_schedule: []
+periodic_bc_params:
+- 7
+- 9
+device: cuda
 architecture:
   gradnorm:
-    enabled: False
+    enabled: false
     alpha: 1
     learning_rate: 0.0005
-    common_params: "linear_f"
-
-
+    common_params: linear_f
   data_summary:
-
-    type: "Autoencoder"  # Options: "ROM", "Autoencoder", "MarginalEncoder", "MarginalAutoencoder"
+    type: Autoencoder
     BrutalCompression:
       Nfreqs: 1000
       lowdim: 16
       in_channels: 4
-
     PeregrineModel:
-      n_channels: 2 # number of channels used (AE--> 2, AET-->3)
+      n_channels: 2
       n_timesteps: 6048
       n_freqs: 4096
-      # Nfreqs: 100
-      # lowdim: 16
-      # in_channels: 6
-      # cnn_channels: [32, 64]
     ROM:
-      load: False
+      load: false
       max_basis_elements: 50
-      filename: "/u/g/gpuleo/pembhb/rom_td_fd.pt"
-      device: "cuda"
+      filename: /u/g/gpuleo/pembhb/rom_td_fd.pt
+      device: cuda
       batch_train: 1000
       patience: 25
       freq_split_idx: 2048
-      high_freq_only: True
+      high_freq_only: true
     Autoencoder:
-      load: False
-      finetune_previous: True
-      filename: ""
-      device: "cuda"
-      # --- Reference (20260420autoenc_test5d) architecture ---
-      architecture: "conv"         # "conv" or "unet"
-      representation: "real_imag"  # "amp_phase" or "real_imag"
-      n_channels: 2                # TDI channels (AE→2, AET→3)
-      # n_freqs is now auto-derived from the HDF5 grid; the value below is
-      # a fallback used only if the data module can't be read.
+      load: false
+      finetune_previous: true
+      filename: ''
+      device: cuda
+      architecture: conv
+      representation: real_imag
+      n_channels: 2
       n_freqs: 4096
       bottleneck_dim: 128
-      hidden_channels: [32, 64, 128, 256, 256]
+      hidden_channels:
+      - 32
+      - 64
+      - 128
+      - 256
+      - 256
       kernel_size: 3
       stride: 2
       dropout: 0.0
-      residual: False
-      decoder_post_fc_bn: False
-      subtract_mean_whitened: True
-      #high_freq_only: False
-      compressor_window: 7 # defines the width of the moving average taken over freq bins
-      reconstruct_std: True # if False, decoder reconstructs only the per-block mean channels (std still seen by encoder, not in MSE)
-      ae_output_target: "compressed"
-      # Reconstruction-loss band (Hz). Encoder still sees the full input;
-      # the decoder/loss are restricted to [fmin_loss, fmax_loss]. Omit
-      # either side for "no cut on that side". Legacy keys
-      # idx_lowerbound/idx_upperbound (bin indices) still work as a fallback.
-      # fmin_loss: 2.55e-3
-      # fmax_loss: 1.0e-2
-
-      #freq_split_idx: 2048
-      # Apply ASD whitening before feeding the AE.
-      # When false, the AE sees raw (un-whitened) FD amplitudes — the
-      # pre-204be7a baseline behaviour. Default true.
-      whiten: True
-      amplitude_normalise: True
-      # --- Reference training hyper-parameters ---
+      residual: false
+      decoder_post_fc_bn: false
+      subtract_mean_whitened: true
+      compressor_window: 7
+      reconstruct_std: true
+      ae_output_target: compressed
+      whiten: true
+      amplitude_normalise: true
       lr: 0.001
-      weight_decay: 1.0e-5
-      epochs: 500                  # inert in joint mode (warmup uses ae_warmup_epochs)
+      weight_decay: 1.0e-05
+      epochs: 500
       scheduler_patience: 10
       scheduler_factor: 0.3
       early_stop_patience: 20
-      log_name: "autoencoder"
-  
-    # -----------------------------------------------------------------------
-    # Per-marginal encoder with parameter regression (replaces shared AE).
-    # Each marginal gets its own ConvEncoder trained to regress its param(s).
-    # Activate by setting  data_summary.type: "MarginalEncoder"
-    # -----------------------------------------------------------------------
+      log_name: autoencoder
     MarginalEncoder:
-      load: False
-      finetune_previous: True
-      filename: ""          # path to MarginalEncoderTrainer checkpoint (load: True only)
-      device: "cuda"
-      # --- ConvEncoder architecture (same hyper-params as Autoencoder.conv) ---
-      representation: "real_imag"   # "real_imag" or "amp_phase"
-      n_channels: 2                 # TDI channels (AE→2, AET→3)
+      load: false
+      finetune_previous: true
+      filename: ''
+      device: cuda
+      representation: real_imag
+      n_channels: 2
       n_freqs: 4096
       bottleneck_dim: 200
-      hidden_channels: [32, 64, 128, 256, 512, 512, 512]
+      hidden_channels:
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 512
+      - 512
       kernel_size: 5
       stride: 2
       dropout: 0.0
-      residual: True          # residual shortcut connections in the ConvEncoder
-      # --- Regression head (MLP after bottleneck) ---
-      # Predicts the parameter(s) associated with each marginal.
-      # Loss: MSE on normalised parameter values.
-      # Deeper heads help for 2-D marginals; keep small to not dominate capacity.
-      regressor_hidden_sizes: [128, 64]
-      # --- Training ---
+      residual: true
+      regressor_hidden_sizes:
+      - 128
+      - 64
       lr: 0.001
       weight_decay: 0.0001
       epochs: 150
       scheduler_patience: 75
       scheduler_factor: 0.3
       early_stop_patience: 3
-      log_name: "marginal_encoder"
-
+      log_name: marginal_encoder
 baseline_model:
-  use: False
-  #filename: "/data/gpuleo/mbhb/logs/20251205_100028_round_0/version_0/checkpoints/epoch=474-step=133000.ckpt"
-  filename: ""
-
-# =========================================================================
-# SEQUENTIAL training  (scripts/tmnre.py only)
-# These keys are merged into the top level of the config at script startup,
-# so InferenceNetwork reads them at the flat keys it expects (learning_rate,
-# scheduler_patience, ...).  Old configs with these keys at the top level
-# continue to work unchanged.
-# =========================================================================
+  use: false
+  filename: ''
 sequential_training:
-  early_stop_criterion: "accuracy"  # "accuracy" | "volume_ratio"
+  early_stop_criterion: accuracy
   learning_rate: 0.0001
   scheduler_patience: 80
   scheduler_factor: 0.3
-  # Accuracy-based EarlyStopping on the NRE validation accuracy.
   early_stop_patience: 100
   early_stop_min_delta: 0.001
   early_stop_threshold: 0.999
-
-
-# =========================================================================
-# JOINT AE + NRE training  (scripts/tmnre_joint.py only)
-# =========================================================================
 joint_training:
-  ae_warmup_epochs: 100       # reduced from 150 (AE plateaus early)
-  lr_ae: 0.001                  # matches reference AE lr
-  lr_nre: 0.0001                # matches reference NRE learning_rate
-  ae_weight_decay: 1.0e-5       # matches reference AE weight_decay
-  freeze_ae_after_warmup: false  # keep training the AE jointly with NRE after warmup
-  transfer_enabled: true        # retain the previously trained classifier for the next round
+  ae_warmup_epochs: 0
+  lr_ae: 0.001
+  lr_nre: 0.001
+  ae_weight_decay: 1.0e-05
+  freeze_ae_after_warmup: false
+  transfer_enabled: true
   checkpoint_every_n_epochs: 10
-  # -----------------------------------------------------------------------
-  # Per-parameter-group LR schedulers.
-  # Each block is wired to its own optimizer param group (encoder vs. NRE)
-  # via SingleGroupReduceLROnPlateau, so reducing one does not touch the
-  # other.  Set enabled: false to disable the scheduler for that group.
-  #
-  # `monitor`:  any scalar logged by training_step / validation_step,
-  #             e.g. "val_ae_loss", "val_nre_loss", "val_loss".
-  # `start_epoch`: ignore epochs before this index (useful for the NRE
-  #             scheduler so it does not see val_nre_loss = 0 during the
-  #             AE warmup).  If omitted, the NRE scheduler auto-defaults to
-  #             ae_warmup_epochs.
-  # Deprecated flat keys ae_scheduler_patience / ae_scheduler_factor are
-  # still read as fallbacks when these dicts are absent.
-  # -----------------------------------------------------------------------
   ae_scheduler:
     enabled: true
-    monitor: "val_ae_loss"
-    mode: "min"
-    factor: 0.3            # matches autoencoder.py @ cb948642 (scheduler_factor=0.3)
-    patience: 10           # matches autoencoder.py @ cb948642 (scheduler_patience=10)
-    min_lr: 1.0e-7
-    start_epoch: 0
-
-  nre_scheduler:
-    enabled: false         # reference model.py @ cb948642 returns optimizer with NO scheduler
-    monitor: "val_nre_loss"
-    mode: "min"
+    monitor: val_ae_loss
+    mode: min
     factor: 0.3
     patience: 20
-    min_lr: 1.0e-7
-    # start_epoch: <defaults to ae_warmup_epochs if omitted>
-
-  # -----------------------------------------------------------------------
-  # Joint-only early stopping criterion: "volume_ratio" | "differential_entropy" | "accuracy"
-  # The reference run (sequential tmnre.py) used accuracy-based EarlyStopping;
-  # "accuracy" is implemented in tmnre_joint.py via WarmupEarlyStopping that
-  # ignores epochs before ae_warmup_epochs (where val_accuracy is constant 0.5).
-  # -----------------------------------------------------------------------
-  early_stop_criterion: "volume_ratio"
-
-  # accuracy-based early-stopping parameters (used when
-  # early_stop_criterion == "accuracy"); values from reference sequential_training.
+    min_lr: 1.0e-07
+    start_epoch: 0
+  nre_scheduler:
+    enabled: false
+    monitor: val_nre_loss
+    mode: min
+    factor: 0.3
+    patience: 20
+    min_lr: 1.0e-07
+  early_stop_criterion: volume_ratio
   accuracy_early_stop:
     patience: 90
     min_delta: 0.001
     threshold: 0.999
-
-  # differential-entropy stop parameters (used when
-  # early_stop_criterion == "differential_entropy")
   diff_entropy_early_stop:
     warmup_epochs: 50
     patience: 10
     rel_tol: 0.02
     ema_alpha: 0.3
-
-
-# =========================================================================
-# Volume-ratio early stopping  (shared — used by both tmnre.py and
-# tmnre_joint.py when their respective configs select it)
-# =========================================================================
 volume_ratio_early_stop:
-  warmup_epochs: 80       # ignore first N epochs (posterior is noisy)
-  patience: 20            # consecutive stalled evaluations before stopping
-  rel_tol: 0.02           # relative EMA change threshold for "stalled"
-  ema_alpha: 0.3          # EMA smoothing factor (higher = more reactive)
-  min_ratio_threshold: 0.5  # fast path: stop immediately if any marginal ratio drops here
-  plateau_grace_epochs: 40  # plateau fallback only allowed after warmup+this many epochs
-                            # (i.e. once the 0.5 threshold has failed to fire that long)
-
-# =========================================================================
-# Campaign-level (across-round) convergence — stops the whole TMNRE chain.
-# Per marginal: a marginal converges when its round-final absolute differential
-# entropy flattens (|ΔH| < eps_nats, a relative width change since H = log-volume)
-# for `patience` consecutive candidate rounds; the chain stops when ALL marginals
-# have converged. Rounds that stopped via the 0.5 volume threshold reset stalls.
-# =========================================================================
+  warmup_epochs: 80
+  patience: 20
+  rel_tol: 0.02
+  ema_alpha: 0.3
+  min_ratio_threshold: 0.5
+  plateau_grace_epochs: 40
 chain_convergence:
   enabled: true
-  eps_nats: 0.05          # per-round entropy change tolerance (~5% width change)
-  patience: 2             # consecutive flattened rounds required, per marginal
-  require_not_threshold: true  # a 0.5-threshold round resets all stalls
-  # tau_gate: [0.8, 1.25]  # optional Fisher floor gate (needs pp_ks_early_stop.lambda_tau)
-
-# =========================================================================
-# PP-KS rank monitor (P-P / KS overconfidence) + λ/τ per-sample diagnostics.
-# trigger_on_overconfidence: false -> MONITOR only (logs P-P overlays and,
-# with lambda_tau.enabled, writes lambda_tau_stats_round_{i}.h5); it does NOT
-# early-stop, so it does not interfere with the volume_ratio criterion.
-# =========================================================================
+  eps_nats: 0.05
+  patience: 2
+  require_not_threshold: true
 pp_ks_early_stop:
   enabled: true
   trigger_on_overconfidence: false
   test_n: 100
   ngrid_points: 50
-  warmup_epochs: 0          # log ranks + λ/τ from epoch 0 (trigger is off anyway)
+  warmup_epochs: 0
   run_every_n_epochs: 1
   print_every: 20
   lambda_tau:
-    enabled: true            # write λ_i / τ_i ingredients to per-round HDF5
-    # fisher_backend: cuda12x  # default: datagen backend
-
-rom_use_pinned_memory: false  # Only set true for single-session usage
-rom_prefetch_batches: 4       # Increase to reduce Python overhead
-
-# -------------------------------------------------------------------------
-# Fisher-matrix prior initialisation for round 1
-# When enabled: true the prior for the first round of data generation is
-# computed automatically from the Fisher Information Matrix evaluated at the
-# true parameters of the target event.  Set enabled: false to fall back to
-# the bounds in datagen_config.yaml.
-# -------------------------------------------------------------------------
+    enabled: true
+rom_use_pinned_memory: false
+rom_prefetch_batches: 4
 fisher_prior:
-  enabled: true
-  event_idx: 0           # which event in the HDF5 file to use as expansion point
-  varying_params:        # FIM-based bounds are computed for these parameters
-    - "logMchirp"
-    - "q"
-    - "lambda"
-    - "beta"
-    - "Deltat"
-    - "psi"
-  fixed_params:
-    - "chi_eff"
-    - "chi_diff"
-    - "dist"
-    - "phi"
-    - "inc"
-
-  n_sigma: 10.0           # prior half-width in units of FIM sigma
-  param_n_sigma: {}       # per-parameter override of n_sigma (waveform-derivative Fisher
-                          # is PSD & noise-independent, so the old Deltat: 100 hack is gone)
-  step_frac: 1.0e-3       # central-difference step as a fraction of prior width
+  enabled: false
+  event_idx: 0
+  fixed_params: []
+  varying_params:
+  - logMchirp
+  - q
+  - lambda
+  - beta
+  - Deltat
+  - psi
+  - chi_eff
+  - chi_diff
+  - dist
+  - phi
+  - inc
+  n_sigma: 50.0
+  param_n_sigma: {}
+step_cadence:
+  call_every_n_steps: null
+  print_every_n_steps: null
+  warmup_steps: null
+  seq_samples_per_epoch: null
+  call_every_n_epochs_seq: 10
+  print_every_seq: 20

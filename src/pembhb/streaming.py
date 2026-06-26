@@ -141,6 +141,25 @@ class RingBuffer:
         for name, dst_list in self.fields.items():
             dst_list[j].copy_(chunk[name])
 
+    def write_slice(self, j, off, chunk):
+        """Copy a sub-batch of ``n`` samples into buffer ``j`` at offset ``off``.
+
+        Used to fill a buffer incrementally (sub-batched generation) without
+        ever materialising a full ``M``-sample chunk or flipping any flag.
+        """
+        n = next(iter(chunk.values())).shape[0]
+        for name, dst_list in self.fields.items():
+            dst_list[j][off:off + n].copy_(chunk[name])
+
+    def commit_fill(self, j):
+        """Mark buffer ``j`` ready after an incremental fill (see ``write_slice``)."""
+        with self._cond:
+            self._filling[j] = False
+            self._consumed[j] = False
+            self._fill_clock += 1
+            self._fill_seq[j] = self._fill_clock
+            self._cond.notify_all()
+
 
 class Producer:
     """Background thread that continuously refills a ``RingBuffer`` from a
@@ -153,9 +172,10 @@ class Producer:
     ``self.error`` and the ring is stopped so the consumer never hangs.
     """
 
-    def __init__(self, ring, sim):
+    def __init__(self, ring, sim, gen_batch_size=250):
         self.ring = ring
         self.sim = sim
+        self.gen_batch_size = int(gen_batch_size)  # sub-batch per bbhx call (VRAM)
         self.error = None
         self.n_seed = 0    # buffers filled by the blocking seed_fill_all()
         self.n_chunks = 0  # buffers refreshed by the running producer loop
@@ -180,11 +200,22 @@ class Producer:
             chunk["wave_td"] = sample["wave_td"]
         return chunk
 
+    def _fill(self, j):
+        """Fill buffer ``j`` with ``M`` samples, generated in sub-batches of
+        ``gen_batch_size`` so bbhx never builds the whole buffer at once
+        (bounds the transient VRAM) and written straight into the buffer slice
+        (no separate full-M chunk tensor)."""
+        M, gb = self.ring.M, self.gen_batch_size
+        for off in range(0, M, gb):
+            n = min(gb, M - off)
+            sample = self.sim.sample(n, keep_on_gpu=True)
+            self.ring.write_slice(j, off, self._chunk(sample))
+        self.ring.commit_fill(j)
+
     def seed_fill_all(self):
         """Blocking initial fill of every buffer; call once before ``start()``."""
         for j in range(self.ring.n):
-            sample = self.sim.sample(self.ring.M, keep_on_gpu=True)
-            self.ring.seed_fill(j, self._chunk(sample))
+            self._fill(j)
             self.n_seed += 1
 
     def start(self):
@@ -199,8 +230,7 @@ class Producer:
                 j = self.ring.acquire_writable()
                 if j is None:
                     return
-                sample = self.sim.sample(self.ring.M, keep_on_gpu=True)
-                self.ring.write(j, self._chunk(sample))
+                self._fill(j)
                 self.n_chunks += 1
         except Exception as e:  # noqa: BLE001 - surface to the main thread
             self.error = e
@@ -217,20 +247,26 @@ class LiveBufferDataset(Dataset):
     buffers.
     """
 
-    def __init__(self, ring, j):
+    def __init__(self, ring, j, length=None):
         self.wave_fd = ring.fields["wave_fd"][j]   # (M, C, F) on device
         self.params = ring.fields["params"][j]     # (M, P) on device
+        self.M = self.wave_fd.shape[0]
+        # length lets one epoch span more steps than the buffer holds by cycling
+        # over it (idx % M), so the streaming epoch can match a large HDF5 epoch
+        # (and thus the per-epoch validation/callback cadence).
+        self.length = int(length) if length else self.M
         self.has_td = "wave_td" in ring.fields
         if self.has_td:
             self.wave_td = ring.fields["wave_td"][j]
 
     def __len__(self):
-        return self.wave_fd.shape[0]
+        return self.length
 
     def __getitem__(self, idx):
-        out = {"wave_fd": self.wave_fd[idx], "params": self.params[idx]}
+        i = idx % self.M
+        out = {"wave_fd": self.wave_fd[i], "params": self.params[i]}
         if self.has_td:
-            out["wave_td"] = self.wave_td[idx]
+            out["wave_td"] = self.wave_td[i]
         return out
 
 
@@ -265,7 +301,7 @@ class StreamingDataModule(L.LightningDataModule):
     """
 
     def __init__(self, ring, sim, val_pool, batch_size, noise_factor=1.0,
-                 n_train_noise_realisations=1, device="cuda"):
+                 n_train_noise_realisations=1, device="cuda", samples_per_epoch=None):
         super().__init__()
         self.ring = ring
         self.sim = sim
@@ -274,6 +310,9 @@ class StreamingDataModule(L.LightningDataModule):
         self.noise_factor = noise_factor
         self.n_train_noise_realisations = n_train_noise_realisations
         self.device = device
+        # Steps per epoch = samples_per_epoch / batch_size. Defaults to one
+        # buffer; set larger to match a big HDF5 epoch's validation cadence.
+        self.samples_per_epoch = samples_per_epoch
 
         # noise_scale = filtered_asd / sqrt(4*df); on-device so materialize_gpu_noise
         # draws coloured noise on the same device as the (GPU-resident) waveforms.
@@ -348,7 +387,7 @@ class StreamingDataModule(L.LightningDataModule):
         if self._active_j is not None:
             self.ring.release_epoch(self._active_j)
         self._active_j = self.ring.next_readable()
-        ds = LiveBufferDataset(self.ring, self._active_j)
+        ds = LiveBufferDataset(self.ring, self._active_j, length=self.samples_per_epoch)
         # num_workers MUST be 0: workers are separate processes and cannot share
         # the parent process's GPU tensors.
         return DataLoader(ds, batch_size=self.batch_size, shuffle=shuffle, num_workers=0,

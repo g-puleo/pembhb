@@ -1542,6 +1542,11 @@ FISHER_ABSOLUTE_STEP_DEFAULTS = {
     "q":         8.0e-5,
     "chi1":      2.0e-5,
     "chi2":      8.0e-5,
+    # chieff_chidiff basis: same aligned-spin scale as chi1/chi2; chi_diff
+    # propagates through chi1/chi2 with a 2/(1+q) factor so a step similar to
+    # chi1 produces comparable wave-derivative magnitudes.
+    "chi_eff":   2.0e-5,
+    "chi_diff":  2.0e-5,
     "dist":      5.0e-5,   # Gpc
     "phi":       6.25e-6,  # rad
     "inc":       1.25e-5,  # cos(inc)
@@ -2006,19 +2011,15 @@ def compute_fisher_prior_bounds(
             lo = float(true_val - n_sig_eff * sigma)
             hi = float(true_val + n_sig_eff * sigma)
         else:
-            print(f"[Fisher] WARNING: σ({key}) is NaN – keeping datagen_config bounds.")
-            lo, hi = datagen_config["prior"][key]
-        # Clip to the physical prior range — those are hard constraints
+            raise ValueError("[Fisher] non finite sigma was produced by the FIM computation")
+        # In principle we should clip to the physical prior range — those are hard constraints
         # (e.g. cos(inc) ∈ [-1, 1], chi ∈ [-1, 1]). Fisher tails beyond them
         # would produce NaN waveforms via downstream arcsin/arccos.
-        phys_lo, phys_hi = datagen_config["prior"][key]
-        lo_c = max(lo, float(phys_lo))
-        hi_c = min(hi, float(phys_hi))
-        if (lo_c, hi_c) != (lo, hi):
-            print(f"[Fisher] {key}: clipped to physical prior [{phys_lo}, {phys_hi}] "
-                  f"(was [{lo:.6e}, {hi:.6e}])")
-        prior_bounds[key] = [lo_c, hi_c]
-        print(f"[Fisher] {key}: true={true_val:.6e}, σ={sigma:.3e}, n_sigma={n_sig_eff} → [{lo_c:.6e}, {hi_c:.6e}]")
+        # But for now we are staying far from the edges, so this check will be a future implementation
+        # moreover it will need to not rely on prior bounds from a datagen config. 
+
+        prior_bounds[key] = [lo, hi]
+        print(f"[Fisher] {key}: true={true_val:.6e}, σ={sigma:.3e}, n_sigma={n_sig_eff} → [{lo:.6e}, {hi:.6e}]")
 
     print(f"[Fisher] Final prior bounds: {prior_bounds}")
     return prior_bounds
@@ -2092,7 +2093,12 @@ def compute_fisher_sigmas_for_testset(
     wp = fisher_config["waveform_params"]
     simulator = MBHBSimulatorFD(
         fisher_config,
-        sampler_init_kwargs={"prior_bounds": copy.deepcopy(datagen_config["prior"])},
+        sampler_init_kwargs={
+            "prior_bounds": copy.deepcopy(datagen_config["prior"]),
+            # Match the run's spin basis so the sampler's prior keys
+            # (chi_eff/chi_diff vs chi1/chi2) line up with datagen_config["prior"].
+            "spin_param_basis": datagen_config.get("spin_param_basis", "chi1chi2"),
+        },
         seed=42,
         n_freq_bins=wp.get("n_freq_bins", 4096),
         freq_spacing=wp.get("freq_spacing", "linear"),
@@ -2119,7 +2125,12 @@ def compute_fisher_sigmas_for_testset(
     # [-1, 1] (clamp is per-point, so eps is (n_test, n)).
     DOMAIN = {"inc": (-1.0, 1.0), "beta": (-1.0, 1.0)}
     SAFETY = 1e-6
-    col_of = {name: _ORDERED_PRIOR_KEYS.index(name) for name in varying_params}
+    # Column indices use the run's spin basis so chi_eff/chi_diff names resolve
+    # to the right slots in true_params (which are stored in basis order).
+    _fisher_keys = ordered_prior_keys(
+        datagen_config.get("spin_param_basis", "chi1chi2")
+    )
+    col_of = {name: _fisher_keys.index(name) for name in varying_params}
     eps = np.zeros((n_test, n), dtype=np.float64)
     for k, name in enumerate(varying_params):
         if name not in FISHER_ABSOLUTE_STEP_DEFAULTS:

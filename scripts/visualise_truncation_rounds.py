@@ -24,7 +24,7 @@ from scipy.stats import gaussian_kde
 
 from pembhb import ROOT_DIR
 from pembhb.data import MBHBDataset
-from pembhb.utils import _ORDERED_PRIOR_KEYS, mbhb_collate_fn
+from pembhb.utils import mbhb_collate_fn
 
 from _visualise_common import (
     DATA_ROOT_DIR,
@@ -36,6 +36,8 @@ from _visualise_common import (
     find_out_param_idx,
     register_ckpt_override,
     compute_normalised_posterior,
+    keys_for_model,
+    detect_basis,
 )
 from viz_helpers import (
     load_mcmc_samples,
@@ -43,6 +45,10 @@ from viz_helpers import (
     marginalise_2d_to_1d,
     deltat_axis_transforms,
 )
+from pembhb.sampler import chi12_to_chieff_chidiff
+from pembhb.utils import compute_fisher_sigmas_for_testset
+import h5py
+import yaml as _yaml
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +67,57 @@ def _density_to_violin(grid, density, x_center, max_half_width=0.4):
     else:
         half = np.zeros_like(d)
     return np.asarray(grid, dtype=float), x_center - half, x_center + half
+
+
+def _gaussian_density_on_grid(grid, mu, sigma):
+    """N(mu, sigma) density evaluated on *grid*."""
+    return np.exp(-0.5 * ((grid - mu) / sigma) ** 2) / (sigma * np.sqrt(2.0 * np.pi))
+
+
+def _compute_fisher_sigmas(round_dirs, obs_path: str) -> dict:
+    """Cramer-Rao 1-sigma per parameter at the obs injection, in the run's basis.
+
+    Uses the round-1 sidecar ``conf`` block as datagen_config (carries
+    ``spin_param_basis`` so chieff/chidiff runs are handled), reads the obs
+    truth row, and calls ``compute_fisher_sigmas_for_testset`` on every
+    non-degenerate prior param. Returns ``{param_name: sigma_fisher}``.
+    """
+    # round-1 sidecar lives next to the data, not the log dir.
+    from _visualise_common import _sidecar_yaml_path
+    with open(_sidecar_yaml_path(round_dirs[0], 1)) as f:
+        sc = _yaml.safe_load(f)
+    datagen_conf = sc["conf"]
+    with h5py.File(obs_path, "r") as f:
+        true_params = np.asarray(f["source_parameters"][0:1])  # (1, 11)
+    varying = [k for k, v in datagen_conf["prior"].items() if v[0] != v[1]]
+    if not varying:
+        return {}
+    sigmas, vp = compute_fisher_sigmas_for_testset(
+        datagen_conf, true_params, varying, backend="cpu",
+    )
+    return {name: float(s) for name, s in zip(vp, sigmas[0])}
+
+
+def _maybe_remap_mcmc_to_basis(samples, names, basis: str):
+    """If *basis* is ``"chieff_chidiff"`` and MCMC carries ``(chi1, chi2, q)``,
+    derive ``(chi_eff, chi_diff)`` and replace the chi1/chi2 columns in place.
+
+    No-op otherwise. Returns ``(samples, names)``.
+    """
+    if basis != "chieff_chidiff":
+        return samples, names
+    need = {"chi1", "chi2", "q"}
+    if not need.issubset(names):
+        return samples, names
+    i1, i2, iq = names.index("chi1"), names.index("chi2"), names.index("q")
+    q = samples[:, iq]; c1 = samples[:, i1]; c2 = samples[:, i2]
+    chi_eff, chi_diff = chi12_to_chieff_chidiff(q, c1, c2)
+    samples = samples.copy()
+    samples[:, i1] = chi_eff
+    samples[:, i2] = chi_diff
+    names = list(names); names[i1] = "chi_eff"; names[i2] = "chi_diff"
+    print(f"[mcmc] remapped chi1,chi2 → chi_eff,chi_diff to match NRE basis")
+    return samples, names
 
 
 def _samples_to_violin(samples, x_center, ngrid=200, max_half_width=0.4,
@@ -94,6 +151,7 @@ def _iter_param_marginals(model):
     inside a 2-D head, yield it with source_dim=2 and axis_to_keep set to
     the axis (0 or 1) of that head whose marginalisation produces it.
     """
+    keys = keys_for_model(model)
     one_d = {}
     two_d_only = {}
     for label, ndim, in_idx, out_idx in get_all_marginals(model):
@@ -104,10 +162,10 @@ def _iter_param_marginals(model):
                 if p in one_d:
                     continue
                 two_d_only.setdefault(
-                    p, (_ORDERED_PRIOR_KEYS[p], 2, in_idx, out_idx, axis)
+                    p, (keys[p], 2, in_idx, out_idx, axis)
                 )
     # Emit in canonical parameter order so subplots are in a predictable order.
-    for p_idx, _ in enumerate(_ORDERED_PRIOR_KEYS):
+    for p_idx in range(len(keys)):
         if p_idx in one_d:
             yield one_d[p_idx]
         elif p_idx in two_d_only:
@@ -129,8 +187,9 @@ def _eval_1d_marginal(model, dataloader, param_info, prior_box, ngrid):
         return eval_nre_1d(model, dataloader, in_idx, out_idx, low, high, ngrid)
     # 2-D head → marginalise.
     p0, p1 = in_idx
-    bounds_0 = prior_box[_ORDERED_PRIOR_KEYS[p0]]
-    bounds_1 = prior_box[_ORDERED_PRIOR_KEYS[p1]]
+    keys = keys_for_model(model)
+    bounds_0 = prior_box[keys[p0]]
+    bounds_1 = prior_box[keys[p1]]
     norm2d, inj_params, gx, gy = compute_normalised_posterior(
         dataloader, model, in_idx, out_idx, bounds_0, bounds_1,
         ngrid_points=ngrid,
@@ -205,10 +264,24 @@ def plot_violin_evolution(
     # Deltat axis transform).
     duration_weeks = load_duration_weeks(round_dirs[0], 1)
 
-    # Optional MCMC samples.
+    # Optional MCMC samples. Remap chi1/chi2 → chi_eff/chi_diff if the NRE
+    # was trained on the chieff_chidiff basis (read off the last-round model).
     mcmc_samples = mcmc_param_names = None
+    fisher_sigmas_by_name = {}
     if mcmc_samples_path:
         mcmc_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_path)
+        nre_basis = detect_basis(getattr(last_model, "bounds_trained", {}) or {})
+        mcmc_samples, mcmc_param_names = _maybe_remap_mcmc_to_basis(
+            mcmc_samples, mcmc_param_names, nre_basis,
+        )
+        # Fisher CRLB at the obs injection, in the same basis the run uses.
+        try:
+            obs_path = dataloader.dataset.dataset.filename
+            fisher_sigmas_by_name = _compute_fisher_sigmas(round_dirs, obs_path)
+            print(f"[fisher] CRLB sigmas: " + ", ".join(
+                f"{k}={v:.3e}" for k, v in fisher_sigmas_by_name.items()))
+        except Exception as e:
+            print(f"[fisher] WARN: could not compute Fisher sigmas: {e}")
 
     # Pre-compute every (round, param) → (grid, density, inj) so we know the
     # y-axis range per parameter before drawing. Also stash the per-round
@@ -234,6 +307,7 @@ def plot_violin_evolution(
 
     half_width = 0.4
     x_mcmc = n_rounds + 1
+    x_fisher = n_rounds + 2  # only used if fisher_sigmas_by_name is available
     for idx, (label, source_dim, in_idx, _, _) in enumerate(params):
         ax = axes[idx // cols, idx % cols]
 
@@ -321,19 +395,55 @@ def plot_violin_evolution(
                 ax.fill_betweenx(y, xl, xr, color="grey", alpha=0.5,
                                   edgecolor="grey", linewidth=0.5)
 
+        # Fisher Gaussian violin: N(MCMC_median, sigma_fisher) drawn as a violin
+        # in the column just past MCMC. Shows what the linear-Gaussian (Cramer-
+        # Rao) approximation predicts for the same param.
+        has_fisher = (
+            mcmc_col_disp is not None
+            and label in fisher_sigmas_by_name
+            and np.isfinite(fisher_sigmas_by_name[label])
+        )
+        if has_fisher:
+            sigma_f = fisher_sigmas_by_name[label]
+            # Convert sigma to display units by mapping a unit interval at the
+            # MCMC median through the transform (handles Deltat: days→seconds).
+            mu_disp = float(np.median(mcmc_col_disp))
+            # nre_to_y is applied to NRE-native (= param-native) values. mcmc_to_y
+            # is applied to MCMC-native values. For Deltat the sigma is in the
+            # NRE-native unit (days), so scale via nre_to_y derivative.
+            if label == "Deltat":
+                # Scale factor = mcmc_to_y(median+1) - mcmc_to_y(median), but
+                # sigma_fisher is in NRE-native (days). Use NRE-native sigma
+                # then transform centered at zero: dx_disp ≈ |nre_to_y(s) - nre_to_y(0)|.
+                scale = abs(float(nre_to_y(np.array([sigma_f]))[0])
+                            - float(nre_to_y(np.array([0.0]))[0]))
+                sigma_disp = scale
+            else:
+                sigma_disp = sigma_f
+            grid_g = np.linspace(y_lo, y_hi, ngrid_1d)
+            dens_g = _gaussian_density_on_grid(grid_g, mu_disp, sigma_disp)
+            y, xl, xr = _density_to_violin(grid_g, dens_g, x_fisher, half_width)
+            ax.fill_betweenx(y, xl, xr, color="tab:green", alpha=0.45,
+                              edgecolor="tab:green", linewidth=0.5)
+
         # Truth line.
         if truth_val is not None:
             ax.axhline(truth_val, color="red", linestyle=":", linewidth=0.9,
                        zorder=3)
 
         # Cosmetics.
-        ax.set_xlim(0.4, x_mcmc + 0.6 if mcmc_col_disp is not None else n_rounds + 0.6)
+        rightmost = (x_fisher if has_fisher
+                     else (x_mcmc if mcmc_col_disp is not None else n_rounds))
+        ax.set_xlim(0.4, rightmost + 0.6)
         ax.set_ylim(y_lo, y_hi)
         xticks = list(range(1, n_rounds + 1))
         xticklabels = [str(i) for i in xticks]
         if mcmc_col_disp is not None:
             xticks.append(x_mcmc)
             xticklabels.append("MCMC")
+        if has_fisher:
+            xticks.append(x_fisher)
+            xticklabels.append("Fisher")
         ax.set_xticks(xticks)
         ax.set_xticklabels(xticklabels, fontsize=8)
         suffix = "" if source_dim == 1 else "  (from 2-D)"
@@ -443,6 +553,10 @@ def main():
     if args.mcmc_file and args.zoom_mcmc_sigmas > 0:
         flat_samples, mcmc_param_names = load_mcmc_samples(args.mcmc_file)
         last_model = load_model(os.path.join(round_dirs[-1], "checkpoints"))
+        nre_basis = detect_basis(getattr(last_model, "bounds_trained", {}) or {})
+        flat_samples, mcmc_param_names = _maybe_remap_mcmc_to_basis(
+            flat_samples, mcmc_param_names, nre_basis,
+        )
         params = list(_iter_param_marginals(last_model))
         duration_weeks = load_duration_weeks(round_dirs[0], 1)
         first_round_prior = load_prior_box(round_dirs[0], 1)

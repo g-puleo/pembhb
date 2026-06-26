@@ -471,7 +471,7 @@ class SequentialTrainerJoint:
             device=device,
             host_fields=("params",),  # keep params on CPU (matches HDF5 path)
         )
-        producer = Producer(ring, sim)
+        producer = Producer(ring, sim, gen_batch_size=int(sconf.get("gen_batch_size", 250)))
         producer.seed_fill_all()  # blocking: give the trainer data on step 0
 
         # Frozen validation pool (generated once, never refreshed this round).
@@ -492,6 +492,11 @@ class SequentialTrainerJoint:
             noise_factor=self.train_conf["noise_factor"],
             n_train_noise_realisations=self.train_conf.get("n_train_noise_realisations", 1),
             device=device,
+            # Steps/epoch = samples_per_epoch / batch_size. Set this to a large
+            # HDF5-like epoch so per-epoch validation/callbacks fire at the same
+            # cadence as the non-streaming path (otherwise a small buffer makes
+            # them fire ~steps_per_epoch_seq/steps_per_epoch_stream times more).
+            samples_per_epoch=sconf.get("samples_per_epoch", None),
         )
         self.data_module.setup(stage="fit")
         self.test_dataloader = self.data_module.test_dataloader()
@@ -956,6 +961,33 @@ class SequentialTrainerJoint:
         #     stopping_threshold=self.train_conf["early_stop_threshold"],
         # )
 
+        # --- Opt-in global-step callback cadence (see the plan / STREAMING_DATAGEN).
+        # Unset -> epoch behaviour unchanged. Auto-enabled for streaming so small
+        # ring-buffer epochs don't inflate plot/log/early-stop frequency.
+        streaming_enabled = self.train_conf.get("streaming", {}).get("enabled", False)
+        sc = self.train_conf.get("step_cadence", {})
+        call_every_n_steps = sc.get("call_every_n_steps")
+        print_every_n_steps = sc.get("print_every_n_steps")
+        steps_per_seq_epoch = None
+        if streaming_enabled and call_every_n_steps is None and sc.get("seq_samples_per_epoch"):
+            steps_per_seq_epoch = max(
+                1, int(sc["seq_samples_per_epoch"]) // int(self.train_conf["batch_size"]))
+            call_every_n_steps = sc.get("call_every_n_epochs_seq", 10) * steps_per_seq_epoch
+            if print_every_n_steps is None:
+                print_every_n_steps = sc.get("print_every_seq", 20) * steps_per_seq_epoch
+            print(f"[StepCadence] streaming auto: steps_per_seq_epoch={steps_per_seq_epoch}, "
+                  f"call_every_n_steps={call_every_n_steps}, print_every_n_steps={print_every_n_steps}")
+        step_mode = call_every_n_steps is not None
+
+        def _warmup_steps_for(warmup_epochs_value):
+            """Explicit step_cadence.warmup_steps wins; else derive from the seq
+            epoch size when auto-enabled; else None (epoch warmup)."""
+            if sc.get("warmup_steps") is not None:
+                return sc["warmup_steps"]
+            if steps_per_seq_epoch is not None:
+                return int(warmup_epochs_value) * steps_per_seq_epoch
+            return None
+
         plot_posterior_callback = PlotPosteriorCallback(
             timestamp=TIME_OF_EXECUTION,
             obs_loader=self.dataloader_obs,
@@ -965,6 +997,8 @@ class SequentialTrainerJoint:
             call_every_n_epochs=10,
             training_start_time=self.training_start,
             warmup_epochs=ae_warmup_epochs,
+            call_every_n_steps=call_every_n_steps,
+            warmup_steps=_warmup_steps_for(ae_warmup_epochs),
         )
         if ae_warmup_epochs > 0:
             print(f"[PlotPosterior] skipping first {ae_warmup_epochs} epochs (AE warmup)")
@@ -973,7 +1007,8 @@ class SequentialTrainerJoint:
         callbacks_list = [checkpoint_callback,
                           periodic_checkpoint_callback,
                           plot_posterior_callback,
-                          PeriodicProgressCallback(print_every=20, label="Joint")]
+                          PeriodicProgressCallback(print_every=20, label="Joint",
+                                                   print_every_n_steps=print_every_n_steps)]
         # AE-specific gradient/weight diagnostics only make sense when the
         # encoder is an actual DenoisingAutoencoder (has .encoder.conv etc.).
         if ds_type not in ("ChannelizedMLP", "MarginalEncoder"):
@@ -996,6 +1031,8 @@ class SequentialTrainerJoint:
                 ema_alpha=vr_conf.get("ema_alpha", 0.3),
                 min_ratio_threshold=vr_conf.get("min_ratio_threshold", 0.5),
                 plateau_grace_epochs=vr_conf.get("plateau_grace_epochs", 0),
+                warmup_steps=_warmup_steps_for(vr_warmup),
+                step_mode=step_mode,
             )
             print(f"[EarlyStopping] criterion=volume_ratio, warmup_epochs={vr_warmup} "
                   f"(ae_warmup={ae_warmup_epochs} + vr_warmup={vr_conf.get('warmup_epochs', 50)})")
@@ -1012,6 +1049,8 @@ class SequentialTrainerJoint:
                 patience=de_conf.get("patience", 10),
                 rel_tol=de_conf.get("rel_tol", 0.02),
                 ema_alpha=de_conf.get("ema_alpha", 0.3),
+                warmup_steps=_warmup_steps_for(de_warmup),
+                step_mode=step_mode,
             )
             print(f"[EarlyStopping] criterion=differential_entropy, warmup_epochs={de_warmup} "
                   f"(ae_warmup={ae_warmup_epochs} + de_warmup={de_conf.get('warmup_epochs', 50)})")
@@ -1150,7 +1189,8 @@ class SequentialTrainerJoint:
         # Reserve GPU memory on the first round so other processes cannot
         # steal it during the overnight run. Skipped under streaming: the probe
         # loader would claim a ring buffer without releasing it.
-        if device == "cuda" and not streaming and not getattr(self, "_gpu_reserved", False):
+        if (device == "cuda" and not streaming and not getattr(self, "_gpu_reserved", False)
+                and not self.train_conf.get("skip_gpu_reserve", False)):
             from pembhb.gpu_utils import reserve_gpu_memory
             safety = self.train_conf.get("gpu_reserve_safety_factor", 1.25)
             reserve_gpu_memory(self.model, self.data_module.train_dataloader(),

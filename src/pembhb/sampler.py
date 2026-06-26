@@ -23,6 +23,17 @@ def chieff_chidiff_to_chi12(q, chi_eff, chi_diff):
     return chi1, chi2
 
 
+def chi12_to_chieff_chidiff(q, chi1, chi2):
+    """Forward (chi1, chi2) -> (chi_eff, chi_diff) given mass ratio q = m1/m2.
+
+    Used to compare external (chi1, chi2) samples — e.g. MCMC chains — against
+    an NRE trained on the (chi_eff, chi_diff) basis.
+    """
+    chi_eff = (q * chi1 + chi2) / (1.0 + q)
+    chi_diff = (chi1 - chi2) / 2.0
+    return chi_eff, chi_diff
+
+
 def lMcq_m1m2(x: np.array):
     """Return m1, m2 from log10(chirp mass) and q
 

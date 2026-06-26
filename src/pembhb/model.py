@@ -1399,6 +1399,7 @@ class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
 
         Returns a detached ``(B, bottleneck_dim)`` tensor for AE mode, or a
         detached ``{param_idx: (B, bottleneck_dim)}`` dict for ME mode.
+        Returns a non detached tensor if self.encoder_trains_via_nre. 
         """
         if self._is_me:
             x_norm = self.encoder_model.preprocess(d_f)
@@ -1457,7 +1458,9 @@ class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
                 input_data = torch.cat([bottleneck, reparametrised_withbc_params[:, remapped_marginal]], dim=-1)
                 logratios_list.append(classifier(input_data))
         else:
+            # when 
             bottleneck = self._encode_detached(d_f)
+            # non detached if the channelized MLP is being used. 
             features_dict = {"ft": None, "f": bottleneck, "t": d_t}
             logratios_list = []
             for key in self.logratios_model_dict.keys():

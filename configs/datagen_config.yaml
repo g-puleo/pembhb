@@ -22,17 +22,17 @@ waveform_params:
 prior:
   # Pinned to the injection truth for observation generation (simulate_data.py).
   # Fisher overrides these for the varying params at TMNRE round 1 anyway.
-  "logMchirp": [5.25, 5.25]
-  "q":         [3.00, 3.00]
-  "chi_eff":   [0.0, 0.0]        # effective aligned spin (slot 2; basis chieff_chidiff)
-  "chi_diff":  [0.0, 0.0]        # differential spin (chi1-chi2)/2 (slot 3)
-  "dist":      [10.0, 10.0]                                      # Gpc (sampled uniformly in dist^3)
-  "phi":       [3.1415, 3.1415]                                  # phase at coalescence (phimid, matches obs)
-  "inc":       [0.5, 0.5]                                        # cos inclination
-  "lambda":    [3.14159265358979, 3.14159265358979]            # ecliptic longitude
-  "beta":      [0.2, 0.2]        # sin ecliptic latitude
-  "psi":       [1.0,1.0]                                        # polarization angle in [0, pi]
-  "Deltat":    [-2.50, -2.50]        # t_merger from end of observation (days)
+  "logMchirp": [5, 6]
+  "q":         [1, 5]
+  "chi_eff":   [-0.97, 0.97]        # effective aligned spin (slot 2; basis chieff_chidiff)
+  "chi_diff":  [0.97, 0.97]        # differential spin (chi1-chi2)/2 (slot 3)
+  "dist":      [1.0, 100.0]                                      # Gpc (sampled uniformly in dist^3)
+  "phi":       [0, 6.283185307179586]                                  # phase at coalescence (phimid, matches obs)
+  "inc":       [-1.0, 1.0]                                        # cos inclination
+  "lambda":    [0, 6.283185307179586]            # ecliptic longitude
+  "beta":      [-1.0, 1.0]        # sin ecliptic latitude
+  "psi":       [0,3.14159265358979]                                        # polarization angle in [0, pi]
+  "Deltat":    [-2.55, -2.45]        # t_merger from end of observation (days)
 
   # "logMchirp": [5.25, 5.25]
   # "q":         [3.00, 3.00]
