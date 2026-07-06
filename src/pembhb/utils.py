@@ -2206,15 +2206,22 @@ def compute_fisher_sigmas_for_testset(
     return sigmas, list(varying_params)
 
 
-def transfer_classifier_weights(old_model, new_model):
+def transfer_classifier_weights(old_model, new_model, skip_keys=None):
     """Transfer classifier weights from *old_model* to *new_model* for matching marginals.
 
     Marginals are matched by their parameter-index tuple (e.g. ``(0,)`` or ``(7, 8)``).
     For every marginal that exists in both models the corresponding classifier
     weights are copied; new marginals keep their random initialisation.
 
+    ``skip_keys`` is an optional set of marginal tuples that must **not** be
+    transferred even if they match — used for per-marginal selective reinit
+    (heads whose posterior/prior volume ratio dropped below threshold are left
+    freshly initialised so they retrain on the newly-truncated prior).
+
     Works with both ``InferenceNetwork`` and ``JointAEInferenceNetwork``.
     """
+    skip_keys = {tuple(k) for k in skip_keys} if skip_keys else set()
+
     # Build a lookup: marginal_tuple -> (domain_key, position_in_domain) for old model
     old_lookup = {}
     for domain, marginal_list in old_model.marginals_dict.items():
@@ -2225,7 +2232,7 @@ def transfer_classifier_weights(old_model, new_model):
     for domain, marginal_list in new_model.marginals_dict.items():
         for pos, marginal in enumerate(marginal_list):
             key = tuple(marginal)
-            if key in old_lookup:
+            if key in old_lookup and key not in skip_keys:
                 old_domain, old_pos = old_lookup[key]
                 src = old_model.logratios_model_dict[old_domain].classifiers[old_pos]
                 dst = new_model.logratios_model_dict[domain].classifiers[pos]
@@ -2248,8 +2255,12 @@ def transfer_classifier_weights(old_model, new_model):
                     old_model.weights_loss_logits.data[old_idx]
                 )
 
+    reinit = sorted(k for k in fresh if k in old_lookup)  # matched but skipped
+    brand_new = sorted(k for k in fresh if k not in old_lookup)
     print(f"[transfer] Carried over classifiers for {transferred}")
-    print(f"[transfer] Freshly initialised classifiers for {fresh}")
+    if reinit:
+        print(f"[transfer] Reinitialised (below volume-ratio threshold) classifiers for {reinit}")
+    print(f"[transfer] Freshly initialised (new marginal) classifiers for {brand_new}")
 
 
 def resolve_marginals_for_round(train_conf: dict, round_idx: int) -> dict:

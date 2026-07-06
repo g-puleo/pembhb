@@ -334,7 +334,7 @@ class SequentialTrainer:
                 weight_decay=ae_conf.get("weight_decay", 1e-5),
                 scheduler_patience=ae_conf.get("scheduler_patience", 10),
                 scheduler_factor=ae_conf.get("scheduler_factor", 0.3),
-                representation=ae_conf.get("representation", "amp_phase"),
+                representation=ae_conf.get("representation", "real_imag"),
                 high_freq_only=ae_conf.get("high_freq_only", False),
                 freq_split_idx=ae_conf.get("freq_split_idx", 2048),
                 idx_lowerbound=idx_lo,
@@ -348,14 +348,11 @@ class SequentialTrainer:
             )
             autoencoder = autoencoder.to(device)
 
-            if ae_conf.get("whiten", True):
+            if autoencoder.whiten:
                 autoencoder.set_whitening(self.data_module.get_noise_scale())
-                if autoencoder.amplitude_normalise:
-                    norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
-                    autoencoder.fit_white_normalisation(norm_loader)
-            else:
-                norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=4)
-                autoencoder.fit_normalisation(norm_loader)
+            if autoencoder.amplitude_normalise or autoencoder.subtract_mean_whitened:
+                norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
+                autoencoder.fit_white_normalisation(norm_loader)
         else:
             autoencoder = self.data_summary.autoencoder
             self.data_summary.unfreeze_parameters()
@@ -364,14 +361,11 @@ class SequentialTrainer:
             # Whitening scale depends only on ASD and T_obs (constant across
             # rounds in the standard setup); re-set defensively in case the
             # new round's dataset has different noise settings.
-            if ae_conf.get("whiten", True):
+            if autoencoder.whiten:
                 autoencoder.set_whitening(self.data_module.get_noise_scale())
-                if autoencoder.amplitude_normalise:
-                    norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
-                    autoencoder.fit_white_normalisation(norm_loader)
-            else:
-                norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=4)
-                autoencoder.fit_normalisation(norm_loader)
+            if autoencoder.amplitude_normalise or autoencoder.subtract_mean_whitened:
+                norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
+                autoencoder.fit_white_normalisation(norm_loader)
         # --- callbacks ----------------------------------------------------
         checkpoint_cb = ModelCheckpoint(
             monitor="val_loss",

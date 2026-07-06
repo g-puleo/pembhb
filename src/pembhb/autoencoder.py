@@ -409,7 +409,7 @@ class DenoisingAutoencoder(GPUNoiseMixin, LightningModule):
         weight_decay: float = 1e-5,
         scheduler_patience: int = 10,
         scheduler_factor: float = 0.5,
-        representation: str = "amp_phase",
+        representation: str = "real_imag",
         # --- Reconstruction band masking ---
         # Encoder always sees the full input; only the reconstruction
         # target / decoder output is restricted to bins
@@ -422,8 +422,8 @@ class DenoisingAutoencoder(GPUNoiseMixin, LightningModule):
         high_freq_only: bool = False,
         freq_split_idx: int = 2048,
         # --- Optional global amplitude normalisation on top of whitening ---
-        amplitude_normalise: bool = False,
-        subtract_mean_whitened: bool = False,
+        amplitude_normalise: bool = True,
+        subtract_mean_whitened: bool = True,
         whiten: bool = True,
         # --- Frequency-bin compression ---
         # Window width for non-overlapping block average+std before the encoder.
@@ -449,10 +449,10 @@ class DenoisingAutoencoder(GPUNoiseMixin, LightningModule):
                 f"architecture must be one of {self.VALID_ARCHITECTURES}, "
                 f"got '{architecture}'"
             )
-        if amplitude_normalise and representation != "real_imag":
+        if (amplitude_normalise or subtract_mean_whitened) and representation != "real_imag":
             raise NotImplementedError(
-                "amplitude_normalise=True is only supported with "
-                "representation='real_imag'."
+                "amplitude_normalise / subtract_mean_whitened are only "
+                "supported with representation='real_imag'."
             )
         self.save_hyperparameters()
 
@@ -474,11 +474,6 @@ class DenoisingAutoencoder(GPUNoiseMixin, LightningModule):
             raise ValueError(
                 "reconstruct_std=False requires compressor_window to be set "
                 "(there are no std channels to drop without compression)."
-            )
-        if subtract_mean_whitened and not amplitude_normalise:
-            raise ValueError(
-                "subtract_mean_whitened=True requires amplitude_normalise=True "
-                "(the mean is fit alongside the max in fit_amplitude_normalisation)."
             )
         # Complex → real representation doubles the channels
         n_real_channels = n_channels * 2
@@ -601,72 +596,10 @@ class DenoisingAutoencoder(GPUNoiseMixin, LightningModule):
         self.register_buffer("amplitude_scale",     torch.tensor(1.0, dtype=get_torch_dtype()))
         self.register_buffer("amplitude_scale_std", torch.tensor(1.0, dtype=get_torch_dtype()))
         self.register_buffer("mean_whitened", torch.zeros(n_channels * 2, n_freqs, dtype=get_torch_dtype()))
-        
-        self.register_buffer(
-            "mean_vec",
-            torch.zeros(n_channels * 2, n_freqs, dtype=get_torch_dtype()),
-        )
-        self.register_buffer(
-            "global_scale_factor",
-            torch.tensor(1.0, dtype=get_torch_dtype()),
-        )
 
-    def fit_normalisation(self, dataloader: DataLoader) -> None:
-        """Compute per-channel-per-freq mean and a global max over the
-        **clean unwhitened** training signals. Mirrors the baseline pipeline
-        (commit 69d3752): the AE sees ``(x - mean_vec) / global_scale_factor``
-        as input.
-
-        Call once before training when ``whiten=False``. The buffers are
-        saved with the checkpoint.
-        """
-        if self.whiten:
-            raise RuntimeError(
-                "fit_normalisation called but whiten=True. Use set_whitening "
-                "(+ optional fit_amplitude_normalisation) for the whitening path."
-            )
-        device = next(self.parameters()).device
-        running_sum = torch.zeros(
-            self.n_channels * 2, self.n_freqs, device=device,
-            dtype=self.mean_vec.dtype,
-        )
-        n_samples = 0
-        max_val = 0.0
-        with torch.no_grad():
-            for batch in dataloader:
-                batch = materialize_gpu_noise(batch)
-                wave_fd = batch["wave_fd"].to(device)
-                real = self._complex_to_real(wave_fd)  # (B, 2C, F)
-                running_sum += real.sum(dim=0)
-                n_samples += real.shape[0]
-                max_val = max(max_val, real.abs().max().item())
-        self.mean_vec.copy_(running_sum / n_samples)
-        self.global_scale_factor.fill_(max_val)
-        print(
-            f"[AutoEncoder] normalisation fitted on {n_samples} samples  "
-            f"(representation={self.representation}, "
-            f"global_scale={self.global_scale_factor.item():.4e})"
-        )
     # ------------------------------------------------------------------
     # Complex → real conversion
     # ------------------------------------------------------------------
-    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
-        if self.whiten:
-            raise RuntimeError(
-                "_normalize called but whiten=True. The whitening pipeline does "
-                "not use mean_vec/global_scale_factor."
-            )
-        mean = self._get_mean_vec_for(x.shape[-1])
-        return (x - mean) / self.global_scale_factor
-
-    def _denormalize(self, x: torch.Tensor) -> torch.Tensor:
-        if self.whiten:
-            raise RuntimeError(
-                "_denormalize called but whiten=True."
-            )
-        mean = self._get_mean_vec_for(x.shape[-1])
-        return x * self.global_scale_factor + mean
-
     def _complex_to_real(self, z: torch.Tensor) -> torch.Tensor:
         """Convert a complex tensor (B, C, F) → real tensor (B, 2C, F).
 
@@ -730,18 +663,13 @@ class DenoisingAutoencoder(GPUNoiseMixin, LightningModule):
             f"Frequency dimension {n_freq} does not match full ({self.n_freqs}) "
             f"or masked ({masked_size}) expected size."
         )
-    def _get_mean_vec_for(self, n_freq: int) -> torch.Tensor:
-        """Slice ``mean_vec`` to match the decoder output size (handles band mask)."""
-        if n_freq == self.n_freqs:
-            return self.mean_vec
-        masked_size = self.idx_upperbound - self.idx_lowerbound
-        if self._mask_active and n_freq == masked_size:
-            return self.mean_vec[:, self.idx_lowerbound:self.idx_upperbound]
-        raise ValueError(
-            f"Frequency dimension {n_freq} does not match full ({self.n_freqs}) "
-            f"or masked ({masked_size}) expected size."
-        )
-    
+    def _prewhiten_real(self, z: torch.Tensor) -> torch.Tensor:
+        """Complex FD (B, C, F) → real channels (B, 2C, F), whitened iff
+        ``self.whiten``. This is the common representation that both
+        ``preprocess`` and the amplitude/mean fit operate on, so the two
+        stay in sync for both the whitened and unwhitened paths."""
+        return self._complex_to_real(z / self.whitening if self.whiten else z)
+
     def _get_mean_whitened_for(self, n_freq: int) -> torch.Tensor:
         """Slice ``mean_whitened`` to match the decoder output size (handles band mask)."""
         if n_freq == self.n_freqs:
@@ -758,20 +686,23 @@ class DenoisingAutoencoder(GPUNoiseMixin, LightningModule):
     # ------------------------------------------------------------------
 
     def fit_white_normalisation(self, dataloader: DataLoader) -> None:
-        """Compute the global amplitude scale on **whitened clean signals**.
+        """Fit the mean and/or global amplitude scale used by ``preprocess``.
 
-        Mirrors the old ``fit_normalisation`` (max over samples × channels ×
-        frequencies), but applied to the whitened clean signal — so the
-        scale is well-defined once ``set_whitening`` has been called.
-        Mean is *not* subtracted.
+        Operates on the same real representation ``preprocess`` sees
+        (``_prewhiten_real``): whitened clean signals when ``whiten`` is set,
+        raw real channels otherwise. ``mean_whitened`` is fitted when
+        ``subtract_mean_whitened`` is set; ``amplitude_scale`` is fitted when
+        ``amplitude_normalise`` is set. The two flags are independent.
         """
-        if not self.amplitude_normalise:
+        if not (self.amplitude_normalise or self.subtract_mean_whitened):
             raise RuntimeError(
-                "fit_amplitude_normalisation called but amplitude_normalise=False."
+                "fit_white_normalisation called but neither amplitude_normalise "
+                "nor subtract_mean_whitened is set."
             )
         if self.representation != "real_imag":
             raise NotImplementedError(
-                "amplitude_normalise is only supported with representation='real_imag'."
+                "amplitude_normalise / subtract_mean_whitened are only "
+                "supported with representation='real_imag'."
             )
         device = next(self.parameters()).device
         n_samples = 0
@@ -780,13 +711,12 @@ class DenoisingAutoencoder(GPUNoiseMixin, LightningModule):
             dtype=self.mean_whitened.dtype,
         )
 
-        # --- Pass 1: accumulate mean_whitened on the full grid ---
+        # --- Pass 1: accumulate mean on the full grid ---
         with torch.no_grad():
             for batch in dataloader:
                 batch = materialize_gpu_noise(batch)
                 wave_fd = batch["wave_fd"].to(device)
-                wave_w = wave_fd / self.whitening
-                real = self._complex_to_real(wave_w)  # (B, 2C, F)
+                real = self._prewhiten_real(wave_fd)  # (B, 2C, F)
                 n_samples += real.shape[0]
                 if self.subtract_mean_whitened:
                     running_sum += real.sum(dim=0)
@@ -799,6 +729,9 @@ class DenoisingAutoencoder(GPUNoiseMixin, LightningModule):
                 f"{self.mean_whitened.max().item():.4e}]"
             )
 
+        if not self.amplitude_normalise:
+            return
+
         # --- Pass 2: compute amplitude scale(s) after mean-subtraction and compression ---
         max_mean = 0.0
         max_std  = 0.0
@@ -806,8 +739,7 @@ class DenoisingAutoencoder(GPUNoiseMixin, LightningModule):
             for batch in dataloader:
                 batch = materialize_gpu_noise(batch)
                 wave_fd = batch["wave_fd"].to(device)
-                wave_w = wave_fd / self.whitening
-                real = self._complex_to_real(wave_w)  # (B, 2C, F)
+                real = self._prewhiten_real(wave_fd)  # (B, 2C, F)
                 if self.subtract_mean_whitened:
                     real = real - self.mean_whitened
                 if self.compressor is not None:
@@ -821,7 +753,7 @@ class DenoisingAutoencoder(GPUNoiseMixin, LightningModule):
         self.amplitude_scale.fill_(max_mean)
         self.amplitude_scale_std.fill_(max_std if self.compressor is not None else 1.0)
         print(
-            f"[AutoEncoder] amplitude scales fitted on {n_samples} whitened clean samples: "
+            f"[AutoEncoder] amplitude scales fitted on {n_samples} clean samples: "
             f"amplitude_scale={max_mean:.4e}"
             + (f", amplitude_scale_std={max_std:.4e}" if self.compressor is not None else "")
         )
@@ -878,36 +810,28 @@ class DenoisingAutoencoder(GPUNoiseMixin, LightningModule):
     # ------------------------------------------------------------------
 
     def preprocess(self, z: torch.Tensor) -> torch.Tensor:
-        """Whiten complex FD data, convert to real channels, optionally
-        divide by the global amplitude scale.
+        """Complex FD data → normalised real tensor. Each step is independently
+        gated: optional whitening, optional mean subtraction, optional
+        compression, optional global amplitude scaling.
 
         :param z: complex tensor (B, C, F).
         :return: real tensor (B, 2C, F) — channel layout per ``representation``.
         """
-        if self.whiten:
-            z_whitened = z / self.whitening
-            real = self._complex_to_real(z_whitened)
-            if self.amplitude_normalise:
-                if self.subtract_mean_whitened:
-                    mean_whitened = self._get_mean_whitened_for(z.shape[-1])
-                    real = real - mean_whitened
-                if self.compressor is not None:
-                    real = self.compressor(real)   # (B, 2*n_real_channels, n_compressed)
-                    C = self.n_real_channels
-                    real = torch.cat([
-                        real[:, :C, :] / self.amplitude_scale,
-                        real[:, C:, :] / self.amplitude_scale_std,
-                    ], dim=1)
-                else:
-                    real = real / self.amplitude_scale
-            elif self.compressor is not None:
-                real = self.compressor(real)
-            return real
-        else:
-            real = self._complex_to_real(z)
+        real = self._prewhiten_real(z)
+        if self.subtract_mean_whitened:
+            real = real - self._get_mean_whitened_for(z.shape[-1])
+        if self.compressor is not None:
+            real = self.compressor(real)   # (B, 2*n_real_channels, n_compressed)
+        if self.amplitude_normalise:
             if self.compressor is not None:
-                real = self.compressor(real)
-            return self._normalize(real)
+                C = self.n_real_channels
+                real = torch.cat([
+                    real[:, :C, :] / self.amplitude_scale,
+                    real[:, C:, :] / self.amplitude_scale_std,
+                ], dim=1)
+            else:
+                real = real / self.amplitude_scale
+        return real
     # ------------------------------------------------------------------
     # Lightning training / validation steps
     # ------------------------------------------------------------------
@@ -1603,19 +1527,17 @@ class ChannelizedMLPCompressor(nn.Module):
             "mean_whitened",
             torch.zeros(self.n_real_channels, n_freqs, dtype=get_torch_dtype()),
         )
-        self.register_buffer(
-            "mean_vec",
-            torch.zeros(self.n_real_channels, n_freqs, dtype=get_torch_dtype()),
-        )
-        self.register_buffer(
-            "global_scale_factor", torch.tensor(1.0, dtype=get_torch_dtype())
-        )
 
     # ------------------------------------------------------------------
     # Complex → real conversion (real_imag only)
     # ------------------------------------------------------------------
     def _complex_to_real(self, z: torch.Tensor) -> torch.Tensor:
         return torch.cat([z.real, z.imag], dim=1)
+
+    def _prewhiten_real(self, z: torch.Tensor) -> torch.Tensor:
+        """Complex FD → real channels, whitened iff ``self.whiten``. Shared by
+        ``preprocess`` and the amplitude/mean fit (see DenoisingAutoencoder)."""
+        return self._complex_to_real(z / self.whitening if self.whiten else z)
 
     # ------------------------------------------------------------------
     # Whitening
@@ -1631,12 +1553,16 @@ class ChannelizedMLPCompressor(nn.Module):
         )
 
     # ------------------------------------------------------------------
-    # Amplitude / mean-whitened normalisation (whiten=True path)
+    # Mean / amplitude normalisation (independent of whitening)
     # ------------------------------------------------------------------
     def fit_white_normalisation(self, dataloader: DataLoader) -> None:
-        if not self.amplitude_normalise:
+        """Fit ``mean_whitened`` (if subtract_mean_whitened) and
+        ``amplitude_scale`` (if amplitude_normalise) on the same real
+        representation ``preprocess`` sees (whitened or raw)."""
+        if not (self.amplitude_normalise or self.subtract_mean_whitened):
             raise RuntimeError(
-                "fit_white_normalisation called but amplitude_normalise=False."
+                "fit_white_normalisation called but neither amplitude_normalise "
+                "nor subtract_mean_whitened is set."
             )
         device = next(self.parameters()).device
         running_sum = torch.zeros(
@@ -1648,8 +1574,7 @@ class ChannelizedMLPCompressor(nn.Module):
             for batch in dataloader:
                 batch = materialize_gpu_noise(batch)
                 wave_fd = batch["wave_fd"].to(device)
-                wave_w = wave_fd / self.whitening
-                real = self._complex_to_real(wave_w)
+                real = self._prewhiten_real(wave_fd)
                 n_samples += real.shape[0]
                 if self.subtract_mean_whitened:
                     running_sum += real.sum(dim=0)
@@ -1659,13 +1584,15 @@ class ChannelizedMLPCompressor(nn.Module):
                 f"[ChannelizedMLP] mean_whitened fitted on {n_samples} samples"
             )
 
+        if not self.amplitude_normalise:
+            return
+
         max_mean = 0.0
         with torch.no_grad():
             for batch in dataloader:
                 batch = materialize_gpu_noise(batch)
                 wave_fd = batch["wave_fd"].to(device)
-                wave_w = wave_fd / self.whitening
-                real = self._complex_to_real(wave_w)
+                real = self._prewhiten_real(wave_fd)
                 if self.subtract_mean_whitened:
                     real = real - self.mean_whitened
                 max_mean = max(max_mean, real.abs().max().item())
@@ -1673,51 +1600,15 @@ class ChannelizedMLPCompressor(nn.Module):
         print(f"[ChannelizedMLP] amplitude_scale={max_mean:.4e}")
 
     # ------------------------------------------------------------------
-    # Non-whitening normalisation (whiten=False path)
-    # ------------------------------------------------------------------
-    def fit_normalisation(self, dataloader: DataLoader) -> None:
-        if self.whiten:
-            raise RuntimeError(
-                "fit_normalisation called but whiten=True. Use set_whitening "
-                "(+ optional fit_white_normalisation) for the whitening path."
-            )
-        device = next(self.parameters()).device
-        running_sum = torch.zeros(
-            self.n_real_channels, self.n_freqs, device=device,
-            dtype=self.mean_vec.dtype,
-        )
-        n_samples = 0
-        max_val = 0.0
-        with torch.no_grad():
-            for batch in dataloader:
-                batch = materialize_gpu_noise(batch)
-                wave_fd = batch["wave_fd"].to(device)
-                real = self._complex_to_real(wave_fd)
-                running_sum += real.sum(dim=0)
-                n_samples += real.shape[0]
-                max_val = max(max_val, real.abs().max().item())
-        self.mean_vec.copy_(running_sum / n_samples)
-        self.global_scale_factor.fill_(max_val)
-        print(
-            f"[ChannelizedMLP] normalisation fitted on {n_samples} samples "
-            f"(global_scale={self.global_scale_factor.item():.4e})"
-        )
-
-    # ------------------------------------------------------------------
     # Preprocess (mirrors DenoisingAutoencoder.preprocess, no compressor)
     # ------------------------------------------------------------------
     def preprocess(self, z: torch.Tensor) -> torch.Tensor:
-        if self.whiten:
-            z_whitened = z / self.whitening
-            real = self._complex_to_real(z_whitened)
-            if self.amplitude_normalise:
-                if self.subtract_mean_whitened:
-                    real = real - self.mean_whitened
-                real = real / self.amplitude_scale
-            return real
-        else:
-            real = self._complex_to_real(z)
-            return (real - self.mean_vec) / self.global_scale_factor
+        real = self._prewhiten_real(z)
+        if self.subtract_mean_whitened:
+            real = real - self.mean_whitened
+        if self.amplitude_normalise:
+            real = real / self.amplitude_scale
+        return real
 
     # ------------------------------------------------------------------
     # Channelized MLP (encoder)

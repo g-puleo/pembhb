@@ -234,6 +234,7 @@ def plot_violin_evolution(
     ngrid_1d: int = 200,
     reason: str = "truncation",
     y_range_per_label: dict | None = None,
+    zoom_sigmas: float | None = None,
     filename_suffix: str = "",
 ):
     """Build the unified 1-D violin-evolution figure.
@@ -242,10 +243,14 @@ def plot_violin_evolution(
     MCMC (if provided). y-axis: parameter value. Faint horizontal ±1σ MCMC
     band + median, and a red dotted line at the true (injection) value.
 
-    ``y_range_per_label`` (dict mapping label → ``(y_lo, y_hi)``) overrides
-    the auto-computed full-range y-axis. When set, every violin still draws
-    its full density but the axis clips outside the override window — useful
-    for a "zoom on MCMC" companion figure.
+    ``zoom_sigmas`` (float) clips each panel's y-axis to a window centered on
+    the **ground-truth injection** with half-width ``zoom_sigmas * sigma_mcmc``.
+    The center is the true injection (``res[2]``, never the prior midpoint or
+    the MCMC median); window and violins share the same transform so they stay
+    aligned by construction. Used for the "zoom on MCMC" companion figure.
+
+    ``y_range_per_label`` (dict mapping label → ``(y_lo, y_hi)``) is an explicit
+    manual override of the y-axis window; it wins over ``zoom_sigmas``.
     """
     os.makedirs(outdir, exist_ok=True)
     n_rounds = len(round_dirs)
@@ -344,6 +349,20 @@ def plot_violin_evolution(
         y_pad = 0.05 * (y_max - y_min)
         y_lo = y_min - y_pad
         y_hi = y_max + y_pad
+        # Zoom window: centered on the ground-truth injection (in display
+        # coords), half-width N * MCMC sigma. inj_for_transform is res[2] from
+        # the NRE eval — the true obs value, never the prior midpoint. For
+        # Deltat the transform sends the injection to 0; for other params it is
+        # the identity, so truth_disp is the native injection. sigma is offset-
+        # invariant, so it is correct regardless of the transform reference.
+        if zoom_sigmas is not None and mcmc_col_disp is not None:
+            if inj_for_transform is not None:
+                truth_disp = float(nre_to_y(np.array([inj_for_transform]))[0])
+            else:
+                truth_disp = float(np.median(mcmc_col_disp))
+            sigma_disp = float(np.std(mcmc_col_disp))
+            y_lo = truth_disp - zoom_sigmas * sigma_disp
+            y_hi = truth_disp + zoom_sigmas * sigma_disp
         if y_range_per_label and label in y_range_per_label:
             y_lo, y_hi = y_range_per_label[label]
 
@@ -549,39 +568,10 @@ def main():
         reason=args.reason,
     )
 
-    # Optional MCMC-zoom companion figure.
+    # Optional MCMC-zoom companion figure. The window is centered on the
+    # ground-truth injection (computed inside plot_violin_evolution from the
+    # NRE eval), with half-width zoom_sigmas * MCMC sigma.
     if args.mcmc_file and args.zoom_mcmc_sigmas > 0:
-        flat_samples, mcmc_param_names = load_mcmc_samples(args.mcmc_file)
-        last_model = load_model(os.path.join(round_dirs[-1], "checkpoints"))
-        nre_basis = detect_basis(getattr(last_model, "bounds_trained", {}) or {})
-        flat_samples, mcmc_param_names = _maybe_remap_mcmc_to_basis(
-            flat_samples, mcmc_param_names, nre_basis,
-        )
-        params = list(_iter_param_marginals(last_model))
-        duration_weeks = load_duration_weeks(round_dirs[0], 1)
-        first_round_prior = load_prior_box(round_dirs[0], 1)
-        # Single-point obs prior → midpoint is the injection value (Deltat
-        # axis transform needs it).
-        deltat_inj = None
-        if "Deltat" in first_round_prior:
-            lo, hi = first_round_prior["Deltat"]
-            deltat_inj = 0.5 * (lo + hi)
-
-        y_range_per_label = {}
-        N = args.zoom_mcmc_sigmas
-        for label, _, _, _, _ in params:
-            if label not in mcmc_param_names:
-                continue
-            col = flat_samples[:, mcmc_param_names.index(label)]
-            # Apply transform if Deltat.
-            _, mcmc_to_y, _ = _axis_transforms_for(
-                label, deltat_inj, duration_weeks, args.mcmc_file,
-            )
-            col_disp = mcmc_to_y(col)
-            med = float(np.median(col_disp))
-            std = float(np.std(col_disp))
-            y_range_per_label[label] = (med - N * std, med + N * std)
-
         plot_violin_evolution(
             round_dirs=round_dirs,
             dataloader=dataloader,
@@ -589,8 +579,8 @@ def main():
             outdir=outdir,
             ngrid_1d=args.ngrid_1d,
             reason=args.reason,
-            y_range_per_label=y_range_per_label,
-            filename_suffix=f"_zoom{int(N)}sigma",
+            zoom_sigmas=args.zoom_mcmc_sigmas,
+            filename_suffix=f"_zoom{int(args.zoom_mcmc_sigmas)}sigma",
         )
 
 

@@ -1925,16 +1925,16 @@ class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
             periodic_bc_params=hp["train_conf"].get("periodic_bc_params"),
             encoder_trains_via_nre=hp.get("encoder_trains_via_nre", False),
         )
-        # i added a branch so that the whiten:False restores a behaviour where
-        # mean_vec and global_scale_factor are used. 
-        # these buffers are now registered in the model by default, but old checkpoints dont store them. 
-        # hence, we need to ignore their absence when loading old checkpoints. 
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        # Old checkpoints predate the baseline-pipeline buffers; their identity-init
-        # defaults (mean_vec=0, global_scale_factor=1) are correct for whiten=True.
-        allowed_missing = {"encoder_model.mean_vec", "encoder_model.global_scale_factor", "encoder_model.mean_whitened",
+        # Old checkpoints predate some normalisation buffers (identity-init
+        # defaults are correct for the whiten path); tolerate their absence.
+        allowed_missing = {"encoder_model.mean_whitened",
                            "encoder_model.amplitude_scale_std"}
-        unexpected_real = set(unexpected)
+        # The per-bin standardisation buffers were removed; older checkpoints
+        # may still carry them — ignore them on load.
+        allowed_unexpected = {"encoder_model.mean_vec",
+                              "encoder_model.global_scale_factor"}
+        unexpected_real = set(unexpected) - allowed_unexpected
         missing_real = set(missing) - allowed_missing
         if missing_real or unexpected_real:
             raise RuntimeError(

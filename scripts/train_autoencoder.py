@@ -130,7 +130,7 @@ def main():
         weight_decay=ae_conf.get("weight_decay", 1e-5),
         scheduler_patience=ae_conf.get("scheduler_patience", 10),
         scheduler_factor=ae_conf.get("scheduler_factor", 0.3),
-        representation=ae_conf.get("representation", "amp_phase"),
+        representation=ae_conf.get("representation", "real_imag"),
         high_freq_only=ae_conf.get("high_freq_only", False),
         freq_split_idx=ae_conf.get("freq_split_idx", 2048),
         idx_lowerbound=idx_lo,
@@ -144,14 +144,11 @@ def main():
     )
     model = model.to(device)
 
-    if ae_conf.get("whiten", True):
+    if model.whiten:
         model.set_whitening(data_module.get_noise_scale())
-        if model.amplitude_normalise:
-            norm_loader = data_module.train_dataloader(shuffle=False, num_workers=0)
-            model.fit_white_normalisation(norm_loader)
-    else:
-        norm_loader = data_module.train_dataloader(shuffle=False, num_workers=4)
-        model.fit_normalisation(norm_loader)
+    if model.amplitude_normalise or model.subtract_mean_whitened:
+        norm_loader = data_module.train_dataloader(shuffle=False, num_workers=0)
+        model.fit_white_normalisation(norm_loader)
 
     checkpoint_cb = ModelCheckpoint(
         monitor="val_loss",

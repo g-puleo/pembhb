@@ -73,6 +73,21 @@ def _round_marginal_entropies(plot_cb, keys=_PPKS_ORDERED_PRIOR_KEYS):
     return out
 
 
+def _round_volume_ratios(plot_cb):
+    """Round-final posterior/prior volume ratio per marginal: ``{tuple: ratio}``.
+
+    Keyed by the marginal's parameter-index tuple (e.g. ``(0,)``, ``(7, 8)``),
+    matching ``model.marginals_dict`` so it can drive per-marginal reinit.
+    """
+    if plot_cb is None or not getattr(plot_cb, "volume_ratios", None):
+        return {}
+    out = {}
+    for key, hist in plot_cb.volume_ratios.items():
+        if hist:
+            out[tuple(key)] = hist[-1]["ratio"]
+    return out
+
+
 def _round_median_tau(lt_h5_path):
     """Median τ = σ_post²/σ_Fisher² over all params/samples at the round's last eval."""
     if not lt_h5_path or not os.path.exists(lt_h5_path):
@@ -281,6 +296,12 @@ class SequentialTrainerJoint:
         self._last_marginal_entropies = {}
         self._last_stopped_via = ""
         self._last_median_tau = None
+        # Per-marginal final volume ratios from the previous round, used to
+        # decide which classifier heads to reinit (selective transfer). Empty
+        # before round 1. The persistent merged parameter-normalisation vector
+        # is rebuilt selectively each round from this.
+        self._last_volume_ratios = {}
+        self._current_normalisation = None
         cc_conf = self.train_conf.get("chain_convergence", {})
         self.chain_monitor = None
         if cc_conf.get("enabled", False):
@@ -517,6 +538,27 @@ class SequentialTrainerJoint:
     # Build or update autoencoder
     # -----------------------------------------------------------------
 
+    def _transfer_data_summary(self):
+        """Whether encoder weights + data-normalisation carry across rounds."""
+        return self.train_conf.get("joint_training", {}).get(
+            "transfer_data_summary_across_rounds", False)
+
+    def _reset_whitening(self, model):
+        """Re-set the (physics-derived, round-invariant) whitening scale only.
+        Used when reusing a transferred encoder so its fitted amplitude/mean
+        stay frozen at their round-1 values."""
+        if getattr(model, "whiten", False):
+            model.set_whitening(self.data_module.get_noise_scale())
+
+    def _fit_data_normalisation(self, model):
+        """Fit the encoder's input normalisation on the current round's data:
+        whitening scale (if whiten) + amplitude scale / mean (if either flag)."""
+        self._reset_whitening(model)
+        if getattr(model, "amplitude_normalise", False) or getattr(
+                model, "subtract_mean_whitened", False):
+            norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
+            model.fit_white_normalisation(norm_loader)
+
     def _build_autoencoder(self, round_idx):
         """Create or reuse the DenoisingAutoencoder for this round.
 
@@ -543,7 +585,8 @@ class SequentialTrainerJoint:
         except Exception:
             pass
 
-        if self._autoencoder is None or round_idx == 1:
+        # Build a fresh encoder unless we are transferring weights across rounds.
+        if self._autoencoder is None or round_idx == 1 or not self._transfer_data_summary():
             hidden_channels = ae_conf.get("hidden_channels", (32, 64, 128, 256, 256))
             if isinstance(hidden_channels, list):
                 hidden_channels = tuple(hidden_channels)
@@ -587,13 +630,13 @@ class SequentialTrainerJoint:
                 weight_decay=ae_conf.get("weight_decay", 1e-5),
                 scheduler_patience=ae_conf.get("scheduler_patience", 10),
                 scheduler_factor=ae_conf.get("scheduler_factor", 0.3),
-                representation=ae_conf.get("representation", "amp_phase"),
+                representation=ae_conf.get("representation", "real_imag"),
                 high_freq_only=ae_conf.get("high_freq_only", False),
                 freq_split_idx=ae_conf.get("freq_split_idx", 2048),
                 idx_lowerbound=idx_lo,
                 idx_upperbound=idx_hi,
-                amplitude_normalise=ae_conf.get("amplitude_normalise", False),
-                subtract_mean_whitened=ae_conf.get("subtract_mean_whitened", False),
+                amplitude_normalise=ae_conf.get("amplitude_normalise", True),
+                subtract_mean_whitened=ae_conf.get("subtract_mean_whitened", True),
                 prior_bounds=prior_bounds,
                 whiten=ae_conf.get("whiten", True),
                 compressor_window=ae_conf.get("compressor_window", None),
@@ -601,33 +644,15 @@ class SequentialTrainerJoint:
             )
             autoencoder = autoencoder.to(device)
 
-            if ae_conf.get("whiten", True):
-                autoencoder.set_whitening(self.data_module.get_noise_scale())
-                if autoencoder.amplitude_normalise:
-                    norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
-                    autoencoder.fit_white_normalisation(norm_loader)
-            else:
-                norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=4)
-                autoencoder.fit_normalisation(norm_loader)
-
-
             self._autoencoder = autoencoder
+            self._fit_data_normalisation(self._autoencoder)
         else:
-            # Reuse previous round's autoencoder (already trained). The
-            # whitening scale depends only on ASD and T_obs (constant across
-            # rounds in the standard setup); re-set it defensively in case the
-            # new round's dataset has different noise settings.
+            # Reuse the transferred encoder with its round-1 data-normalisation
+            # frozen (symmetric with classifier transfer / param-norm). Only the
+            # physics-derived whitening scale is re-set defensively.
             print(f"[Joint] Reusing autoencoder from previous round for round {round_idx}")
+            self._reset_whitening(self._autoencoder)
 
-            if ae_conf.get("whiten", True):
-                self._autoencoder.set_whitening(self.data_module.get_noise_scale())
-                if self._autoencoder.amplitude_normalise:
-                    norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
-                    self._autoencoder.fit_white_normalisation(norm_loader)
-            else:
-                norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=4)
-                self._autoencoder.fit_normalisation(norm_loader)
-                
         return self._autoencoder
 
     def _build_channelized_mlp_compressor(self, round_idx):
@@ -651,7 +676,7 @@ class SequentialTrainerJoint:
         except Exception:
             n_freqs = cfg.get("n_freqs", 4096)
 
-        if self._autoencoder is None or round_idx == 1:
+        if self._autoencoder is None or round_idx == 1 or not self._transfer_data_summary():
             compressor = ChannelizedMLPCompressor(
                 n_channels=cfg.get("n_channels", 2),
                 n_freqs=n_freqs,
@@ -664,25 +689,11 @@ class SequentialTrainerJoint:
                 dropout=cfg.get("dropout", 0.0),
             )
             compressor = compressor.to(device)
-            if compressor.whiten:
-                compressor.set_whitening(self.data_module.get_noise_scale())
-                if compressor.amplitude_normalise:
-                    norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
-                    compressor.fit_white_normalisation(norm_loader)
-            else:
-                norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=4)
-                compressor.fit_normalisation(norm_loader)
             self._autoencoder = compressor
+            self._fit_data_normalisation(self._autoencoder)
         else:
             print(f"[Joint] Reusing ChannelizedMLP compressor from previous round for round {round_idx}")
-            if self._autoencoder.whiten:
-                self._autoencoder.set_whitening(self.data_module.get_noise_scale())
-                if self._autoencoder.amplitude_normalise:
-                    norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
-                    self._autoencoder.fit_white_normalisation(norm_loader)
-            else:
-                norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=4)
-                self._autoencoder.fit_normalisation(norm_loader)
+            self._reset_whitening(self._autoencoder)
         return self._autoencoder
 
     def _build_marginal_encoder(self, round_idx):
@@ -792,6 +803,25 @@ class SequentialTrainerJoint:
             print(f"[Resume] Warning: {prior_path} not found; using prior from config. "
                   f"First resumed round may use a slightly wider prior.")
 
+        # Selective-transfer state (merged normalisation + last volume ratios).
+        # Absent for runs that pre-date the selective path; harmless otherwise.
+        base = os.path.join(DATA_ROOT_DIR, run_name)
+        norm_p = os.path.join(base, f"normalisation_after_round_{last_round}.yaml")
+        vr_p = os.path.join(base, f"volume_ratios_after_round_{last_round}.yaml")
+        if os.path.exists(norm_p):
+            with open(norm_p) as _f:
+                payload = _yaml.safe_load(_f)
+            self._current_normalisation = {k: np.asarray(v) for k, v in payload.items()}
+            print(f"[Resume] Restored merged normalisation from {norm_p}")
+        if os.path.exists(vr_p):
+            with open(vr_p) as _f:
+                vr_payload = _yaml.safe_load(_f) or {}
+            self._last_volume_ratios = {
+                tuple(int(x) for x in k.split(",")): float(v)
+                for k, v in vr_payload.items()
+            }
+            print(f"[Resume] Restored last volume ratios: {self._last_volume_ratios}")
+
     # -----------------------------------------------------------------
     # Round-1 parameter normalisation (frozen across rounds)
     # -----------------------------------------------------------------
@@ -825,6 +855,72 @@ class SequentialTrainerJoint:
         return {k: np.asarray(v) for k, v in payload.items()}
 
     # -----------------------------------------------------------------
+    # Selective (per-marginal) parameter normalisation
+    # -----------------------------------------------------------------
+
+    def _compute_full_normalisation(self, periodic_bc_params):
+        """Fresh normalisation from the current round's data (all params)."""
+        mean, std = self.data_module.get_params_mean_std()
+        sincos_mean, sincos_std = self.data_module.get_sincos_mean_std(periodic_bc_params)
+        return {
+            "td_normalisation": np.array(self.data_module.get_max_td()),
+            "param_mean": np.asarray(mean),
+            "param_std": np.asarray(std),
+            "sincos_mean": np.asarray(sincos_mean),
+            "sincos_std": np.asarray(sincos_std),
+        }
+
+    def _build_selective_normalisation(self, reinit_param_idxs, periodic_bc_params):
+        """Merge fresh stats for *reinit_param_idxs* into the frozen baseline.
+
+        Params whose marginal was reinitialised are re-standardised on the new
+        (truncated) data; every other param keeps the normalisation locked from
+        the round in which its head was last (re)initialised. Round 1 (no
+        baseline yet) returns fully-fresh stats. Updates
+        ``self._current_normalisation`` in place.
+        """
+        fresh = self._compute_full_normalisation(periodic_bc_params)
+        if self._current_normalisation is None:
+            self._current_normalisation = {k: np.array(v) for k, v in fresh.items()}
+            return self._current_normalisation
+
+        merged = {k: np.array(v) for k, v in self._current_normalisation.items()}
+        # td_normalisation is a global data scale, not tied to a head — refresh.
+        merged["td_normalisation"] = fresh["td_normalisation"]
+        for i in reinit_param_idxs:
+            merged["param_mean"][i] = fresh["param_mean"][i]
+            merged["param_std"][i] = fresh["param_std"][i]
+        # sincos entries are laid out [sin(p),cos(p)] per periodic param, in the
+        # order of periodic_bc_params.
+        for j, pidx in enumerate(periodic_bc_params):
+            if pidx in reinit_param_idxs and 2 * j + 1 < len(merged["sincos_mean"]):
+                merged["sincos_mean"][2 * j:2 * j + 2] = fresh["sincos_mean"][2 * j:2 * j + 2]
+                merged["sincos_std"][2 * j:2 * j + 2] = fresh["sincos_std"][2 * j:2 * j + 2]
+        self._current_normalisation = merged
+        return merged
+
+    def _round_state_paths(self, round_idx):
+        base = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION)
+        return (
+            os.path.join(base, f"normalisation_after_round_{round_idx}.yaml"),
+            os.path.join(base, f"volume_ratios_after_round_{round_idx}.yaml"),
+        )
+
+    def _persist_round_state(self, round_idx):
+        """Persist merged normalisation + final volume ratios for resume/provenance."""
+        import yaml as _yaml
+        norm_path, vr_path = self._round_state_paths(round_idx)
+        os.makedirs(os.path.dirname(norm_path), exist_ok=True)
+        if self._current_normalisation is not None:
+            payload = {k: np.asarray(v).tolist() for k, v in self._current_normalisation.items()}
+            with open(norm_path, "w") as f:
+                _yaml.safe_dump(payload, f)
+        # keys are param-index tuples → stringify for YAML
+        vr_payload = {",".join(map(str, k)): float(v) for k, v in self._last_volume_ratios.items()}
+        with open(vr_path, "w") as f:
+            _yaml.safe_dump(vr_payload, f)
+
+    # -----------------------------------------------------------------
     # Joint training
     # -----------------------------------------------------------------
 
@@ -832,7 +928,15 @@ class SequentialTrainerJoint:
         """Train encoder + NRE jointly for this round (AE or ME mode)."""
         ds_type = self.train_conf["architecture"]["data_summary"].get("type", "Autoencoder")
         joint_conf = self.train_conf.get("joint_training", {})
-        transfer_enabled = joint_conf.get("transfer_classifiers_across_rounds", True)
+        # Two independent cross-round transfers, both off by default. Each also
+        # freezes the input-normalisation of the subnetwork it carries.
+        transfer_classifier = joint_conf.get("transfer_classifiers_across_rounds", False)
+        transfer_data_summary = joint_conf.get("transfer_data_summary_across_rounds", False)
+        # Selective per-marginal transfer: carry over every head except those
+        # whose posterior/prior volume ratio dropped below threshold last round
+        # (those are reinitialised and their params re-standardised). Takes
+        # precedence over the all-or-nothing transfer_classifier flag.
+        reinit_selective = joint_conf.get("reinit_truncated_classifiers", False)
 
         if ds_type == "MarginalEncoder":
             enc_conf = self.train_conf["architecture"]["data_summary"]["MarginalEncoder"]
@@ -846,17 +950,33 @@ class SequentialTrainerJoint:
 
         device = enc_conf.get("device", self.train_conf["device"])
 
-        # Warm-up: full warmup for round 1, none for subsequent rounds
-        ae_warmup_epochs = joint_conf.get("ae_warmup_epochs", 50) if round_idx == 1 else 0
+        # Warm-up runs whenever the encoder is freshly built — round 1, or any
+        # round where the data-summary is not transferred (fresh untrained
+        # encoder). It is skipped only when reusing a transferred encoder.
+        fresh_encoder = (round_idx == 1) or not transfer_data_summary
+        ae_warmup_epochs = joint_conf.get("ae_warmup_epochs", 50) if fresh_encoder else 0
 
-        # Parameter normalisation.  When ``transfer_classifiers_across_rounds``
-        # is true the round-1 stats are persisted to YAML and reused for every
-        # later round, so classifier heads carried over via
-        # ``transfer_classifier_weights`` keep seeing the same input
-        # distribution they were trained on.  When false we recompute every
-        # round (legacy behaviour, used as a fallback for comparisons).
+        # Parameter normalisation is paired with the classifier heads: when the
+        # heads are transferred we freeze the round-1 stats (persisted to YAML)
+        # so carried-over heads keep seeing the same input distribution; when
+        # they are not transferred we recompute the stats every round.
         periodic_bc_params = self.train_conf.get("periodic_bc_params", [])
-        if not transfer_enabled:
+        reinit_keys = set()
+        if reinit_selective:
+            # Marginals whose final volume ratio last round was <= threshold get
+            # fresh heads + re-standardised params; all others keep frozen norm.
+            threshold = self.train_conf.get("volume_ratio_early_stop", {}).get(
+                "min_ratio_threshold", 0.5)
+            reinit_keys = {k for k, r in self._last_volume_ratios.items()
+                           if r <= threshold}
+            reinit_param_idxs = {i for k in reinit_keys for i in k}
+            normalisation = self._build_selective_normalisation(
+                reinit_param_idxs, periodic_bc_params)
+            if round_idx > 1:
+                print(f"[Transfer] Selective reinit: {len(reinit_keys)} head(s) "
+                      f"below vr<= {threshold}: {sorted(reinit_keys)}; "
+                      f"re-standardised params {sorted(reinit_param_idxs)}.")
+        elif not transfer_classifier:
             mean, std = self.data_module.get_params_mean_std()
             sincos_mean, sincos_std = self.data_module.get_sincos_mean_std(periodic_bc_params)
             normalisation = {
@@ -893,6 +1013,7 @@ class SequentialTrainerJoint:
         # epochs where val_nre_loss is logged as 0.
         if nre_sched_cfg is not None and "start_epoch" not in nre_sched_cfg:
             nre_sched_cfg = {**nre_sched_cfg, "start_epoch": ae_warmup_epochs}
+        
         self.model = JointAEInferenceNetwork(
             train_conf=self.train_conf,
             dataset_info=self.datagen_info,
@@ -911,7 +1032,9 @@ class SequentialTrainerJoint:
             encoder_trains_via_nre=(ds_type == "ChannelizedMLP"),
         )
         self.model.to(device)
-        if transfer_enabled and old_model is not None:
+        if reinit_selective and old_model is not None:
+            transfer_classifier_weights(old_model, self.model, skip_keys=reinit_keys)
+        elif transfer_classifier and old_model is not None:
             transfer_classifier_weights(old_model, self.model)
         self.model.train()
 
@@ -1246,6 +1369,8 @@ class SequentialTrainerJoint:
             keys=utils.ordered_prior_keys(
                 self.datagen_conf.get("spin_param_basis", "chi1chi2")))
         self._last_median_tau = _round_median_tau(locals().get("lt_h5_path"))
+        self._last_volume_ratios = _round_volume_ratios(plot_posterior_callback)
+        self._persist_round_state(round_idx)
         opt = self.model.optimizers()
         if isinstance(opt, list):
             opt = opt[0]
