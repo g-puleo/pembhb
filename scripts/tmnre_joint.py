@@ -50,6 +50,7 @@ from pembhb.callbacks import (
     PlotPosteriorCallback, VolumeRatioEarlyStopping,
     DifferentialEntropyEarlyStopping, PeriodicProgressCallback,
     WarmupEarlyStopping, PPKSTestEarlyStopping, ChainConvergenceMonitor,
+    compute_truncation_coverage,
 )
 from pembhb.utils import _ORDERED_PRIOR_KEYS as _PPKS_ORDERED_PRIOR_KEYS
 from pembhb.diagnostics import AutoencoderDiagnosticsCallback
@@ -86,6 +87,59 @@ def _round_volume_ratios(plot_cb):
         if hist:
             out[tuple(key)] = hist[-1]["ratio"]
     return out
+
+
+def _round_entropies(plot_cb):
+    """Round-final differential entropy per marginal: ``{tuple: H}`` (nats).
+
+    Keyed by the marginal's parameter-index tuple, matching
+    ``_round_volume_ratios`` so it can drive per-marginal entropy-plateau reinit.
+    """
+    if plot_cb is None or not getattr(plot_cb, "differential_entropies", None):
+        return {}
+    out = {}
+    for key, hist in plot_cb.differential_entropies.items():
+        if hist:
+            out[tuple(key)] = hist[-1]["entropy"]
+    return out
+
+
+def _entropy_plateau_keys(history, min_delta, patience, warmup_rounds, round_idx):
+    """Marginal tuples whose end-of-round differential entropy has plateaued.
+
+    A marginal plateaus when its last ``patience`` round-to-round changes in H
+    are *all* smaller than ``min_delta`` nats. Rounds up to ``warmup_rounds`` are
+    skipped: early on many heads sit flat at the prior entropy because they have
+    not started learning yet (e.g. ``phi`` stays at ~1.85 nats until it suddenly
+    drops) — that is a false plateau we must not mistake for convergence.
+
+    ``history`` is ``{tuple: [H_1, H_2, ...]}`` accumulated one value per round.
+    """
+    if round_idx <= warmup_rounds:
+        return set()
+    out = set()
+    for key, hist in history.items():
+        if len(hist) < patience + 1:
+            continue
+        diffs = np.abs(np.diff(hist[-(patience + 1):]))
+        if np.all(diffs < min_delta):
+            out.add(tuple(key))
+    return out
+
+
+def _marginal_prior_volume(marginal, prior, ordered_keys):
+    """Prior-box volume of a marginal = product of its parameters' widths.
+
+    For a 1D marginal ``(i,)`` this is just the width of parameter ``i``; for a
+    2D marginal ``(i, j)`` it is the box area. ``prior`` is ``{name: [lo, hi]}``
+    and ``ordered_keys`` maps a parameter index to its name for the run's spin
+    basis (see ``utils.ordered_prior_keys``).
+    """
+    vol = 1.0
+    for idx in marginal:
+        lo, hi = prior[ordered_keys[idx]]
+        vol *= abs(float(hi) - float(lo))
+    return vol
 
 
 def _round_median_tau(lt_h5_path):
@@ -178,6 +232,9 @@ class SequentialTrainerJoint:
     def __init__(self, train_conf, datagen_conf, dataset_obs_path, resume=False, seed=42):
         self.train_conf = train_conf
         self.datagen_conf = datagen_conf
+        # Untruncated initial prior — the reference for the very first
+        # prior-shrink cold-restart comparison (see _train_joint).
+        self._initial_prior = copy.deepcopy(datagen_conf["prior"])
         self.dataset_obs_path = dataset_obs_path
         self.seed = seed
         self.training_start = datetime.now()
@@ -301,6 +358,22 @@ class SequentialTrainerJoint:
         # before round 1. The persistent merged parameter-normalisation vector
         # is rebuilt selectively each round from this.
         self._last_volume_ratios = {}
+        # Cross-round end-of-round differential entropy per marginal tuple,
+        # ``{tuple: [H_round1, H_round2, ...]}``. Drives entropy-plateau reinit
+        # and is persisted/restored for --resume.
+        self._entropy_history = {}
+        # Prior-shrink cold restart: per-marginal reference box volume (the box
+        # at the last cold restart, or the initial prior before the first) and
+        # the number of cold restarts fired so far. A marginal is reset once its
+        # current box has shrunk by >= shrink_factor relative to its reference,
+        # after which the reference ratchets down to the current box.
+        self._cr_reference_vol = {}   # {marginal_tuple: float}
+        self._cr_level = {}           # {marginal_tuple: int}
+        self._cr_history = []         # provenance: list of reset events
+        # Per-marginal empirical coverage from the previous round's final model,
+        # {marginal_tuple: (coverage, n_inside, n_total)}; drives the truncation
+        # veto. Recomputed each round, so no resume state needed.
+        self._last_coverage = {}
         self._current_normalisation = None
         cc_conf = self.train_conf.get("chain_convergence", {})
         self.chain_monitor = None
@@ -556,7 +629,8 @@ class SequentialTrainerJoint:
         self._reset_whitening(model)
         if getattr(model, "amplitude_normalise", False) or getattr(
                 model, "subtract_mean_whitened", False):
-            norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
+            norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0,
+                                                            single_chunk=True)
             model.fit_white_normalisation(norm_loader)
 
     def _build_autoencoder(self, round_idx):
@@ -738,14 +812,16 @@ class SequentialTrainerJoint:
 
             encoder.set_whitening(self.data_module.get_noise_scale())
             if encoder.amplitude_normalise:
-                norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
+                norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0,
+                                                                single_chunk=True)
                 encoder.fit_amplitude_normalisation(norm_loader)
             self._autoencoder = encoder
         else:
             print(f"[Joint-ME] Reusing ME from previous round for round {round_idx}")
             self._autoencoder.set_whitening(self.data_module.get_noise_scale())
             if self._autoencoder.amplitude_normalise:
-                norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0)
+                norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0,
+                                                                single_chunk=True)
                 self._autoencoder.fit_amplitude_normalisation(norm_loader)
 
         return self._autoencoder
@@ -808,6 +884,8 @@ class SequentialTrainerJoint:
         base = os.path.join(DATA_ROOT_DIR, run_name)
         norm_p = os.path.join(base, f"normalisation_after_round_{last_round}.yaml")
         vr_p = os.path.join(base, f"volume_ratios_after_round_{last_round}.yaml")
+        ent_p = os.path.join(base, f"diff_entropies_after_round_{last_round}.yaml")
+        cr_p = os.path.join(base, f"cold_restart_state_after_round_{last_round}.yaml")
         if os.path.exists(norm_p):
             with open(norm_p) as _f:
                 payload = _yaml.safe_load(_f)
@@ -821,6 +899,30 @@ class SequentialTrainerJoint:
                 for k, v in vr_payload.items()
             }
             print(f"[Resume] Restored last volume ratios: {self._last_volume_ratios}")
+        if os.path.exists(ent_p):
+            with open(ent_p) as _f:
+                ent_payload = _yaml.safe_load(_f) or {}
+            self._entropy_history = {
+                tuple(int(x) for x in k.split(",")): [float(v) for v in vals]
+                for k, vals in ent_payload.items()
+            }
+            print(f"[Resume] Restored entropy history for {len(self._entropy_history)} marginals "
+                  f"({sum(len(v) for v in self._entropy_history.values())} values)")
+        if os.path.exists(cr_p):
+            with open(cr_p) as _f:
+                cr_payload = _yaml.safe_load(_f) or {}
+            self._cr_reference_vol = {
+                tuple(int(x) for x in k.split(",")): float(v)
+                for k, v in (cr_payload.get("reference_vol") or {}).items()
+            }
+            self._cr_level = {
+                tuple(int(x) for x in k.split(",")): int(v)
+                for k, v in (cr_payload.get("level") or {}).items()
+            }
+            self._cr_history = cr_payload.get("history") or []
+            print(f"[Resume] Restored cold-restart state: "
+                  f"{sum(self._cr_level.values())} resets across "
+                  f"{len(self._cr_reference_vol)} marginals")
 
     # -----------------------------------------------------------------
     # Round-1 parameter normalisation (frozen across rounds)
@@ -853,6 +955,53 @@ class SequentialTrainerJoint:
         with open(path) as f:
             payload = _yaml.safe_load(f)
         return {k: np.asarray(v) for k, v in payload.items()}
+
+    # -----------------------------------------------------------------
+    # Prior-shrink cold restart
+    # -----------------------------------------------------------------
+
+    def _prior_shrink_reinit_keys(self, round_idx, joint_conf):
+        """Marginals whose prior box shrank by >= shrink_factor since last reset.
+
+        The current box is ``self.datagen_conf["prior"]`` — the prior the current
+        round's data was drawn from (i.e. ``prior_after_round_{round_idx-1}``).
+        Each triggered marginal is reset (its head is left out of the weight
+        transfer and its params re-standardised) and its reference box ratchets
+        down to the current box, so the next reset needs another shrink_factor.
+        """
+        ps_conf = joint_conf.get("prior_shrink_reinit", {})
+        factor = float(ps_conf.get("shrink_factor", 100))
+        ordered_keys = utils.ordered_prior_keys(
+            self.datagen_conf.get("spin_param_basis", "chi1chi2"))
+        cur_prior = self.datagen_conf["prior"]
+        marg_dict = utils.resolve_marginals_for_round(self.train_conf, round_idx)
+        all_marginals = [tuple(m) for lst in marg_dict.values() for m in lst]
+
+        shrink_keys = set()
+        for key in all_marginals:
+            cur_vol = _marginal_prior_volume(key, cur_prior, ordered_keys)
+            # First sight of this marginal: reference is the initial prior box.
+            if key not in self._cr_reference_vol:
+                self._cr_reference_vol[key] = _marginal_prior_volume(
+                    key, self._initial_prior, ordered_keys)
+                self._cr_level.setdefault(key, 0)
+            ref_vol = self._cr_reference_vol[key]
+            if ref_vol > 0 and cur_vol <= ref_vol / factor:
+                self._cr_level[key] = self._cr_level.get(key, 0) + 1
+                level = self._cr_level[key]
+                self._cr_history.append({
+                    "round": int(round_idx), "marginal": list(key),
+                    "level": level, "ref_vol": float(ref_vol),
+                    "cur_vol": float(cur_vol),
+                    "ratio": float(cur_vol / ref_vol) if ref_vol else 0.0,
+                })
+                self._cr_reference_vol[key] = cur_vol   # ratchet reference down
+                shrink_keys.add(key)
+                names = "-".join(ordered_keys[i] for i in key)
+                print(f"[ColdRestart] marginal {key} ({names}) cold_restart_{level}: "
+                      f"box vol {cur_vol:.3e} <= ref/{factor:g} ({ref_vol/factor:.3e}); "
+                      f"resetting head + param standardisation.")
+        return shrink_keys
 
     # -----------------------------------------------------------------
     # Selective (per-marginal) parameter normalisation
@@ -904,12 +1053,14 @@ class SequentialTrainerJoint:
         return (
             os.path.join(base, f"normalisation_after_round_{round_idx}.yaml"),
             os.path.join(base, f"volume_ratios_after_round_{round_idx}.yaml"),
+            os.path.join(base, f"diff_entropies_after_round_{round_idx}.yaml"),
+            os.path.join(base, f"cold_restart_state_after_round_{round_idx}.yaml"),
         )
 
     def _persist_round_state(self, round_idx):
-        """Persist merged normalisation + final volume ratios for resume/provenance."""
+        """Persist merged normalisation + volume ratios + entropy history + cold-restart state."""
         import yaml as _yaml
-        norm_path, vr_path = self._round_state_paths(round_idx)
+        norm_path, vr_path, ent_path, cr_path = self._round_state_paths(round_idx)
         os.makedirs(os.path.dirname(norm_path), exist_ok=True)
         if self._current_normalisation is not None:
             payload = {k: np.asarray(v).tolist() for k, v in self._current_normalisation.items()}
@@ -919,6 +1070,86 @@ class SequentialTrainerJoint:
         vr_payload = {",".join(map(str, k)): float(v) for k, v in self._last_volume_ratios.items()}
         with open(vr_path, "w") as f:
             _yaml.safe_dump(vr_payload, f)
+        # full cross-round entropy history (one list per marginal) so --resume
+        # can restore the series the plateau detector reads.
+        ent_payload = {",".join(map(str, k)): [float(x) for x in v]
+                       for k, v in self._entropy_history.items()}
+        with open(ent_path, "w") as f:
+            _yaml.safe_dump(ent_payload, f)
+        # prior-shrink cold-restart state (reference box volume + level per
+        # marginal, plus the reset-event history) so --resume keeps ratcheting.
+        cr_payload = {
+            "reference_vol": {",".join(map(str, k)): float(v)
+                              for k, v in self._cr_reference_vol.items()},
+            "level": {",".join(map(str, k)): int(v)
+                      for k, v in self._cr_level.items()},
+            "history": self._cr_history,
+        }
+        with open(cr_path, "w") as f:
+            _yaml.safe_dump(cr_payload, f)
+        # round-end truncation-veto coverage per marginal (provenance/review).
+        if self._last_coverage:
+            base = os.path.dirname(norm_path)
+            cov_payload = {
+                ",".join(map(str, k)): {
+                    "coverage": float(c), "n_inside": int(n_in), "n_total": int(n_tot)}
+                for k, (c, n_in, n_tot) in self._last_coverage.items()
+            }
+            with open(os.path.join(
+                    base, f"truncation_coverage_after_round_{round_idx}.yaml"), "w") as f:
+                _yaml.safe_dump(cov_payload, f)
+
+    # -----------------------------------------------------------------
+    # Truncation-veto coverage
+    # -----------------------------------------------------------------
+
+    def _compute_round_coverage(self, round_idx):
+        """Empirical coverage of each marginal's truncation box at round end.
+
+        For the coverage-gated truncation veto: evaluate the final model on up to
+        ``truncation_veto.n_coverage`` held-out val-pool samples and, per marginal,
+        count how many ground truths fall inside their own credible box (same box
+        the truncation builds). Returns ``{marginal_tuple: (coverage, n_in, n_tot)}``
+        or ``{}`` when the veto is disabled.
+        """
+        veto_conf = self.train_conf.get("truncation_veto", {})
+        if not veto_conf.get("enabled", False):
+            return {}
+        from torch.utils.data import Subset, DataLoader as _DL
+        test_ds = self.data_module.test
+        n_cov = min(int(veto_conf.get("n_coverage", 1000)), len(test_ds))
+        base_loader = self.data_module.test_dataloader()
+        cov_loader = _DL(
+            Subset(test_ds, list(range(n_cov))),
+            batch_size=base_loader.batch_size, shuffle=False,
+            num_workers=0, collate_fn=base_loader.collate_fn,
+        )
+        keys = utils.ordered_prior_keys(
+            self.datagen_conf.get("spin_param_basis", "chi1chi2"))
+        m1d, m2d = [], []
+        for out_idx, marginal in enumerate(self.model.marginals_list):
+            if len(marginal) == 1:
+                m1d.append((keys[marginal[0]], marginal[0], out_idx))
+            elif len(marginal) == 2:
+                m2d.append((f"{keys[marginal[0]]}__{keys[marginal[1]]}",
+                            (marginal[0], marginal[1]), out_idx))
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            cov = compute_truncation_coverage(
+                self.model, cov_loader, m1d, m2d,
+                eps_1d=float(veto_conf.get("eps_1d", 1e-4)),
+                sky_credible_level=float(veto_conf.get("sky_credible_level", 0.999)),
+                sky_dilation=float(veto_conf.get("sky_dilation", 1.1)),
+            )
+        finally:
+            if was_training:
+                self.model.train()
+        for key, (c, n_in, n_tot) in sorted(cov.items()):
+            name = "-".join(keys[i] for i in key)
+            print(f"[TruncVeto] round {round_idx} coverage {name}: "
+                  f"{c:.3f} ({n_in}/{n_tot})", flush=True)
+        return cov
 
     # -----------------------------------------------------------------
     # Joint training
@@ -933,10 +1164,18 @@ class SequentialTrainerJoint:
         transfer_classifier = joint_conf.get("transfer_classifiers_across_rounds", False)
         transfer_data_summary = joint_conf.get("transfer_data_summary_across_rounds", False)
         # Selective per-marginal transfer: carry over every head except those
-        # whose posterior/prior volume ratio dropped below threshold last round
-        # (those are reinitialised and their params re-standardised). Takes
-        # precedence over the all-or-nothing transfer_classifier flag.
-        reinit_selective = joint_conf.get("reinit_truncated_classifiers", False)
+        # flagged for reinit (those are reinitialised and their params
+        # re-standardised). Two independent triggers, both taking precedence
+        # over the all-or-nothing transfer_classifier flag:
+        #   * reinit_truncated_classifiers — head's volume ratio <= threshold
+        #   * reinit_plateaued_classifiers — head's entropy has plateaued
+        #     (|dH| < min_delta for `patience` rounds; a "cold restart").
+        #   * reinit_on_prior_shrink — head's prior box has shrunk by
+        #     >= shrink_factor since its last reset (a "cold restart").
+        reinit_truncated = joint_conf.get("reinit_truncated_classifiers", False)
+        reinit_plateau = joint_conf.get("reinit_plateaued_classifiers", False)
+        reinit_prior_shrink = joint_conf.get("reinit_on_prior_shrink", False)
+        reinit_selective = reinit_truncated or reinit_plateau or reinit_prior_shrink
 
         if ds_type == "MarginalEncoder":
             enc_conf = self.train_conf["architecture"]["data_summary"]["MarginalEncoder"]
@@ -963,19 +1202,47 @@ class SequentialTrainerJoint:
         periodic_bc_params = self.train_conf.get("periodic_bc_params", [])
         reinit_keys = set()
         if reinit_selective:
-            # Marginals whose final volume ratio last round was <= threshold get
-            # fresh heads + re-standardised params; all others keep frozen norm.
-            threshold = self.train_conf.get("volume_ratio_early_stop", {}).get(
-                "min_ratio_threshold", 0.5)
-            reinit_keys = {k for k, r in self._last_volume_ratios.items()
+            # (a) volume-ratio trigger: heads whose final volume ratio last round
+            #     was <= threshold get fresh heads + re-standardised params.
+            if reinit_truncated:
+                threshold = self.train_conf.get("volume_ratio_early_stop", {}).get(
+                    "min_ratio_threshold", 0.5)
+                vr_keys = {k for k, r in self._last_volume_ratios.items()
                            if r <= threshold}
+                reinit_keys |= vr_keys
+                if round_idx > 1:
+                    print(f"[Transfer] Volume-ratio reinit: {len(vr_keys)} head(s) "
+                          f"below vr<= {threshold}: {sorted(vr_keys)}.")
+            # (b) entropy-plateau trigger (cold restart): heads whose end-of-round
+            #     entropy stopped moving over the last `patience` rounds.
+            if reinit_plateau:
+                pl_conf = joint_conf.get("diff_entropy_plateau_reinit", {})
+                pl_keys = _entropy_plateau_keys(
+                    self._entropy_history,
+                    min_delta=pl_conf.get("min_delta", 0.1),
+                    patience=pl_conf.get("patience", 3),
+                    warmup_rounds=pl_conf.get("warmup_rounds", 10),
+                    round_idx=round_idx,
+                )
+                reinit_keys |= pl_keys
+                if round_idx > 1 and pl_keys:
+                    print(f"[Transfer] Entropy-plateau reinit (cold restart): "
+                          f"{sorted(pl_keys)} (min_delta={pl_conf.get('min_delta', 0.1)}, "
+                          f"patience={pl_conf.get('patience', 3)}).")
+            # (c) prior-shrink trigger (cold restart): heads whose prior box has
+            #     shrunk by >= shrink_factor since their last reset. The current
+            #     box is the prior that generated this round's data
+            #     (self.datagen_conf["prior"] == prior_after_round_{round-1}).
+            if reinit_prior_shrink:
+                ps_keys = self._prior_shrink_reinit_keys(round_idx, joint_conf)
+                reinit_keys |= ps_keys
             reinit_param_idxs = {i for k in reinit_keys for i in k}
             normalisation = self._build_selective_normalisation(
                 reinit_param_idxs, periodic_bc_params)
             if round_idx > 1:
-                print(f"[Transfer] Selective reinit: {len(reinit_keys)} head(s) "
-                      f"below vr<= {threshold}: {sorted(reinit_keys)}; "
-                      f"re-standardised params {sorted(reinit_param_idxs)}.")
+                print(f"[Transfer] Selective reinit total: {len(reinit_keys)} head(s) "
+                      f"{sorted(reinit_keys)}; re-standardised params "
+                      f"{sorted(reinit_param_idxs)}.")
         elif not transfer_classifier:
             mean, std = self.data_module.get_params_mean_std()
             sincos_mean, sincos_std = self.data_module.get_sincos_mean_std(periodic_bc_params)
@@ -1370,6 +1637,13 @@ class SequentialTrainerJoint:
                 self.datagen_conf.get("spin_param_basis", "chi1chi2")))
         self._last_median_tau = _round_median_tau(locals().get("lt_h5_path"))
         self._last_volume_ratios = _round_volume_ratios(plot_posterior_callback)
+        # Append this round's final entropy per marginal to the cross-round
+        # history that drives entropy-plateau (cold-restart) reinit.
+        for k, h in _round_entropies(plot_posterior_callback).items():
+            self._entropy_history.setdefault(k, []).append(float(h))
+        # Round-end empirical coverage of each marginal's truncation box over the
+        # (up to) 1000-sample val pool — drives the truncation veto in run().
+        self._last_coverage = self._compute_round_coverage(round_idx)
         self._persist_round_state(round_idx)
         opt = self.model.optimizers()
         if isinstance(opt, list):
@@ -1455,9 +1729,25 @@ class SequentialTrainerJoint:
             # dict is keyed with these names, so truncation must write the same.
             prior_keys = utils.ordered_prior_keys(
                 self.datagen_conf.get("spin_param_basis", "chi1chi2"))
+            # Coverage-gated truncation veto: skip narrowing a parameter whose
+            # round-end box coverage over the val pool is below threshold (the
+            # network is overconfident, so its box would risk excluding the truth).
+            veto_conf = self.train_conf.get("truncation_veto", {})
+            veto_enabled = veto_conf.get("enabled", False)
+            min_cov = float(veto_conf.get("min_coverage", 0.95))
             for key, marginal_list in self.train_conf["marginals"].items():
                 for marginal in marginal_list:
                     marginal_key = tuple(marginal)
+
+                    cov_entry = self._last_coverage.get(marginal_key)
+                    if (veto_enabled and cov_entry is not None
+                            and cov_entry[0] < min_cov):
+                        name = "-".join(prior_keys[j] for j in marginal_key)
+                        print(f"[TruncVeto] round {i}: keeping prior for {name} "
+                              f"(coverage {cov_entry[0]:.3f} < {min_cov}); "
+                              f"truncation skipped.", flush=True)
+                        out_idx += 1
+                        continue
 
                     if len(marginal) == 1:
                         param_name = prior_keys[marginal[0]]

@@ -300,7 +300,10 @@ class MBHBDataModule( L.LightningDataModule ):
                 extra = {"persistent_workers": True, "prefetch_factor": 4}
         return pin_memory, extra
 
-    def train_dataloader(self, shuffle=True, num_workers=None, pin_memory=False):
+    def train_dataloader(self, shuffle=True, num_workers=None, pin_memory=False,
+                         single_chunk=False):
+        # single_chunk is a streaming-only knob (StreamingDataModule); the HDF5
+        # path passes over the whole train set, so it is accepted and ignored.
         if num_workers is None:
             num_workers = self.num_workers
         noise_scale = self.full_dataset.noise_scale

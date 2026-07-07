@@ -1024,6 +1024,73 @@ class DifferentialEntropyEarlyStopping(Callback):
             trainer.should_stop = True
 
 
+def compute_truncation_coverage(
+    model, loader, marginals_1d_info, marginals_2d_info,
+    eps_1d=1e-4, sky_credible_level=0.999, sky_dilation=1.1,
+    ngrid_1d=100, ngrid_2d=100,
+):
+    """Empirical coverage of each marginal's truncation box over a labelled set.
+
+    For every marginal, per sample, build the *same* credible box the round-end
+    truncation would build, and count how many samples' ground truths fall inside
+    their own box. Returns ``{marginal_key_tuple: (coverage, n_inside, n_total)}``.
+
+    This is the signal for the coverage-gated truncation veto (see
+    ``tmnre_joint.SequentialTrainerJoint.run``): a box that is nominally
+    ``1 - eps`` credible but empirically covers far fewer truths means the network
+    is overconfident for that parameter, so its truncation should be vetoed rather
+    than discard the true value.
+
+    * 1D: equal-tailed ``[eps/2, 1-eps/2]`` interval on the grid posterior,
+      matching :func:`get_widest_interval_1d`.
+    * 2D: main-mode sky rectangle from :func:`get_main_mode_box` (the sky ``(7,8)``
+      marginal is the only 2D marginal in current configs; non-sky 2D would need
+      ``get_widest_box_2d`` and is not handled here).
+    """
+    coverage = {}
+
+    for _label, in_idx, out_idx in marginals_1d_info:
+        logratios, inj, grid = get_logratios_grid(
+            loader, model, ngrid_1d, in_param_idx=in_idx, out_param_idx=out_idx)
+        grid = grid[:, 0]
+        dp = float(grid[1] - grid[0])
+        assert dp>0 
+        n_total = logratios.shape[0]
+        n_inside = 0
+        for s in range(n_total):
+            ratios = np.exp(logratios[s])
+            norm = ratios / np.sum(ratios * dp)
+            cdf = np.cumsum(norm * dp)
+            idx_lo = int(np.searchsorted(cdf, eps_1d / 2))
+            idx_hi = min(int(np.searchsorted(cdf, 1 - eps_1d / 2)), len(grid) - 1)
+            if grid[idx_lo] <= inj[s] <= grid[idx_hi]:
+                n_inside += 1
+        coverage[(in_idx,)] = (n_inside / n_total, n_inside, n_total)
+
+    for _label, in_pair, out_idx in marginals_2d_info:
+        norm2d, inj, gx, gy = eval_posterior_2d(
+            model, loader, in_pair, out_idx,
+            ngrid_points=ngrid_2d, keep_batch_dim=True)
+        n_total = norm2d.shape[0]
+        n_inside = 0
+        for s in range(n_total):
+            box = get_main_mode_box(
+                gx, gy, norm2d[s],
+                credible_level=sky_credible_level, dilation_factor=sky_dilation)
+            lam_true, beta_true = float(inj[s, 0]), float(inj[s, 1])
+            lam_lo, lam_hi = box["lam"]
+            beta_lo, beta_hi = box["beta"]
+            if box.get("is_wrapped", False):
+                lam_in = (lam_true >= lam_lo) or (lam_true <= lam_hi)
+            else:
+                lam_in = lam_lo <= lam_true <= lam_hi
+            if lam_in and (beta_lo <= beta_true <= beta_hi):
+                n_inside += 1
+        coverage[tuple(in_pair)] = (n_inside / n_total, n_inside, n_total)
+
+    return coverage
+
+
 class ChainConvergenceMonitor:
     """Across-round (campaign) convergence, tracked **per marginal**.
 

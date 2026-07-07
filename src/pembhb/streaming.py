@@ -12,7 +12,7 @@ import threading
 import lightning as L
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 
 from pembhb import get_torch_complex_dtype, get_torch_dtype
 from pembhb.utils import mbhb_collate_fn
@@ -237,37 +237,60 @@ class Producer:
             self.ring.stop()
 
 
-class LiveBufferDataset(Dataset):
-    """Map-style view over a single ring buffer index ``j``.
+class StreamingChunkIterable(IterableDataset):
+    """Iterable view that streams whole chunks round-robin until ``length``
+    samples have been yielded, decoupling the epoch (a sample count) from the
+    buffer size.
 
-    ``__getitem__`` returns the same per-sample dict the HDF5 ``MBHBDataset``
-    yields (``wave_fd`` + ``params``), but sliced straight from the GPU-resident
-    buffer (zero host round-trip). Built fresh each epoch by
-    ``StreamingDataModule.train_dataloader`` so consecutive epochs read different
-    buffers.
+    Each ``__iter__`` locks **one** buffer at a time via ``acquire`` (=
+    ``ring.next_readable``), yields its ``M`` samples in a fresh within-chunk
+    permutation, then ``release``s it (= ``ring.release_epoch``) before moving
+    to the next buffer. The final chunk of an epoch is read only partially when
+    ``length`` is not a multiple of ``M`` — so the epoch ends at exactly
+    ``length`` samples, with no ``idx % M`` replay. Consecutive epochs continue
+    the round-robin from the ring's internal pointer, so every chunk is read
+    once before any is revisited.
+
+    ``acquire``/``release`` are callbacks onto ``StreamingDataModule`` so it can
+    track the held buffer (``_active_j``) for the post-``fit`` safety net; the
+    ring's one-buffer-at-a-time locking invariant is unchanged.
     """
 
-    def __init__(self, ring, j, length=None):
-        self.wave_fd = ring.fields["wave_fd"][j]   # (M, C, F) on device
-        self.params = ring.fields["params"][j]     # (M, P) on device
-        self.M = self.wave_fd.shape[0]
-        # length lets one epoch span more steps than the buffer holds by cycling
-        # over it (idx % M), so the streaming epoch can match a large HDF5 epoch
-        # (and thus the per-epoch validation/callback cadence).
-        self.length = int(length) if length else self.M
+    def __init__(self, ring, acquire, release, length, seed=None):
+        self.ring = ring
+        self.acquire = acquire
+        self.release = release
+        self.length = int(length)
         self.has_td = "wave_td" in ring.fields
-        if self.has_td:
-            self.wave_td = ring.fields["wave_td"][j]
+        self._seed = seed
 
     def __len__(self):
         return self.length
 
-    def __getitem__(self, idx):
-        i = idx % self.M
-        out = {"wave_fd": self.wave_fd[i], "params": self.params[i]}
-        if self.has_td:
-            out["wave_td"] = self.wave_td[i]
-        return out
+    def __iter__(self):
+        g = torch.Generator()
+        if self._seed is not None:
+            g.manual_seed(int(self._seed))
+        yielded = 0
+        while yielded < self.length:
+            j = self.acquire()          # locks one buffer (blocks if none free)
+            if j is None:               # ring stopped (producer died / round end)
+                return
+            try:
+                wave_fd = self.ring.fields["wave_fd"][j]
+                params = self.ring.fields["params"][j]
+                wave_td = self.ring.fields["wave_td"][j] if self.has_td else None
+                M = wave_fd.shape[0]
+                for i in torch.randperm(M, generator=g).tolist():
+                    out = {"wave_fd": wave_fd[i], "params": params[i]}
+                    if self.has_td:
+                        out["wave_td"] = wave_td[i]
+                    yield out
+                    yielded += 1
+                    if yielded >= self.length:
+                        break
+            finally:
+                self.release(j)         # free the chunk as soon as its pass ends
 
 
 class _FrozenPoolDataset(Dataset):
@@ -286,10 +309,10 @@ class _FrozenPoolDataset(Dataset):
 class StreamingDataModule(L.LightningDataModule):
     """Drop-in replacement for ``MBHBDataModule`` backed by a live ring buffer.
 
-    Training reads one buffer per epoch (round-robin via ``ring.next_readable``);
-    the previous epoch's buffer is released back to the producer at the start of
-    the next ``train_dataloader`` call, so the trainer must run with
-    ``reload_dataloaders_every_n_epochs=1``. Validation/test read a *frozen* pool
+    Training streams whole chunks round-robin (via ``StreamingChunkIterable``):
+    one buffer is locked at a time, read once, then released, until the epoch's
+    ``samples_per_epoch`` sample budget is met. The epoch is thus a pure sample
+    count, decoupled from the buffer size. Validation/test read a *frozen* pool
     generated once at round start. Noise is produced on-device via the existing
     ``gpu_noise`` deferred path (``mbhb_collate_fn(..., gpu_noise=True)`` +
     ``GPUNoiseMixin.on_after_batch_transfer``).
@@ -310,9 +333,10 @@ class StreamingDataModule(L.LightningDataModule):
         self.noise_factor = noise_factor
         self.n_train_noise_realisations = n_train_noise_realisations
         self.device = device
-        # Steps per epoch = samples_per_epoch / batch_size. Defaults to one
-        # buffer; set larger to match a big HDF5 epoch's validation cadence.
-        self.samples_per_epoch = samples_per_epoch
+        # Epoch = samples_per_epoch training examples (a sample count, not a
+        # buffer count): the trainer streams chunks round-robin until this many
+        # are read. Defaults to one buffer.
+        self.samples_per_epoch = int(samples_per_epoch) if samples_per_epoch else ring.M
 
         # noise_scale = filtered_asd / sqrt(4*df); on-device so materialize_gpu_noise
         # draws coloured noise on the same device as the (GPU-resident) waveforms.
@@ -332,7 +356,8 @@ class StreamingDataModule(L.LightningDataModule):
             [ring.fields["params"][j] for j in range(ring.n)], dim=0).cpu()
         self.median_snr = self._compute_median_snr()
 
-        self._active_j = None             # buffer currently held for the epoch
+        self._active_j = None             # buffer currently locked by the iterator
+        self._epoch = 0                   # per-epoch seed for within-chunk shuffle
         self.test = _FrozenPoolDataset(val_pool)  # exposed for PP-KS eval
 
     # --- normalisation / metadata (MBHBDataModule contract) --------------
@@ -381,16 +406,34 @@ class StreamingDataModule(L.LightningDataModule):
         return lambda b: mbhb_collate_fn(b, noise_scale, nf, noise_shuffling=shuffle, td_params=td,
                                          n_noise_realisations=n_noise, gpu_noise=True)
 
-    def train_dataloader(self, shuffle=True, num_workers=None, pin_memory=False):
-        # Release the buffer trained on last epoch, then claim the next one.
-        # Relies on Trainer(reload_dataloaders_every_n_epochs=1).
-        if self._active_j is not None:
-            self.ring.release_epoch(self._active_j)
-        self._active_j = self.ring.next_readable()
-        ds = LiveBufferDataset(self.ring, self._active_j, length=self.samples_per_epoch)
+    def _acquire(self):
+        """Lock the next buffer round-robin and remember it (safety-net for
+        ``release_active``). Returns ``None`` if the ring was stopped."""
+        j = self.ring.next_readable()
+        self._active_j = j
+        return j
+
+    def _release(self, j):
+        if j is not None:
+            self.ring.release_epoch(j)
+        if self._active_j == j:
+            self._active_j = None
+
+    def train_dataloader(self, shuffle=True, num_workers=None, pin_memory=False,
+                         single_chunk=False):
+        # Stream chunks round-robin until samples_per_epoch samples are read; the
+        # iterable locks one buffer at a time (invariant unchanged). shuffle is
+        # honoured *within* each chunk. single_chunk caps the epoch at one buffer
+        # (M samples) for cheap normalisation-stat passes.
+        length = self.ring.M if single_chunk else self.samples_per_epoch
+        seed = self._epoch if shuffle else None
+        self._epoch += 1
+        ds = StreamingChunkIterable(self.ring, self._acquire, self._release,
+                                    length=length, seed=seed)
         # num_workers MUST be 0: workers are separate processes and cannot share
-        # the parent process's GPU tensors.
-        return DataLoader(ds, batch_size=self.batch_size, shuffle=shuffle, num_workers=0,
+        # the parent process's GPU tensors. shuffle=False at the DataLoader level
+        # (an IterableDataset can't use it); shuffling is done inside the iterable.
+        return DataLoader(ds, batch_size=self.batch_size, shuffle=False, num_workers=0,
                           collate_fn=self._collate(shuffle, self.n_train_noise_realisations,
                                                    self.noise_scale))
 
