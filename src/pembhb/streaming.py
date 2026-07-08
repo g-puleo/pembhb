@@ -293,6 +293,41 @@ class StreamingChunkIterable(IterableDataset):
                 self.release(j)         # free the chunk as soon as its pass ends
 
 
+class LiveBufferDataset(Dataset):
+    """Map-style view over a single ring buffer index ``j`` (legacy behaviour,
+    selectable via ``StreamingDataModule(dataset_style="mapstyle")``).
+
+    One buffer is locked for the whole epoch and cycled over (``idx % M``) for
+    ``length`` samples. A slow producer therefore just causes data *reuse* (never
+    a wait), and because the buffer is only released at the *next* epoch's
+    ``train_dataloader`` call, the producer back-pressures during the epoch and
+    leaves the GPU to training / the PPKS eval. Relies on
+    ``Trainer(reload_dataloaders_every_n_epochs=1)``.
+    """
+
+    def __init__(self, ring, j, length=None):
+        self.wave_fd = ring.fields["wave_fd"][j]   # (M, C, F) on device
+        self.params = ring.fields["params"][j]     # (M, P) on device
+        self.M = self.wave_fd.shape[0]
+        # length lets one epoch span more steps than the buffer holds by cycling
+        # over it (idx % M), so the streaming epoch can match a large HDF5 epoch
+        # (and thus the per-epoch validation/callback cadence).
+        self.length = int(length) if length else self.M
+        self.has_td = "wave_td" in ring.fields
+        if self.has_td:
+            self.wave_td = ring.fields["wave_td"][j]
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        i = idx % self.M
+        out = {"wave_fd": self.wave_fd[i], "params": self.params[i]}
+        if self.has_td:
+            out["wave_td"] = self.wave_td[i]
+        return out
+
+
 class _FrozenPoolDataset(Dataset):
     """Map-style dataset over a fixed (val/test) pool of GPU tensors."""
 
@@ -324,8 +359,19 @@ class StreamingDataModule(L.LightningDataModule):
     """
 
     def __init__(self, ring, sim, val_pool, batch_size, noise_factor=1.0,
-                 n_train_noise_realisations=1, device="cuda", samples_per_epoch=None):
+                 n_train_noise_realisations=1, device="cuda", samples_per_epoch=None,
+                 dataset_style="iterable"):
         super().__init__()
+        # dataset_style selects the train-dataloader semantics:
+        #   "iterable"  (default) -> StreamingChunkIterable: stream distinct chunks
+        #                round-robin until samples_per_epoch, releasing each after
+        #                one pass (producer runs continuously = fresher data, but
+        #                contends with training for the GPU).
+        #   "mapstyle"  (legacy, July-6 commit) -> LiveBufferDataset: lock one
+        #                buffer for the whole epoch and cycle over it; producer
+        #                back-pressures during the epoch (faster training).
+        assert dataset_style in ("iterable", "mapstyle"), dataset_style
+        self.dataset_style = dataset_style
         self.ring = ring
         self.sim = sim
         self.val_pool = val_pool          # dict: {"wave_fd": (Mv,C,F), "params": (Mv,P)} on device
@@ -421,11 +467,24 @@ class StreamingDataModule(L.LightningDataModule):
 
     def train_dataloader(self, shuffle=True, num_workers=None, pin_memory=False,
                          single_chunk=False):
+        length = self.ring.M if single_chunk else self.samples_per_epoch
+
+        if self.dataset_style == "mapstyle":
+            # Legacy: release the buffer trained on last epoch, then claim the next
+            # one and cycle over it for `length` samples. Relies on
+            # Trainer(reload_dataloaders_every_n_epochs=1).
+            if self._active_j is not None:
+                self.ring.release_epoch(self._active_j)
+            self._active_j = self.ring.next_readable()
+            ds = LiveBufferDataset(self.ring, self._active_j, length=length)
+            return DataLoader(ds, batch_size=self.batch_size, shuffle=shuffle, num_workers=0,
+                              collate_fn=self._collate(shuffle, self.n_train_noise_realisations,
+                                                       self.noise_scale))
+
         # Stream chunks round-robin until samples_per_epoch samples are read; the
         # iterable locks one buffer at a time (invariant unchanged). shuffle is
         # honoured *within* each chunk. single_chunk caps the epoch at one buffer
         # (M samples) for cheap normalisation-stat passes.
-        length = self.ring.M if single_chunk else self.samples_per_epoch
         seed = self._epoch if shuffle else None
         self._epoch += 1
         ds = StreamingChunkIterable(self.ring, self._acquire, self._release,

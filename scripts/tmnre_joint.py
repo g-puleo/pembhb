@@ -591,6 +591,9 @@ class SequentialTrainerJoint:
             # cadence as the non-streaming path (otherwise a small buffer makes
             # them fire ~steps_per_epoch_seq/steps_per_epoch_stream times more).
             samples_per_epoch=sconf.get("samples_per_epoch", None),
+            # "iterable" (default, fresh chunks/epoch) or "mapstyle" (legacy
+            # July-6 behaviour: one buffer/epoch cycled over, producer throttled).
+            dataset_style=sconf.get("dataset_style", "iterable"),
         )
         self.data_module.setup(stage="fit")
         self.test_dataloader = self.data_module.test_dataloader()
@@ -1735,6 +1738,7 @@ class SequentialTrainerJoint:
             veto_conf = self.train_conf.get("truncation_veto", {})
             veto_enabled = veto_conf.get("enabled", False)
             min_cov = float(veto_conf.get("min_coverage", 0.95))
+            vetoed_this_round = []   # marginals whose truncation was skipped
             for key, marginal_list in self.train_conf["marginals"].items():
                 for marginal in marginal_list:
                     marginal_key = tuple(marginal)
@@ -1746,6 +1750,13 @@ class SequentialTrainerJoint:
                         print(f"[TruncVeto] round {i}: keeping prior for {name} "
                               f"(coverage {cov_entry[0]:.3f} < {min_cov}); "
                               f"truncation skipped.", flush=True)
+                        vetoed_this_round.append({
+                            "name": name,
+                            "marginal": list(marginal_key),
+                            "coverage": float(cov_entry[0]),
+                            "n_inside": int(cov_entry[1]),
+                            "n_total": int(cov_entry[2]),
+                        })
                         out_idx += 1
                         continue
 
@@ -1784,6 +1795,24 @@ class SequentialTrainerJoint:
 
             print(f"Updated prior after round {i}: {self.datagen_conf['prior']}")
             self._plot_updated_prior_bounds(self.datagen_conf["prior"])
+
+            # Log which marginals had their truncation vetoed this round (empty
+            # list when the veto is off or nothing was vetoed) for review.
+            if veto_enabled:
+                names = [v["name"] for v in vetoed_this_round]
+                print(f"[TruncVeto] round {i}: vetoed {len(vetoed_this_round)} "
+                      f"marginal(s): {names}", flush=True)
+                import yaml as _yaml
+                veto_save_path = os.path.join(
+                    DATA_ROOT_DIR, TIME_OF_EXECUTION,
+                    f"vetoed_params_after_round_{i}.yaml")
+                os.makedirs(os.path.dirname(veto_save_path), exist_ok=True)
+                with open(veto_save_path, "w") as _f:
+                    _yaml.safe_dump({
+                        "round": int(i),
+                        "min_coverage": min_cov,
+                        "vetoed": vetoed_this_round,
+                    }, _f)
 
             # Persist the updated prior so a resumed run can start from
             # the correct (narrowed) prior rather than the round's data prior.
