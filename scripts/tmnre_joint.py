@@ -50,7 +50,7 @@ from pembhb.callbacks import (
     PlotPosteriorCallback, VolumeRatioEarlyStopping,
     DifferentialEntropyEarlyStopping, PeriodicProgressCallback,
     WarmupEarlyStopping, PPKSTestEarlyStopping, ChainConvergenceMonitor,
-    compute_truncation_coverage,
+    compute_truncation_coverage, StreamReuseLogger,
 )
 from pembhb.utils import _ORDERED_PRIOR_KEYS as _PPKS_ORDERED_PRIOR_KEYS
 from pembhb.diagnostics import AutoencoderDiagnosticsCallback
@@ -314,7 +314,8 @@ class SequentialTrainerJoint:
                     if len(marginal) == 1:
                         widest_interval, _, _, _ = get_widest_interval_1d(
                             self.model, self.dataloader_obs,
-                            in_param_idx=marginal[0], out_param_idx=out_idx, eps=1e-4,
+                            in_param_idx=marginal[0], out_param_idx=out_idx,
+                            eps=float(self.train_conf.get("truncation_veto", {}).get("eps_1d", 1e-4)),
                         )
                         param_name = prior_keys[marginal[0]]
                         self.datagen_conf["prior"][param_name] = widest_interval
@@ -386,6 +387,8 @@ class SequentialTrainerJoint:
                     DATA_ROOT_DIR, TIME_OF_EXECUTION, "chain_convergence_state.yaml"),
                 tau_gate=tuple(_tg) if _tg else None,
                 require_not_threshold=cc_conf.get("require_not_threshold", True),
+                log_path=os.path.join(
+                    DATA_ROOT_DIR, TIME_OF_EXECUTION, "chain_convergence.log"),
             )
             print(f"[ChainConv] enabled: eps_nats={cc_conf.get('eps_nats', 0.05)}, "
                   f"patience={cc_conf.get('patience', 2)}, tau_gate={_tg}")
@@ -534,6 +537,11 @@ class SequentialTrainerJoint:
         from pembhb import get_torch_complex_dtype, get_torch_dtype
         from pembhb.streaming import RingBuffer, Producer, StreamingDataModule
 
+        # Disk-backed ring (buffers = HDF5 files, ~zero VRAM) vs the default
+        # GPU-resident ring. Same producer/consumer logic; see streaming_disk.py.
+        if self.train_conf["streaming"].get("storage", "gpu") == "disk":
+            return self._setup_streaming_disk(round_idx, sampler_init_kwargs)
+
         self._stream_t0 = time.time()
 
         sconf = self.train_conf["streaming"]
@@ -563,7 +571,8 @@ class SequentialTrainerJoint:
             sample_shapes={"wave_fd": (C, F), "params": (n_params,)},
             dtypes={"wave_fd": get_torch_complex_dtype(), "params": get_torch_dtype()},
             device=device,
-            host_fields=("params",),  # keep params on CPU (matches HDF5 path)
+            host_fields=("params",),  # keep params on CPU (matches HDF5 path),
+            reuse_threshold=sconf.get("reuse_threshold", 1)
         )
         producer = Producer(ring, sim, gen_batch_size=int(sconf.get("gen_batch_size", 250)))
         producer.seed_fill_all()  # blocking: give the trainer data on step 0
@@ -600,6 +609,98 @@ class SequentialTrainerJoint:
 
         # Audit sidecar (same path the HDF5 path writes) so the round-end
         # shutil.copy and resume bookkeeping keep working.
+        self.data_fname_yaml = os.path.join(
+            DATA_ROOT_DIR, TIME_OF_EXECUTION, f"simulation_round_{round_idx}.yaml")
+        os.makedirs(os.path.dirname(self.data_fname_yaml), exist_ok=True)
+        with open(self.data_fname_yaml, "w") as _f:
+            yaml.safe_dump(
+                {"conf": self.datagen_conf, "sampler_init_kwargs": sampler_init_kwargs,
+                 "streaming": dict(sconf)}, _f)
+        self.datagen_info = utils.read_config(self.data_fname_yaml)
+        assert self.data_module.median_snr > 8, "Median SNR lower than 8."
+
+    def _setup_streaming_disk(self, round_idx, sampler_init_kwargs):
+        """Disk-backed counterpart of :meth:`_setup_streaming`: buffers are
+        ``buffer_{j}.h5`` files overwritten in place (bounded disk, ~zero VRAM),
+        read one-per-epoch round-robin with ``num_workers`` workers. Same ring
+        logic and same downstream teardown (``release_active`` / ``ring.stop`` /
+        producer counters) as the GPU path; see ``streaming_disk.py``."""
+        import time
+        import torch
+        import yaml
+        from pembhb import get_torch_complex_dtype, get_torch_dtype
+        from pembhb.streaming_disk import (
+            DiskRingBuffer, DiskProducer, DiskStreamingDataModule)
+
+        self._stream_t0 = time.time()
+
+        sconf = self.train_conf["streaming"]
+        n_buffers = int(sconf.get("n_buffers", 5))
+        # One buffer == one epoch of distinct examples (disk mapstyle): size the
+        # buffer from the epoch knob so every row is read exactly once (no idx%M
+        # cycling). samples_per_epoch is authoritative; buffer_size is the
+        # fallback when it's unset. Disk (unlike VRAM) has room for a full epoch.
+        M = int(sconf.get("samples_per_epoch") or sconf.get("buffer_size", 10000))
+        val_size = int(sconf.get("val_size", 2000))
+        device = self.train_conf["device"]
+
+        wp = self.datagen_conf["waveform_params"]
+        assert wp.get("domain", "fd_td") == "fd", (
+            "streaming requires the FD simulator (set waveform_params.domain='fd')"
+        )
+        round_seed = self.seed + round_idx
+        sim = MBHBSimulatorFD(
+            self.datagen_conf, sampler_init_kwargs=sampler_init_kwargs, seed=round_seed,
+            n_freq_bins=wp.get("n_freq_bins", 4096),
+            freq_spacing=wp.get("freq_spacing", "linear"),
+        )
+
+        # Per-sample shapes from a tiny host probe.
+        probe = sim.sample(2, keep_on_gpu=False)
+        C, F = probe["wave_fd"].shape[1], probe["wave_fd"].shape[2]
+        n_params = probe["parameters"].shape[0]
+
+        buffer_dir = sconf.get(
+            "buffer_dir",
+            os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION, "stream_buffers"))
+        ring = DiskRingBuffer(
+            n_buffers=n_buffers, buffer_size=M, buffer_dir=buffer_dir,
+            n_channels=C, n_freq=F, n_params=n_params,
+            reuse_threshold=sconf.get("reuse_threshold", 1),
+        )
+        producer = DiskProducer(ring, sim, gen_batch_size=int(sconf.get("gen_batch_size", 250)))
+        producer.seed_fill_all()  # blocking: give the trainer data on step 0
+
+        # Frozen validation pool (generated once, never refreshed this round).
+        vs = sim.sample(val_size, keep_on_gpu=False)
+        val_pool = {
+            "wave_fd": torch.as_tensor(vs["wave_fd"], dtype=get_torch_complex_dtype()),
+            "params": torch.as_tensor(vs["parameters"].T.copy(), dtype=get_torch_dtype()),
+        }
+
+        producer.start()
+        self._ring = ring
+        self._producer = producer
+        bs = int(self.train_conf["batch_size"])
+        print(f"[streaming][disk] epoch = buffer_size = {M} distinct examples; "
+              f"steps/epoch = {M // bs}; n_buffers = {n_buffers} "
+              f"(disk ~{n_buffers * M} waveforms in {buffer_dir})")
+        self.data_module = DiskStreamingDataModule(
+            ring, sim, val_pool,
+            batch_size=self.train_conf["batch_size"],
+            noise_factor=self.train_conf["noise_factor"],
+            n_train_noise_realisations=self.train_conf.get("n_train_noise_realisations", 1),
+            device=device,
+            # M == the epoch, so length == M -> each buffer read once, all distinct.
+            samples_per_epoch=M,
+            num_workers=int(sconf.get("num_workers", 8)),
+            prefetch_factor=int(sconf.get("prefetch_factor", 4)),
+        )
+        self.data_module._producer = producer  # so a dead producer surfaces its error
+        self.data_module.setup(stage="fit")
+        self.test_dataloader = self.data_module.test_dataloader()
+
+        # Audit sidecar (same path the HDF5 path writes).
         self.data_fname_yaml = os.path.join(
             DATA_ROOT_DIR, TIME_OF_EXECUTION, f"simulation_round_{round_idx}.yaml")
         os.makedirs(os.path.dirname(self.data_fname_yaml), exist_ok=True)
@@ -1144,6 +1245,7 @@ class SequentialTrainerJoint:
                 eps_1d=float(veto_conf.get("eps_1d", 1e-4)),
                 sky_credible_level=float(veto_conf.get("sky_credible_level", 0.999)),
                 sky_dilation=float(veto_conf.get("sky_dilation", 1.1)),
+                dilation_1d=float(veto_conf.get("dilation_1d", 1.0)),
             )
         finally:
             if was_training:
@@ -1392,6 +1494,14 @@ class SequentialTrainerJoint:
             warmup_epochs=ae_warmup_epochs,
             call_every_n_steps=call_every_n_steps,
             warmup_steps=_warmup_steps_for(ae_warmup_epochs),
+            box_dilation_1d=float(
+                self.train_conf.get("truncation_veto", {}).get("dilation_1d", 1.0)),
+            eps_1d=float(
+                self.train_conf.get("truncation_veto", {}).get("eps_1d", 1e-4)),
+            sky_credible_level=float(
+                self.train_conf.get("truncation_veto", {}).get("sky_credible_level", 0.999)),
+            sky_dilation=float(
+                self.train_conf.get("truncation_veto", {}).get("sky_dilation", 1.1)),
         )
         if ae_warmup_epochs > 0:
             print(f"[PlotPosterior] skipping first {ae_warmup_epochs} epochs (AE warmup)")
@@ -1406,6 +1516,12 @@ class SequentialTrainerJoint:
         # encoder is an actual DenoisingAutoencoder (has .encoder.conv etc.).
         if ds_type not in ("ChannelizedMLP", "MarginalEncoder"):
             callbacks_list.insert(3, AutoencoderDiagnosticsCallback())
+
+        # Streaming-only: per-epoch reuse accounting (examples vs distinct sims).
+        # Guarded on config — the HDF5 datamodule has no .ring.
+        if self.train_conf.get("streaming", {}).get("enabled", False):
+            callbacks_list.append(StreamReuseLogger(
+                summary_path=os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION, "round_summary.log")))
 
         # Joint-only knobs live under joint_training: (fall back to top level
         # for old configs where they were at the root).
@@ -1739,9 +1855,27 @@ class SequentialTrainerJoint:
             veto_enabled = veto_conf.get("enabled", False)
             min_cov = float(veto_conf.get("min_coverage", 0.95))
             vetoed_this_round = []   # marginals whose truncation was skipped
+            # Per-marginal truncation gate: only narrow the prior for marginals
+            # whose round-final posterior/prior ratio actually reached the 0.5
+            # threshold. The `should_stop` from VolumeRatioEarlyStopping ends the
+            # round as soon as the first marginal crosses, but the others keep
+            # their (wide) prior and continue training in the next round.
+            trunc_threshold = float(self.train_conf.get("volume_ratio_early_stop", {}).get(
+                "min_ratio_threshold", 0.5))
+            trunc_keys = {k for k, r in self._last_volume_ratios.items()
+                          if r <= trunc_threshold}
             for key, marginal_list in self.train_conf["marginals"].items():
                 for marginal in marginal_list:
                     marginal_key = tuple(marginal)
+
+                    # if marginal_key not in trunc_keys:
+                    #     name = "-".join(prior_keys[j] for j in marginal_key)
+                    #     ratio = self._last_volume_ratios.get(marginal_key, float("nan"))
+                    #     print(f"[Trunc] round {i}: keeping prior for {name} "
+                    #           f"(vol_ratio {ratio:.4f} > {trunc_threshold}); "
+                    #           f"not truncatable yet.", flush=True)
+                    #     out_idx += 1
+                    #     continue
 
                     cov_entry = self._last_coverage.get(marginal_key)
                     if (veto_enabled and cov_entry is not None
@@ -1779,7 +1913,8 @@ class SequentialTrainerJoint:
                                 self.model, self.dataloader_obs, out_param_idx=out_idx,
                                 datagen_conf=self.datagen_conf,
                                 mode="rectangle",
-                                credible_level=0.999, dilation_factor=1.1,
+                                credible_level=float(veto_conf.get("sky_credible_level", 0.999)),
+                                dilation_factor=float(veto_conf.get("sky_dilation", 1.1)),
                             )
                         elif hasattr(self.model, "widest_boxes") and marginal_key in self.model.widest_boxes: 
                             print(f"Updating prior for 2D marginal {marginal_key} using widest box from model ...")
@@ -1875,19 +2010,20 @@ class SequentialTrainerJoint:
                 )
                 n_conv = len(self.chain_monitor.converged_at)
                 n_tot = len(self._last_marginal_entropies)
-                print(f"[ChainConv] round {i}: stopped_via='{self._last_stopped_via}', "
-                      f"median_tau={self._last_median_tau}, "
-                      f"converged {n_conv}/{n_tot} marginals")
+                self.chain_monitor.log(
+                    f"[ChainConv] round {i}: stopped_via='{self._last_stopped_via}', "
+                    f"median_tau={self._last_median_tau}, "
+                    f"converged {n_conv}/{n_tot} marginals")
                 if stop_chain:
-                    print(f"[ChainConv] STOP chain after round {i}: "
-                          f"{self.chain_monitor.stop_reason}")
-                    print(self.chain_monitor.summary())
+                    self.chain_monitor.log(f"[ChainConv] STOP chain after round {i}: "
+                                           f"{self.chain_monitor.stop_reason}")
+                    self.chain_monitor.log(self.chain_monitor.summary())
                     break
 
         # Per-marginal convergence record at end of the campaign (converged or
         # simply out of rounds).
         if self.chain_monitor is not None:
-            print(self.chain_monitor.summary())
+            self.chain_monitor.log(self.chain_monitor.summary())
 
 
 # -------------------------------------------------------------------------

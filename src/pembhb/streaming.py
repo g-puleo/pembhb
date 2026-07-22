@@ -32,7 +32,7 @@ class RingBuffer:
     """
 
     def __init__(self, n_buffers, buffer_size, sample_shapes, dtypes, device="cpu",
-                 host_fields=()):
+                 host_fields=(), reuse_threshold=1):
         """
         :param sample_shapes: per-field per-sample shape, e.g.
             ``{"wave_fd": (n_channels, n_freq), "params": (n_params,)}``.
@@ -41,8 +41,6 @@ class RingBuffer:
             (e.g. ``params`` — tiny, and downstream callbacks read them with
             ``np.asarray`` exactly as in the HDF5 path).
         """
-        self.n = n_buffers
-        self.M = buffer_size
         self.device = device
         self.host_fields = set(host_fields)
         self.fields = {
@@ -53,16 +51,27 @@ class RingBuffer:
             ]
             for name, shape in sample_shapes.items()
         }
+        self._init_state(n_buffers, buffer_size, reuse_threshold)
 
+    def _init_state(self, n_buffers, buffer_size, reuse_threshold):
+        """Initialise the storage-agnostic synchronisation state (all the flags
+        the producer/consumer protocol below reads). Shared verbatim by the GPU
+        ring and the disk-backed :class:`DiskRingBuffer`, so the "no unseen
+        overwrite" / round-robin / reuse-threshold logic is identical."""
+        self.n = n_buffers
+        self.M = buffer_size
         self._in_use = [False] * n_buffers
-        self._consumed = [False] * n_buffers  # nothing trained on yet
+        self._consumed = [0] * n_buffers  # nothing trained on yet
         self._filling = [False] * n_buffers
         self._fill_seq = [0] * n_buffers  # when each buffer was last filled (LRU)
         self._fill_clock = 0  # monotonic counter, bumped on every fill
         self._rr = 0  # consumer round-robin pointer
         self._stop = False
         self._cond = threading.Condition()
-
+        self.reuse_threshold = reuse_threshold
+        self._seen_rows = [ torch.zeros(buffer_size, dtype=torch.bool) for _ in range(n_buffers)]
+        self.distinct_sims_seen=0
+        self.count_seen=False
     # --- producer side --------------------------------------------------
 
     def seed_fill(self, j, chunk):
@@ -71,9 +80,10 @@ class RingBuffer:
         self._copy_in(j, chunk)
         with self._cond:
             self._filling[j] = False
-            self._consumed[j] = False
+            self._consumed[j] = 0
             self._fill_clock += 1
             self._fill_seq[j] = self._fill_clock
+            self._seen_rows[j].zero_() 
             self._cond.notify_all()
 
     def acquire_writable(self):
@@ -83,7 +93,7 @@ class RingBuffer:
             while not self._stop:
                 eligible = [
                     j for j in range(self.n)
-                    if self._consumed[j] and not self._in_use[j] and not self._filling[j]
+                    if self._consumed[j]>=self.reuse_threshold and not self._in_use[j] and not self._filling[j]
                 ]
                 if eligible:
                     j = min(eligible, key=lambda k: self._fill_seq[k])  # least-recently filled
@@ -97,8 +107,9 @@ class RingBuffer:
         self._copy_in(j, chunk)
         with self._cond:
             self._filling[j] = False
-            self._consumed[j] = False
+            self._consumed[j] = 0 # reset count for that buffer
             self._fill_clock += 1
+            self._seen_rows[j].zero_()
             self._fill_seq[j] = self._fill_clock
             self._cond.notify_all()
 
@@ -123,7 +134,7 @@ class RingBuffer:
         """Mark buffer ``j`` consumed (>=1 epoch done) and no longer in use."""
         with self._cond:
             self._in_use[j] = False
-            self._consumed[j] = True
+            self._consumed[j] += 1
             self._cond.notify_all()
 
     # --- lifecycle ------------------------------------------------------
@@ -155,10 +166,22 @@ class RingBuffer:
         """Mark buffer ``j`` ready after an incremental fill (see ``write_slice``)."""
         with self._cond:
             self._filling[j] = False
-            self._consumed[j] = False
+            self._consumed[j] = 0
+            self._seen_rows[j].zero_()
             self._fill_clock += 1
             self._fill_seq[j] = self._fill_clock
             self._cond.notify_all()
+
+    def mark_seen(self, j, rows):
+        """Count the distinct, not-yet-seen rows of buffer ``j``'s current fill
+        that the consumer is about to yield. ``rows`` is the CPU index tensor of
+        exactly the rows trained on this touch. No-op unless counting is armed."""
+        if not self.count_seen:
+            return
+        seen = self._seen_rows[j]
+        new = int((~seen[rows]).sum())
+        seen[rows] = True
+        self.distinct_sims_seen += new
 
 
 class Producer:
@@ -281,14 +304,16 @@ class StreamingChunkIterable(IterableDataset):
                 params = self.ring.fields["params"][j]
                 wave_td = self.ring.fields["wave_td"][j] if self.has_td else None
                 M = wave_fd.shape[0]
-                for i in torch.randperm(M, generator=g).tolist():
+                r = min(M, self.length - yielded)# compute how many rows will be needed for this over-the-buffer iteration
+                rows = torch.randperm(M, generator=g)[:r]
+                self.ring.mark_seen(j, rows)
+                for i in rows.tolist():
                     out = {"wave_fd": wave_fd[i], "params": params[i]}
                     if self.has_td:
                         out["wave_td"] = wave_td[i]
                     yield out
                     yielded += 1
-                    if yielded >= self.length:
-                        break
+
             finally:
                 self.release(j)         # free the chunk as soon as its pass ends
 
@@ -403,6 +428,7 @@ class StreamingDataModule(L.LightningDataModule):
         self.median_snr = self._compute_median_snr()
 
         self._active_j = None             # buffer currently locked by the iterator
+        self._examples_consumed = 0
         self._epoch = 0                   # per-epoch seed for within-chunk shuffle
         self.test = _FrozenPoolDataset(val_pool)  # exposed for PP-KS eval
 

@@ -44,7 +44,9 @@ from viz_helpers import (
     eval_nre_1d,
     marginalise_2d_to_1d,
     deltat_axis_transforms,
+    eval_mcmc_kde_1d,
 )
+from matplotlib.lines import Line2D
 from pembhb.sampler import chi12_to_chieff_chidiff
 from pembhb.utils import compute_fisher_sigmas_for_testset
 import h5py
@@ -226,9 +228,80 @@ def _axis_transforms_for(label: str, inj_val: float | None,
     return identity, identity, label
 
 
+def _compute_round_data(round_dirs, dataloader, ngrid_1d, mcmc_samples_path):
+    """Load each round's model exactly once and evaluate every 1-D marginal.
+
+    Returns a dict consumed by the render functions so no model is loaded (nor
+    posterior re-evaluated) more than once across the normal figure, the zoom
+    figure, and the last-round-vs-MCMC figure:
+
+    ``params`` (last round's marginal list — the canonical/superset order),
+    ``per_round_densities`` (list of ``{label: (grid, density, inj) or None}``,
+    keyed by label; a label absent in a round is simply missing), and
+    ``per_round_priors``, ``duration_weeks``, ``mcmc_samples``,
+    ``mcmc_param_names``, ``fisher_sigmas_by_name``, ``n_rounds``.
+    """
+    n_rounds = len(round_dirs)
+    if n_rounds == 0:
+        raise ValueError("No round directories provided.")
+
+    per_round_densities: list[dict] = []
+    per_round_priors: list[dict] = []
+    params = None
+    nre_basis = "chi1chi2"
+    for r_idx, rd in enumerate(round_dirs, start=1):
+        model = load_model(os.path.join(rd, "checkpoints"))   # ONE load / round
+        prior_box = load_prior_box(rd, r_idx)
+        round_params = list(_iter_param_marginals(model))
+        densities = {}
+        for pi in round_params:
+            densities[pi[0]] = _eval_1d_marginal(
+                model, dataloader, pi, prior_box, ngrid_1d)
+        per_round_densities.append(densities)
+        per_round_priors.append(prior_box)
+        # Later rounds can introduce marginals, so the last round's list is the
+        # canonical superset used for panel layout (matches prior behaviour).
+        params = round_params
+        nre_basis = detect_basis(getattr(model, "bounds_trained", {}) or {})
+        print(f"[round {r_idx}] "
+              f"{sum(v is not None for v in densities.values())}"
+              f"/{len(round_params)} marginals evaluated.")
+
+    if not params:
+        raise RuntimeError("Model has no 1-D-recoverable marginals.")
+
+    duration_weeks = load_duration_weeks(round_dirs[0], 1)
+
+    mcmc_samples = mcmc_param_names = None
+    fisher_sigmas_by_name = {}
+    if mcmc_samples_path:
+        mcmc_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_path)
+        mcmc_samples, mcmc_param_names = _maybe_remap_mcmc_to_basis(
+            mcmc_samples, mcmc_param_names, nre_basis,
+        )
+        # Fisher CRLB at the obs injection, in the same basis the run uses.
+        try:
+            obs_path = dataloader.dataset.dataset.filename
+            fisher_sigmas_by_name = _compute_fisher_sigmas(round_dirs, obs_path)
+            print(f"[fisher] CRLB sigmas: " + ", ".join(
+                f"{k}={v:.3e}" for k, v in fisher_sigmas_by_name.items()))
+        except Exception as e:
+            print(f"[fisher] WARN: could not compute Fisher sigmas: {e}")
+
+    return {
+        "params": params,
+        "per_round_densities": per_round_densities,
+        "per_round_priors": per_round_priors,
+        "duration_weeks": duration_weeks,
+        "mcmc_samples": mcmc_samples,
+        "mcmc_param_names": mcmc_param_names,
+        "fisher_sigmas_by_name": fisher_sigmas_by_name,
+        "n_rounds": n_rounds,
+    }
+
+
 def plot_violin_evolution(
-    round_dirs,
-    dataloader,
+    data: dict,
     mcmc_samples_path: str | None,
     outdir: str,
     ngrid_1d: int = 200,
@@ -237,7 +310,8 @@ def plot_violin_evolution(
     zoom_sigmas: float | None = None,
     filename_suffix: str = "",
 ):
-    """Build the unified 1-D violin-evolution figure.
+    """Render the unified 1-D violin-evolution figure from precomputed *data*
+    (see :func:`_compute_round_data`).
 
     One subplot per parameter. x-axis: round 1..R (NRE) + an extra slot for
     MCMC (if provided). y-axis: parameter value. Faint horizontal ±1σ MCMC
@@ -253,57 +327,14 @@ def plot_violin_evolution(
     manual override of the y-axis window; it wins over ``zoom_sigmas``.
     """
     os.makedirs(outdir, exist_ok=True)
-    n_rounds = len(round_dirs)
-    if n_rounds == 0:
-        raise ValueError("No round directories provided.")
-
-    # Use the last round's model to enumerate which params we'll plot
-    # (later-round models can introduce marginals; an earlier round simply
-    # contributes None for those slots).
-    last_model = load_model(os.path.join(round_dirs[-1], "checkpoints"))
-    params = list(_iter_param_marginals(last_model))
-    if not params:
-        raise RuntimeError("Model has no 1-D-recoverable marginals.")
-
-    # Duration in weeks — read from round 1's sidecar (used only by the
-    # Deltat axis transform).
-    duration_weeks = load_duration_weeks(round_dirs[0], 1)
-
-    # Optional MCMC samples. Remap chi1/chi2 → chi_eff/chi_diff if the NRE
-    # was trained on the chieff_chidiff basis (read off the last-round model).
-    mcmc_samples = mcmc_param_names = None
-    fisher_sigmas_by_name = {}
-    if mcmc_samples_path:
-        mcmc_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_path)
-        nre_basis = detect_basis(getattr(last_model, "bounds_trained", {}) or {})
-        mcmc_samples, mcmc_param_names = _maybe_remap_mcmc_to_basis(
-            mcmc_samples, mcmc_param_names, nre_basis,
-        )
-        # Fisher CRLB at the obs injection, in the same basis the run uses.
-        try:
-            obs_path = dataloader.dataset.dataset.filename
-            fisher_sigmas_by_name = _compute_fisher_sigmas(round_dirs, obs_path)
-            print(f"[fisher] CRLB sigmas: " + ", ".join(
-                f"{k}={v:.3e}" for k, v in fisher_sigmas_by_name.items()))
-        except Exception as e:
-            print(f"[fisher] WARN: could not compute Fisher sigmas: {e}")
-
-    # Pre-compute every (round, param) → (grid, density, inj) so we know the
-    # y-axis range per parameter before drawing. Also stash the per-round
-    # prior box so whiskers can read its boundaries during drawing.
-    per_round_densities: list[dict] = []
-    per_round_priors: list[dict] = []
-    for r_idx, rd in enumerate(round_dirs, start=1):
-        model = load_model(os.path.join(rd, "checkpoints"))
-        prior_box = load_prior_box(rd, r_idx)
-        densities = {}
-        for pi in params:
-            res = _eval_1d_marginal(model, dataloader, pi, prior_box, ngrid_1d)
-            densities[pi[0]] = res  # keyed by param label
-        per_round_densities.append(densities)
-        per_round_priors.append(prior_box)
-        print(f"[round {r_idx}] {sum(v is not None for v in densities.values())}"
-              f"/{len(params)} marginals evaluated.")
+    params = data["params"]
+    per_round_densities = data["per_round_densities"]
+    per_round_priors = data["per_round_priors"]
+    duration_weeks = data["duration_weeks"]
+    mcmc_samples = data["mcmc_samples"]
+    mcmc_param_names = data["mcmc_param_names"]
+    fisher_sigmas_by_name = data["fisher_sigmas_by_name"]
+    n_rounds = data["n_rounds"]
 
     rows, cols = _grid_layout(len(params))
     fig, axes = plt.subplots(
@@ -320,7 +351,7 @@ def plot_violin_evolution(
         # Deltat axis transform). It's constant across rounds.
         inj_for_transform = None
         for densities in per_round_densities:
-            res = densities[label]
+            res = densities.get(label)
             if res is not None:
                 inj_for_transform = res[2]
                 break
@@ -332,7 +363,7 @@ def plot_violin_evolution(
         # the display coordinates produced by the transforms.
         y_min, y_max = +np.inf, -np.inf
         for densities in per_round_densities:
-            res = densities[label]
+            res = densities.get(label)
             if res is None:
                 continue
             grid_disp = nre_to_y(res[0])
@@ -378,7 +409,7 @@ def plot_violin_evolution(
         for r_idx, (densities, prior_box) in enumerate(
             zip(per_round_densities, per_round_priors), start=1,
         ):
-            res = densities[label]
+            res = densities.get(label)
             if res is None:
                 continue
             grid, density, _ = res
@@ -490,6 +521,116 @@ def plot_violin_evolution(
     return out_path
 
 
+def plot_last_round_vs_mcmc(
+    data: dict,
+    mcmc_samples_path: str | None,
+    outdir: str,
+    ngrid_1d: int = 200,
+    reason: str = "truncation",
+):
+    """One panel per marginal: the last-round NRE 1-D posterior, the
+    corresponding MCMC posterior, and the Fisher (Cramer-Rao) Gaussian overlaid
+    on the same axis. Consumes the precomputed *data* (see
+    :func:`_compute_round_data`) — no model is loaded here.
+
+    All curves are drawn as densities over the *display* coordinate produced by
+    :func:`_axis_transforms_for` (identity for most parameters; "seconds offset
+    from true merger" for ``Deltat``) and each is renormalised to unit area over
+    the shared window so their shapes are directly comparable. The Fisher
+    Gaussian is ``N(truth, sigma_fisher)``. The true (injection) value is a red
+    dotted line.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    params = data["params"]
+    last_densities = data["per_round_densities"][-1]
+    duration_weeks = data["duration_weeks"]
+    mcmc_samples = data["mcmc_samples"]
+    mcmc_param_names = data["mcmc_param_names"]
+    fisher_sigmas_by_name = data["fisher_sigmas_by_name"]
+    n_rounds = data["n_rounds"]
+
+    if mcmc_samples is None:
+        print("[warn] no MCMC samples; drawing NRE last-round marginals only.")
+
+    rows, cols = _grid_layout(len(params))
+    fig, axes = plt.subplots(
+        rows, cols, figsize=(3.2 * cols, 2.6 * rows), squeeze=False,
+    )
+
+    for idx, pi in enumerate(params):
+        label = pi[0]
+        ax = axes[idx // cols, idx % cols]
+        res = last_densities.get(label)
+        if res is None:
+            ax.set_visible(False)
+            continue
+        grid_1d, norm1d, inj = res
+        nre_to_x, mcmc_to_x, x_label = _axis_transforms_for(
+            label, inj, duration_weeks, mcmc_samples_path,
+        )
+        x_grid = nre_to_x(grid_1d)
+        dx = abs(float(x_grid[1] - x_grid[0]))  # uniform (linear transform)
+
+        y_nre = norm1d / max(np.sum(norm1d) * dx, 1e-300)
+        ax.plot(x_grid, y_nre, color="C0", lw=1.5)
+        ax.fill_between(x_grid, y_nre, alpha=0.2, color="C0")
+
+        if mcmc_samples is not None and label in mcmc_param_names:
+            mvals = eval_mcmc_kde_1d(
+                mcmc_samples, mcmc_param_names, label, x_grid,
+                sample_transform=mcmc_to_x,
+            )
+            if mvals is not None:
+                mvals = mvals / max(np.sum(mvals) * dx, 1e-300)
+                ax.plot(x_grid, mvals, color="grey", lw=1.5)
+                ax.fill_between(x_grid, mvals, alpha=0.15, color="grey")
+
+        # Fisher (Cramer-Rao) Gaussian: N(truth, sigma_fisher), centered on the
+        # injection. sigma is in NRE-native units; map to display coords the
+        # same way the violin figure does (via the transform derivative at 0).
+        mu_disp = float(nre_to_x(np.array([inj]))[0])
+        sigma_f = fisher_sigmas_by_name.get(label)
+        if sigma_f is not None and np.isfinite(sigma_f):
+            if label == "Deltat":
+                sigma_disp = abs(float(nre_to_x(np.array([inj + sigma_f]))[0])
+                                 - mu_disp)
+            else:
+                sigma_disp = float(sigma_f)
+            gvals = _gaussian_density_on_grid(x_grid, mu_disp, sigma_disp)
+            gvals = gvals / max(np.sum(gvals) * dx, 1e-300)
+            ax.plot(x_grid, gvals, color="tab:green", lw=1.3, ls="--")
+
+        ax.axvline(mu_disp, color="red", ls=":", lw=1.0)
+        ax.set_title(label, fontsize=10)
+        ax.set_xlabel(x_label, fontsize=9)
+        ax.set_yticks([])
+        ax.tick_params(axis="x", labelsize=8)
+
+    for k in range(len(params), rows * cols):
+        axes[k // cols, k % cols].set_visible(False)
+
+    handles = [
+        Line2D([0], [0], color="C0", lw=1.5, label=f"NRE (round {n_rounds})"),
+        Line2D([0], [0], color="grey", lw=1.5, label="MCMC"),
+        Line2D([0], [0], color="tab:green", lw=1.3, ls="--", label="Fisher"),
+        Line2D([0], [0], color="red", ls=":", lw=1.0, label="truth"),
+    ]
+    fig.legend(handles=handles, loc="lower center", ncol=4, fontsize=9,
+               frameon=False, bbox_to_anchor=(0.5, -0.01))
+    fig.suptitle(
+        f"Last-round posterior vs MCMC — round {n_rounds} — reason: {reason}",
+        fontsize=11,
+    )
+    fig.tight_layout(rect=(0, 0.02, 1, 0.97))
+    out_path = os.path.join(
+        outdir, f"round_{n_rounds}_last_posterior_vs_mcmc_{reason}.png",
+    )
+    fig.savefig(out_path, dpi=140)
+    plt.close(fig)
+    print(f"saved {out_path}")
+    return out_path
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -559,9 +700,15 @@ def main():
         "plots",
         args.name + (f"_upto_round_{args.last_round}" if args.last_round else ""),
     )
+
+    # Load each round's model once and evaluate every marginal a single time;
+    # all figures below render from this precomputed data.
+    data = _compute_round_data(
+        round_dirs, dataloader, args.ngrid_1d, args.mcmc_file,
+    )
+
     plot_violin_evolution(
-        round_dirs=round_dirs,
-        dataloader=dataloader,
+        data=data,
         mcmc_samples_path=args.mcmc_file,
         outdir=outdir,
         ngrid_1d=args.ngrid_1d,
@@ -569,12 +716,11 @@ def main():
     )
 
     # Optional MCMC-zoom companion figure. The window is centered on the
-    # ground-truth injection (computed inside plot_violin_evolution from the
-    # NRE eval), with half-width zoom_sigmas * MCMC sigma.
+    # ground-truth injection (from the NRE eval), with half-width
+    # zoom_sigmas * MCMC sigma. Re-renders the same precomputed data.
     if args.mcmc_file and args.zoom_mcmc_sigmas > 0:
         plot_violin_evolution(
-            round_dirs=round_dirs,
-            dataloader=dataloader,
+            data=data,
             mcmc_samples_path=args.mcmc_file,
             outdir=outdir,
             ngrid_1d=args.ngrid_1d,
@@ -582,6 +728,15 @@ def main():
             zoom_sigmas=args.zoom_mcmc_sigmas,
             filename_suffix=f"_zoom{int(args.zoom_mcmc_sigmas)}sigma",
         )
+
+    # Last-round posterior vs MCMC (+ Fisher), one overlaid panel per marginal.
+    plot_last_round_vs_mcmc(
+        data=data,
+        mcmc_samples_path=args.mcmc_file,
+        outdir=outdir,
+        ngrid_1d=args.ngrid_1d,
+        reason=args.reason,
+    )
 
 
 if __name__ == "__main__":

@@ -31,6 +31,45 @@ from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 
 
+class StreamReuseLogger(Callback):
+    """Per-epoch reuse accounting for the streaming ring-buffer data path.
+
+    Arms ``ring.count_seen`` only for the fit loop (so the pre-fit normalisation
+    and GPU-reserve passes are not counted), tallies pre-noise training examples,
+    and logs examples / distinct sims / reuse each epoch to TB. If ``summary_path``
+    is given, also appends one line per epoch. All counters are per round (the
+    datamodule and ring are rebuilt each round).
+    """
+
+    def __init__(self, summary_path=None):
+        self.summary_path = summary_path
+
+    def on_train_start(self, trainer, pl_module):
+        trainer.datamodule.ring.count_seen = True
+
+    def on_train_end(self, trainer, pl_module):
+        trainer.datamodule.ring.count_seen = False
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        dm = trainer.datamodule
+        dm._examples_consumed += batch["wave_fd"].shape[0] // dm.n_train_noise_realisations
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        dm = trainer.datamodule
+        examples, distinct = dm._examples_consumed, dm.ring.distinct_sims_seen
+        reuse = examples / max(distinct, 1)
+        if trainer.logger:
+            trainer.logger.log_metrics(
+                {"stream/examples_consumed": examples,
+                 "stream/distinct_sims_seen": distinct,
+                 "stream/reuse_factor": reuse}, step=trainer.global_step)
+        if self.summary_path:
+            os.makedirs(os.path.dirname(self.summary_path), exist_ok=True)
+            with open(self.summary_path, "a") as f:
+                f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  [epoch {trainer.current_epoch}] "
+                        f"examples={examples} distinct_sims={distinct} reuse={reuse:.2f}\n")
+
+
 def _param_keys(pl_module):
     """Parameter names for the run's spin basis (slots 2,3), from dataset_info.
 
@@ -155,8 +194,15 @@ class PeriodicProgressCallback(Callback):
 
 
 class PlotPosteriorCallback(Callback):
-    def __init__(self, timestamp: str, obs_loader: DataLoader, input_idx_list: list, output_idx_list: list, round_idx: int , call_every_n_epochs=1, training_start_time: datetime = None, print_every: int = 20, warmup_epochs: int = 0, call_every_n_steps=None, warmup_steps=None):
+    def __init__(self, timestamp: str, obs_loader: DataLoader, input_idx_list: list, output_idx_list: list, round_idx: int , call_every_n_epochs=1, training_start_time: datetime = None, print_every: int = 20, warmup_epochs: int = 0, call_every_n_steps=None, warmup_steps=None, box_dilation_1d: float = 1.0, eps_1d: float = 1e-4, sky_credible_level: float = 0.999, sky_dilation: float = 1.1):
         self.epochs_elapsed = 0
+        # Box-construction params — single source of truth is the run's
+        # truncation_veto config, so the boxes written into widest_boxes match
+        # the ones the coverage veto measures (see _compute_round_coverage).
+        self.box_dilation_1d = box_dilation_1d
+        self.eps_1d = eps_1d
+        self.sky_credible_level = sky_credible_level
+        self.sky_dilation = sky_dilation
         self.call_every_n_epochs = call_every_n_epochs
         # Opt-in global-step cadence; None -> unchanged epoch behaviour.
         self._step = _StepCadence(call_every_n_steps)
@@ -458,13 +504,14 @@ class PlotPosteriorCallback(Callback):
                     )
                     
                     try:
-                        epsilon_value = 1e-4
+                        epsilon_value = self.eps_1d
                         widest_interval, norm1d, grid, inj_params = get_widest_interval_1d(
                             pl_module,
                             self.obs_loader,
                             in_param_idx=param_idx,
                             out_param_idx=out_param_idx,
-                            eps=epsilon_value
+                            eps=epsilon_value,
+                            dilation=self.box_dilation_1d,
                         )
                         
                         # Plot
@@ -564,7 +611,7 @@ class PlotPosteriorCallback(Callback):
                             ax.clabel(cs, fmt=fmt, fontsize=8)
 
                             if marginal_key == (7, 8):
-                                box = get_main_mode_box(gx, gy, norm_2d, credible_level=0.999, dilation_factor=1.1)
+                                box = get_main_mode_box(gx, gy, norm_2d, credible_level=self.sky_credible_level, dilation_factor=self.sky_dilation)
                                 widest_box = (box['lam'][0], box['lam'][1], box['beta'][0], box['beta'][1])
                                 is_wrapped = box["is_wrapped"]
                             else:
@@ -1027,7 +1074,7 @@ class DifferentialEntropyEarlyStopping(Callback):
 def compute_truncation_coverage(
     model, loader, marginals_1d_info, marginals_2d_info,
     eps_1d=1e-4, sky_credible_level=0.999, sky_dilation=1.1,
-    ngrid_1d=100, ngrid_2d=100,
+    ngrid_1d=100, ngrid_2d=100, dilation_1d=1.0,
 ):
     """Empirical coverage of each marginal's truncation box over a labelled set.
 
@@ -1063,7 +1110,12 @@ def compute_truncation_coverage(
             cdf = np.cumsum(norm * dp)
             idx_lo = int(np.searchsorted(cdf, eps_1d / 2))
             idx_hi = min(int(np.searchsorted(cdf, 1 - eps_1d / 2)), len(grid) - 1)
-            if grid[idx_lo] <= inj[s] <= grid[idx_hi]:
+            lo, hi = float(grid[idx_lo]), float(grid[idx_hi])
+            if dilation_1d != 1.0:
+                c = 0.5 * (lo + hi); half = 0.5 * (hi - lo) * dilation_1d
+                lo = max(c - half, float(grid[0]))
+                hi = min(c + half, float(grid[-1]))
+            if lo <= inj[s] <= hi:
                 n_inside += 1
         coverage[(in_idx,)] = (n_inside / n_total, n_inside, n_total)
 
@@ -1121,12 +1173,14 @@ class ChainConvergenceMonitor:
     def __init__(self, eps_nats: float = 0.05, patience: int = 2,
                  state_path: str | None = None,
                  tau_gate: tuple | None = None,
-                 require_not_threshold: bool = True):
+                 require_not_threshold: bool = True,
+                 log_path: str | None = None):
         self.eps_nats = eps_nats
         self.patience = patience
         self.state_path = state_path
         self.tau_gate = tau_gate
         self.require_not_threshold = require_not_threshold
+        self.log_path = log_path
         self.history: list[dict] = []
         self._prev_H: dict[str, float] = {}
         self._stall: dict[str, int] = {}
@@ -1134,6 +1188,15 @@ class ChainConvergenceMonitor:
         self.converged = False
         self.stop_reason = ""
         self._load()
+
+    def log(self, msg):
+        """Tee a ChainConv message to stdout and, if configured, append it
+        (timestamped) to the dedicated chain-convergence log."""
+        print(msg, flush=True)
+        if self.log_path:
+            os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
 
     def _load(self):
         if self.state_path and os.path.exists(self.state_path):
@@ -1181,8 +1244,8 @@ class ChainConvergenceMonitor:
             # First time this marginal reaches patience: stamp the round.
             if self._stall[label] >= self.patience and label not in self.converged_at:
                 self.converged_at[label] = int(round_idx)
-                print(f"[ChainConv] marginal '{label}' CONVERGED at round {round_idx} "
-                      f"(H={H:.4f}, |ΔH|={dH:.2e} < {self.eps_nats})", flush=True)
+                self.log(f"[ChainConv] marginal '{label}' CONVERGED at round {round_idx} "
+                         f"(H={H:.4f}, |ΔH|={dH:.2e} < {self.eps_nats})")
             per[label] = {"H": float(H), "dH": None if dH is None else float(dH),
                           "stall": self._stall[label]}
 
