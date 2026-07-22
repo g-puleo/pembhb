@@ -1,17 +1,24 @@
 """Visualise 1-D posterior evolution across TMNRE truncation rounds.
 
-Produces a single figure: a grid of subplots, one per parameter, with the
-round index on the x-axis and parameter value on the y-axis. Each round
-contributes one symmetric violin (NRE 1-D marginal at the obs); MCMC, if
-provided, contributes the rightmost violin and a faint horizontal ±1σ band.
+Produces a grid of subplots, one per parameter, with the round index on the
+x-axis and parameter value on the y-axis. Each round contributes nested
+equal-tailed credible bands (50/90/99%) of the NRE 1-D marginal at the obs,
+held constant from round r to r+1. Each panel is an offset from the truth on a
+symlog scale, so the prior-wide early rounds and the narrow final ones are both
+legible. MCMC, if provided, is only compared against in the last-round figure.
 
 2-D contour evolution lives in ``visualise_2d_truncation.py``.
+
+Figures are paper-styled: a ``--rows`` x ``--cols`` grid (default 2x6) at
+``--width-pt`` (default \\textwidth = 2 x 246 pt) and ``--fontsize`` (10),
+written as both PDF and PNG.
 
 Usage
 -----
     python scripts/visualise_truncation_rounds.py NAME \\
         --data-path obs.h5 [--mcmc-file mcmc.h5] [--ngrid-1d 200] \\
-        [--last-round N] [--ckpt-final-round PATH] [--reason TAG]
+        [--last-round N] [--ckpt-final-round PATH] [--reason TAG] \\
+        [--rows 2 --cols 6 --width-pt 492 --fontsize 10]
 """
 
 import argparse
@@ -20,7 +27,6 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 from torch.utils.data import DataLoader, Subset
-from scipy.stats import gaussian_kde
 
 from pembhb import ROOT_DIR
 from pembhb.data import MBHBDataset
@@ -38,64 +44,87 @@ from _visualise_common import (
     compute_normalised_posterior,
     keys_for_model,
     detect_basis,
+    PT_PER_INCH,
+    TEXTWIDTH_PT,
+    latex_label,
+    apply_paper_style,
+    save_figure,
 )
 from viz_helpers import (
     load_mcmc_samples,
     eval_nre_1d,
     marginalise_2d_to_1d,
     deltat_axis_transforms,
+    eval_mcmc_kde_1d,
 )
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+from matplotlib.ticker import MaxNLocator, NullLocator, SymmetricalLogLocator
 from pembhb.sampler import chi12_to_chieff_chidiff
-from pembhb.utils import compute_fisher_sigmas_for_testset
-import h5py
-import yaml as _yaml
 
 
 # ---------------------------------------------------------------------------
-# Violin geometry helpers
+# Credible-band helpers
 # ---------------------------------------------------------------------------
 
-def _density_to_violin(grid, density, x_center, max_half_width=0.4):
-    """Return (y, x_left, x_right) for a mirrored fill_betweenx violin.
+# Drawn outermost-first so the narrower bands sit on top.
+BAND_LEVELS = (0.99, 0.90, 0.50)
+BAND_ALPHA = {0.99: 0.20, 0.90: 0.38, 0.50: 0.70}
 
-    The density is scaled so its max maps to ``max_half_width``. The mirror
-    is symmetric about ``x_center``.
+# Half-width of the symlog linear region, in units of the last round's 99% band.
+SYMLOG_LINTHRESH_FACTOR = 5.0
+
+# Panel titles for the parameters that carry a unit. Everything else falls back
+# to ``latex_label`` (dimensionless: q, spins, cos(iota), sin(beta), logMchirp).
+UNIT_LABELS = {
+    "dist":   r"$d_L\,[\mathrm{Gpc}]$",
+    "phi":    r"$\phi\,[\mathrm{rad}]$",
+    "lambda": r"$\lambda\,[\mathrm{rad}]$",
+    "psi":    r"$\psi\,[\mathrm{rad}]$",
+    "Deltat": r"$\Delta t\,[\mathrm{s}]$",
+}
+
+
+def _panel_title(label: str) -> str:
+    return UNIT_LABELS.get(label, latex_label(label))
+
+
+def _symlog_ticks(linthresh, y_lo, y_hi, max_per_side=2):
+    """Sparse tick list for a symlog axis: 0 plus a couple of decades a side.
+
+    The default ``SymmetricalLogLocator`` also emits decades *inside* the
+    linear region, which at these panel widths overprint the zero label.
     """
-    d = np.asarray(density, dtype=float)
-    if d.max() > 0:
-        half = d / d.max() * max_half_width
-    else:
-        half = np.zeros_like(d)
-    return np.asarray(grid, dtype=float), x_center - half, x_center + half
+    ticks = [0.0]
+    for sign, lim in ((1.0, y_hi), (-1.0, y_lo)):
+        if sign * lim <= linthresh:
+            continue
+        k_min = int(np.ceil(np.log10(linthresh)))
+        k_max = int(np.floor(np.log10(sign * lim)))
+        decades = list(range(k_min, k_max + 1))
+        if not decades:
+            continue
+        if len(decades) > max_per_side:
+            idx = np.linspace(0, len(decades) - 1, max_per_side).round()
+            decades = [decades[int(i)] for i in idx]
+        ticks += [sign * 10.0 ** k for k in decades]
+    return sorted(ticks)
 
 
-def _gaussian_density_on_grid(grid, mu, sigma):
-    """N(mu, sigma) density evaluated on *grid*."""
-    return np.exp(-0.5 * ((grid - mu) / sigma) ** 2) / (sigma * np.sqrt(2.0 * np.pi))
+def _equal_tailed_interval(grid, density, level):
+    """Two-tailed ``level`` credible interval of a 1-D density on *grid*.
 
-
-def _compute_fisher_sigmas(round_dirs, obs_path: str) -> dict:
-    """Cramer-Rao 1-sigma per parameter at the obs injection, in the run's basis.
-
-    Uses the round-1 sidecar ``conf`` block as datagen_config (carries
-    ``spin_param_basis`` so chieff/chidiff runs are handled), reads the obs
-    truth row, and calls ``compute_fisher_sigmas_for_testset`` on every
-    non-degenerate prior param. Returns ``{param_name: sigma_fisher}``.
+    Equal-tailed (percentile) rather than highest-density: the excluded
+    probability is split evenly between the two tails.
     """
-    # round-1 sidecar lives next to the data, not the log dir.
-    from _visualise_common import _sidecar_yaml_path
-    with open(_sidecar_yaml_path(round_dirs[0], 1)) as f:
-        sc = _yaml.safe_load(f)
-    datagen_conf = sc["conf"]
-    with h5py.File(obs_path, "r") as f:
-        true_params = np.asarray(f["source_parameters"][0:1])  # (1, 11)
-    varying = [k for k, v in datagen_conf["prior"].items() if v[0] != v[1]]
-    if not varying:
-        return {}
-    sigmas, vp = compute_fisher_sigmas_for_testset(
-        datagen_conf, true_params, varying, backend="cpu",
-    )
-    return {name: float(s) for name, s in zip(vp, sigmas[0])}
+    cdf = np.cumsum(np.asarray(density, dtype=float))
+    if cdf[-1] <= 0:
+        return np.nan, np.nan
+    cdf = cdf / cdf[-1]
+    tail = 0.5 * (1.0 - level)
+    grid = np.asarray(grid, dtype=float)
+    return (float(np.interp(tail, cdf, grid)),
+            float(np.interp(1.0 - tail, cdf, grid)))
 
 
 def _maybe_remap_mcmc_to_basis(samples, names, basis: str):
@@ -118,25 +147,6 @@ def _maybe_remap_mcmc_to_basis(samples, names, basis: str):
     names = list(names); names[i1] = "chi_eff"; names[i2] = "chi_diff"
     print(f"[mcmc] remapped chi1,chi2 → chi_eff,chi_diff to match NRE basis")
     return samples, names
-
-
-def _samples_to_violin(samples, x_center, ngrid=200, max_half_width=0.4,
-                       y_range=None):
-    """KDE → mirrored fill_betweenx violin.
-
-    Restricts the KDE evaluation grid to *y_range* if given so different-round
-    violins line up vertically with the same axes.
-    """
-    samples = np.asarray(samples, dtype=float).ravel()
-    if samples.size < 2:
-        return None
-    kde = gaussian_kde(samples)
-    if y_range is None:
-        lo, hi = np.percentile(samples, [0.5, 99.5])
-    else:
-        lo, hi = y_range
-    grid = np.linspace(lo, hi, ngrid)
-    return _density_to_violin(grid, kde(grid), x_center, max_half_width)
 
 
 # ---------------------------------------------------------------------------
@@ -201,10 +211,16 @@ def _eval_1d_marginal(model, dataloader, param_info, prior_box, ngrid):
 # Main figure
 # ---------------------------------------------------------------------------
 
-def _grid_layout(n_panels: int) -> tuple:
-    """Pick a (rows, cols) grid that's roughly 16:9 with at most 4 columns."""
-    cols = min(4, n_panels)
-    rows = int(np.ceil(n_panels / cols))
+DEFAULT_ROWS, DEFAULT_COLS = 2, 6
+
+
+def _grid_layout(n_panels: int, rows: int = DEFAULT_ROWS,
+                 cols: int = DEFAULT_COLS) -> tuple:
+    """Requested (rows, cols), growing rows if the run has more marginals."""
+    if n_panels > rows * cols:
+        rows = int(np.ceil(n_panels / cols))
+        print(f"[layout] {n_panels} panels exceed the requested grid; "
+              f"using {rows}x{cols}.")
     return rows, cols
 
 
@@ -226,9 +242,70 @@ def _axis_transforms_for(label: str, inj_val: float | None,
     return identity, identity, label
 
 
-def plot_violin_evolution(
-    round_dirs,
-    dataloader,
+def _compute_round_data(round_dirs, dataloader, ngrid_1d, mcmc_samples_path):
+    """Load each round's model exactly once and evaluate every 1-D marginal.
+
+    Returns a dict consumed by the render functions so no model is loaded (nor
+    posterior re-evaluated) more than once across the normal figure, the zoom
+    figure, and the last-round-vs-MCMC figure:
+
+    ``params`` (last round's marginal list — the canonical/superset order),
+    ``per_round_densities`` (list of ``{label: (grid, density, inj) or None}``,
+    keyed by label; a label absent in a round is simply missing), and
+    ``per_round_priors``, ``duration_weeks``, ``mcmc_samples``,
+    ``mcmc_param_names``, ``n_rounds``.
+    """
+    n_rounds = len(round_dirs)
+    if n_rounds == 0:
+        raise ValueError("No round directories provided.")
+
+    per_round_densities: list[dict] = []
+    per_round_priors: list[dict] = []
+    params = None
+    nre_basis = "chi1chi2"
+    for r_idx, rd in enumerate(round_dirs, start=1):
+        model = load_model(os.path.join(rd, "checkpoints"))   # ONE load / round
+        prior_box = load_prior_box(rd, r_idx)
+        round_params = list(_iter_param_marginals(model))
+        densities = {}
+        for pi in round_params:
+            densities[pi[0]] = _eval_1d_marginal(
+                model, dataloader, pi, prior_box, ngrid_1d)
+        per_round_densities.append(densities)
+        per_round_priors.append(prior_box)
+        # Later rounds can introduce marginals, so the last round's list is the
+        # canonical superset used for panel layout (matches prior behaviour).
+        params = round_params
+        nre_basis = detect_basis(getattr(model, "bounds_trained", {}) or {})
+        print(f"[round {r_idx}] "
+              f"{sum(v is not None for v in densities.values())}"
+              f"/{len(round_params)} marginals evaluated.")
+
+    if not params:
+        raise RuntimeError("Model has no 1-D-recoverable marginals.")
+
+    duration_weeks = load_duration_weeks(round_dirs[0], 1)
+
+    mcmc_samples = mcmc_param_names = None
+    if mcmc_samples_path:
+        mcmc_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_path)
+        mcmc_samples, mcmc_param_names = _maybe_remap_mcmc_to_basis(
+            mcmc_samples, mcmc_param_names, nre_basis,
+        )
+
+    return {
+        "params": params,
+        "per_round_densities": per_round_densities,
+        "per_round_priors": per_round_priors,
+        "duration_weeks": duration_weeks,
+        "mcmc_samples": mcmc_samples,
+        "mcmc_param_names": mcmc_param_names,
+        "n_rounds": n_rounds,
+    }
+
+
+def plot_interval_evolution(
+    data: dict,
     mcmc_samples_path: str | None,
     outdir: str,
     ngrid_1d: int = 200,
@@ -236,83 +313,56 @@ def plot_violin_evolution(
     y_range_per_label: dict | None = None,
     zoom_sigmas: float | None = None,
     filename_suffix: str = "",
+    width_pt: float = TEXTWIDTH_PT,
+    height_in: float | None = None,
+    rows: int = DEFAULT_ROWS,
+    cols: int = DEFAULT_COLS,
 ):
-    """Build the unified 1-D violin-evolution figure.
+    """Render the 1-D credible-interval evolution figure from precomputed
+    *data* (see :func:`_compute_round_data`).
 
-    One subplot per parameter. x-axis: round 1..R (NRE) + an extra slot for
-    MCMC (if provided). y-axis: parameter value. Faint horizontal ±1σ MCMC
-    band + median, and a red dotted line at the true (injection) value.
+    One subplot per parameter. Each round contributes nested equal-tailed
+    credible bands (:data:`BAND_LEVELS`) drawn piecewise-constant from ``x=r``
+    to ``x=r+1``, so the whole panel reads as a staircase rather than a row of
+    violins. The truncated prior bounds are the black staircase and the true
+    (injection) value the red dashed line.
+
+    Every panel is plotted as an **offset from the truth** on a symlog y-axis
+    whose linear region is ``SYMLOG_LINTHRESH_FACTOR`` times the width of the
+    last round's 99% band. Early rounds (prior-wide) and the final rounds
+    (posterior-narrow) are then both legible in one panel — on a linear axis
+    the last ~30 rounds collapse onto the truth line.
+
+    MCMC is not drawn here (see :func:`plot_last_round_vs_mcmc`); when
+    ``zoom_sigmas`` is given the MCMC spread is still used to size the window.
 
     ``zoom_sigmas`` (float) clips each panel's y-axis to a window centered on
     the **ground-truth injection** with half-width ``zoom_sigmas * sigma_mcmc``.
     The center is the true injection (``res[2]``, never the prior midpoint or
-    the MCMC median); window and violins share the same transform so they stay
+    the MCMC median); window and bands share the same transform so they stay
     aligned by construction. Used for the "zoom on MCMC" companion figure.
 
     ``y_range_per_label`` (dict mapping label → ``(y_lo, y_hi)``) is an explicit
     manual override of the y-axis window; it wins over ``zoom_sigmas``.
     """
     os.makedirs(outdir, exist_ok=True)
-    n_rounds = len(round_dirs)
-    if n_rounds == 0:
-        raise ValueError("No round directories provided.")
+    params = data["params"]
+    per_round_densities = data["per_round_densities"]
+    per_round_priors = data["per_round_priors"]
+    duration_weeks = data["duration_weeks"]
+    mcmc_samples = data["mcmc_samples"]
+    mcmc_param_names = data["mcmc_param_names"]
+    n_rounds = data["n_rounds"]
 
-    # Use the last round's model to enumerate which params we'll plot
-    # (later-round models can introduce marginals; an earlier round simply
-    # contributes None for those slots).
-    last_model = load_model(os.path.join(round_dirs[-1], "checkpoints"))
-    params = list(_iter_param_marginals(last_model))
-    if not params:
-        raise RuntimeError("Model has no 1-D-recoverable marginals.")
-
-    # Duration in weeks — read from round 1's sidecar (used only by the
-    # Deltat axis transform).
-    duration_weeks = load_duration_weeks(round_dirs[0], 1)
-
-    # Optional MCMC samples. Remap chi1/chi2 → chi_eff/chi_diff if the NRE
-    # was trained on the chieff_chidiff basis (read off the last-round model).
-    mcmc_samples = mcmc_param_names = None
-    fisher_sigmas_by_name = {}
-    if mcmc_samples_path:
-        mcmc_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_path)
-        nre_basis = detect_basis(getattr(last_model, "bounds_trained", {}) or {})
-        mcmc_samples, mcmc_param_names = _maybe_remap_mcmc_to_basis(
-            mcmc_samples, mcmc_param_names, nre_basis,
-        )
-        # Fisher CRLB at the obs injection, in the same basis the run uses.
-        try:
-            obs_path = dataloader.dataset.dataset.filename
-            fisher_sigmas_by_name = _compute_fisher_sigmas(round_dirs, obs_path)
-            print(f"[fisher] CRLB sigmas: " + ", ".join(
-                f"{k}={v:.3e}" for k, v in fisher_sigmas_by_name.items()))
-        except Exception as e:
-            print(f"[fisher] WARN: could not compute Fisher sigmas: {e}")
-
-    # Pre-compute every (round, param) → (grid, density, inj) so we know the
-    # y-axis range per parameter before drawing. Also stash the per-round
-    # prior box so whiskers can read its boundaries during drawing.
-    per_round_densities: list[dict] = []
-    per_round_priors: list[dict] = []
-    for r_idx, rd in enumerate(round_dirs, start=1):
-        model = load_model(os.path.join(rd, "checkpoints"))
-        prior_box = load_prior_box(rd, r_idx)
-        densities = {}
-        for pi in params:
-            res = _eval_1d_marginal(model, dataloader, pi, prior_box, ngrid_1d)
-            densities[pi[0]] = res  # keyed by param label
-        per_round_densities.append(densities)
-        per_round_priors.append(prior_box)
-        print(f"[round {r_idx}] {sum(v is not None for v in densities.values())}"
-              f"/{len(params)} marginals evaluated.")
-
-    rows, cols = _grid_layout(len(params))
+    rows, cols = _grid_layout(len(params), rows, cols)
+    width_in = width_pt / PT_PER_INCH
     fig, axes = plt.subplots(
-        rows, cols, figsize=(3.2 * cols, 2.6 * rows), squeeze=False,
+        rows, cols, squeeze=False, constrained_layout=True,
+        figsize=(width_in, height_in or 1.45 * rows + 0.55),
     )
 
-    half_width = 0.4
-    x_mcmc = n_rounds + 1
-    x_fisher = n_rounds + 2  # only used if fisher_sigmas_by_name is available
+    # Round r occupies [r, r+1].
+    x_edges = np.arange(1, n_rounds + 2, dtype=float)
     for idx, (label, source_dim, in_idx, _, _) in enumerate(params):
         ax = axes[idx // cols, idx % cols]
 
@@ -320,174 +370,272 @@ def plot_violin_evolution(
         # Deltat axis transform). It's constant across rounds.
         inj_for_transform = None
         for densities in per_round_densities:
-            res = densities[label]
+            res = densities.get(label)
             if res is not None:
                 inj_for_transform = res[2]
                 break
         nre_to_y, mcmc_to_y, y_label = _axis_transforms_for(
             label, inj_for_transform, duration_weeks, mcmc_samples_path,
         )
+        # Everything is drawn as an offset from the truth so the symlog scale
+        # can be centred on it. For Deltat the transform already does this.
+        truth_disp = (
+            float(nre_to_y(np.array([inj_for_transform]))[0])
+            if inj_for_transform is not None else 0.0
+        )
+        to_c = lambda v: nre_to_y(v) - truth_disp
 
-        # Determine y-range from all non-None densities (NRE) and MCMC, in
-        # the display coordinates produced by the transforms.
-        y_min, y_max = +np.inf, -np.inf
-        for densities in per_round_densities:
-            res = densities[label]
-            if res is None:
-                continue
-            grid_disp = nre_to_y(res[0])
-            y_min = min(y_min, float(grid_disp.min()))
-            y_max = max(y_max, float(grid_disp.max()))
-        mcmc_col_disp = None
-        if mcmc_samples is not None and label in mcmc_param_names:
-            mcmc_col_disp = mcmc_to_y(mcmc_samples[:, mcmc_param_names.index(label)])
-            y_min = min(y_min, float(np.percentile(mcmc_col_disp, 0.5)))
-            y_max = max(y_max, float(np.percentile(mcmc_col_disp, 99.5)))
+        # Per-round, per-level intervals in truth-centred display coords.
+        bands = {}
+        for level in BAND_LEVELS:
+            lo = np.full(n_rounds + 1, np.nan)
+            hi = np.full(n_rounds + 1, np.nan)
+            for r, densities in enumerate(per_round_densities):
+                res = densities.get(label)
+                if res is None:
+                    continue
+                grid, density, _ = res
+                lo[r], hi[r] = _equal_tailed_interval(to_c(grid), density, level)
+            lo[-1], hi[-1] = lo[-2], hi[-2]     # step="post" needs a last value
+            bands[level] = (lo, hi)
+
+        widest = max(BAND_LEVELS)
+        y_min = np.nanmin(bands[widest][0])
+        y_max = np.nanmax(bands[widest][1])
+        for prior_box in per_round_priors:
+            if label in prior_box:
+                b_lo, b_hi = prior_box[label]
+                y_min = min(y_min, float(to_c(np.array([b_lo]))[0]))
+                y_max = max(y_max, float(to_c(np.array([b_hi]))[0]))
         if not np.isfinite(y_min) or not np.isfinite(y_max):
             ax.set_visible(False)
             continue
         y_pad = 0.05 * (y_max - y_min)
-        y_lo = y_min - y_pad
-        y_hi = y_max + y_pad
-        # Zoom window: centered on the ground-truth injection (in display
-        # coords), half-width N * MCMC sigma. inj_for_transform is res[2] from
-        # the NRE eval — the true obs value, never the prior midpoint. For
-        # Deltat the transform sends the injection to 0; for other params it is
-        # the identity, so truth_disp is the native injection. sigma is offset-
-        # invariant, so it is correct regardless of the transform reference.
-        if zoom_sigmas is not None and mcmc_col_disp is not None:
-            if inj_for_transform is not None:
-                truth_disp = float(nre_to_y(np.array([inj_for_transform]))[0])
-            else:
-                truth_disp = float(np.median(mcmc_col_disp))
-            sigma_disp = float(np.std(mcmc_col_disp))
-            y_lo = truth_disp - zoom_sigmas * sigma_disp
-            y_hi = truth_disp + zoom_sigmas * sigma_disp
+        y_lo, y_hi = y_min - y_pad, y_max + y_pad
+
+        # Linear region of the symlog scale: a few times the final resolution.
+        lo99, hi99 = bands[widest][0][n_rounds - 1], bands[widest][1][n_rounds - 1]
+        last_width = hi99 - lo99 if np.isfinite(hi99 - lo99) else np.nan
+        if not np.isfinite(last_width) or last_width <= 0:
+            last_width = (y_max - y_min) / 100.0
+        linthresh = SYMLOG_LINTHRESH_FACTOR * last_width
+
+        # Zoom window: centered on the truth (now 0), half-width N * MCMC sigma.
+        # MCMC is not drawn here, only used to size the window.
+        if zoom_sigmas is not None and mcmc_samples is not None \
+                and label in mcmc_param_names:
+            col = mcmc_to_y(mcmc_samples[:, mcmc_param_names.index(label)])
+            sigma_disp = float(np.std(col))
+            y_lo, y_hi = -zoom_sigmas * sigma_disp, zoom_sigmas * sigma_disp
         if y_range_per_label and label in y_range_per_label:
             y_lo, y_hi = y_range_per_label[label]
 
-        # MCMC ±1σ band + median.
-        truth_val = None
-        if mcmc_col_disp is not None:
-            mlo, mmed, mhi = np.percentile(mcmc_col_disp, [15.865, 50.0, 84.135])
-            ax.axhspan(mlo, mhi, color="grey", alpha=0.15, zorder=0)
-            ax.axhline(mmed, color="grey", linestyle="--", linewidth=0.7, zorder=0)
+        # Nested NRE credible bands, piecewise-constant over each round.
+        for level in BAND_LEVELS:
+            lo, hi = bands[level]
+            ax.fill_between(x_edges, lo, hi, step="post", color="C0",
+                            alpha=BAND_ALPHA[level], linewidth=0, zorder=1)
 
-        # Per-round NRE violins (in display coords) + prior-box whiskers.
-        whisker_half = 0.5 * half_width
-        for r_idx, (densities, prior_box) in enumerate(
-            zip(per_round_densities, per_round_priors), start=1,
-        ):
-            res = densities[label]
-            if res is None:
-                continue
-            grid, density, _ = res
-            grid_disp = nre_to_y(grid)
-            y, xl, xr = _density_to_violin(grid_disp, density, r_idx, half_width)
-            ax.fill_betweenx(y, xl, xr, color="C0", alpha=0.55,
-                              edgecolor="C0", linewidth=0.5)
+        # Truncated prior bounds as a staircase.
+        plo = np.full(n_rounds + 1, np.nan)
+        phi = np.full(n_rounds + 1, np.nan)
+        for r, prior_box in enumerate(per_round_priors):
             if label in prior_box:
-                lo, hi = prior_box[label]
-                lo_disp = float(nre_to_y(np.array([lo]))[0])
-                hi_disp = float(nre_to_y(np.array([hi]))[0])
-                # Horizontal whisker caps at lo and hi.
-                ax.hlines([lo_disp, hi_disp],
-                          r_idx - whisker_half, r_idx + whisker_half,
-                          colors="k", linewidth=0.9, zorder=2)
-                # Thin vertical connector through the violin (clipped to box).
-                ax.vlines(r_idx, lo_disp, hi_disp,
-                          colors="k", linewidth=0.5, linestyles=":",
-                          alpha=0.6, zorder=2)
-        truth_val = (
-            float(nre_to_y(np.array([inj_for_transform]))[0])
-            if inj_for_transform is not None else None
-        )
+                b_lo, b_hi = prior_box[label]
+                plo[r] = float(to_c(np.array([b_lo]))[0])
+                phi[r] = float(to_c(np.array([b_hi]))[0])
+        plo[-1], phi[-1] = plo[-2], phi[-2]
+        ax.step(x_edges, plo, where="post", color="k", linewidth=0.6, zorder=2)
+        ax.step(x_edges, phi, where="post", color="k", linewidth=0.6, zorder=2)
 
-        # MCMC violin in the last column (already in display coords).
-        if mcmc_col_disp is not None:
-            mres = _samples_to_violin(
-                mcmc_col_disp, x_mcmc, ngrid=ngrid_1d,
-                max_half_width=half_width, y_range=(y_lo, y_hi),
-            )
-            if mres is not None:
-                y, xl, xr = mres
-                ax.fill_betweenx(y, xl, xr, color="grey", alpha=0.5,
-                                  edgecolor="grey", linewidth=0.5)
-
-        # Fisher Gaussian violin: N(MCMC_median, sigma_fisher) drawn as a violin
-        # in the column just past MCMC. Shows what the linear-Gaussian (Cramer-
-        # Rao) approximation predicts for the same param.
-        has_fisher = (
-            mcmc_col_disp is not None
-            and label in fisher_sigmas_by_name
-            and np.isfinite(fisher_sigmas_by_name[label])
-        )
-        if has_fisher:
-            sigma_f = fisher_sigmas_by_name[label]
-            # Convert sigma to display units by mapping a unit interval at the
-            # MCMC median through the transform (handles Deltat: days→seconds).
-            mu_disp = float(np.median(mcmc_col_disp))
-            # nre_to_y is applied to NRE-native (= param-native) values. mcmc_to_y
-            # is applied to MCMC-native values. For Deltat the sigma is in the
-            # NRE-native unit (days), so scale via nre_to_y derivative.
-            if label == "Deltat":
-                # Scale factor = mcmc_to_y(median+1) - mcmc_to_y(median), but
-                # sigma_fisher is in NRE-native (days). Use NRE-native sigma
-                # then transform centered at zero: dx_disp ≈ |nre_to_y(s) - nre_to_y(0)|.
-                scale = abs(float(nre_to_y(np.array([sigma_f]))[0])
-                            - float(nre_to_y(np.array([0.0]))[0]))
-                sigma_disp = scale
-            else:
-                sigma_disp = sigma_f
-            grid_g = np.linspace(y_lo, y_hi, ngrid_1d)
-            dens_g = _gaussian_density_on_grid(grid_g, mu_disp, sigma_disp)
-            y, xl, xr = _density_to_violin(grid_g, dens_g, x_fisher, half_width)
-            ax.fill_betweenx(y, xl, xr, color="tab:green", alpha=0.45,
-                              edgecolor="tab:green", linewidth=0.5)
-
-        # Truth line.
-        if truth_val is not None:
-            ax.axhline(truth_val, color="red", linestyle=":", linewidth=0.9,
-                       zorder=3)
+        # Truth line — at 0 by construction.
+        ax.axhline(0.0, color="red", linestyle="--", linewidth=0.9, zorder=3)
 
         # Cosmetics.
-        rightmost = (x_fisher if has_fisher
-                     else (x_mcmc if mcmc_col_disp is not None else n_rounds))
-        ax.set_xlim(0.4, rightmost + 0.6)
+        ax.set_xlim(1.0, n_rounds + 1)
+        ax.set_yscale("symlog", linthresh=linthresh)
         ax.set_ylim(y_lo, y_hi)
-        xticks = list(range(1, n_rounds + 1))
-        xticklabels = [str(i) for i in xticks]
-        if mcmc_col_disp is not None:
-            xticks.append(x_mcmc)
-            xticklabels.append("MCMC")
-        if has_fisher:
-            xticks.append(x_fisher)
-            xticklabels.append("Fisher")
+        ax.set_yticks(_symlog_ticks(linthresh, y_lo, y_hi))
+        ax.yaxis.set_minor_locator(NullLocator())
+        # Thin the round ticks: at this width one label per round is illegible.
+        # Ticks sit at the centre of each round's band.
+        step = max(1, int(np.ceil(n_rounds / 3)))
+        rounds_ticked = list(range(1, n_rounds + 1, step))
+        if n_rounds - rounds_ticked[-1] > 0.5 * step:
+            rounds_ticked.append(n_rounds)
+        xticks = [r + 0.5 for r in rounds_ticked]
+        xticklabels = [str(r) for r in rounds_ticked]
         ax.set_xticks(xticks)
-        ax.set_xticklabels(xticklabels, fontsize=8)
-        suffix = "" if source_dim == 1 else "  (from 2-D)"
-        ax.set_title(f"{y_label}{suffix}", fontsize=10)
-        ax.tick_params(axis="y", labelsize=8)
-        if idx // cols == rows - 1:
-            ax.set_xlabel("round", fontsize=9)
+        ax.set_xticklabels(xticklabels)
+        # Panels are truth-centred, so the transformed Deltat label would be
+        # redundant — only its unit is worth keeping.
+        ax.set_title(_panel_title(label), pad=3)
 
-    # Hide unused panels.
+    _finish_grid(axes, len(params), rows, cols, xlabel="round")
+    fig.supylabel(r"$\theta - \theta_\mathrm{true}$")
+
+    handles = [
+        Patch(facecolor="C0", alpha=BAND_ALPHA[lv], linewidth=0,
+              label=f"NRE {int(100 * lv)}%")
+        for lv in BAND_LEVELS
+    ]
+    handles += [
+        Line2D([0], [0], color="k", lw=0.6, label="prior bounds"),
+        Line2D([0], [0], color="red", ls="--", lw=0.9, label="ground truth"),
+    ]
+    _place_legend(fig, axes, handles, len(params), rows, cols)
+
+    return save_figure(
+        fig, outdir, f"interval_evolution_{reason}{filename_suffix}",
+    )
+
+
+def _finish_grid(axes, n_panels: int, rows: int, cols: int, xlabel: str) -> None:
+    """Hide the unused cells and label the x-axis of every panel."""
+    for k in range(n_panels, rows * cols):
+        axes[k // cols, k % cols].set_visible(False)
+    for k in range(n_panels):
+        axes[k // cols, k % cols].set_xlabel(xlabel)
+
+
+def _place_legend(fig, axes, handles, n_panels: int, rows: int,
+                  cols: int) -> None:
+    """Put the legend in the blank cells of a ragged last row, else in a single
+    row underneath the figure.
+
+    The layout is frozen first (``draw`` then a null layout engine) so the
+    legend can be anchored in figure coordinates without constrained_layout
+    reserving space for it — reserving space would stretch the column it sits
+    in and break the uniform panel grid.
+    """
+    n_free = rows * cols - n_panels
+    if n_free < 1:
+        fig.legend(handles=handles, loc="outside lower center",
+                   ncol=len(handles), frameon=False, handlelength=1.6,
+                   columnspacing=1.4, borderaxespad=0.0)
+        return
+
+    r0, c0 = n_panels // cols, n_panels % cols
+    first = axes[r0, c0]
+    last = axes[rows - 1, cols - 1]
+    fig.canvas.draw()
+    p0, p1 = first.get_position(), last.get_position()
+    fig.set_layout_engine("none")
+    # The hidden cell draws no tick labels, so its left gutter is free space —
+    # claim it, otherwise the legend is squeezed into ~60% of the column.
+    x0 = p0.x0
+    if c0 > 0:
+        x0 = axes[r0, c0 - 1].get_position().x1 + 0.006
+    rect = (x0, p1.y0, p1.x1 - x0, p0.y1 - p1.y0)
+
+    # Shrink until the legend fits inside the free cells: at these panel widths
+    # the default size spills over the neighbouring axes.
+    fontsize = plt.rcParams["axes.labelsize"]   # match the axis labels
+    for _ in range(4):
+        leg = fig.legend(handles=handles, loc="center", frameon=False,
+                         handlelength=1.0, handletextpad=0.4, borderpad=0.1,
+                         labelspacing=0.5, borderaxespad=0.0,
+                         fontsize=fontsize, bbox_to_anchor=rect,
+                         bbox_transform=fig.transFigure)
+        fig.canvas.draw()
+        bb = leg.get_window_extent().transformed(fig.transFigure.inverted())
+        scale = min(rect[2] / bb.width, rect[3] / bb.height)
+        if scale >= 0.99 or fontsize <= 4.0:
+            break
+        leg.remove()
+        fontsize = max(4.0, fontsize * 0.98 * scale)
+    print(f"[legend] fontsize {fontsize:.1f} pt "
+          f"(axis labels: {plt.rcParams['axes.labelsize']:.1f} pt)")
+
+
+def plot_last_round_vs_mcmc(
+    data: dict,
+    mcmc_samples_path: str | None,
+    outdir: str,
+    ngrid_1d: int = 200,
+    reason: str = "truncation",
+    width_pt: float = TEXTWIDTH_PT,
+    height_in: float | None = None,
+    rows: int = DEFAULT_ROWS,
+    cols: int = DEFAULT_COLS,
+):
+    """One panel per marginal: the last-round NRE 1-D posterior and the
+    corresponding MCMC posterior overlaid on the same axis. Consumes the
+    precomputed *data* (see :func:`_compute_round_data`) — no model is loaded
+    here.
+
+    All curves are drawn as densities over the *display* coordinate produced by
+    :func:`_axis_transforms_for` (identity for most parameters; "seconds offset
+    from true merger" for ``Deltat``) and each is renormalised to unit area over
+    the shared window so their shapes are directly comparable. The true
+    (injection) value is a red dashed line.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    params = data["params"]
+    last_densities = data["per_round_densities"][-1]
+    duration_weeks = data["duration_weeks"]
+    mcmc_samples = data["mcmc_samples"]
+    mcmc_param_names = data["mcmc_param_names"]
+    n_rounds = data["n_rounds"]
+
+    if mcmc_samples is None:
+        print("[warn] no MCMC samples; drawing NRE last-round marginals only.")
+
+    rows, cols = _grid_layout(len(params), rows, cols)
+    width_in = width_pt / PT_PER_INCH
+    fig, axes = plt.subplots(
+        rows, cols, squeeze=False, constrained_layout=True,
+        figsize=(width_in, height_in or 1.45 * rows + 0.55),
+    )
+
+    for idx, pi in enumerate(params):
+        label = pi[0]
+        ax = axes[idx // cols, idx % cols]
+        res = last_densities.get(label)
+        if res is None:
+            ax.set_visible(False)
+            continue
+        grid_1d, norm1d, inj = res
+        nre_to_x, mcmc_to_x, x_label = _axis_transforms_for(
+            label, inj, duration_weeks, mcmc_samples_path,
+        )
+        x_grid = nre_to_x(grid_1d)
+        dx = abs(float(x_grid[1] - x_grid[0]))  # uniform (linear transform)
+
+        y_nre = norm1d / max(np.sum(norm1d) * dx, 1e-300)
+        ax.plot(x_grid, y_nre, color="C0", lw=1.5)
+        ax.fill_between(x_grid, y_nre, alpha=0.2, color="C0")
+
+        if mcmc_samples is not None and label in mcmc_param_names:
+            mvals = eval_mcmc_kde_1d(
+                mcmc_samples, mcmc_param_names, label, x_grid,
+                sample_transform=mcmc_to_x,
+            )
+            if mvals is not None:
+                mvals = mvals / max(np.sum(mvals) * dx, 1e-300)
+                ax.plot(x_grid, mvals, color="grey", lw=1.5)
+                ax.fill_between(x_grid, mvals, alpha=0.15, color="grey")
+
+        mu_disp = float(nre_to_x(np.array([inj]))[0])
+        ax.axvline(mu_disp, color="red", ls="--", lw=1.0)
+        title = _panel_title(label)
+        ax.set_title(title, pad=3)
+        ax.set_yticks([])
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=3))
+
     for k in range(len(params), rows * cols):
         axes[k // cols, k % cols].set_visible(False)
 
-    zoom_tag = f" — zoom on MCMC" if filename_suffix else ""
-    fig.suptitle(
-        f"1-D posterior evolution — NRE per round, MCMC reference — "
-        f"reason: {reason}{zoom_tag}",
-        fontsize=11,
+    handles = [
+        Line2D([0], [0], color="C0", lw=1.5, label=f"NRE (round {n_rounds})"),
+        Line2D([0], [0], color="red", ls="--", lw=1.0, label="ground truth"),
+    ]
+    if mcmc_samples is not None:
+        handles.insert(1, Line2D([0], [0], color="grey", lw=1.5, label="MCMC"))
+    _place_legend(fig, axes, handles, len(params), rows, cols)
+    return save_figure(
+        fig, outdir, f"round_{n_rounds}_last_posterior_vs_mcmc_{reason}",
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
-    out_path = os.path.join(
-        outdir, f"violin_evolution_{reason}{filename_suffix}.png",
-    )
-    fig.savefig(out_path, dpi=140)
-    print(f"saved {out_path}")
-    return out_path
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +681,13 @@ def main():
                         "companion figure with each subplot's y-axis "
                         "restricted to ±N·σ_MCMC around the MCMC median. "
                         "0 disables the zoom output. Default: 5.")
+    p.add_argument("--width-pt", type=float, default=TEXTWIDTH_PT,
+                   help="Figure width in points (default: \\textwidth = 492).")
+    p.add_argument("--height-in", type=float, default=None,
+                   help="Figure height in inches (default: from the row count).")
+    p.add_argument("--rows", type=int, default=DEFAULT_ROWS)
+    p.add_argument("--cols", type=int, default=DEFAULT_COLS)
+    p.add_argument("--fontsize", type=float, default=10.0)
     args = p.parse_args()
     if args.reason == "auto":
         args.reason = "trigger" if args.ckpt_final_round else "truncation"
@@ -559,29 +714,50 @@ def main():
         "plots",
         args.name + (f"_upto_round_{args.last_round}" if args.last_round else ""),
     )
-    plot_violin_evolution(
-        round_dirs=round_dirs,
-        dataloader=dataloader,
+
+    # Load each round's model once and evaluate every marginal a single time;
+    # all figures below render from this precomputed data.
+    data = _compute_round_data(
+        round_dirs, dataloader, args.ngrid_1d, args.mcmc_file,
+    )
+
+    apply_paper_style(args.fontsize)
+    style = dict(width_pt=args.width_pt, height_in=args.height_in,
+                 rows=args.rows, cols=args.cols)
+
+    plot_interval_evolution(
+        data=data,
         mcmc_samples_path=args.mcmc_file,
         outdir=outdir,
         ngrid_1d=args.ngrid_1d,
         reason=args.reason,
+        **style,
     )
 
     # Optional MCMC-zoom companion figure. The window is centered on the
-    # ground-truth injection (computed inside plot_violin_evolution from the
-    # NRE eval), with half-width zoom_sigmas * MCMC sigma.
+    # ground-truth injection (from the NRE eval), with half-width
+    # zoom_sigmas * MCMC sigma. Re-renders the same precomputed data.
     if args.mcmc_file and args.zoom_mcmc_sigmas > 0:
-        plot_violin_evolution(
-            round_dirs=round_dirs,
-            dataloader=dataloader,
+        plot_interval_evolution(
+            data=data,
             mcmc_samples_path=args.mcmc_file,
             outdir=outdir,
             ngrid_1d=args.ngrid_1d,
             reason=args.reason,
             zoom_sigmas=args.zoom_mcmc_sigmas,
             filename_suffix=f"_zoom{int(args.zoom_mcmc_sigmas)}sigma",
+            **style,
         )
+
+    # Last-round posterior vs MCMC, one overlaid panel per marginal.
+    plot_last_round_vs_mcmc(
+        data=data,
+        mcmc_samples_path=args.mcmc_file,
+        outdir=outdir,
+        ngrid_1d=args.ngrid_1d,
+        reason=args.reason,
+        **style,
+    )
 
 
 if __name__ == "__main__":

@@ -40,11 +40,26 @@ def _hpd_threshold(density_2d, credible_level):
     return sorted_density[min(i, len(sorted_density) - 1)]
 
 
-def _label_with_periodic_lambda(binary_mask):
-    """Connected-component labelling with periodic BCs in the lambda direction.
+def _is_lambda_periodic(lam_lo_grid, lam_hi_grid, dlam,
+                        lam_domain=(0.0, 2 * np.pi), tol_cells=1.0):
+    """True if the lambda grid spans the full [0, 2pi] circle.
+
+    The periodic seam at lambda = 0 == 2pi is only physical when the grid
+    endpoints actually sit on the domain edges.  After truncation the grid
+    covers an interior slice ``[lam_lo, lam_hi]`` whose left/right columns are
+    *not* neighbours, so periodic merging/wrapping must be disabled.
+    """
+    tol = tol_cells * abs(dlam)
+    return (abs(lam_lo_grid - lam_domain[0]) <= tol
+            and abs(lam_hi_grid - lam_domain[1]) <= tol)
+
+
+def _label_with_periodic_lambda(binary_mask, periodic=True):
+    """Connected-component labelling, optionally periodic in the lambda direction.
 
     The mask has shape (n_beta, n_lambda).  Axis 1 (columns) is lambda and
-    is periodic.  Axis 0 (rows) is sin(beta) and is NOT periodic.
+    is periodic *only when the grid spans the full circle* (``periodic``).
+    Axis 0 (rows) is sin(beta) and is NOT periodic.
 
     Strategy
     --------
@@ -68,7 +83,7 @@ def _label_with_periodic_lambda(binary_mask):
     struct = ndimage.generate_binary_structure(2, 2)
     labeled, n_features = ndimage.label(binary_mask, structure=struct)
 
-    if n_features <= 1:
+    if n_features <= 1 or not periodic:
         return labeled, n_features
 
     # Step 2: union-find to merge labels across the periodic boundary
@@ -171,12 +186,17 @@ def _dilate_mask_periodic(mask, dilation_factor):
     return result
 
 
-def _component_bbox_lambda(comp_mask):
+def _component_bbox_lambda(comp_mask, periodic=True):
     """Bounding interval in the lambda (column) direction, detecting wrapping.
+
+    Wrapping is only considered when ``periodic`` is True (grid spans the full
+    circle).  On a truncated grid the edges are not adjacent, so the component
+    is always reported as a plain contiguous interval.
 
     Parameters
     ----------
     comp_mask : (n_beta, n_lam) bool array
+    periodic : bool
 
     Returns
     -------
@@ -204,7 +224,7 @@ def _component_bbox_lambda(comp_mask):
 
     # Heuristic: wrapped if it touches both edges and the largest gap
     # is wider than 1/4 of the grid (otherwise it's just a big blob).
-    is_wrapped = touches_left and touches_right and max_gap > n_lam // 4
+    is_wrapped = periodic and touches_left and touches_right and max_gap > n_lam // 4
 
     if is_wrapped:
         # The largest gap separates the "end" of the component from the
@@ -261,12 +281,16 @@ def analyse_sky_posterior(grid_lam, grid_beta, posterior_2d,
     dlam = grid_lam[0, 1] - grid_lam[0, 0] if n_lam > 1 else 1.0
     dbeta = grid_beta[1, 0] - grid_beta[0, 0] if n_beta > 1 else 1.0
 
+    # Periodicity is physical only when the grid covers the whole [0, 2pi]
+    # circle; on a truncated lambda slice the two edges are not neighbours.
+    periodic = _is_lambda_periodic(float(grid_lam[0, 0]), float(grid_lam[0, -1]), dlam)
+
     # --- 1. HPD threshold --------------------------------------------------
     threshold = _hpd_threshold(posterior_2d, credible_level)
     binary_mask = posterior_2d >= threshold
 
     # --- 2. Connected components with periodic lambda ----------------------
-    labeled, n_components = _label_with_periodic_lambda(binary_mask)
+    labeled, n_components = _label_with_periodic_lambda(binary_mask, periodic=periodic)
 
     # --- 3. Per-component analysis -----------------------------------------
     components = []
@@ -280,8 +304,8 @@ def analyse_sky_posterior(grid_lam, grid_beta, posterior_2d,
         beta_lo = float(grid_beta[row_idx[0], 0])
         beta_hi = float(grid_beta[row_idx[-1], 0])
 
-        # Lambda bounding box (axis 1, periodic)
-        col_lo, col_hi, is_wrapped = _component_bbox_lambda(cmask)
+        # Lambda bounding box (axis 1, periodic only if grid spans full circle)
+        col_lo, col_hi, is_wrapped = _component_bbox_lambda(cmask, periodic=periodic)
         lam_lo = float(grid_lam[0, col_lo])
         lam_hi = float(grid_lam[0, col_hi])
 
@@ -299,7 +323,10 @@ def analyse_sky_posterior(grid_lam, grid_beta, posterior_2d,
     main_mode_idx = 0 if components else -1
 
     # --- 4. Dilate the full mask -------------------------------------------
-    dilated_mask = _dilate_mask_periodic(binary_mask, dilation_factor)
+    if periodic:
+        dilated_mask = _dilate_mask_periodic(binary_mask, dilation_factor)
+    else:
+        dilated_mask = _dilate_mask_isotropic(binary_mask, dilation_factor)
 
     return {
         'mask': dilated_mask,
@@ -307,18 +334,24 @@ def analyse_sky_posterior(grid_lam, grid_beta, posterior_2d,
         'components': components,
         'threshold': threshold,
         'main_mode_idx': main_mode_idx,
+        'periodic': periodic,
     }
 
 
 def _dilate_box(lam_lo, lam_hi, beta_lo, beta_hi,
                 dilation_factor, is_wrapped,
                 lam_domain=(0.0, 2 * np.pi),
-                beta_domain=(-1.0, 1.0)):
+                beta_domain=(-1.0, 1.0),
+                periodic=True):
     """Dilate an axis-aligned box by *dilation_factor*, respecting domain bounds.
 
-    For lambda (periodic): if dilated width exceeds the full domain, fall
-    back to the full domain.  Otherwise expand symmetrically around the
-    centre.
+    For lambda when ``periodic`` (grid spans the full circle): if dilated width
+    exceeds the full domain, fall back to the full domain; otherwise expand
+    symmetrically around the centre, wrapping across 0/2pi if needed.
+
+    For lambda when NOT periodic (truncated slice): treat it like a bounded
+    coordinate -- expand around the centre and clamp to ``lam_domain``, never
+    wrapping across the seam.
 
     For sin(beta) (bounded): clamp to [-1, 1].
 
@@ -327,48 +360,56 @@ def _dilate_box(lam_lo, lam_hi, beta_lo, beta_hi,
     lam_full = lam_domain[1] - lam_domain[0]
 
     # -- Lambda -------------------------------------------------------------
-    if is_wrapped:
-        # Wrapped: width = (lam_hi - lam_domain[0]) + (lam_domain[1] - lam_lo)
-        width = (lam_hi - lam_domain[0]) + (lam_domain[1] - lam_lo)
-    else:
-        width = lam_hi - lam_lo
-
-    new_width = width * dilation_factor
-    if new_width >= lam_full:
-        # Covers the whole circle -> no truncation in lambda
-        lam_lo_new = lam_domain[0]
-        lam_hi_new = lam_domain[1]
+    if not periodic:
+        # Truncated slice: bounded coordinate, expand + clamp, never wrap.
+        lam_centre = (lam_lo + lam_hi) / 2.0
+        lam_half = (lam_hi - lam_lo) / 2.0
+        lam_lo_new = max(lam_centre - dilation_factor * lam_half, lam_domain[0])
+        lam_hi_new = min(lam_centre + dilation_factor * lam_half, lam_domain[1])
         is_wrapped_new = False
     else:
-        expand = (new_width - width) / 2.0
         if is_wrapped:
-            lam_lo_new = lam_lo - expand
-            lam_hi_new = lam_hi + expand
-            # Check if we un-wrapped (gap closed)
-            if lam_lo_new <= lam_hi_new:
-                lam_lo_new = lam_domain[0]
-                lam_hi_new = lam_domain[1]
-                is_wrapped_new = False
-            else:
-                is_wrapped_new = True
+            # Wrapped: width = (lam_hi - lam_domain[0]) + (lam_domain[1] - lam_lo)
+            width = (lam_hi - lam_domain[0]) + (lam_domain[1] - lam_lo)
         else:
-            centre = (lam_lo + lam_hi) / 2.0
-            lam_lo_new = centre - new_width / 2.0
-            lam_hi_new = centre + new_width / 2.0
-            # Check if expansion caused wrapping
-            if lam_lo_new < lam_domain[0]:
-                # Wrap: shift the deficit to the other side
-                deficit = lam_domain[0] - lam_lo_new
-                lam_lo_new = lam_domain[1] - deficit
-                is_wrapped_new = True
-            elif lam_hi_new > lam_domain[1]:
-                surplus = lam_hi_new - lam_domain[1]
-                lam_hi_new = lam_domain[0] + surplus
-                is_wrapped_new = True
-                # Swap so convention is: lam_lo > lam_hi for wrapped
-                lam_lo_new, lam_hi_new = lam_lo_new, lam_hi_new
+            width = lam_hi - lam_lo
+
+        new_width = width * dilation_factor
+        if new_width >= lam_full:
+            # Covers the whole circle -> no truncation in lambda
+            lam_lo_new = lam_domain[0]
+            lam_hi_new = lam_domain[1]
+            is_wrapped_new = False
+        else:
+            expand = (new_width - width) / 2.0
+            if is_wrapped:
+                lam_lo_new = lam_lo - expand
+                lam_hi_new = lam_hi + expand
+                # Check if we un-wrapped (gap closed)
+                if lam_lo_new <= lam_hi_new:
+                    lam_lo_new = lam_domain[0]
+                    lam_hi_new = lam_domain[1]
+                    is_wrapped_new = False
+                else:
+                    is_wrapped_new = True
             else:
-                is_wrapped_new = False
+                centre = (lam_lo + lam_hi) / 2.0
+                lam_lo_new = centre - new_width / 2.0
+                lam_hi_new = centre + new_width / 2.0
+                # Check if expansion caused wrapping
+                if lam_lo_new < lam_domain[0]:
+                    # Wrap: shift the deficit to the other side
+                    deficit = lam_domain[0] - lam_lo_new
+                    lam_lo_new = lam_domain[1] - deficit
+                    is_wrapped_new = True
+                elif lam_hi_new > lam_domain[1]:
+                    surplus = lam_hi_new - lam_domain[1]
+                    lam_hi_new = lam_domain[0] + surplus
+                    is_wrapped_new = True
+                    # Swap so convention is: lam_lo > lam_hi for wrapped
+                    lam_lo_new, lam_hi_new = lam_lo_new, lam_hi_new
+                else:
+                    is_wrapped_new = False
 
     # -- Beta (clamped to [-1, 1]) ------------------------------------------
     beta_centre = (beta_lo + beta_hi) / 2.0
@@ -429,6 +470,7 @@ def get_main_mode_box(grid_lam, grid_beta, posterior_2d,
     lam_lo, lam_hi, beta_lo, beta_hi, is_wrapped = _dilate_box(
         lam_lo, lam_hi, beta_lo, beta_hi,
         dilation_factor, main['is_wrapped'],
+        periodic=result.get('periodic', True),
     )
 
     return {

@@ -2300,14 +2300,17 @@ def validate_marginals(marginals_config: dict):
                     )
                 all_indices.append(idx)
 
-def get_widest_interval_1d(model, dataloader, in_param_idx, out_param_idx, eps=0.0001):
+def get_widest_interval_1d(model, dataloader, in_param_idx, out_param_idx, eps=0.0001, dilation=1.0):
     """Get the widest credible interval for a 1D marginal posterior.
-    
+
     :param model: trained inference model
     :param dataloader: dataloader containing the observation
     :param in_param_idx: index of the input parameter
     :param out_param_idx: index of the output (logratio)
     :param eps: credible level (default 0.0001 for 99.99% interval)
+    :param dilation: widen the interval about its centre by this factor
+        (clipped to the grid/prior range); 1.0 leaves it unchanged. A small
+        safety margin (~1.1) offsets the network's mild overconfidence.
     :return: (widest_interval, norm1d, grid, inj_params) where widest_interval is [low, high]
     """
     logratios, inj_params, grid = get_logratios_grid(
@@ -2324,10 +2327,15 @@ def get_widest_interval_1d(model, dataloader, in_param_idx, out_param_idx, eps=0
     
     # Find credible interval using cumulative sum
     cumsum = np.cumsum(norm1d * dp)
-    idx_low = np.searchsorted(cumsum, eps / 2)
-    idx_high = np.searchsorted(cumsum, 1 - eps / 2)
-    
-    widest_interval = [float(grid[idx_low, 0]), float(grid[idx_high, 0])]
+    idx_low = int(np.searchsorted(cumsum, eps / 2))
+    idx_high = min(int(np.searchsorted(cumsum, 1 - eps / 2)), len(grid) - 1)
+
+    lo, hi = float(grid[idx_low, 0]), float(grid[idx_high, 0])
+    if dilation != 1.0:
+        c = 0.5 * (lo + hi); half = 0.5 * (hi - lo) * dilation
+        lo = max(c - half, float(grid[0, 0]))
+        hi = min(c + half, float(grid[-1, 0]))
+    widest_interval = [lo, hi]
     return widest_interval, norm1d, grid, inj_params
 
 def get_widest_box_2d(model, dataloader, in_param_idx, out_param_idx, ax_buffer=None, do_plot=False,

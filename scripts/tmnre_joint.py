@@ -50,10 +50,22 @@ from pembhb.callbacks import (
     PlotPosteriorCallback, VolumeRatioEarlyStopping,
     DifferentialEntropyEarlyStopping, PeriodicProgressCallback,
     WarmupEarlyStopping, PPKSTestEarlyStopping, ChainConvergenceMonitor,
-    compute_truncation_coverage,
+    compute_truncation_coverage, StreamReuseLogger,
 )
 from pembhb.utils import _ORDERED_PRIOR_KEYS as _PPKS_ORDERED_PRIOR_KEYS
+from pembhb.utils import eval_posterior_2d
+from pembhb.mask_truncation import (
+    eval_posterior_1d, analyse_posterior_1d, analyse_posterior_2d, MaskRejectSampler,
+    save_truncation, load_truncation, truth_violations, format_violations, _MASK_PERIOD_BY_NAME
+)
 from pembhb.diagnostics import AutoencoderDiagnosticsCallback
+
+# Physical period of the angular parameters, keyed by prior-key name (spin-basis
+# independent — only slots 2,3 change with basis). Used to gate periodic mask
+# handling: analyse_posterior_* only treats an axis as periodic when its grid
+# still spans the full period (an already-truncated interior window is not).
+def _envelope( intervals):
+    return [min(lo for lo, _ in intervals), max(hi for _, hi in intervals)]
 
 def get_timestamp():
     return datetime.now().strftime("%Y/%m/%d")
@@ -220,8 +232,6 @@ def _discover_last_round(run_name, data_root_dir):
     return round_idx
 
 
-
-
 # -------------------------------------------------------------------------
 # SequentialTrainerJoint  (mirrors SequentialTrainer from tmnre.py)
 # -------------------------------------------------------------------------
@@ -294,11 +304,6 @@ class SequentialTrainerJoint:
                 td_params=obs_td_params,
             ),
         )
-        self.logMchirp_lower = [datagen_conf["prior"]["logMchirp"][0]]
-        self.logMchirp_upper = [datagen_conf["prior"]["logMchirp"][1]]
-        self.q_lower = [datagen_conf["prior"]["q"][0]]
-        self.q_upper = [datagen_conf["prior"]["q"][1]]
-        self._setup_plot()
 
         # ---- baseline model (optional, skipped on resume) ---------------
         if not resume and self.train_conf["baseline_model"]["use"]:
@@ -314,7 +319,8 @@ class SequentialTrainerJoint:
                     if len(marginal) == 1:
                         widest_interval, _, _, _ = get_widest_interval_1d(
                             self.model, self.dataloader_obs,
-                            in_param_idx=marginal[0], out_param_idx=out_idx, eps=1e-4,
+                            in_param_idx=marginal[0], out_param_idx=out_idx,
+                            eps=float(self.train_conf.get("truncation_veto", {}).get("eps_1d", 1e-4)),
                         )
                         param_name = prior_keys[marginal[0]]
                         self.datagen_conf["prior"][param_name] = widest_interval
@@ -386,57 +392,77 @@ class SequentialTrainerJoint:
                     DATA_ROOT_DIR, TIME_OF_EXECUTION, "chain_convergence_state.yaml"),
                 tau_gate=tuple(_tg) if _tg else None,
                 require_not_threshold=cc_conf.get("require_not_threshold", True),
+                log_path=os.path.join(
+                    DATA_ROOT_DIR, TIME_OF_EXECUTION, "chain_convergence.log"),
             )
             print(f"[ChainConv] enabled: eps_nats={cc_conf.get('eps_nats', 0.05)}, "
                   f"patience={cc_conf.get('patience', 2)}, tau_gate={_tg}")
 
-    # -----------------------------------------------------------------
-    # Plot helpers (unchanged from tmnre.py)
-    # -----------------------------------------------------------------
 
-    def _setup_plot(self):
-        self.fig, self.axes = plt.subplots(1, 2, figsize=(12, 6))
-        for ax, title, ylabel in zip(
-            self.axes,
-            ["logMchirp Prior Bounds", "q Prior Bounds"],
-            ["logMchirp", "q"],
-        ):
-            ax.set_title(title)
-            ax.set_xlabel("Iteration")
-            ax.set_ylabel(ylabel)
+    # ------------------------
+    # Truncation helpers
 
-    def _plot_updated_prior_bounds(self, updated_prior):
-        self.logMchirp_lower.append(updated_prior["logMchirp"][0])
-        self.logMchirp_upper.append(updated_prior["logMchirp"][1])
-        self.q_lower.append(updated_prior["q"][0])
-        self.q_upper.append(updated_prior["q"][1])
-        for ax in self.axes:
-            ax.cla()
-        self.axes[0].set_title("logMchirp Prior Bounds")
-        self.axes[0].set_xlabel("Iteration")
-        self.axes[0].set_ylabel("logMchirp")
-        self.axes[1].set_title("q Prior Bounds")
-        self.axes[1].set_xlabel("Iteration")
-        self.axes[1].set_ylabel("q")
-        self.axes[0].plot(range(len(self.logMchirp_lower)), self.logMchirp_lower, label="Lower Bound", color="blue")
-        self.axes[0].plot(range(len(self.logMchirp_upper)), self.logMchirp_upper, label="Upper Bound", color="orange")
-        self.axes[1].plot(range(len(self.q_lower)), self.q_lower, label="Lower Bound", color="blue")
-        self.axes[1].plot(range(len(self.q_upper)), self.q_upper, label="Upper Bound", color="orange")
-        self.axes[0].legend()
-        self.axes[1].legend()
-        self.fig.tight_layout()
-        self.fig.savefig(
-            os.path.join(ROOT_DIR, "plots", TIME_OF_EXECUTION,
-                         f"prior_bounds_iteration_{len(self.logMchirp_lower)-1}.png")
-        )
+    def _mask_truncate_marginal(self, marginal_key, out_idx, prior_keys,
+                            intervals_1d, masks_2d, trunc_conf):
+
+        if len(marginal_key)==1:
+            param_name = prior_keys[marginal_key[0]]
+            grid, norm1d, _ = eval_posterior_1d(
+                self.model, self.dataloader_obs,
+                in_param_idx=marginal_key[0], out_param_idx=out_idx,
+                ngrid_points=trunc_conf.get("ngrid_1d", 100))
+
+            res = analyse_posterior_1d(
+                grid, norm1d,
+                credible_level=float(trunc_conf.get("credible_level_1d", 0.997)),
+                dilation_factor=float(trunc_conf.get("dilation_1d", 1.2)),
+                period=_MASK_PERIOD_BY_NAME.get(prior_keys[marginal_key[0]]))
+            
+            intervals = res["intervals"]
+            intervals_1d[marginal_key[0]] = intervals
+            widest_interval = _envelope(intervals)
+            tmp = copy.deepcopy(self.datagen_conf["prior"])
+            tmp[param_name] = [widest_interval[0], widest_interval[1]]
+            self.datagen_conf["prior"] = tmp
+
+        elif len(marginal_key)==2:
+            inj1, inj2 = marginal_key 
+            norm2d, _, gx, gy, _, _ = utils.eval_posterior_2d(
+                self.model, self.dataloader_obs,
+                in_param_idx=marginal_key, out_param_idx=out_idx,
+                ngrid_points=trunc_conf.get("ngrid_2d", 100))
+
+            labels, comps, grid_x, grid_y = analyse_posterior_2d(
+                gx, gy, norm2d,
+                period=(_MASK_PERIOD_BY_NAME.get(prior_keys[marginal_key[0]]),
+                        _MASK_PERIOD_BY_NAME.get(prior_keys[marginal_key[1]])),
+                credible_level=float(trunc_conf.get("credible_level_2d", 0.997)),
+                dilation_factor=float(trunc_conf.get("dilation_2d", 1.2)))
+            masks_2d.append({"idx": tuple(marginal_key), "labels": labels,
+                            "grid_x": grid_x, "grid_y": grid_y, "components": comps})
+            intervals_x =[]
+            intervals_y =[]
+            for k in comps:
+                intervals_x.extend(comps[k]["x_intervals"])
+                intervals_y.extend(comps[k]["y_intervals"])
+            envelope_x = _envelope(intervals_x)
+            envelope_y = _envelope(intervals_y)
+
+            widest_box = [ envelope_x[0], envelope_x[1], envelope_y[0], envelope_y[1]]
+            tmp = copy.deepcopy(self.datagen_conf["prior"])
+            tmp[prior_keys[inj1]] = [widest_box[0], widest_box[1]]
+            tmp[prior_keys[inj2]] = [widest_box[2], widest_box[3]]
+            self.datagen_conf["prior"] = tmp
+        else: 
+            raise ValueError (f"marginal_key has len {len(marginal_key)} but 1 or 2 was expected.")
 
     # -----------------------------------------------------------------
     # Data generation (same as SequentialTrainer)
     # -----------------------------------------------------------------
 
-    def _generate_data(self, round_idx, sampler_init_kwargs):
+    def _generate_data(self, round_idx, sampler_init_kwargs, sampler=None):
         if self.train_conf.get("streaming", {}).get("enabled", False):
-            self._setup_streaming(round_idx, sampler_init_kwargs)
+            self._setup_streaming(round_idx, sampler_init_kwargs, sampler=sampler)
             return
         fname_base = f"simulation_round_{round_idx}"
         fname_h5 = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION, f"{fname_base}.h5")
@@ -471,9 +497,10 @@ class SequentialTrainerJoint:
                 seed=round_seed,
                 n_freq_bins=wp.get("n_freq_bins", 4096),
                 freq_spacing=wp.get("freq_spacing", "linear"),
+                sampler=sampler,
             )
         else:
-            sim = MBHBSimulatorFD_TD(self.datagen_conf, sampler_init_kwargs=sampler_init_kwargs, seed=round_seed)
+            sim = MBHBSimulatorFD_TD(self.datagen_conf, sampler_init_kwargs=sampler_init_kwargs, seed=round_seed, sampler=sampler)
         N_simulations = 50000
         batch_size_generation = 100
         if not os.path.exists(fname_h5):
@@ -519,7 +546,7 @@ class SequentialTrainerJoint:
     # Streaming data generation (producer thread + GPU ring buffer)
     # -----------------------------------------------------------------
 
-    def _setup_streaming(self, round_idx, sampler_init_kwargs):
+    def _setup_streaming(self, round_idx, sampler_init_kwargs, sampler=None):
         """Round-start setup for the streaming path: build the simulator for
         this round's box, allocate + seed-fill the GPU ring buffer, generate a
         frozen validation pool, start the background producer, and expose a
@@ -551,6 +578,7 @@ class SequentialTrainerJoint:
             self.datagen_conf, sampler_init_kwargs=sampler_init_kwargs, seed=round_seed,
             n_freq_bins=wp.get("n_freq_bins", 4096),
             freq_spacing=wp.get("freq_spacing", "linear"),
+            sampler=sampler,
         )
 
         # Discover per-sample shapes from a tiny probe.
@@ -558,12 +586,29 @@ class SequentialTrainerJoint:
         C, F = probe["wave_fd"].shape[1], probe["wave_fd"].shape[2]
         n_params = probe["parameters"].shape[0]
 
+        # Release the PREVIOUS round's ring before allocating this one.
+        # _train_joint calls ring.stop(), but that only signals the producer
+        # thread -- the buffers stay alive as long as _ring / _producer /
+        # data_module / test_dataloader reference them (and through the
+        # data_module, the old simulator's bbhx workspace too). Without this,
+        # every round leaks a full ring: n_buffers * buffer_size * C * F
+        # complex samples, ~6.3 GiB at 3 x 35000 x 2 x 4096.
+        if getattr(self, "_ring", None) is not None:
+            import gc
+            self.test_dataloader = None
+            self.data_module = None
+            self._producer = None
+            self._ring = None
+            gc.collect()
+            torch.cuda.empty_cache()
+
         ring = RingBuffer(
             n_buffers=n_buffers, buffer_size=M,
             sample_shapes={"wave_fd": (C, F), "params": (n_params,)},
             dtypes={"wave_fd": get_torch_complex_dtype(), "params": get_torch_dtype()},
             device=device,
-            host_fields=("params",),  # keep params on CPU (matches HDF5 path)
+            host_fields=("params",),  # keep params on CPU (matches HDF5 path),
+            reuse_threshold=sconf.get("reuse_threshold", 1)
         )
         producer = Producer(ring, sim, gen_batch_size=int(sconf.get("gen_batch_size", 250)))
         producer.seed_fill_all()  # blocking: give the trainer data on step 0
@@ -868,16 +913,31 @@ class SequentialTrainerJoint:
         print(f"[Resume] Model and autoencoder restored from round {last_round}.")
 
         prior_path = os.path.join(DATA_ROOT_DIR, run_name, f"prior_after_round_{last_round}.yaml")
+        mask_path = os.path.join(DATA_ROOT_DIR, run_name, f"truncation_round_{last_round}.npz")
         if os.path.exists(prior_path):
-            with open(prior_path) as _f:
-                saved = _yaml.safe_load(_f)
+            # Raises if the round was saved in mask mode but the .npz is gone:
+            # resuming from the bounding box alone would silently widen the
+            # proposal relative to the round being continued.
+            saved = load_truncation(prior_path, mask_path)
             self.datagen_conf["prior"] = saved["prior"]
             print(f"[Resume] Prior restored from {prior_path}: {self.datagen_conf['prior']}")
+            if saved["mode"] == "mask":
+                self._mask_sampler = MaskRejectSampler(
+                    prior_bounds=saved["prior"],
+                    intervals_1d=saved["intervals_1d"],
+                    masks_2d=saved["masks_2d"],
+                    # Same derivation as run(), so a resumed run reproduces the
+                    # proposal stream of an uninterrupted one.
+                    rng=np.random.default_rng([self.seed, last_round]),
+                    dist_uniform_in_volume=self.datagen_conf.get(
+                        "prior_dist_volumetric", True),
+                    spin_param_basis=self.datagen_conf.get(
+                        "spin_param_basis", "chi1chi2"),
+                )
+                print(f"[Resume] Mask truncation restored: "
+                      f"{len(saved['intervals_1d'])} 1D interval set(s), "
+                      f"{len(saved['masks_2d'])} 2D mask(s) from {mask_path}")
             # Re-initialise plot tracking lists from the restored prior
-            self.logMchirp_lower = [self.datagen_conf["prior"]["logMchirp"][0]]
-            self.logMchirp_upper = [self.datagen_conf["prior"]["logMchirp"][1]]
-            self.q_lower = [self.datagen_conf["prior"]["q"][0]]
-            self.q_upper = [self.datagen_conf["prior"]["q"][1]]
         else:
             print(f"[Resume] Warning: {prior_path} not found; using prior from config. "
                   f"First resumed round may use a slightly wider prior.")
@@ -1113,10 +1173,19 @@ class SequentialTrainerJoint:
         ``truncation_veto.n_coverage`` held-out val-pool samples and, per marginal,
         count how many ground truths fall inside their own credible box (same box
         the truncation builds). Returns ``{marginal_tuple: (coverage, n_in, n_tot)}``
-        or ``{}`` when the veto is disabled.
+        or ``{}`` when neither enforcement nor logging is requested.
+
+        ``enabled`` and ``log_coverage`` are independent: ``log_coverage`` computes
+        and prints the numbers without gating any truncation (enforcement is gated
+        separately on ``veto_enabled`` in ``run``), so a run can be monitored
+        before deciding whether to switch the veto on.
+
+        NB in mask mode these numbers still describe the *bounding box*, not the
+        mask that is actually sampled -- i.e. an upper bound on true coverage.
         """
         veto_conf = self.train_conf.get("truncation_veto", {})
-        if not veto_conf.get("enabled", False):
+        if not (veto_conf.get("enabled", False)
+                or veto_conf.get("log_coverage", False)):
             return {}
         from torch.utils.data import Subset, DataLoader as _DL
         test_ds = self.data_module.test
@@ -1144,6 +1213,7 @@ class SequentialTrainerJoint:
                 eps_1d=float(veto_conf.get("eps_1d", 1e-4)),
                 sky_credible_level=float(veto_conf.get("sky_credible_level", 0.999)),
                 sky_dilation=float(veto_conf.get("sky_dilation", 1.1)),
+                dilation_1d=float(veto_conf.get("dilation_1d", 1.0)),
             )
         finally:
             if was_training:
@@ -1392,6 +1462,14 @@ class SequentialTrainerJoint:
             warmup_epochs=ae_warmup_epochs,
             call_every_n_steps=call_every_n_steps,
             warmup_steps=_warmup_steps_for(ae_warmup_epochs),
+            box_dilation_1d=float(
+                self.train_conf.get("truncation_veto", {}).get("dilation_1d", 1.0)),
+            eps_1d=float(
+                self.train_conf.get("truncation_veto", {}).get("eps_1d", 1e-4)),
+            sky_credible_level=float(
+                self.train_conf.get("truncation_veto", {}).get("sky_credible_level", 0.999)),
+            sky_dilation=float(
+                self.train_conf.get("truncation_veto", {}).get("sky_dilation", 1.1)),
         )
         if ae_warmup_epochs > 0:
             print(f"[PlotPosterior] skipping first {ae_warmup_epochs} epochs (AE warmup)")
@@ -1406,6 +1484,12 @@ class SequentialTrainerJoint:
         # encoder is an actual DenoisingAutoencoder (has .encoder.conv etc.).
         if ds_type not in ("ChannelizedMLP", "MarginalEncoder"):
             callbacks_list.insert(3, AutoencoderDiagnosticsCallback())
+
+        # Streaming-only: per-epoch reuse accounting (examples vs distinct sims).
+        # Guarded on config — the HDF5 datamodule has no .ring.
+        if self.train_conf.get("streaming", {}).get("enabled", False):
+            callbacks_list.append(StreamReuseLogger(
+                summary_path=os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION, "round_summary.log")))
 
         # Joint-only knobs live under joint_training: (fall back to top level
         # for old configs where they were at the root).
@@ -1683,8 +1767,8 @@ class SequentialTrainerJoint:
     # Round  (data generation + joint training)
     # -----------------------------------------------------------------
 
-    def round(self, idx, sampler_init_kwargs):
-        self._generate_data(round_idx=idx, sampler_init_kwargs=sampler_init_kwargs)
+    def round(self, idx, sampler_init_kwargs, sampler=None):
+        self._generate_data(round_idx=idx, sampler_init_kwargs=sampler_init_kwargs, sampler=sampler)
         self._train_joint(round_idx=idx)
 
     # -----------------------------------------------------------------
@@ -1719,7 +1803,10 @@ class SequentialTrainerJoint:
                                   "dist_uniform_in_volume": dist_uniform_in_volume,
                                   "spin_param_basis": spin_param_basis}
 
-            self.round(idx=i, sampler_init_kwargs=sampler_kwargs)
+            # In mask mode the previous round left a MaskRejectSampler; it
+            # overrides the uniform draw for the truncated dimensions.
+            self.round(idx=i, sampler_init_kwargs=sampler_kwargs,
+                       sampler=getattr(self, "_mask_sampler", None))
 
             # ---- Update prior from posterior contours -------------------
             if self.train_conf["device"] == "cuda":
@@ -1739,9 +1826,37 @@ class SequentialTrainerJoint:
             veto_enabled = veto_conf.get("enabled", False)
             min_cov = float(veto_conf.get("min_coverage", 0.95))
             vetoed_this_round = []   # marginals whose truncation was skipped
+            # Per-marginal truncation gate: only narrow the prior for marginals
+            # whose round-final posterior/prior ratio actually reached the 0.5
+            # threshold. The `should_stop` from VolumeRatioEarlyStopping ends the
+            # round as soon as the first marginal crosses, but the others keep
+            # their (wide) prior and continue training in the next round.
+            trunc_threshold = float(self.train_conf.get("volume_ratio_early_stop", {}).get(
+                "min_ratio_threshold", 0.5))
+            trunc_keys = {k for k, r in self._last_volume_ratios.items()
+                          if r <= trunc_threshold}
+            # Truncation mode: "rectangle" (legacy widest_boxes) or "mask"
+            # (HPD level-set + rejection sampling). Default keeps old behaviour.
+            trunc_conf = self.train_conf.get("truncation", {})
+            truncation_mode = trunc_conf.get("mode", "rectangle")
+            if truncation_mode not in ("rectangle", "mask"):
+                raise ValueError(f"truncation.mode must be 'rectangle' or 'mask', "
+                                 f"got {truncation_mode!r}")
+            # Accumulated by _mask_truncate_marginal; consumed after the loop by
+            # the sampler, save_truncation and truth_violations.
+            intervals_1d, masks_2d = {}, []
             for key, marginal_list in self.train_conf["marginals"].items():
                 for marginal in marginal_list:
                     marginal_key = tuple(marginal)
+
+                    # if marginal_key not in trunc_keys:
+                    #     name = "-".join(prior_keys[j] for j in marginal_key)
+                    #     ratio = self._last_volume_ratios.get(marginal_key, float("nan"))
+                    #     print(f"[Trunc] round {i}: keeping prior for {name} "
+                    #           f"(vol_ratio {ratio:.4f} > {trunc_threshold}); "
+                    #           f"not truncatable yet.", flush=True)
+                    #     out_idx += 1
+                    #     continue
 
                     cov_entry = self._last_coverage.get(marginal_key)
                     if (veto_enabled and cov_entry is not None
@@ -1760,7 +1875,17 @@ class SequentialTrainerJoint:
                         out_idx += 1
                         continue
 
-                    if len(marginal) == 1:
+                    if truncation_mode == "mask":
+                        # Mask path subsumes the sky special case: the sky pair
+                        # is just a 2D marginal with lambda periodic.
+                        name = "-".join(prior_keys[j] for j in marginal_key)
+                        print(f"[Trunc/mask] round {i}: {name} (head {out_idx}) ...",
+                              flush=True)
+                        self._mask_truncate_marginal(
+                            marginal_key, out_idx, prior_keys,
+                            intervals_1d, masks_2d, trunc_conf)
+
+                    elif len(marginal) == 1:
                         param_name = prior_keys[marginal[0]]
                         if hasattr(self.model, "widest_boxes") and marginal_key in self.model.widest_boxes:
                             widest_interval = self.model.widest_boxes[marginal_key]
@@ -1779,7 +1904,8 @@ class SequentialTrainerJoint:
                                 self.model, self.dataloader_obs, out_param_idx=out_idx,
                                 datagen_conf=self.datagen_conf,
                                 mode="rectangle",
-                                credible_level=0.999, dilation_factor=1.1,
+                                credible_level=float(veto_conf.get("sky_credible_level", 0.999)),
+                                dilation_factor=float(veto_conf.get("sky_dilation", 1.1)),
                             )
                         elif hasattr(self.model, "widest_boxes") and marginal_key in self.model.widest_boxes: 
                             print(f"Updating prior for 2D marginal {marginal_key} using widest box from model ...")
@@ -1794,7 +1920,6 @@ class SequentialTrainerJoint:
                     out_idx += 1
 
             print(f"Updated prior after round {i}: {self.datagen_conf['prior']}")
-            self._plot_updated_prior_bounds(self.datagen_conf["prior"])
 
             # Log which marginals had their truncation vetoed this round (empty
             # list when the veto is off or nothing was vetoed) for review.
@@ -1814,15 +1939,37 @@ class SequentialTrainerJoint:
                         "vetoed": vetoed_this_round,
                     }, _f)
 
-            # Persist the updated prior so a resumed run can start from
-            # the correct (narrowed) prior rather than the round's data prior.
-            import yaml as _yaml
+            # Build the proposal for round i+1. In mask mode the masks -- not
+            # the bounding box -- define it, so the sampler is stashed on self
+            # and handed to the next round's simulator.
+            self._mask_sampler = None
+            if truncation_mode == "mask" and (intervals_1d or masks_2d):
+                self._mask_sampler = MaskRejectSampler(
+                    prior_bounds=self.datagen_conf["prior"],
+                    intervals_1d=intervals_1d,
+                    masks_2d=masks_2d,
+                    # Injecting a sampler bypasses the simulator's own seeded
+                    # rng, so seed it here or --seed stops governing the
+                    # proposal. [seed, round] keeps it distinct from the
+                    # simulator's noise stream (default_rng(seed + round)).
+                    rng=np.random.default_rng([self.seed, i]),
+                    dist_uniform_in_volume=self.datagen_conf.get(
+                        "prior_dist_volumetric", True),
+                    spin_param_basis=self.datagen_conf.get(
+                        "spin_param_basis", "chi1chi2"),
+                )
+                print(f"[Trunc/mask] round {i}: MaskRejectSampler with "
+                      f"{len(intervals_1d)} 1D interval set(s), "
+                      f"{len(masks_2d)} 2D mask(s)", flush=True)
+
+            # Persist the truncation so a resumed run starts from the correct
+            # (narrowed) proposal rather than the round's data prior. The mask
+            # is the source of truth; the box is its envelope, kept for plots.
             prior_save_path = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION, f"prior_after_round_{i}.yaml")
-            os.makedirs(os.path.dirname(prior_save_path), exist_ok=True)
-            #this line exist because numpy stuff can't be dumped into yaml
-            prior_plain = {k: [float(v[0]), float(v[1])] for k, v in self.datagen_conf["prior"].items()}
-            with open(prior_save_path, "w") as _f:
-                _yaml.safe_dump({"prior": prior_plain}, _f)
+            mask_save_path = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION, f"truncation_round_{i}.npz")
+            save_truncation(prior_save_path, mask_save_path,
+                            self.datagen_conf["prior"], intervals_1d, masks_2d,
+                            mode=truncation_mode)
 
             # ---- Sanity check: does the new window still contain the truth? --
             # The proposal for round i+1 is self.datagen_conf["prior"].  If the
@@ -1843,23 +1990,19 @@ class SequentialTrainerJoint:
             # prior dict (which is keyed by the run's basis).
             obs_keys = utils.ordered_prior_keys(
                 getattr(self.dataset_observation.dataset, "spin_param_basis", "chi1chi2"))
-            violations = []
-            for idx in sorted(truncated_idxs):
-                param_name = obs_keys[idx]
-                lo, hi = self.datagen_conf["prior"][param_name]
-                true_val = float(true_params[idx])
-                if not (lo <= true_val <= hi):
-                    violations.append((param_name, true_val, float(lo), float(hi)))
+            # Masked parameters are checked against the mask, not its bounding
+            # box: a truth sitting in a gap between components passes the box
+            # test while the sampler can never propose it.
+            violations = truth_violations(
+                true_params, self.datagen_conf["prior"], intervals_1d, masks_2d,
+                obs_keys, check_idxs=truncated_idxs)
 
             if violations:
-                detail = "\n".join(
-                    f"    {name}: true={true_val:.6g} outside [{lo:.6g}, {hi:.6g}]"
-                    for name, true_val, lo, hi in violations
-                )
                 raise ValueError(
-                    f"[Truncation] Round {i} proposal window misses the true value "
-                    f"for {len(violations)} parameter(s):\n{detail}\n"
-                    f"The truncated prior (saved to {prior_save_path}) excludes the "
+                    f"[Truncation] Round {i} proposal misses the true value "
+                    f"for {len(violations)} marginal(s):\n"
+                    f"{format_violations(violations)}\n"
+                    f"The truncation (saved to {prior_save_path}) excludes the "
                     "observation's true parameters; subsequent rounds cannot recover them."
                 )
 
@@ -1875,19 +2018,20 @@ class SequentialTrainerJoint:
                 )
                 n_conv = len(self.chain_monitor.converged_at)
                 n_tot = len(self._last_marginal_entropies)
-                print(f"[ChainConv] round {i}: stopped_via='{self._last_stopped_via}', "
-                      f"median_tau={self._last_median_tau}, "
-                      f"converged {n_conv}/{n_tot} marginals")
+                self.chain_monitor.log(
+                    f"[ChainConv] round {i}: stopped_via='{self._last_stopped_via}', "
+                    f"median_tau={self._last_median_tau}, "
+                    f"converged {n_conv}/{n_tot} marginals")
                 if stop_chain:
-                    print(f"[ChainConv] STOP chain after round {i}: "
-                          f"{self.chain_monitor.stop_reason}")
-                    print(self.chain_monitor.summary())
+                    self.chain_monitor.log(f"[ChainConv] STOP chain after round {i}: "
+                                           f"{self.chain_monitor.stop_reason}")
+                    self.chain_monitor.log(self.chain_monitor.summary())
                     break
 
         # Per-marginal convergence record at end of the campaign (converged or
         # simply out of rounds).
         if self.chain_monitor is not None:
-            print(self.chain_monitor.summary())
+            self.chain_monitor.log(self.chain_monitor.summary())
 
 
 # -------------------------------------------------------------------------
