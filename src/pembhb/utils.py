@@ -44,6 +44,44 @@ _SPIN_KEYS_BY_BASIS = {
 }
 
 
+def _parse_period_value(value):
+    """Coerce a config period into radians.
+
+    Accepts a plain number (already in radians) or a small string expression
+    in terms of ``pi`` (e.g. ``"2*pi"``, ``"pi"``, ``"pi/2"``) so YAML stays
+    readable. ``psi`` has period ``pi``; angular phases have period ``2*pi``.
+    """
+    if isinstance(value, str):
+        return float(eval(value, {"__builtins__": {}}, {"pi": np.pi}))
+    return float(value)
+
+
+def parse_periodic_bc_spec(spec):
+    """Normalise a ``periodic_bc_params`` config value.
+
+    Two accepted forms:
+      * list/tuple of int indices — every index has period ``2*pi`` (angular
+        frequency ``k = 1``). This is the legacy form, kept for backward compat.
+      * dict ``{index: period}`` — per-index period; the sin/cos embedding uses
+        ``sin(k*theta), cos(k*theta)`` with ``k = 2*pi / period``. Use this to
+        express e.g. ``psi`` (period ``pi`` → ``k = 2``).
+
+    Returns ``(indices, k_by_index)`` where ``indices`` is a list[int] in config
+    order and ``k_by_index`` maps each index to its angular frequency ``k``.
+    """
+    if spec is None:
+        return [], {}
+    if isinstance(spec, dict):
+        indices = [int(i) for i in spec]
+        k_by_index = {
+            int(i): 2.0 * np.pi / _parse_period_value(p) for i, p in spec.items()
+        }
+    else:
+        indices = [int(i) for i in spec]
+        k_by_index = {i: 1.0 for i in indices}
+    return indices, k_by_index
+
+
 def ordered_prior_keys(basis: str = "chi1chi2"):
     """Return the 11 parameter names for a given spin sampling *basis*.
 

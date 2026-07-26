@@ -15,7 +15,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 
 from pembhb import get_torch_complex_dtype, get_torch_dtype
-from pembhb.utils import mbhb_collate_fn
+from pembhb.utils import mbhb_collate_fn, parse_periodic_bc_spec
 
 
 class RingBuffer:
@@ -456,10 +456,11 @@ class StreamingDataModule(L.LightningDataModule):
         return p.mean(dim=0), p.std(dim=0)
 
     def get_sincos_mean_std(self, periodic_bc_params):
+        indices, k_by_index = parse_periodic_bc_spec(periodic_bc_params)
         p = self._params_pool
         sincos_mean, sincos_std = [], []
-        for idx in periodic_bc_params:
-            col = p[:, idx]
+        for idx in indices:
+            col = k_by_index[idx] * p[:, idx]
             s, c = torch.sin(col), torch.cos(col)
             sincos_mean.extend([s.mean().item(), c.mean().item()])
             sincos_std.extend([s.std().item(), c.std().item()])

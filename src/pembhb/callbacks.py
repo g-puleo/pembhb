@@ -26,9 +26,19 @@ from torch.utils.data import DataLoader
 from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from pembhb.sky_truncation import get_main_mode_box
+from pembhb.regions import (
+    Region, region_from_equal_tailed, region_from_main_mode, region_from_hpd,
+    prev_keep_mask,
+)
+from pembhb.mask_truncation import _MASK_PERIOD_BY_NAME
 from datetime import datetime, timedelta
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+
+# Single-colour map for the §2 "suppressed region" wash in 2D posterior plots.
+# NaN cells (the kept region) render transparent, so only ~keep is tinted.
+_SUPPRESSED_CMAP = ListedColormap(["red"])
 
 
 class StreamReuseLogger(Callback):
@@ -203,8 +213,17 @@ class PlotPosteriorCallback(Callback):
                 credible_level_1d: float = 0.997,
                 dilation_1d: float = 1.2,
                 credible_level_2d: float = 0.997,
-                dilation_2d: float = 1.2):
+                dilation_2d: float = 1.2,
+                prev_accepted: dict = None,
+                zero_policy: str = "off"):
         self.epochs_elapsed = 0
+        # §2 — the previous round's accepted set per marginal ({marginal_key:
+        # {"kind": "1d"/"2d", ...}}) and the active zeroing policy. When set (and
+        # not "off"), the posterior plots shade the region OUTSIDE the previous
+        # mask, where _mask_truncate_marginal zeroes / down-weights the density
+        # before this round's HPD analysis (see pembhb.regions.apply_prev_mask).
+        self.prev_accepted = prev_accepted or {}
+        self.zero_policy = str(zero_policy)
         # Box-construction params — single source of truth is the run's
         # truncation_veto config, so the boxes written into widest_boxes match
         # the ones the coverage veto measures (see _compute_round_coverage).
@@ -212,6 +231,11 @@ class PlotPosteriorCallback(Callback):
         self.eps_1d = eps_1d
         self.sky_credible_level = sky_credible_level
         self.sky_dilation = sky_dilation
+        # HPD level + dilation used to build the 2D posterior region for the
+        # volume ratio — matched to the truncation (analyse_posterior_2d) so the
+        # numerator is the SAME accepted set the sampler will draw from next round.
+        self.credible_level_2d = credible_level_2d
+        self.dilation_2d = dilation_2d
         self.call_every_n_epochs = call_every_n_epochs
         # Opt-in global-step cadence; None -> unchanged epoch behaviour.
         self._step = _StepCadence(call_every_n_steps)
@@ -231,149 +255,80 @@ class PlotPosteriorCallback(Callback):
         # Storage for differential entropy diagnostics
         self.differential_entropies = {}
     
-    def _compute_posterior_volume_2d(self, widest_box, is_wrapped):
-        """
-        Compute the area/volume of the posterior from the widest contour box.
-        
-        Parameters:
-        -----------
-        widest_box : tuple
-            The bounding box of the 99.99% contour.
-            Currently: (x_min, x_max, y_min, y_max) for axis-aligned boxes.
-            
-        is_wrapped : bool
-            Whether the posterior is wrapped around the extrema of the lambda parameter space, which is periodic in the boundary.
-            
-        Returns:
-        --------
-        float
-            Area enclosed by the posterior contour.
-            
-        Notes:
-        ------
-        FUTURE EXTENSION FOR TILTED BOXES:
-        - If posterior contours become non-axis-aligned, widest_box format may change
-          to a list of vertices [(x1,y1), (x2,y2), ...]
-        - In that case, use Shoelace formula or similar for polygon area:
-          area = 0.5 * abs(sum(x[i]*y[i+1] - x[i+1]*y[i] for i in range(n)))
-        - Consider using shapely.geometry.Polygon for robust area calculation
-        """
-        # Current implementation: axis-aligned box
-        # widest_box = (x_min, x_max, y_min, y_max)
-        if is_wrapped: 
-            lam_width = 2*np.pi - widest_box[0] + widest_box[1]
-            posterior_area = lam_width * (widest_box[3] - widest_box[2])
-        else: 
-            posterior_area = (widest_box[1] - widest_box[0]) * (widest_box[3] - widest_box[2])
-        return posterior_area
-    
-    def _compute_prior_volume_2d(self, pl_module, in_param_idx):
-        """
-        Compute the area/volume of the prior for a 2D marginal.
-        
-        Parameters:
-        -----------
-        pl_module : LightningModule
-            The model containing prior information in hparams.
-        in_param_idx : tuple
-            Indices of the two parameters defining the 2D marginal.
-            
-        Returns:
-        --------
-        float
-            Area of the prior region.
-            
-        Notes:
-        ------
-        **MODIFY THIS METHOD WHEN SWITCHING TO TILTED BOUNDING BOXES**
-        
-        Current implementation assumes axis-aligned rectangular priors.
-        Prior bounds are stored as:
-            prior_dict[param_name] = [min_value, max_value]
-        
-        For tilted/rotated bounding boxes:
-        1. Prior specification will change (e.g., vertices, rotation matrix, etc.)
-        2. Access prior from: pl_module.hparams["dataset_info"]["conf"]["prior"]
-        3. Compute area based on new representation:
-           - If vertices: use Shoelace formula or shapely.geometry.Polygon
-           - If rotation + bounds: compute area of rotated rectangle
-           - Example with vertices:
-             ```python
-             vertices = prior_dict[marginal_key]  # [(x1,y1), (x2,y2), ...]
-             from shapely.geometry import Polygon
-             prior_area = Polygon(vertices).area
-             ```
-        4. Ensure consistency with sampler_init_kwargs format in sampler.py
-        
-        Potential issues to address:
-        - Normalization: If grid evaluation doesn't align with tilted prior,
-          posterior normalization may be affected
-        - Grid coverage: Axis-aligned grids may inefficiently cover tilted regions
-        - Coordinate transforms: May need to transform between rotated and
-          canonical coordinate systems
-        """
-        # Current implementation: axis-aligned rectangular prior
-        # Use the actual sampling prior (sampler_init_kwargs) as the
-        # authoritative source.  Fall back to conf["prior"] for backward compat.
-        _sik = pl_module.hparams["dataset_info"].get("sampler_init_kwargs", {})
-        if "prior_bounds" in _sik:
-            prior_dict = _sik["prior_bounds"]
-        else:
-            prior_dict = pl_module.hparams["dataset_info"]["conf"]["prior"]
-        
-        # Get bounds for each parameter
-        keys = _param_keys(pl_module)
-        param_name_0 = keys[in_param_idx[0]]
-        param_name_1 = keys[in_param_idx[1]]
-        
-        prior_bounds_0 = prior_dict[param_name_0]
-        prior_bounds_1 = prior_dict[param_name_1]
-        
-        # Compute area as product of widths
-        prior_area = (prior_bounds_0[1] - prior_bounds_0[0]) * (prior_bounds_1[1] - prior_bounds_1[0])
-        
-        return prior_area
+    # Posterior/prior volume ratios are now `Region.volume_fraction()` — the
+    # posterior grid spans exactly the trained prior box, so the accepted-pixel
+    # fraction *is* the posterior/prior ratio, with one implementation for 1D and
+    # 2D (rectangle or mask). The four `_compute_*_volume_*` helpers this replaced
+    # are gone; see `pembhb.regions`.
 
-    def _compute_posterior_volume_1d(self, widest_interval):
-        """Compute the width of the posterior credible interval for a 1D marginal.
-        
-        Parameters:
-        -----------
-        widest_interval : list
-            [low, high] bounds of the credible interval.
-            
-        Returns:
-        --------
-        float
-            Width of the posterior interval.
+    # ------------------------------------------------------------------
+    # §2 — visualise where the posterior is zeroed / down-weighted before
+    # this round's HPD analysis (outside the previous round's trained mask).
+    # ------------------------------------------------------------------
+    def _suppressed_label(self):
+        if self.zero_policy == "hysteresis":
+            return "§2 down-weighted (outside prev mask)"
+        return "§2 zeroed (outside prev mask)"
+
+    def _prev_keep_or_none(self, marginal_key, grids):
+        """Boolean 'inside the previous round's mask' on ``grids``, or None when
+        §2 is off / there is no previous mask (round 1) for this marginal."""
+        if self.zero_policy == "off":
+            return None
+        prev = self.prev_accepted.get(marginal_key)
+        if prev is None:
+            return None
+        return prev_keep_mask(prev, grids)
+
+    def _proposal_pixels(self, marginal_key, grids, grid_total):
+        """Pixel count of the mask actually sampled from this round.
+
+        The volume ratio is the early-stop metric ``posterior / proposal``.  In
+        mask mode the sampling proposal is the PREVIOUS round's accepted set, an
+        irregular mask that can fill only a fraction of its own bounding box — so
+        dividing by the full grid (``mask.size``) understates the ratio and it
+        never rises to 1 even when the posterior has converged to the proposal.
+        Here the denominator is the proposal mask itself, resampled onto the
+        current grid.  Falls back to the full grid when there is no mask proposal
+        (round 1, rectangle mode, or a previous mask that does not overlap this
+        grid), where posterior/box is the correct measure.  This is independent
+        of the §2 zero policy: the sampler uses the mask regardless.
         """
-        return widest_interval[1] - widest_interval[0]
-    
-    def _compute_prior_volume_1d(self, pl_module, in_param_idx):
-        """Compute the width of the prior for a 1D marginal.
-        
-        Parameters:
-        -----------
-        pl_module : LightningModule
-            The model containing prior information in hparams.
-        in_param_idx : int
-            Index of the parameter.
-            
-        Returns:
-        --------
-        float
-            Width of the prior range.
-        """
-        # Use the actual sampling prior (sampler_init_kwargs) as the
-        # authoritative source.  Fall back to conf["prior"] for backward compat.
-        _sik = pl_module.hparams["dataset_info"].get("sampler_init_kwargs", {})
-        if "prior_bounds" in _sik:
-            prior_dict = _sik["prior_bounds"]
-        else:
-            prior_dict = pl_module.hparams["dataset_info"]["conf"]["prior"]
-        param_name = _param_keys(pl_module)[in_param_idx]
-        prior_bounds = prior_dict[param_name]
-        return prior_bounds[1] - prior_bounds[0]
+        prev = self.prev_accepted.get(marginal_key)
+        if prev is None:
+            return grid_total
+        n = int(np.count_nonzero(prev_keep_mask(prev, grids)))
+        return n if n > 0 else grid_total
+
+    def _shade_suppressed_1d(self, ax, grid1d, marginal_key):
+        keep = self._prev_keep_or_none(marginal_key, (grid1d,))
+        if keep is None:
+            return
+        supp = ~np.asarray(keep, dtype=bool)
+        if not supp.any():
+            return
+        g = np.asarray(grid1d, dtype=float)
+        half = 0.5 * (g[1] - g[0])
+        # contiguous runs of suppressed cells [a, b); shade to the cell edges
+        padded = np.concatenate(([False], supp, [False]))
+        trans = np.flatnonzero(padded[1:] != padded[:-1])
+        labelled = False
+        for a, b in zip(trans[0::2], trans[1::2]):
+            ax.axvspan(g[a] - half, g[b - 1] + half,
+                       color="red", alpha=0.12, hatch="//", lw=0,
+                       label=None if labelled else self._suppressed_label())
+            labelled = True
+
+    def _shade_suppressed_2d(self, ax, gx, gy, marginal_key):
+        keep = self._prev_keep_or_none(marginal_key, (gx[0, :], gy[:, 0]))
+        if keep is None or keep.all():
+            return
+        # translucent red wash over the suppressed pixels (~keep); the mask is
+        # (n_y, n_x) so imshow with the grid extent lines up with the heatmap.
+        supp = np.where(keep, np.nan, 1.0)
+        extent = (float(gx[0, 0]), float(gx[0, -1]), float(gy[0, 0]), float(gy[-1, 0]))
+        ax.imshow(supp, origin="lower", extent=extent, aspect="auto",
+                  cmap=_SUPPRESSED_CMAP, alpha=0.30, interpolation="nearest", zorder=3)
 
     def _log_sky_contour_ratios(self, norm2d, gx, gy, dp0, dp1, trainer, param_tag):
         """Log width/height ratios between 95.5% and wider HPD contour boxes.
@@ -528,20 +483,39 @@ class PlotPosteriorCallback(Callback):
                         ax.axvline(inj_params[0], color='r', linestyle='--', label='Injection')
                         ax.axvline(widest_interval[0], color='g', linestyle=':', label=f'{100*(1-epsilon_value):.2f}% CI')
                         ax.axvline(widest_interval[1], color='g', linestyle=':')
-                        ax.fill_between(grid.flatten(), 0, norm1d, 
+                        ax.fill_between(grid.flatten(), 0, norm1d,
                                        where=(grid.flatten() >= widest_interval[0]) & (grid.flatten() <= widest_interval[1]),
                                        alpha=0.3, color='green')
+                        # §2: shade the band outside the previous round's mask,
+                        # where the density is zeroed / down-weighted before the
+                        # HPD analysis (only when §2 is active and a prev mask
+                        # exists — i.e. from round 2 onward).
+                        self._shade_suppressed_1d(ax, grid[:, 0], marginal_key)
                         ax.set_xlabel(keys[param_idx])
                         ax.set_ylabel('Posterior density')
                         ax.legend()
                         
                         # Store the widest interval
                         pl_module.widest_boxes[marginal_key] = widest_interval
-                        
-                        # Compute posterior-to-prior volume (width) ratio for 1D marginal
-                        posterior_width = self._compute_posterior_volume_1d(widest_interval)
-                        prior_width = self._compute_prior_volume_1d(pl_module, param_idx)
-                        volume_ratio = posterior_width / prior_width
+
+                        # Posterior-to-prior volume ratio for the 1D marginal.
+                        # The grid spans exactly the trained prior box, so the
+                        # accepted-pixel fraction of the equal-tailed region IS
+                        # the posterior/prior width ratio (one implementation for
+                        # every marginal; see pembhb.regions).
+                        region1d = region_from_equal_tailed(
+                            norm1d, (grid[:, 0],), eps=epsilon_value,
+                            dilation=self.box_dilation_1d)
+                        # ratio = posterior pixels / sampling-proposal pixels
+                        # (NOT / full grid — see _proposal_pixels). Matters for a
+                        # multi-interval (gapped) 1D proposal, e.g. cos-ι.
+                        posterior_pixels = int(np.count_nonzero(region1d.mask))
+                        proposal_pixels = self._proposal_pixels(
+                            marginal_key, (grid[:, 0],), int(region1d.mask.size))
+                        volume_ratio = posterior_pixels / proposal_pixels
+                        _dp = float(grid[1, 0] - grid[0, 0])
+                        posterior_width = posterior_pixels * _dp
+                        prior_width = proposal_pixels * _dp
                         
                         # Store and log the volume ratio
                         if marginal_key not in self.volume_ratios:
@@ -608,6 +582,9 @@ class PlotPosteriorCallback(Callback):
                         # Baseline heatmap — always produced, independent of contour levels.
                         norm_2d, inj_params, gx, gy, dp0, dp1 = eval_posterior_2d(pl_module, self.obs_loader, in_param_idx, out_param_idx)
                         posterior_heatmap_2d(gx, gy, norm_2d, inj_params[0], ax, param_names)
+                        # §2: overlay the region outside the previous round's mask
+                        # (zeroed / down-weighted before this round's analysis).
+                        self._shade_suppressed_2d(ax, gx, gy, marginal_key)
 
                         # Contour overlay + contour-derived diagnostics (best effort).
                         # matplotlib raises ValueError when contour thresholds are
@@ -629,9 +606,32 @@ class PlotPosteriorCallback(Callback):
 
                             pl_module.widest_boxes[marginal_key] = widest_box
 
-                            posterior_area = self._compute_posterior_volume_2d(widest_box, is_wrapped)
-                            prior_area = self._compute_prior_volume_2d(pl_module, in_param_idx)
-                            volume_ratio = posterior_area / prior_area
+                            # Posterior-to-prior area ratio via Region. This is
+                            # the true accepted-MASK fraction of the dominant
+                            # mode — correct for wrapped / non-rectangular modes,
+                            # unlike the bounding-box area the old helpers used
+                            # (a change of measure, not just ±1 px; it slightly
+                            # shifts the 2D early-stop timing).
+                            # Full HPD posterior (ALL modes), built the same way
+                            # as the truncation/proposal (analyse_posterior_2d at
+                            # credible_level_2d/dilation_2d) — NOT the main mode
+                            # only, which undercounts a multimodal posterior and
+                            # trips the 0.5 stop early.
+                            region2d = region_from_hpd(
+                                norm_2d, (gx[0, :], gy[:, 0]),
+                                credible_level=self.credible_level_2d,
+                                dilation_factor=self.dilation_2d,
+                                periods=(_MASK_PERIOD_BY_NAME.get(keys[in_param_idx[0]]),
+                                         _MASK_PERIOD_BY_NAME.get(keys[in_param_idx[1]])))
+                            # ratio = posterior pixels / sampling-proposal pixels
+                            # (NOT / full grid — see _proposal_pixels).
+                            posterior_pixels = int(np.count_nonzero(region2d.mask))
+                            proposal_pixels = self._proposal_pixels(
+                                marginal_key, (gx[0, :], gy[:, 0]), int(region2d.mask.size))
+                            volume_ratio = posterior_pixels / proposal_pixels
+                            cell_area = float(dp0 * dp1)
+                            posterior_area = posterior_pixels * cell_area
+                            prior_area = proposal_pixels * cell_area
 
                             if marginal_key not in self.volume_ratios:
                                 self.volume_ratios[marginal_key] = []
@@ -1085,68 +1085,63 @@ def compute_truncation_coverage(
     eps_1d=1e-4, sky_credible_level=0.999, sky_dilation=1.1,
     ngrid_1d=100, ngrid_2d=100, dilation_1d=1.0,
 ):
-    """Empirical coverage of each marginal's truncation box over a labelled set.
+    """Empirical coverage of each marginal's truncation region over a labelled set.
 
-    For every marginal, per sample, build the *same* credible box the round-end
-    truncation would build, and count how many samples' ground truths fall inside
-    their own box. Returns ``{marginal_key_tuple: (coverage, n_inside, n_total)}``.
+    For every marginal, per sample, build the accepted :class:`~pembhb.regions.Region`
+    the round-end truncation would build and count how many samples' ground truths
+    fall inside their own region (``Region.contains``). Returns
+    ``{marginal_key_tuple: (coverage, n_inside, n_total)}``.
 
     This is the signal for the coverage-gated truncation veto (see
-    ``tmnre_joint.SequentialTrainerJoint.run``): a box that is nominally
+    ``tmnre_joint.SequentialTrainerJoint.run``): a region that is nominally
     ``1 - eps`` credible but empirically covers far fewer truths means the network
     is overconfident for that parameter, so its truncation should be vetoed rather
     than discard the true value.
 
-    * 1D: equal-tailed ``[eps/2, 1-eps/2]`` interval on the grid posterior,
-      matching :func:`get_widest_interval_1d`.
-    * 2D: main-mode sky rectangle from :func:`get_main_mode_box` (the sky ``(7,8)``
-      marginal is the only 2D marginal in current configs; non-sky 2D would need
-      ``get_widest_box_2d`` and is not handled here).
+    * 1D: equal-tailed ``[eps_1d/2, 1-eps_1d/2]`` interval
+      (:func:`~pembhb.regions.region_from_equal_tailed`).
+    * 2D: highest-mass HPD component (:func:`~pembhb.regions.region_from_main_mode`),
+      with each axis's periodicity resolved from its parameter name — so this now
+      works for **any** 2D marginal, not just the sky ``(7,8)`` pair (the old code
+      applied sky main-mode logic to every 2D marginal, the bug its own docstring
+      admitted).
+
+    Membership is the true accepted-mask test, not a bounding-box test: a truth
+    that lands in a gap between components (inside the box but outside the mask)
+    correctly counts as NOT covered.
     """
     coverage = {}
 
     for _label, in_idx, out_idx in marginals_1d_info:
         logratios, inj, grid = get_logratios_grid(
             loader, model, ngrid_1d, in_param_idx=in_idx, out_param_idx=out_idx)
-        grid = grid[:, 0]
-        dp = float(grid[1] - grid[0])
-        assert dp>0 
+        g1d = grid[:, 0]
         n_total = logratios.shape[0]
         n_inside = 0
         for s in range(n_total):
-            ratios = np.exp(logratios[s])
-            norm = ratios / np.sum(ratios * dp)
-            cdf = np.cumsum(norm * dp)
-            idx_lo = int(np.searchsorted(cdf, eps_1d / 2))
-            idx_hi = min(int(np.searchsorted(cdf, 1 - eps_1d / 2)), len(grid) - 1)
-            lo, hi = float(grid[idx_lo]), float(grid[idx_hi])
-            if dilation_1d != 1.0:
-                c = 0.5 * (lo + hi); half = 0.5 * (hi - lo) * dilation_1d
-                lo = max(c - half, float(grid[0]))
-                hi = min(c + half, float(grid[-1]))
-            if lo <= inj[s] <= hi:
-                n_inside += 1
+            region = region_from_equal_tailed(
+                np.exp(logratios[s]), (g1d,), eps=eps_1d, dilation=dilation_1d)
+            n_inside += int(region.contains(np.array([float(inj[s])]))[0])
         coverage[(in_idx,)] = (n_inside / n_total, n_inside, n_total)
 
     for _label, in_pair, out_idx in marginals_2d_info:
         norm2d, inj, gx, gy = eval_posterior_2d(
             model, loader, in_pair, out_idx,
             ngrid_points=ngrid_2d, keep_batch_dim=True)
+        gx_1d, gy_1d = gx[0, :], gy[:, 0]
+        # Periodic axes resolved per parameter from the "<name0>__<name1>" label.
+        names = str(_label).split("__")
+        periods = (_MASK_PERIOD_BY_NAME.get(names[0]) if len(names) > 0 else None,
+                   _MASK_PERIOD_BY_NAME.get(names[1]) if len(names) > 1 else None)
         n_total = norm2d.shape[0]
         n_inside = 0
         for s in range(n_total):
-            box = get_main_mode_box(
-                gx, gy, norm2d[s],
-                credible_level=sky_credible_level, dilation_factor=sky_dilation)
-            lam_true, beta_true = float(inj[s, 0]), float(inj[s, 1])
-            lam_lo, lam_hi = box["lam"]
-            beta_lo, beta_hi = box["beta"]
-            if box.get("is_wrapped", False):
-                lam_in = (lam_true >= lam_lo) or (lam_true <= lam_hi)
-            else:
-                lam_in = lam_lo <= lam_true <= lam_hi
-            if lam_in and (beta_lo <= beta_true <= beta_hi):
-                n_inside += 1
+            region = region_from_main_mode(
+                norm2d[s], (gx_1d, gy_1d),
+                credible_level=sky_credible_level, dilation_factor=sky_dilation,
+                periods=periods)
+            n_inside += int(region.contains(
+                np.array([[float(inj[s, 0])], [float(inj[s, 1])]]))[0])
         coverage[tuple(in_pair)] = (n_inside / n_total, n_inside, n_total)
 
     return coverage

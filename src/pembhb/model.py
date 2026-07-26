@@ -11,7 +11,7 @@ from torch.nn import functional as F
 from typing import Iterable
 from pembhb.data import MBHBDataset
 from torch.utils.data import DataLoader
-from pembhb.utils import _ORDERED_PRIOR_KEYS, ordered_prior_keys, GPUNoiseMixin
+from pembhb.utils import _ORDERED_PRIOR_KEYS, ordered_prior_keys, GPUNoiseMixin, parse_periodic_bc_spec
 from pembhb import ROOT_DIR, get_torch_dtype
 import numpy as np
 # class GWTransformer(LightningModule):
@@ -245,12 +245,15 @@ class MarginalClassifierHead(nn.Module):
 
 
 
-def reparametrise_periodic_bc(parameters, position_indices: list):
-    """Replace each column in position_indices with (sin, cos) pair.
+def reparametrise_periodic_bc(parameters, position_indices: list, k_by_index: dict = None):
+    """Replace each column in position_indices with (sin(k·θ), cos(k·θ)) pair.
 
     Args:
         parameters: Tensor of shape (B, N)
         position_indices: list of column indices (in the original N-dim space) to reparametrise
+        k_by_index: optional {index: k} angular frequencies. ``k = 2π/period``;
+            defaults to 1 (period 2π) for any index not present, which reproduces
+            the legacy plain sin/cos embedding.
 
     Returns:
         Tensor of shape (B, N + len(position_indices))
@@ -258,9 +261,10 @@ def reparametrise_periodic_bc(parameters, position_indices: list):
     parameters_out = parameters
     offset = 0
     for idx in position_indices:
+        k = 1.0 if k_by_index is None else k_by_index.get(idx, 1.0)
         shifted_idx = idx + offset
-        sin_col = torch.sin(parameters_out[:, shifted_idx:shifted_idx+1])
-        cos_col = torch.cos(parameters_out[:, shifted_idx:shifted_idx+1])
+        sin_col = torch.sin(k * parameters_out[:, shifted_idx:shifted_idx+1])
+        cos_col = torch.cos(k * parameters_out[:, shifted_idx:shifted_idx+1])
         parameters_out = torch.cat(
             [parameters_out[:, :shifted_idx], sin_col, cos_col, parameters_out[:, shifted_idx+1:]],
             dim=-1,
@@ -349,15 +353,14 @@ class InferenceNetwork(GPUNoiseMixin, LightningModule):
 
         # Build index remapping for periodic BC reparametrisation.
         # Each periodic parameter column is replaced by (sin, cos), expanding the tensor by 1 per param.
-        if periodic_bc_params is None:
-            periodic_bc_params = []
-        self.periodic_bc_params = periodic_bc_params
+        # Accepts a list of indices (all period 2π) or a {index: period} dict.
+        self.periodic_bc_params, self.periodic_bc_k = parse_periodic_bc_spec(periodic_bc_params)
         # Normalization is a no-op for periodic params (they are passed raw to sin/cos).
-        self.param_mean[periodic_bc_params] = 0
-        self.param_std[periodic_bc_params] = 1
+        self.param_mean[self.periodic_bc_params] = 0
+        self.param_std[self.periodic_bc_params] = 1
 
         # sin/cos normalization statistics (identity fallback for backward compat)
-        _n_periodic = len(periodic_bc_params)
+        _n_periodic = len(self.periodic_bc_params)
         _sc_mean = normalisation.get("sincos_mean", [0.0] * (2 * _n_periodic))
         _sc_std  = normalisation.get("sincos_std",  [1.0] * (2 * _n_periodic))
         self.register_buffer("sincos_mean", torch.tensor(_sc_mean, dtype=get_torch_dtype()))
@@ -458,7 +461,7 @@ class InferenceNetwork(GPUNoiseMixin, LightningModule):
         # this line does not touch the parameters in periodic_bc_params because their mean is set to 0 and std to 1
         normalised_parameters = (parameters - self.param_mean) / self.param_std
         # take sin and cos of the params specified in periodic_bc_params
-        reparametrised_withbc_params = reparametrise_periodic_bc(normalised_parameters, self.periodic_bc_params)
+        reparametrised_withbc_params = reparametrise_periodic_bc(normalised_parameters, self.periodic_bc_params, self.periodic_bc_k)
         if len(self.periodic_bc_params) > 0:
             reparametrised_withbc_params = normalise_sincos_cols(
                 reparametrised_withbc_params, self.periodic_bc_params,
@@ -711,7 +714,7 @@ class PerMarginalInferenceNetwork(InferenceNetwork):
         bottleneck_dict, _d_t = self.data_summary(d_f, d_t)
 
         normalised_parameters = (parameters - self.param_mean) / self.param_std
-        reparametrised = reparametrise_periodic_bc(normalised_parameters, self.periodic_bc_params)
+        reparametrised = reparametrise_periodic_bc(normalised_parameters, self.periodic_bc_params, self.periodic_bc_k)
 
         logratios_list = []
         for domain, pos, remapped_marginal, original_marginal in self._marginal_order:
@@ -1268,14 +1271,13 @@ class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
         )
 
         # ---- Periodic BC reparametrisation (mirrors InferenceNetwork) ---
-        if periodic_bc_params is None:
-            periodic_bc_params = []
-        self.periodic_bc_params = periodic_bc_params
-        self.param_mean[periodic_bc_params] = 0
-        self.param_std[periodic_bc_params] = 1
+        # Accepts a list of indices (all period 2π) or a {index: period} dict.
+        self.periodic_bc_params, self.periodic_bc_k = parse_periodic_bc_spec(periodic_bc_params)
+        self.param_mean[self.periodic_bc_params] = 0
+        self.param_std[self.periodic_bc_params] = 1
 
         # sin/cos normalization statistics (identity fallback for backward compat)
-        _n_periodic = len(periodic_bc_params)
+        _n_periodic = len(self.periodic_bc_params)
         _sc_mean = normalisation.get("sincos_mean", [0.0] * (2 * _n_periodic))
         _sc_std  = normalisation.get("sincos_std",  [1.0] * (2 * _n_periodic))
         self.register_buffer("sincos_mean", torch.tensor(_sc_mean, dtype=get_torch_dtype()))
@@ -1440,7 +1442,7 @@ class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
         Bottleneck(s) are detached so this is safe inside a training loop.
         """
         normalised_parameters = (parameters - self.param_mean) / self.param_std
-        reparametrised_withbc_params = reparametrise_periodic_bc(normalised_parameters, self.periodic_bc_params)
+        reparametrised_withbc_params = reparametrise_periodic_bc(normalised_parameters, self.periodic_bc_params, self.periodic_bc_k)
         if len(self.periodic_bc_params) > 0:
             reparametrised_withbc_params = normalise_sincos_cols(
                 reparametrised_withbc_params, self.periodic_bc_params,

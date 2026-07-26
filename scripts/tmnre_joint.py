@@ -58,6 +58,7 @@ from pembhb.mask_truncation import (
     eval_posterior_1d, analyse_posterior_1d, analyse_posterior_2d, MaskRejectSampler,
     save_truncation, load_truncation, truth_violations, format_violations, _MASK_PERIOD_BY_NAME
 )
+from pembhb.regions import Region, apply_prev_mask, clip_intervals_to_prev, clip_labels_to_prev
 from pembhb.diagnostics import AutoencoderDiagnosticsCallback
 
 # Physical period of the angular parameters, keyed by prior-key name (spin-basis
@@ -380,6 +381,15 @@ class SequentialTrainerJoint:
         # {marginal_tuple: (coverage, n_inside, n_total)}; drives the truncation
         # veto. Recomputed each round, so no resume state needed.
         self._last_coverage = {}
+        # §2 (evaluate the network only on the mask it was trained on): the
+        # accepted set of each marginal from the PREVIOUS round, used to zero the
+        # posterior outside it before this round's HPD analysis. 1D stores the
+        # sub-intervals (exact membership); 2D stores a Region for nearest-pixel
+        # resampling onto the new grid. Populated by _mask_truncate_marginal and
+        # rebuilt on --resume from the saved truncation. See _zero_outside_prev.
+        self._prev_accepted = {}
+        # §2 monotonicity: warn only once if the flag is set under a non-hard policy.
+        self._monotonic_warned = False
         self._current_normalisation = None
         cc_conf = self.train_conf.get("chain_convergence", {})
         self.chain_monitor = None
@@ -402,44 +412,115 @@ class SequentialTrainerJoint:
     # ------------------------
     # Truncation helpers
 
+    def _zero_outside_prev(self, marginal_key, density, grids, trunc_conf):
+        """§2: down-weight the posterior outside the region the network was
+        *trained* on last round, before this round's HPD analysis.
+
+        Thin wrapper over :func:`pembhb.regions.apply_prev_mask` (which holds the
+        policy + re-weighting logic) that supplies the previous round's accepted
+        set and logs the degenerate no-overlap case.  ``grids`` is ``(grid_x,)``
+        (1D) or ``(grid_x, grid_y)`` (2D) of the CURRENT round.
+        """
+        new, status = apply_prev_mask(
+            density, self._prev_accepted.get(marginal_key), grids,
+            policy=str(trunc_conf.get("zero_outside_prev_mask", "hard")),
+            hysteresis_weight=float(trunc_conf.get("hysteresis_weight", 0.1)))
+        if status == "degenerate":
+            # The previous mask does not intersect this round's grid at all;
+            # zeroing would leave nothing to threshold. Leave the density
+            # untouched and let truth_violations / the veto catch a bad window.
+            print(f"[Trunc/mask/§2] {marginal_key}: previous mask has no overlap "
+                  f"with this round's grid; skipping zeroing.", flush=True)
+        return new
+
+    def _monotonic_enabled(self, trunc_conf):
+        """§2 monotonicity flag: once a region is excluded it stays excluded
+        (``A_N := A_N ∩ A_{N-1}``), preventing the post-zeroing dilation from
+        re-opening the previous boundary.  Only meaningful with the ``hard`` zero
+        policy; a no-op (with a one-time warning) under ``hysteresis``/``off``,
+        which are deliberately recoverable.
+        """
+        if not bool(trunc_conf.get("enforce_monotonic_regions", False)):
+            return False
+        policy = str(trunc_conf.get("zero_outside_prev_mask", "hard"))
+        if policy != "hard":
+            if not self._monotonic_warned:
+                print(f"[Trunc/mask/§2] enforce_monotonic_regions ignored: it "
+                      f"requires zero_outside_prev_mask='hard' but policy is "
+                      f"{policy!r}.", flush=True)
+                self._monotonic_warned = True
+            return False
+        return True
+
     def _mask_truncate_marginal(self, marginal_key, out_idx, prior_keys,
                             intervals_1d, masks_2d, trunc_conf):
 
         if len(marginal_key)==1:
             param_name = prior_keys[marginal_key[0]]
+            # Previous round's accepted set (before it is overwritten below),
+            # used for §2 zeroing and, if enabled, monotonic clipping.
+            prev = self._prev_accepted.get(marginal_key)
             grid, norm1d, _ = eval_posterior_1d(
                 self.model, self.dataloader_obs,
                 in_param_idx=marginal_key[0], out_param_idx=out_idx,
                 ngrid_points=trunc_conf.get("ngrid_1d", 100))
 
+            # §2: restrict to the region the network was trained on last round.
+            norm1d = self._zero_outside_prev(marginal_key, norm1d, (grid[:, 0],),
+                                             trunc_conf)
+
+            period = _MASK_PERIOD_BY_NAME.get(prior_keys[marginal_key[0]])
             res = analyse_posterior_1d(
                 grid, norm1d,
                 credible_level=float(trunc_conf.get("credible_level_1d", 0.997)),
                 dilation_factor=float(trunc_conf.get("dilation_1d", 1.2)),
-                period=_MASK_PERIOD_BY_NAME.get(prior_keys[marginal_key[0]]))
-            
-            intervals = res["intervals"]
+                period=period)
+
+            # §2 monotonicity: clip the dilated mask back inside the previous
+            # accepted set so exclusions are permanent (A_N ⊆ A_{N-1}).
+            if self._monotonic_enabled(trunc_conf):
+                intervals = clip_intervals_to_prev(res["mask"], grid[:, 0], prev,
+                                                   period=period)
+            else:
+                intervals = res["intervals"]
             intervals_1d[marginal_key[0]] = intervals
+            # Record this round's accepted set for next round's §2 zeroing.
+            self._prev_accepted[marginal_key] = {"kind": "1d", "intervals": intervals}
             widest_interval = _envelope(intervals)
             tmp = copy.deepcopy(self.datagen_conf["prior"])
             tmp[param_name] = [widest_interval[0], widest_interval[1]]
             self.datagen_conf["prior"] = tmp
 
         elif len(marginal_key)==2:
-            inj1, inj2 = marginal_key 
+            inj1, inj2 = marginal_key
+            prev = self._prev_accepted.get(marginal_key)
             norm2d, _, gx, gy, _, _ = utils.eval_posterior_2d(
                 self.model, self.dataloader_obs,
                 in_param_idx=marginal_key, out_param_idx=out_idx,
                 ngrid_points=trunc_conf.get("ngrid_2d", 100))
 
+            # §2: restrict to the region the network was trained on last round.
+            norm2d = self._zero_outside_prev(marginal_key, norm2d,
+                                             (gx[0, :], gy[:, 0]), trunc_conf)
+
+            period = (_MASK_PERIOD_BY_NAME.get(prior_keys[marginal_key[0]]),
+                      _MASK_PERIOD_BY_NAME.get(prior_keys[marginal_key[1]]))
             labels, comps, grid_x, grid_y = analyse_posterior_2d(
-                gx, gy, norm2d,
-                period=(_MASK_PERIOD_BY_NAME.get(prior_keys[marginal_key[0]]),
-                        _MASK_PERIOD_BY_NAME.get(prior_keys[marginal_key[1]])),
+                gx, gy, norm2d, period=period,
                 credible_level=float(trunc_conf.get("credible_level_2d", 0.997)),
                 dilation_factor=float(trunc_conf.get("dilation_2d", 1.2)))
+
+            # §2 monotonicity: clip the dilated region back inside the previous
+            # accepted set so exclusions are permanent (A_N ⊆ A_{N-1}).
+            if self._monotonic_enabled(trunc_conf):
+                labels, comps = clip_labels_to_prev(labels, grid_x, grid_y, prev,
+                                                    period=period)
             masks_2d.append({"idx": tuple(marginal_key), "labels": labels,
                             "grid_x": grid_x, "grid_y": grid_y, "components": comps})
+            # Record this round's accepted set (a Region for nearest-pixel
+            # resampling) for next round's §2 zeroing.
+            self._prev_accepted[marginal_key] = {
+                "kind": "2d", "region": Region(labels > 0, (grid_x, grid_y))}
             intervals_x =[]
             intervals_y =[]
             for k in comps:
@@ -453,7 +534,7 @@ class SequentialTrainerJoint:
             tmp[prior_keys[inj1]] = [widest_box[0], widest_box[1]]
             tmp[prior_keys[inj2]] = [widest_box[2], widest_box[3]]
             self.datagen_conf["prior"] = tmp
-        else: 
+        else:
             raise ValueError (f"marginal_key has len {len(marginal_key)} but 1 or 2 was expected.")
 
     # -----------------------------------------------------------------
@@ -937,6 +1018,16 @@ class SequentialTrainerJoint:
                 print(f"[Resume] Mask truncation restored: "
                       f"{len(saved['intervals_1d'])} 1D interval set(s), "
                       f"{len(saved['masks_2d'])} 2D mask(s) from {mask_path}")
+                # §2: rebuild the previous round's accepted set so the resumed
+                # run zeroes the posterior outside the region it was trained on,
+                # exactly as an uninterrupted run would.
+                for idx, ivs in saved["intervals_1d"].items():
+                    self._prev_accepted[(int(idx),)] = {"kind": "1d", "intervals": ivs}
+                for m in saved["masks_2d"]:
+                    self._prev_accepted[tuple(m["idx"])] = {
+                        "kind": "2d",
+                        "region": Region(np.asarray(m["labels"]) > 0,
+                                         (m["grid_x"], m["grid_y"]))}
             # Re-initialise plot tracking lists from the restored prior
         else:
             print(f"[Resume] Warning: {prior_path} not found; using prior from config. "
@@ -1410,7 +1501,11 @@ class SequentialTrainerJoint:
 
         periodic_checkpoint_callback = ModelCheckpoint(
             every_n_epochs=joint_conf.get("checkpoint_every_n_epochs", 10),
-            save_top_k=-1,
+            # save_top_k=1 keeps a single ROLLING periodic snapshot per round
+            # (Lightning deletes the file it rolls past even with epoch in the
+            # name). -1 kept every 10-epoch checkpoint => ~3.8 GB/round of dead
+            # weight; resume uses truncation.ckpt / the monitored best, not these.
+            save_top_k=joint_conf.get("checkpoint_save_top_k", 1),
             save_on_train_epoch_end=True,
             filename="joint-periodic-{epoch:03d}",
         )
@@ -1470,6 +1565,17 @@ class SequentialTrainerJoint:
                 self.train_conf.get("truncation_veto", {}).get("sky_credible_level", 0.999)),
             sky_dilation=float(
                 self.train_conf.get("truncation_veto", {}).get("sky_dilation", 1.1)),
+            # 2D volume-ratio posterior region built at the same HPD level/dilation
+            # as the truncation, so the ratio's numerator is the full accepted set.
+            credible_level_2d=float(
+                self.train_conf.get("truncation", {}).get("credible_level_2d", 0.997)),
+            dilation_2d=float(
+                self.train_conf.get("truncation", {}).get("dilation_2d", 1.2)),
+            # §2: let the posterior plots shade the region outside the previous
+            # round's trained mask (where the density is zeroed / down-weighted).
+            prev_accepted=self._prev_accepted,
+            zero_policy=str(self.train_conf.get("truncation", {}).get(
+                "zero_outside_prev_mask", "hard")),
         )
         if ae_warmup_epochs > 0:
             print(f"[PlotPosterior] skipping first {ae_warmup_epochs} epochs (AE warmup)")

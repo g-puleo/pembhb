@@ -1,6 +1,6 @@
 from torch.utils.data import Dataset, random_split, DataLoader, Subset 
 import lightning as L
-from pembhb.utils import mbhb_collate_fn
+from pembhb.utils import mbhb_collate_fn, parse_periodic_bc_spec
 from pembhb import get_torch_dtype, get_torch_complex_dtype
 import torch
 import numpy as np
@@ -241,11 +241,12 @@ class MBHBDataModule( L.LightningDataModule ):
             sincos_mean: list of floats, length 2 * len(periodic_bc_params)
             sincos_std:  list of floats, length 2 * len(periodic_bc_params)
         """
+        indices, k_by_index = parse_periodic_bc_spec(periodic_bc_params)
         params = self._load_train_params()
         sincos_mean = []
         sincos_std = []
-        for idx in periodic_bc_params:
-            col = params[:, idx]
+        for idx in indices:
+            col = k_by_index[idx] * params[:, idx]
             s = torch.sin(col)
             c = torch.cos(col)
             sincos_mean.extend([s.mean().item(), c.mean().item()])
