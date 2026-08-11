@@ -1,21 +1,24 @@
-batch_size: 25
-epochs: 570
+# ============================================================================
+# Train config for the multimode (mask) truncation + §2 gap-zeroing run.
+# Based on train_phys30_mask_v1.yaml (the channelizedmlp_mask_v2 run). Key knobs
+# for the new code live in the `truncation:` block at the bottom:
+#   truncation.mode: mask                    -> HPD level set + rejection sampling
+#   truncation.zero_outside_prev_mask: hard  -> §2: zero the posterior outside the
+#                                               region the net was trained on
+# Pair with configs/datagen_phys30_chieff_maskzero.yaml.
+# ============================================================================
+batch_size: 125
+epochs: 1000
 precision: float32
 transform_fd: log
 noise_factor: 1.0
-n_train_noise_realisations: 10
+delete_prev_round_h5: true
+n_train_noise_realisations: 2
 classifier_hlayersizes:
+- 256
+- 256
+- 128
 - 64
-- 32
-- 16
-- 8
-streaming:
-  enabled: true
-  n_buffers: 4
-  buffer_size: 2000
-  val_size: 1000
-  gen_batch_size: 150
-  samples_per_epoch: 35000
 keep_ckpt: true
 marginals:
   f:
@@ -24,16 +27,16 @@ marginals:
   - - 2
   - - 3
   - - 4
-  - - 5
-  - - 6
+  - - 10
   - - 7
     - 8
   - - 9
-  - - 10
+  - - 5
+  - - 6
 marginal_schedule: []
 periodic_bc_params:
+- 5
 - 7
-- 9
 device: cuda
 architecture:
   gradnorm:
@@ -42,7 +45,17 @@ architecture:
     learning_rate: 0.0005
     common_params: linear_f
   data_summary:
-    type: Autoencoder
+    type: ChannelizedMLP
+    ChannelizedMLP:
+      device: cuda
+      representation: real_imag
+      n_channels: 2
+      n_freqs: 4096
+      hidden_dim_per_channel: 256
+      out_dim_per_channel: 64
+      whiten: true
+      amplitude_normalise: true
+      subtract_mean_whitened: true
     BrutalCompression:
       Nfreqs: 1000
       lowdim: 16
@@ -82,8 +95,7 @@ architecture:
       residual: false
       decoder_post_fc_bn: false
       subtract_mean_whitened: true
-      compressor_window: 7
-      reconstruct_std: true
+      compressor_window: null
       ae_output_target: compressed
       whiten: true
       amplitude_normalise: true
@@ -129,7 +141,7 @@ baseline_model:
   use: false
   filename: ''
 sequential_training:
-  early_stop_criterion: accuracy
+  early_stop_criterion: volume_ratio
   learning_rate: 0.0001
   scheduler_patience: 80
   scheduler_factor: 0.3
@@ -138,25 +150,31 @@ sequential_training:
   early_stop_threshold: 0.999
 joint_training:
   ae_warmup_epochs: 0
-  lr_ae: 0.001
-  lr_nre: 0.001
+  lr_ae: 0.00005
+  lr_nre: 0.00005
   ae_weight_decay: 1.0e-05
   freeze_ae_after_warmup: false
-  transfer_enabled: true
+  transfer_classifiers_across_rounds: false
+  transfer_data_summary_across_rounds: true
+  reinit_truncated_classifiers: false
+  reinit_plateaued_classifiers: false
+  reinit_on_prior_shrink: true
+  prior_shrink_reinit:
+    shrink_factor: 100
   checkpoint_every_n_epochs: 10
   ae_scheduler:
     enabled: true
-    monitor: val_ae_loss
+    monitor: val_nre_loss
     mode: min
-    factor: 0.3
-    patience: 20
+    factor: 0.5
+    patience: 30
     min_lr: 1.0e-07
     start_epoch: 0
   nre_scheduler:
     enabled: false
     monitor: val_nre_loss
     mode: min
-    factor: 0.3
+    factor: 0.5
     patience: 20
     min_lr: 1.0e-07
   early_stop_criterion: volume_ratio
@@ -166,55 +184,128 @@ joint_training:
     threshold: 0.999
   diff_entropy_early_stop:
     warmup_epochs: 50
-    patience: 10
-    rel_tol: 0.02
+    patience: 30
+    rel_tol: 0.1
     ema_alpha: 0.3
 volume_ratio_early_stop:
-  warmup_epochs: 80
+  warmup_epochs: 30
   patience: 20
   rel_tol: 0.02
   ema_alpha: 0.3
   min_ratio_threshold: 0.5
-  plateau_grace_epochs: 40
-chain_convergence:
-  enabled: true
-  eps_nats: 0.05
-  patience: 2
-  require_not_threshold: true
-pp_ks_early_stop:
-  enabled: true
-  trigger_on_overconfidence: false
-  test_n: 100
-  ngrid_points: 50
-  warmup_epochs: 0
-  run_every_n_epochs: 1
-  print_every: 20
-  lambda_tau:
-    enabled: true
 rom_use_pinned_memory: false
 rom_prefetch_batches: 4
 fisher_prior:
   enabled: false
   event_idx: 0
-  fixed_params: []
   varying_params:
   - logMchirp
   - q
+  - chi_eff
+  - chi_diff
+  - dist
   - lambda
   - beta
   - Deltat
   - psi
-  - chi_eff
-  - chi_diff
-  - dist
   - phi
   - inc
-  n_sigma: 50.0
+  fixed_params: []
+  n_sigma: 5.0
   param_n_sigma: {}
-step_cadence:
-  call_every_n_steps: null
-  print_every_n_steps: null
-  warmup_steps: null
-  seq_samples_per_epoch: null
-  call_every_n_epochs_seq: 10
-  print_every_seq: 20
+  step_frac: 0.001
+pp_ks_early_stop:
+  enabled: true
+  trigger_on_overconfidence: true
+  test_n: 100
+  test_batch_size: 100
+  ngrid_points: 50
+  warmup_epochs: 100
+  run_every_n_epochs: 1
+  patience: 40
+  ema_alpha: 0.3
+  d_threshold: 0.2
+  t_threshold: 0.05
+  t_quantile: 0.05
+  print_every: 20
+  lambda_tau:
+    enabled: true
+    fisher_backend: cuda12x
+bnre:
+  enabled: false
+  lambda: 0.0
+classifier_dropout: 0.0
+chain_convergence:
+  enabled: true
+  eps_nats: 0.1
+  patience: 2
+  require_not_threshold: true
+streaming:
+  enabled: true
+  n_buffers: 5
+  buffer_size: 7000
+  val_size: 1000
+  gen_batch_size: 150
+  # epoch = 35000 examples = 280 steps @ bs125 = the seq train-set epoch, so all
+  # epoch-based callbacks (plot/10, ppks/1, periodic) fire at the same #examples
+  # cadence as the seq run. step_cadence stays off.
+  samples_per_epoch: 35000
+  reuse_threshold: 10
+lambda_tau:
+  enabled: true
+
+truncation_veto:
+  enabled: false       # veto OFF: never gates truncation.
+  log_coverage: true   # ...but still compute + print coverage each round.
+                       # NB in mask mode these numbers describe the bounding
+                       # BOX, not the mask that is actually sampled -> they are
+                       # an upper bound on true coverage.
+  min_coverage: 0.999
+  n_coverage: 1000
+  # 1D truncation box: 99.999% CI (eps=1e-5) inflated 1.1x. Read by the
+  # PlotPosteriorCallback regardless of `enabled` (veto off here).
+  eps_1d: 1.0e-4
+  dilation_1d: 1.0
+
+# ---------------------------------------------------------------------------
+# Prior truncation scheme.
+#   rectangle : legacy widest_boxes / sky main-mode box (default)
+#   mask      : HPD level set -> connected components -> rejection sampling,
+#               handles multimodality and periodic wrapping.
+# NB dilation_factor 1.0 is NOT "no dilation": analyse_posterior_* applies
+# max(1, ceil(...)) so every mode still grows by one pixel per side (~1% of
+# the window at ngrid=100). 1.00 and 1.01 are therefore identical here.
+# ---------------------------------------------------------------------------
+truncation:
+  mode: mask
+  credible_level_1d: 0.9999
+  dilation_1d: 1.00
+  credible_level_2d: 0.999
+  dilation_2d: 1.1
+  ngrid_1d: 100
+  ngrid_2d: 200
+  # §2 — evaluate the network only on the region it was trained on. Before each
+  # round's HPD analysis the posterior is re-weighted by the PREVIOUS round's
+  # accepted set (nearest-pixel resampled onto this round's grid), because NRE's
+  # ratio p(θ|x)/p(θ) is undefined where the proposal put no mass — the network's
+  # output there is unconstrained extrapolation (this is what handed the cos-ι
+  # edge-on band back in round 2 of the v2 run).
+  #   hard       : zero it. This keeps the HPD level set inside the previous
+  #                region, but analyse_posterior_* then DILATES each mode, which
+  #                can grow it back past the previous boundary — so hard alone is
+  #                NOT strictly monotone (see enforce_monotonic_regions below).
+  #   hysteresis : multiply (not zero) the outside by hysteresis_weight, so
+  #                re-opening an excluded region needs a higher bar than keeping
+  #                it open. Recoverable, at the cost of a slower monotonicity.
+  #   off        : pre-§2 behaviour (the posterior spans the full envelope grid).
+  zero_outside_prev_mask: hard
+  hysteresis_weight: 0.1   # only used when zero_outside_prev_mask: hysteresis
+  # §2 monotonicity: after the HPD analysis (threshold + dilation), intersect
+  # this round's accepted set with the previous one, A_N := A_N ∩ A_{N-1}, so the
+  # post-zeroing dilation cannot re-open the previous boundary. Makes the accepted
+  # region strictly non-increasing (the red "suppressed" shading then only grows).
+  # Only meaningful with zero_outside_prev_mask: hard; a no-op under hysteresis/off.
+  # ⚠ EXCLUSIONS BECOME PERMANENT: an over-aggressive early exclusion can no longer
+  # self-correct — truth_violations and the coverage veto are then the ONLY safety
+  # nets against discarding the truth.
+  enforce_monotonic_regions: true

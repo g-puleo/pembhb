@@ -1,0 +1,234 @@
+% Layout sketch for EuCAIF poster — structure/geometry only.
+% Two real figures already dropped in this folder are wired in below;
+% everything else is a labelled placeholder box (see \placeholderfig).
+\documentclass[final]{beamer}
+\usepackage[size=a0,scale=1.15,orientation=portrait]{beamerposter}
+\usetheme{default}
+\usepackage{tikz}
+\usetikzlibrary{shadows}
+\usepackage{graphicx}
+\usepackage{xcolor}
+
+\definecolor{accent}{HTML}{1B6CA8}
+\definecolor{darktext}{HTML}{222222}
+\definecolor{lightbg}{HTML}{F4F7FA}
+\definecolor{highlight}{HTML}{C0392B}
+\definecolor{cardline}{HTML}{D9DEE3}
+\definecolor{futurebg}{HTML}{EAF3FB}
+
+\setbeamercolor{normal text}{fg=darktext,bg=white}
+\setbeamercolor{block body}{fg=darktext,bg=white}
+\setbeamercolor{title}{fg=accent}
+% Title now lives inside the white card (see block begin/end below), set in
+% the accent colour with real weight, instead of white-on-a-solid-bar.
+\setbeamerfont{block title}{series=\bfseries,size=\Large}
+\setbeamerfont{title}{series=\bfseries,size=\Huge}
+\setbeamertemplate{itemize items}{\textcolor{accent}{\textbullet}}
+\setbeamertemplate{navigation symbols}{}
+
+% ---------------------------------------------------------------------
+% "Modern card" look: one rounded, white, drop-shadowed box per block,
+% title set in the accent colour with generous breathing room and a thin
+% rule underneath -- no more solid-colour title bar. \cardbox{} below
+% exposes the same styling standalone, for the placeholder/highlight
+% boxes, so every box on the poster shares one visual language.
+% ---------------------------------------------------------------------
+\newlength{\cardpad}
+\setlength{\cardpad}{5mm}
+\newsavebox{\cardreg}
+\newcommand{\cardbox}[2][cardline]{%
+  \sbox{\cardreg}{#2}%
+  \begin{tikzpicture}
+    \node[rounded corners=7pt,draw=#1,line width=0.7pt,fill=white,
+          inner sep=\cardpad,
+          drop shadow={shadow xshift=0.9mm,shadow yshift=-0.9mm}]
+      {\usebox{\cardreg}};
+  \end{tikzpicture}%
+}
+
+\newsavebox{\blockbox}
+\setbeamertemplate{block begin}{%
+  \par\vskip3mm
+  \begin{lrbox}{\blockbox}
+  \begin{minipage}[t]{\dimexpr\linewidth-2\cardpad\relax}
+  {\usebeamerfont{block title}\color{accent}\insertblocktitle}\par
+  \vspace{2mm}
+  {\color{accent!35}\rule{\linewidth}{0.9pt}}\par
+  \vspace{4mm}
+}
+\setbeamertemplate{block end}{%
+  \end{minipage}
+  \end{lrbox}
+  \begin{tikzpicture}
+    \node[rounded corners=7pt,draw=cardline,line width=0.7pt,fill=white,
+          inner sep=\cardpad,
+          drop shadow={shadow xshift=0.9mm,shadow yshift=-0.9mm}]
+      {\usebox{\blockbox}};
+  \end{tikzpicture}
+  \vskip3mm
+}
+
+% Light-tinted variant of \cardbox, for the "Future plans" callout -- same
+% rounded/shadowed card language but a filled accent-blue background so it
+% visually stands apart from the plain-white content blocks.
+\newsavebox{\futurereg}
+\newcommand{\futurebox}[1]{%
+  \sbox{\futurereg}{#1}%
+  \begin{tikzpicture}
+    \node[rounded corners=7pt,draw=accent,line width=0.9pt,fill=futurebg,
+          inner sep=\cardpad,
+          drop shadow={shadow xshift=0.9mm,shadow yshift=-0.9mm}]
+      {\usebox{\futurereg}};
+  \end{tikzpicture}%
+}
+
+% Generic "figure goes here" box: fixed height #1 (default 6cm), full column
+% width, centered italic label #2. Swap for \includegraphics once a figure
+% is chosen — no other change needed.
+\newcommand{\placeholderfig}[2][6cm]{%
+  \cardbox{%
+    \begin{minipage}[c][#1][c]{\dimexpr\linewidth-2\cardpad\relax}
+      \centering\itshape\color{black!45} #2
+    \end{minipage}%
+  }%
+}
+
+\title{Simulation-Based inference for massive black hole binary from mock LISA data }
+\author{Gianmarco Puleo, R. Trotta, E. Barausse}
+\institute{Scuola Internazionale Superiore di Studi Avanzati (SISSA), Trieste, Italy}
+
+\begin{document}
+\begin{frame}[t]
+
+% ---------------- Header ----------------
+\begin{columns}[T]
+\begin{column}{0.16\paperwidth}
+  \centering
+  \includegraphics[height=8.7cm]{sissa_logo.pdf}
+\end{column}
+\begin{column}{0.66\paperwidth}
+  \centering
+  {\usebeamerfont{title}\usebeamercolor[fg]{title}\inserttitle}\\[0.6cm]
+  {\Large \insertauthor}\\[0.3cm]
+  {\large \insertinstitute}
+\end{column}
+\begin{column}{0.16\paperwidth}
+  \centering
+  \includegraphics[height=8.7cm]{eucaif_logo.png}
+\end{column}
+\end{columns}
+
+\vspace{1.2cm}
+
+% ---------------- Body: two columns ----------------
+\begin{columns}[t]
+
+% ===== Column 1: Motivation + Method =====
+\begin{column}{0.47\paperwidth}
+
+  \begin{block}{Motivation}
+    \begin{itemize}
+      \item The Laser Interferometer Space Antenna (LISA) will be sensitive to gravitational waves (GW) from a plethora of sources, including the coalescence of massive black hole binaries (MBHBs). 
+      \item Several mergers of MBHBs are expected to be observed by LISA during operations with signal to noise ratio (SNR) of thousands. Classical inference requires a tractable likelihood; while one is available under simplified Gaussian stationary noise, more realistic assumptions -- overlapping sources, non-stationary noise, instrumental glitches -- can make it intractable or prohibitively expensive to evaluate.
+      \item We present an improved version of truncated marginal neural ratio estimation (TMNRE), a simulation-based (likelihood-free) inference method, adapted to LISA-like data. We benchmark it against Markov Chain Monte Carlo (MCMC) on a signal with SNR$=2200$, produced by a non-rotating source of chirp mass $\mathcal M_{\rm c}=10^{5.25} M_{\odot}$.
+    \end{itemize}
+  \end{block}
+
+  \begin{block}{Observed data: LISA time series $\to$ frequency domain}
+    \centering
+    \includegraphics[width=0.72\linewidth]{lisa-time-freq-data-example.pdf}
+
+    The LISA data is a time series in three channels (A, E, T); we train on mock A and E data, generated directly in the Fourier domain with the IMRPhenomHM waveform model (channel A shown here).
+    The right panel is the frequency-domain observation used for inference; the left panel is its time-domain counterpart, obtained by inverse Fourier transform -- akin to what LISA would observe.
+  \end{block}
+
+  \begin{block}{TMNRE method: architecture}
+    \centering
+    \includegraphics[width=0.95\linewidth]{architecture_chmlp_tmnre_simple_crop.pdf}
+
+  A neural network receives the observed data and a candidate set of source parameters, and is trained as a binary classifier: does this data actually come from these parameters, or from unrelated ones? The optimal classifier for this task can be shown to recover exactly the posterior-to-prior ratio, so evaluating the trained network on a grid of parameter values, for a fixed observation, yields the posterior.
+  Here $(\lambda,\beta)$ (ecliptic longitude/latitude, i.e.\ sky location) illustrate one such marginal; in practice we train one classifier head per parameter (or pair), covering all 11 source parameters.
+  \end{block}
+
+  \begin{block}{TMNRE workflow}
+    \centering
+    \includegraphics[width=0.82\linewidth]{tmnre-workflow-final.pdf}
+
+    Training proceeds in rounds: within a round, the simulator continuously overwrites the training set with fresh simulations, increasing the effective dataset size at a fixed memory cost. Each round ends with \emph{truncation}: the current posterior estimate defines a narrower proposal prior for the next round, focusing subsequent simulations on the region actually compatible with the data rather than the full prior volume.
+  \end{block}
+\end{column}
+
+% ===== Column 2: Results =====
+\begin{column}{0.47\paperwidth}
+
+  \begin{block}{Multimodal truncation (mask example)}
+    \noindent
+    \begin{minipage}[c]{0.48\linewidth}
+      \centering
+      \includegraphics[width=\linewidth]{cherry_posterior_inc_round25.pdf}
+    \end{minipage}%
+    \hfill
+    \begin{minipage}[c]{0.48\linewidth}
+      Our truncation algorithm accommodates multimodal posteriors, in 1D and 2D: a single bounding box would either miss a mode or waste simulations on the empty region between modes, so we track each mode's support individually. Shown: the $\cos\iota$ (inclination) and sky-location proposal posteriors and training prior at round 25.
+      Angular periodicity is enforced -- note mode 1 of the sky posterior has matching density at $\lambda=0$ and $\lambda=2\pi$.
+    \end{minipage}
+
+    \vspace{3mm}
+    \centering
+    \includegraphics[width=0.95\linewidth]{cherry_posterior_sky_round25.pdf}
+  \end{block}
+
+  \begin{block}{Truncation as a function of training round}
+    \centering
+    \includegraphics[width=0.95\linewidth]{interval_evolution_truncation_params_logMchirp_Deltat_chi_eff.pdf}
+    \par
+    \vspace{6mm}
+    \noindent
+    \begin{minipage}[c]{0.48\linewidth}
+      \centering
+      \includegraphics[width=\linewidth]{volume_from_masks_global.pdf}
+    \end{minipage}%
+    \hfill
+    \begin{minipage}[c]{0.48\linewidth}
+      As rounds proceed, the proposal prior shrinks and stabilizes around the final posterior. Top: the prior bounds per round for a selection of three parameters, the time of coalescence $\Delta t$, the effective spin $\chi_{\rm eff}$ and the chirp mass. Bottom: the cumulative prior volume (product of all per-marginal volumes, normalised to volume of the initial prior) -- a $\sim10^{23}\times$ reduction by round 42, reached in under 30 GPU-hours using a single NVIDIA A100 GPU.
+    \end{minipage}
+  \end{block}
+
+  \begin{block}{\textcolor{highlight}{Final posterior vs.\ MCMC}}
+    \cardbox[highlight]{%
+      \begin{minipage}{\dimexpr\linewidth-2\cardpad\relax}
+        \centering
+        \includegraphics[width=\linewidth]{round_42_last_posterior_vs_mcmc_truncation.pdf}
+
+        \noindent
+        \begin{minipage}[c]{0.48\linewidth}
+          \centering
+          \includegraphics[width=\linewidth]{final_posterior_zoom.pdf}
+        \end{minipage}%
+        \hfill
+        \begin{minipage}[c]{0.48\linewidth}
+          We train our model to produce posteriors for the 11 source parameters. 
+          The final-round posterior agrees with that of an MCMC sampler initialised close to the true value -- our method recovers the likelihood-based result without ever evaluating the likelihood.
+        \end{minipage}
+      \end{minipage}%
+    }
+  \par
+  \vspace{2cm}
+  \futurebox{%
+    \begin{minipage}{\dimexpr\linewidth-2\cardpad\relax}
+      \textbf{\color{accent}Future plans and potential developments}
+      \begin{itemize}
+        \item Increase the observation duration at every round, in order to try an online, pre-merger parameter estimation.
+        \item Add the foreground due to galactic binaries into the power spectrum.
+        \item Use this method to replace importance resampling for amortized SBI pipelines.
+      \end{itemize}
+    \end{minipage}%
+  }
+  \end{block}
+
+\end{column}
+
+\end{columns}
+
+\end{frame}
+\end{document}

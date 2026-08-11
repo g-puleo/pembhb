@@ -224,6 +224,32 @@ def _grid_layout(n_panels: int, rows: int = DEFAULT_ROWS,
     return rows, cols
 
 
+def _resolve_param_subset(all_params, requested):
+    """Filter ``all_params`` (the ``data['params']`` tuples) down to *requested*.
+
+    Matching is case-insensitive and underscore-optional, so ``deltat`` resolves
+    to ``Deltat`` and ``chieff`` to ``chi_eff``. The user's requested order is
+    preserved. Raises ``ValueError`` (listing the available labels) if any name
+    is unknown.
+    """
+    lookup = {}
+    for tup in all_params:
+        label = tup[0]
+        lookup.setdefault(label.lower(), tup)
+        lookup.setdefault(label.lower().replace("_", ""), tup)
+    subset = []
+    for name in requested:
+        key = name.lower()
+        tup = lookup.get(key) or lookup.get(key.replace("_", ""))
+        if tup is None:
+            available = ", ".join(t[0] for t in all_params)
+            raise ValueError(
+                f"--params: unknown parameter '{name}'. Available: {available}."
+            )
+        subset.append(tup)
+    return subset
+
+
 def _axis_transforms_for(label: str, inj_val: float | None,
                           duration_weeks: float | None,
                           mcmc_samples_path: str | None):
@@ -688,6 +714,11 @@ def main():
     p.add_argument("--rows", type=int, default=DEFAULT_ROWS)
     p.add_argument("--cols", type=int, default=DEFAULT_COLS)
     p.add_argument("--fontsize", type=float, default=10.0)
+    p.add_argument("--params", nargs="+", default=None,
+                   help="Also emit an extra single-row (1xN) evolution figure "
+                        "for just these parameters, in the given order. "
+                        "Case-insensitive, underscores optional "
+                        "(e.g. 'logmchirp deltat q', 'chieff').")
     args = p.parse_args()
     if args.reason == "auto":
         args.reason = "trigger" if args.ckpt_final_round else "truncation"
@@ -758,6 +789,27 @@ def main():
         reason=args.reason,
         **style,
     )
+
+    # Extra 1xN evolution figure for a hand-picked subset of parameters.
+    # Built after the full-grid figures so the original data["params"] is left
+    # untouched for them; only the panel list is swapped here.
+    if args.params:
+        subset = _resolve_param_subset(data["params"], args.params)
+        subset_data = {**data, "params": subset}
+        labels = "_".join(lbl for lbl, *_ in subset)
+        print(f"[params] extra 1x{len(subset)} figure for: {labels}")
+        plot_interval_evolution(
+            data=subset_data,
+            mcmc_samples_path=args.mcmc_file,
+            outdir=outdir,
+            ngrid_1d=args.ngrid_1d,
+            reason=args.reason,
+            width_pt=args.width_pt,
+            height_in=args.height_in,
+            rows=1,
+            cols=len(subset),
+            filename_suffix=f"_params_{labels}",
+        )
 
 
 if __name__ == "__main__":

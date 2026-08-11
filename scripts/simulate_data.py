@@ -11,10 +11,13 @@ parser.add_argument("--n", default=1)
 parser.add_argument("--fname", required=True)
 parser.add_argument("-s", "--seed", required=True)
 parser.add_argument("--batch_size", default=None)
-config_path = os.path.join(ROOT_DIR, "configs/datagen_config.yaml")
+config_path_default = os.path.join(ROOT_DIR, "configs/datagen_config.yaml")
+
+parser.add_argument("--datagen_config", default=config_path_default)
+args = parser.parse_args()
+config_path = os.path.join(ROOT_DIR, args.datagen_config)
 with open(config_path, "r") as file:
     conf = yaml.safe_load(file) 
-args = parser.parse_args()
 print(type(args.n))
 sampler_init_kwargs={'prior_bounds': conf["prior"],
                      'spin_param_basis': conf.get("spin_param_basis", "chi1chi2")}
