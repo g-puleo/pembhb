@@ -74,6 +74,9 @@ BAND_ALPHA = {0.99: 0.20, 0.90: 0.38, 0.50: 0.70}
 # Half-width of the symlog linear region, in units of the last round's 99% band.
 SYMLOG_LINTHRESH_FACTOR = 5.0
 
+# Curve/ground-truth linewidth in plot_last_round_vs_mcmc's panels + legend.
+LAST_ROUND_LW = 1.5
+
 # Panel titles for the parameters that carry a unit. Everything else falls back
 # to ``latex_label`` (dimensionless: q, spins, cos(iota), sin(beta), logMchirp).
 UNIT_LABELS = {
@@ -598,6 +601,13 @@ def plot_last_round_vs_mcmc(
     """
     os.makedirs(outdir, exist_ok=True)
     params = data["params"]
+    if len(params) > 1:
+        # Panel [0,0] has no left neighbour to lend its title overhang room
+        # to, so a wide title there (e.g. "log10(Mc/Msun)", typically first
+        # in the canonical order) clips against the figure's outer edge at
+        # large --fontsize. [0,1] has neighbours on both sides -- swap the
+        # first two panels' content so the wide title lands there instead.
+        params = [params[1], params[0]] + list(params[2:])
     last_densities = data["per_round_densities"][-1]
     duration_weeks = data["duration_weeks"]
     mcmc_samples = data["mcmc_samples"]
@@ -629,7 +639,7 @@ def plot_last_round_vs_mcmc(
         dx = abs(float(x_grid[1] - x_grid[0]))  # uniform (linear transform)
 
         y_nre = norm1d / max(np.sum(norm1d) * dx, 1e-300)
-        ax.plot(x_grid, y_nre, color="C0", lw=1.5)
+        ax.plot(x_grid, y_nre, color="C0", lw=LAST_ROUND_LW)
         ax.fill_between(x_grid, y_nre, alpha=0.2, color="C0")
 
         if mcmc_samples is not None and label in mcmc_param_names:
@@ -639,25 +649,25 @@ def plot_last_round_vs_mcmc(
             )
             if mvals is not None:
                 mvals = mvals / max(np.sum(mvals) * dx, 1e-300)
-                ax.plot(x_grid, mvals, color="grey", lw=1.5)
+                ax.plot(x_grid, mvals, color="grey", lw=LAST_ROUND_LW)
                 ax.fill_between(x_grid, mvals, alpha=0.15, color="grey")
 
         mu_disp = float(nre_to_x(np.array([inj]))[0])
-        ax.axvline(mu_disp, color="red", ls="--", lw=1.0)
+        ax.axvline(mu_disp, color="red", ls="--", lw=LAST_ROUND_LW)
         title = _panel_title(label)
         ax.set_title(title, pad=3)
         ax.set_yticks([])
-        ax.xaxis.set_major_locator(MaxNLocator(nbins=3))
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=2))
 
     for k in range(len(params), rows * cols):
         axes[k // cols, k % cols].set_visible(False)
 
     handles = [
-        Line2D([0], [0], color="C0", lw=1.5, label=f"NRE (round {n_rounds})"),
-        Line2D([0], [0], color="red", ls="--", lw=1.0, label="ground truth"),
+        Line2D([0], [0], color="C0", lw=LAST_ROUND_LW, label=f"NRE\n(round {n_rounds})"),
+        Line2D([0], [0], color="red", ls="--", lw=LAST_ROUND_LW, label="ground truth"),
     ]
     if mcmc_samples is not None:
-        handles.insert(1, Line2D([0], [0], color="grey", lw=1.5, label="MCMC"))
+        handles.insert(1, Line2D([0], [0], color="grey", lw=LAST_ROUND_LW, label="MCMC"))
     _place_legend(fig, axes, handles, len(params), rows, cols)
     return save_figure(
         fig, outdir, f"round_{n_rounds}_last_posterior_vs_mcmc_{reason}",
@@ -711,14 +721,27 @@ def main():
                    help="Figure width in points (default: \\textwidth = 492).")
     p.add_argument("--height-in", type=float, default=None,
                    help="Figure height in inches (default: from the row count).")
+    p.add_argument("--mcmc-height-in", type=float, default=None,
+                   help="Figure height in inches for the last-round-vs-MCMC "
+                        "figure (default: same as --height-in).")
     p.add_argument("--rows", type=int, default=DEFAULT_ROWS)
     p.add_argument("--cols", type=int, default=DEFAULT_COLS)
     p.add_argument("--fontsize", type=float, default=10.0)
     p.add_argument("--params", nargs="+", default=None,
-                   help="Also emit an extra single-row (1xN) evolution figure "
-                        "for just these parameters, in the given order. "
-                        "Case-insensitive, underscores optional "
-                        "(e.g. 'logmchirp deltat q', 'chieff').")
+                   help="Also emit an extra evolution figure for just these "
+                        "parameters, in the given order (grid shape from "
+                        "--params-rows/--params-cols). Case-insensitive, "
+                        "underscores optional (e.g. 'logmchirp deltat q', 'chieff').")
+    p.add_argument("--params-rows", type=int, default=1,
+                   help="Row count for the --params figure (default: 1, i.e. a "
+                        "single row).")
+    p.add_argument("--params-cols", type=int, default=None,
+                   help="Column count for the --params figure (default: "
+                        "len(--params)+1, one free cell reserved for the legend "
+                        "at the end of the single default row).")
+    p.add_argument("--params-width-pt", type=float, default=None,
+                   help="Figure width in points for the --params figure "
+                        "(default: same as --width-pt).")
     args = p.parse_args()
     if args.reason == "auto":
         args.reason = "trigger" if args.ckpt_final_round else "truncation"
@@ -787,7 +810,7 @@ def main():
         outdir=outdir,
         ngrid_1d=args.ngrid_1d,
         reason=args.reason,
-        **style,
+        **{**style, "height_in": args.mcmc_height_in or args.height_in},
     )
 
     # Extra 1xN evolution figure for a hand-picked subset of parameters.
@@ -804,10 +827,17 @@ def main():
             outdir=outdir,
             ngrid_1d=args.ngrid_1d,
             reason=args.reason,
-            width_pt=args.width_pt,
+            width_pt=args.params_width_pt or args.width_pt,
             height_in=args.height_in,
-            rows=1,
-            cols=len(subset),
+            rows=args.params_rows,
+            # Default: one extra (blank) column reserves a free cell for
+            # _place_legend's shrink-to-fit branch -- the "grid exactly
+            # filled" branch it otherwise falls into places the legend at a
+            # fixed fontsize with no shrink loop, which clips at large
+            # --fontsize values. Pass --params-rows/--params-cols explicitly
+            # (e.g. 2x2 for 3 params) for a non-single-row layout; the same
+            # free-cell legend placement applies as long as rows*cols > len(params).
+            cols=args.params_cols or len(subset) + 1,
             filename_suffix=f"_params_{labels}",
         )
 

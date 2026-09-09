@@ -1917,9 +1917,7 @@ class SequentialTrainerJoint:
             # ---- Update prior from posterior contours -------------------
             if self.train_conf["device"] == "cuda":
                 torch.cuda.empty_cache()
-            # NOTE: the per-marginal PP plot (utils.pp_plot) used to live here
-            # but is now produced by the PPKS callback as an overlay every
-            # ``run_every_n_epochs`` cumulative epochs.
+
             out_idx = 0
             # Parameter names follow the run's spin basis (slots 2,3). The prior
             # dict is keyed with these names, so truncation must write the same.
@@ -1955,6 +1953,8 @@ class SequentialTrainerJoint:
                 for marginal in marginal_list:
                     marginal_key = tuple(marginal)
 
+                    # This part of code is commented out because i want to keep the truncaiton veto inactive. 
+                    
                     # if marginal_key not in trunc_keys:
                     #     name = "-".join(prior_keys[j] for j in marginal_key)
                     #     ratio = self._last_volume_ratios.get(marginal_key, float("nan"))
