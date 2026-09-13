@@ -18,6 +18,7 @@ from lisatools.sensitivity import get_sensitivity
 from pembhb import ROOT_DIR, FMIN_FLOOR
 from pembhb import get_numpy_dtype, get_numpy_complex_dtype
 from pembhb.sampler import UniformSampler
+from pembhb.psd_veto import bin_widths, bands_to_mask, reference_veto_bands, REF_FMAX
 
 
 WEEK_SI = 7 * 24 * 3600
@@ -471,6 +472,11 @@ class MBHBSimulatorFD:
         # max(requested_fmin, 1/T_obs) and there are no PSD-masked dead bins
         # to worry about downstream.
         self.fmax = conf["waveform_params"].get("fmax", 1.0 / (2.0 * dt))
+        if self.fmax > REF_FMAX:
+            raise ValueError(
+                f"fmax={self.fmax:g} exceeds the PSD-veto reference grid "
+                f"({REF_FMAX:g} Hz); TDI nulls above it would go undetected."
+            )
         fmin_request = conf["waveform_params"].get("fmin", FMIN_FLOOR)
         self.fmin = max(fmin_request, 1.0 / self.obs_length)
         self.freq_spacing = freq_spacing
@@ -492,14 +498,21 @@ class MBHBSimulatorFD:
         else:
             raise ValueError(f"freq_spacing must be 'linear' or 'log', got '{freq_spacing}'")
 
+        # Drop bins inside the TDI nulls: the PSD collapses there but the
+        # splined response does not, so 1/S diverges. Deleting them leaves a
+        # gap that bin_widths bridges, so no interpolation is needed.
+        self.psd_veto_bands = reference_veto_bands(
+            self.channels, conf["waveform_params"]["noise"]
+        )
+        vetoed = bands_to_mask(self.freqs, self.psd_veto_bands)
+        if vetoed.any():
+            self.freqs = self.freqs[~vetoed]
+            self.n_freq_bins = len(self.freqs)
+            print(f"[MBHBSimulatorFD] PSD veto: dropped {vetoed.sum()} bins "
+                  f"across {len(self.psd_veto_bands)} TDI-null bands.")
+
         # Per-bin frequency widths for inner products and noise colouring.
-        # Length n_freq_bins: use midpoint rule so each bin has a width.
-        df_diff = np.diff(self.freqs)
-        # Assign each bin a width: average of adjacent diffs, endpoints get half-width
-        self.df = np.empty(self.n_freq_bins)
-        self.df[0] = df_diff[0]
-        self.df[-1] = df_diff[-1]
-        self.df[1:-1] = 0.5 * (df_diff[:-1] + df_diff[1:])
+        self.df = bin_widths(self.freqs)
 
         # ASD. The grid starts at fmin >= FMIN_FLOOR by construction, so no
         # masking is needed; ``filtered_asd`` is kept as an alias for the

@@ -1356,6 +1356,7 @@ class PPKSTestEarlyStopping(Callback):
         fisher_varying_params: list | None = None,
         fisher_backend: str = "cpu",
         lt_h5_path: str | None = None,
+        lt_warmup_epochs: int | None = None,
     ):
         super().__init__()
         # ``test_loader`` is built once by the caller (typically wrapping a
@@ -1365,6 +1366,10 @@ class PPKSTestEarlyStopping(Callback):
         self.marginals_1d_info = marginals_1d_info
         self.ngrid_points = ngrid_points
         self.warmup_epochs = warmup_epochs
+        # λ/τ stats may start earlier than the trigger bookkeeping; below
+        # ``warmup_epochs`` the callback runs in stats-only mode.
+        self.lt_warmup_epochs = (warmup_epochs if lt_warmup_epochs is None
+                                 else int(lt_warmup_epochs))
         self.run_every_n_epochs = max(1, int(run_every_n_epochs))
         self.patience = patience
         self.ema_alpha = ema_alpha
@@ -1459,8 +1464,13 @@ class PPKSTestEarlyStopping(Callback):
 
     def on_validation_epoch_end(self, trainer, pl_module):
         cum_ep = self._cum_ep(trainer)
-        if cum_ep < self.warmup_epochs:
+        gate = (min(self.warmup_epochs, self.lt_warmup_epochs)
+                if self.compute_lambda_tau else self.warmup_epochs)
+        if cum_ep < gate:
             return
+        # Below warmup_epochs only the λ/τ statistics are collected: no EMA,
+        # no stall counting, no trigger latch, no overlay plot.
+        stats_only = cum_ep < self.warmup_epochs
         # ``run_every_n_epochs`` is keyed off the cumulative axis so the
         # cadence is stable across rounds.
         if cum_ep % self.run_every_n_epochs != 0:
@@ -1472,12 +1482,14 @@ class PPKSTestEarlyStopping(Callback):
         was_training = pl_module.training
         try:
             pl_module.eval()
-            self._evaluate_and_maybe_stop(trainer, pl_module, kstest)
+            self._evaluate_and_maybe_stop(trainer, pl_module, kstest,
+                                          stats_only=stats_only)
         finally:
             if was_training:
                 pl_module.train()
 
-    def _evaluate_and_maybe_stop(self, trainer, pl_module, kstest):
+    def _evaluate_and_maybe_stop(self, trainer, pl_module, kstest,
+                                 stats_only=False):
         keys = _param_keys(pl_module)  # basis-aware parameter names
         self._lt_keys = keys  # cache for _write_lt_h5 (has no pl_module)
         per_marginal: dict[str, dict] = {}
@@ -1506,6 +1518,13 @@ class PPKSTestEarlyStopping(Callback):
             D = float(kstest(ranks, "uniform").statistic)
             q = self.t_quantile
             T = float(np.mean((ranks < q) | (ranks > 1.0 - q)))
+
+            if stats_only:
+                # Raw statistics only; the EMA is left uninitialised so it
+                # still starts from the first post-warmup evaluation.
+                per_marginal[label] = {"D": D, "T": T, "stall": 0,
+                                       "violation": ""}
+                continue
 
             if label not in self._ema_d:
                 self._ema_d[label] = D
@@ -1566,8 +1585,9 @@ class PPKSTestEarlyStopping(Callback):
             for label, v in per_marginal.items():
                 metrics[f"pp_ks/D/{label}"] = v["D"]
                 metrics[f"pp_ks/T/{label}"] = v["T"]
-                metrics[f"pp_ks/D_ema/{label}"] = v["D_ema"]
-                metrics[f"pp_ks/T_ema/{label}"] = v["T_ema"]
+                if "D_ema" in v:
+                    metrics[f"pp_ks/D_ema/{label}"] = v["D_ema"]
+                    metrics[f"pp_ks/T_ema/{label}"] = v["T_ema"]
             metrics["pp_ks/cumulative_epoch"] = float(cum_ep)
             trainer.logger.log_metrics(metrics, step=cum_ep)
 
@@ -1591,7 +1611,7 @@ class PPKSTestEarlyStopping(Callback):
         # the same axes.  Filename keyed by the cumulative-epoch axis so a
         # single sorted listing reads chronologically across the campaign.
         overlay_path = None
-        if self.plots_dir and ranks_per_marginal:
+        if self.plots_dir and ranks_per_marginal and not stats_only:
             overlay_path = os.path.join(
                 self.plots_dir, "ppks_traces",
                 f"cumep_{cum_ep:04d}_pp.png",

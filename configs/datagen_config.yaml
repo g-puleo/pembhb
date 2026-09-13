@@ -2,8 +2,8 @@ waveform_params:
   channels: "AE"
   modes:  [[2,2], [2,1], [3,3], [3,2], [4,4], [4,3]]
   noise: "sangria"
-  duration: 1 # weeks
-  dt: 100 # seconds
+  duration: 1 # weeks # USED TO SET df=1/duration
+  dt: 100 # seconds #IGNORED BY THE CURRENT CODE 
   # FD-only settings (used when domain="fd"; ignored for "fd_td")
   domain: "fd"          # "fd" for FD-only simulator, "fd_td" for FD+TD (default)
   n_freq_bins: 4096        # number of frequency bins (FD-only; used for freq_spacing="log" only)
@@ -12,9 +12,6 @@ waveform_params:
   # Defaults to FMIN_FLOOR (1e-4) when omitted. Use 1.0e-5 to reproduce
   # the pre-60db969 baseline grid.
   fmin: 1.0e-4
-  # Upper edge of the FD grid (Hz). When freq_spacing="linear", the grid is
-  # np.arange(fmin, fmax, downsamplefactor / T_obs).
-
   fmax: 2.0e-2
   downsamplefactor: 1    # match obs_fmin1e-4_fmax2e-2_ds1 grid (12036 bins, 1-week T_obs)
   #psd_fmin_mask: 5.0e-5 # restore the low freq cutoff. 
@@ -22,7 +19,7 @@ waveform_params:
 prior:
   # Pinned to the injection truth for observation generation (simulate_data.py).
   # Fisher overrides these for the varying params at TMNRE round 1 anyway.
-  "logMchirp": [5.2, 5.3]
+  "logMchirp": [5.9,6.1]
   "q":         [1, 5]
   "chi_eff":   [-0.97, 0.97]        # effective aligned spin (slot 2; basis chieff_chidiff)
   "chi_diff":  [-0.97, 0.97]        # differential spin (chi1-chi2)/2 (slot 3)
@@ -32,14 +29,14 @@ prior:
   "lambda":    [0, 6.283185307179586]            # ecliptic longitude
   "beta":      [-1.0, 1.0]        # sin ecliptic latitude
   "psi":       [0,3.14159265358979]                                        # polarization angle in [0, pi]
-  "Deltat":    [-0.2, -0.01]        # t_merger from end of observation (days)
+  "Deltat":    [-2.55, -2.45]        # t_merger from end of observation (days)
 
-  # "logMchirp": [5.25, 5.25]
+  # "logMchirp": [6.0, 6.0]
   # "q":         [3.00, 3.00]
-  # "chi1":      [0.0, 0.0]
-  # "chi2":      [0.0, 0.0]
-  # "dist":      [10.0, 10.0]                                      # Gpc (sampled uniformly in dist^3)
-  # "phi":       [0.0, 0.0]                                        # phase at coalescence
+  # "chi_eff":      [0.0, 0.0]
+  # "chi_diff":      [0.0, 0.0]
+  # "dist":      [15.0, 15.0]                                      # Gpc (sampled uniformly in dist^3)
+  # "phi":       [3.1415, 3.1415]                                        # phase at coalescence
   # "inc":       [0.5, 0.5]                                        # cos inclination
   # "lambda":    [3.14159265358979, 3.14159265358979]            # ecliptic longitude
   # "beta":      [0.2, 0.2]        # sin ecliptic latitude

@@ -1014,6 +1014,7 @@ class SequentialTrainerJoint:
                         "prior_dist_volumetric", True),
                     spin_param_basis=self.datagen_conf.get(
                         "spin_param_basis", "chi1chi2"),
+                    round_idx=last_round + 1,
                 )
                 print(f"[Resume] Mask truncation restored: "
                       f"{len(saved['intervals_1d'])} 1D interval set(s), "
@@ -1713,6 +1714,8 @@ class SequentialTrainerJoint:
             # callback, so AE-warmup epochs already count — no need to
             # offset by ae_warmup_epochs here.
             ppks_warmup = int(pp_conf.get("warmup_epochs", 50))
+            # λ/τ may start before the trigger bookkeeping; defaults to it.
+            lt_warmup = int(lt_conf.get("warmup_epochs", ppks_warmup))
             ppks_state_path = os.path.join(
                 DATA_ROOT_DIR, TIME_OF_EXECUTION, "ppks_state.yaml",
             )
@@ -1743,10 +1746,12 @@ class SequentialTrainerJoint:
                 fisher_varying_params=fisher_varying_params,
                 fisher_backend=lt_backend,
                 lt_h5_path=lt_h5_path,
+                lt_warmup_epochs=lt_warmup,
             ))
             if lt_enabled:
                 print(f"[λτ] enabled: 2d_marginals={len(marginals_2d_info)}, "
                       f"fisher_params={fisher_varying_params}, backend={lt_backend}, "
+                      f"warmup={lt_warmup} (ppks warmup={ppks_warmup}), "
                       f"out={lt_h5_path}")
             mode = ("trigger" if pp_conf.get("trigger_on_overconfidence", False)
                     else "monitor")
@@ -2063,6 +2068,7 @@ class SequentialTrainerJoint:
                         "prior_dist_volumetric", True),
                     spin_param_basis=self.datagen_conf.get(
                         "spin_param_basis", "chi1chi2"),
+                    round_idx=i + 1,
                 )
                 print(f"[Trunc/mask] round {i}: MaskRejectSampler with "
                       f"{len(intervals_1d)} 1D interval set(s), "

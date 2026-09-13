@@ -150,8 +150,8 @@ sequential_training:
   early_stop_threshold: 0.999
 joint_training:
   ae_warmup_epochs: 0
-  lr_ae: 0.00005
-  lr_nre: 0.00005
+  lr_ae: 0.0001
+  lr_nre: 0.0001
   ae_weight_decay: 1.0e-05
   freeze_ae_after_warmup: false
   transfer_classifiers_across_rounds: false
@@ -163,7 +163,7 @@ joint_training:
     shrink_factor: 100
   checkpoint_every_n_epochs: 10
   ae_scheduler:
-    enabled: true
+    enabled: false
     monitor: val_nre_loss
     mode: min
     factor: 0.5
@@ -231,6 +231,7 @@ pp_ks_early_stop:
   lambda_tau:
     enabled: true
     fisher_backend: cuda12x
+    warmup_epochs: 0   # λ/τ from epoch 0; PP-KS trigger still waits for warmup_epochs
 bnre:
   enabled: false
   lambda: 0.0
