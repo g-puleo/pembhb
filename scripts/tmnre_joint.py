@@ -636,11 +636,22 @@ class SequentialTrainerJoint:
 
         sconf = self.train_conf["streaming"]
         n_buffers = int(sconf.get("n_buffers", 5))
-        # One buffer == one epoch of distinct examples (disk mapstyle): size the
-        # buffer from the epoch knob so every row is read exactly once (no idx%M
-        # cycling). samples_per_epoch is authoritative; buffer_size is the
-        # fallback when it's unset. Disk (unlike VRAM) has room for a full epoch.
-        M = int(sconf.get("samples_per_epoch") or sconf.get("buffer_size", 10000))
+        # buffer_size sizes each FILE; samples_per_epoch sizes the EPOCH. An
+        # epoch consumes k = samples_per_epoch / buffer_size whole buffer files
+        # (each row read exactly once, no idx%M cycling), so the two knobs are
+        # independent — unlike VRAM, disk can hold several epochs' worth.
+        M = int(sconf.get("buffer_size") or sconf.get("samples_per_epoch", 10000))
+        spe = int(sconf.get("samples_per_epoch") or M)
+        assert spe % M == 0, (
+            f"streaming.samples_per_epoch ({spe}) must be a multiple of "
+            f"streaming.buffer_size ({M}): an epoch is read as whole buffer files"
+        )
+        k_epoch = spe // M
+        assert n_buffers >= k_epoch + 1, (
+            f"streaming.n_buffers ({n_buffers}) must be >= k+1 = {k_epoch + 1} "
+            f"(k = samples_per_epoch/buffer_size = {spe}/{M}) so the producer "
+            f"always has a buffer free to refresh while an epoch is being read"
+        )
         val_size = int(sconf.get("val_size", 2000))
         device = self.train_conf["device"]
 
@@ -682,17 +693,17 @@ class SequentialTrainerJoint:
         self._ring = ring
         self._producer = producer
         bs = int(self.train_conf["batch_size"])
-        print(f"[streaming][disk] epoch = buffer_size = {M} distinct examples; "
-              f"steps/epoch = {M // bs}; n_buffers = {n_buffers} "
-              f"(disk ~{n_buffers * M} waveforms in {buffer_dir})")
+        print(f"[streaming][disk] epoch = {spe} distinct examples = {k_epoch} x "
+              f"buffer_size {M}; steps/epoch = {spe // bs}; n_buffers = "
+              f"{n_buffers} (disk ~{n_buffers * M} waveforms in {buffer_dir})")
         self.data_module = DiskStreamingDataModule(
             ring, sim, val_pool,
             batch_size=self.train_conf["batch_size"],
             noise_factor=self.train_conf["noise_factor"],
             n_train_noise_realisations=self.train_conf.get("n_train_noise_realisations", 1),
             device=device,
-            # M == the epoch, so length == M -> each buffer read once, all distinct.
-            samples_per_epoch=M,
+            # k = spe/M buffers per epoch, each read once -> spe distinct rows.
+            samples_per_epoch=spe,
             num_workers=int(sconf.get("num_workers", 8)),
             prefetch_factor=int(sconf.get("prefetch_factor", 4)),
         )
