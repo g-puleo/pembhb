@@ -50,6 +50,29 @@ def _axis_cell_size(grid1d):
     return float(g[1] - g[0])
 
 
+def origin_extent_from_grid(grid1d):
+    """``(vertex, width)`` of a grid of pixel *centres* — the storage convention.
+
+    Persistence (npz ``format_version: 2``) stores a subgrid as its bottom-left
+    **vertex** plus its extent, not as an array of centres, so that a mode's
+    support is recorded by its true edges rather than by the centres half a
+    pixel inside them.  ``n`` comes from the mask's own shape.
+    """
+    g = np.asarray(grid1d, dtype=float).reshape(-1)
+    n = g.shape[0]
+    if n < 2:
+        raise ValueError("cannot infer a cell size from a grid of one point")
+    dx = (g[-1] - g[0]) / (n - 1)
+    return float(g[0] - 0.5 * dx), float(n * dx)
+
+
+def grid_from_origin_extent(origin, extent, n):
+    """Inverse of :func:`origin_extent_from_grid`: ``x_c[a] = x0 + (a+0.5)·w/n``."""
+    n = int(n)
+    dx = float(extent) / n
+    return float(origin) + (np.arange(n) + 0.5) * dx
+
+
 def _nearest_index(values, grid1d):
     """Round each value to the nearest pixel index on ``grid1d`` (unclipped).
 
@@ -119,6 +142,10 @@ class Region:
         self._labels_cache = labels
         return labels
 
+    def labels(self):
+        """Connected-component labels of the mask (0 = rejected), wrap-aware."""
+        return self._labels()
+
     # ------------------------------------------------------------------
     # the primitive
     # ------------------------------------------------------------------
@@ -132,16 +159,19 @@ class Region:
         values = np.asarray(values, dtype=float)
         if self.ndim == 1:
             v = values.reshape(-1) if values.ndim <= 1 else values[0]
+            # for each value in v find the index of its nearest pixel in a infinite grid with origin at grid[0] 
             col = _nearest_index(v, self.grids[0])
-            n = self.grids[0].shape[0]
-            in_range = (col >= 0) & (col < n)
-            out = np.zeros(col.shape, dtype=bool)
-            safe = np.clip(col, 0, n - 1)
-            out[in_range] = self.mask[safe][in_range]
+            n = self.grids[0].shape[0]                  # the number of elements in the grid
+            in_range = (col >= 0) & (col < n)           # whether each element is in range or not (array)
+            out = np.zeros(col.shape, dtype=bool) 
+            safe = np.clip(col, 0, n - 1)               # avoid indexerror when calling self.mask[safe]
+            out[in_range] = self.mask[safe][in_range]   # but retain only the indices which are in_range. 
             return out
 
         if values.ndim == 1:
             values = values.reshape(2, 1)
+
+        # else it means self.ndim== 2 and the same thing happen. 
         vx, vy = values[0], values[1]
         col = _nearest_index(vx, self.grids[0])
         row = _nearest_index(vy, self.grids[1])
@@ -166,18 +196,40 @@ class Region:
         if len(new) != self.ndim:
             raise ValueError("grid dimensionality mismatch")
         if self.ndim == 1:
+            # merely use the function .contains()
             return self.contains(new[0])
-        gx, gy = new
+        # if two dim , then .contains() needs a list of points. create it from the grid :
+        gx, gy = new # these are x coords and y coords of shape (m_x) and (m_y), need a list of points (2,mx*my), 
         mesh_x, mesh_y = np.meshgrid(gx, gy, indexing="xy")  # (m_y, m_x)
+        # reshape (-1) goes from (my,mx) to (mx*my) , stack goes to (2, mx*my).
         pts = np.stack([mesh_x.reshape(-1), mesh_y.reshape(-1)], axis=0)
         return self.contains(pts).reshape(mesh_x.shape)
 
     # ------------------------------------------------------------------
     # measures / summaries — one line each on top of the boolean array
     # ------------------------------------------------------------------
-    def volume_fraction(self):
-        """Fraction of the grid (== the trained prior box) that is accepted."""
-        return float(np.count_nonzero(self.mask)) / float(self.mask.size)
+    def cell_volumes(self):
+        """Per-pixel measure, shaped like ``mask`` (uniform grid: a constant)."""
+        dv = float(np.prod([abs(_axis_cell_size(g)) for g in self.grids]))
+        return np.full(self.mask.shape, dv)
+
+    def volume(self, mask=None):
+        """Volume of the mask in pixels. 
+        Accepted measure ``Σ mask·dV``; ``mask`` defaults to this region's own."""
+        m = self.mask if mask is None else np.asarray(mask, dtype=bool)
+        return float(np.sum(self.cell_volumes()[m]))
+
+    def volume_fraction(self, reference=None):
+        """Fraction of ``reference`` that is accepted.
+
+        ``reference=None`` means this region's own grid — the trained prior box
+        in the single-grid case, which is what every pre-subgrid caller intends.
+        Pass a :class:`Region`, a :class:`MultiRegion` or a bare volume to
+        measure against the previous round's accepted set instead.
+        """
+        if reference is None:
+            return float(np.count_nonzero(self.mask)) / float(self.mask.size)
+        return self.volume() / _reference_volume(reference)
 
     def bounds(self):
         """Per-axis outer envelope ``[lo, hi]`` of the accepted pixels.
@@ -313,6 +365,159 @@ class Region:
         return cls(labels > 0, (payload["grid_x"], payload["grid_y"]), periodic)
 
 
+def _reference_volume(reference):
+    """Measure of a denominator given as a region or as a bare number."""
+    vol = reference.volume() if hasattr(reference, "volume") else float(reference)
+    if vol <= 0:
+        raise ValueError("reference volume must be positive")
+    return float(vol)
+
+
+class MultiRegion:
+    """The accepted set of one marginal as a union of per-mode sub-regions.
+
+    Each part is an ordinary :class:`Region` carrying its **own** grid, so
+    different modes can be resolved at different pitches — a mode spanning three
+    pixels of the full-box grid gets its own grid spanning only its support.
+    The accepted set is the union of the parts.  Parts come from disjoint
+    connected components, so their masks never overlap even when their bounding
+    boxes do, and measures simply add.
+
+    The public surface mirrors :class:`Region` and is in every case a reduction
+    over the parts.  The one method whose meaning changes is
+    :meth:`volume_fraction`: with per-mode subgrids there is no implicit
+    denominator left (the parts cover only themselves, not the prior box), so
+    the reference set is a required argument.
+
+    A single-part ``MultiRegion`` spanning the whole box is exactly today's
+    coarse-pass :class:`Region` — see :meth:`from_region` — so the pipeline can
+    carry one type throughout.
+    """
+
+    def __init__(self, parts, periodic=None):
+        parts = tuple(parts)
+        if not parts:
+            raise ValueError("MultiRegion needs at least one part")
+        ndims = {p.ndim for p in parts}
+        if len(ndims) != 1:
+            raise ValueError(f"parts disagree on ndim: {sorted(ndims)}")
+        self.parts = parts
+        self.ndim = parts[0].ndim
+        if periodic is None:
+            # a part is periodic only if its own grid still spans the full
+            # period, so the union is periodic if any part is
+            periodic = tuple(any(p.periodic[a] for p in parts)
+                             for a in range(self.ndim))
+        self.periodic = tuple(bool(p) for p in periodic)
+        if len(self.periodic) != self.ndim:
+            raise ValueError("periodic must have one entry per axis")
+
+    @classmethod
+    def from_region(cls, region):
+        """Wrap one full-box :class:`Region` — the coarse-pass result."""
+        return cls([region], region.periodic)
+
+    def __len__(self):
+        return len(self.parts)
+
+    # ------------------------------------------------------------------
+    # membership — the primitive, OR-reduced
+    # ------------------------------------------------------------------
+    def contains(self, values):
+        out = self.parts[0].contains(values)
+        for part in self.parts[1:]:
+            out = out | part.contains(values)
+        return out
+
+    def contains_grid(self, grids):
+        """Membership at every point of ``grids``, shaped like that grid's mask.
+
+        Each part resamples itself (:meth:`Region.contains_grid`), so the target
+        grid is unrelated to any part's own pitch or extent.
+        """
+        out = self.parts[0].contains_grid(grids)
+        for part in self.parts[1:]:
+            out = out | part.contains_grid(grids)
+        return out
+
+    # ------------------------------------------------------------------
+    # measures / summaries
+    # ------------------------------------------------------------------
+    def volume(self):
+        """Accepted measure, summed over parts (disjoint masks)."""
+        return float(sum(part.volume() for part in self.parts))
+
+    def volume_fraction(self, reference):
+        """Accepted measure as a fraction of ``reference``'s.
+
+        ``reference`` is the set this one is nested in — normally the previous
+        round's accepted region, which is itself a :class:`MultiRegion`, not a
+        box.  A :class:`Region` or a bare volume is also accepted.
+        """
+        return self.volume() / _reference_volume(reference)
+
+    def _nonempty(self):
+        return [p for p in self.parts if p.mask.any()]
+
+    def bounds(self):
+        """Per-axis outer envelope over all parts, same layout as :meth:`Region.bounds`."""
+        parts = self._nonempty()
+        if not parts:
+            return self.parts[0].bounds()
+        b = [p.bounds() for p in parts]
+        if self.ndim == 1:
+            return [min(x[0] for x in b), max(x[1] for x in b)]
+        return [[min(x[0][0] for x in b), max(x[0][1] for x in b)],
+                [min(x[1][0] for x in b), max(x[1][1] for x in b)]]
+
+    def intervals(self, axis=0):
+        """Accepted sub-intervals along ``axis``, concatenated over parts."""
+        out = []
+        for part in self.parts:
+            out.extend(part.intervals(axis))
+        return out
+
+    def components(self):
+        """Connected components of every part, flattened.
+
+        A part is usually one mode, but refinement can split one coarse mode in
+        two, so this is not simply ``self.parts``.
+        """
+        out = []
+        for part in self.parts:
+            out.extend(part.components())
+        return out
+
+    # ------------------------------------------------------------------
+    # sampling
+    # ------------------------------------------------------------------
+    def draw(self, n, rng, cube=False):
+        """Draw ``n`` points uniformly (in the mask) from the union.
+
+        1D pools every part's intervals into one call, so the ``cube`` weighting
+        is applied across parts rather than within each.  2D picks a part with
+        probability proportional to its accepted volume, then delegates.
+        """
+        if self.ndim == 1:
+            return _sample_from_intervals(self.intervals(0), n, rng, cube=cube)
+
+        parts = self._nonempty()
+        if not parts:
+            raise ValueError("cannot draw from an empty MultiRegion")
+        weights = np.array([p.volume() for p in parts], dtype=float)
+        weights /= weights.sum()
+        counts = np.bincount(rng.choice(len(parts), size=n, p=weights),
+                             minlength=len(parts))
+        xs, ys = [], []
+        for part, count in zip(parts, counts):
+            if count == 0:
+                continue
+            x, y = part.draw(int(count), rng)
+            xs.append(x)
+            ys.append(y)
+        return np.concatenate(xs), np.concatenate(ys)
+
+
 # ======================================================================
 # Builders — each replaces one scattered implementation.
 # ======================================================================
@@ -341,11 +546,28 @@ def region_from_hpd(density, grids, credible_level, dilation_factor=1.0,
     if periods is None:
         periods = (None,) * ndim
 
+    thr = _hpd_threshold(density, credible_level=credible_level)
+    return region_from_level(density, grids, thr, dilation_factor, periods)
+
+
+def region_from_level(density, grids, threshold, dilation_factor=1.0,
+                      periods=None):
+    """Level-set region at an **externally supplied** density threshold.
+
+    Split out of :func:`region_from_hpd` because per-mode refinement pools every
+    mode's density to find one common threshold (§2.3) and then cuts each
+    subgrid at that same level — a per-subgrid quantile would give every mode
+    the same mass regardless of how much it actually holds.
+    """
+    grids = tuple(np.asarray(g, dtype=float).reshape(-1) for g in grids)
+    ndim = len(grids)
+    if periods is None:
+        periods = (None,) * ndim
+
     if ndim == 1:
         grid_x = grids[0]
         periodic = _effective_periodic(grid_x, periods[0])
-        thr = _hpd_threshold(density, credible_level=credible_level)
-        mask = np.asarray(density) >= thr
+        mask = np.asarray(density) >= threshold
         labelled, _ = _periodic_labelling(mask, periodic)
         dilated = np.zeros_like(mask)
         for k in np.unique(labelled):
@@ -361,8 +583,7 @@ def region_from_hpd(density, grids, credible_level, dilation_factor=1.0,
     periodic_x = _effective_periodic(grid_x, periods[0])
     periodic_y = _effective_periodic(grid_y, periods[1])
     periodic_rowcol = (periodic_y, periodic_x)   # helpers index (row=y, col=x)
-    thr = _hpd_threshold(density, credible_level)
-    mask = np.asarray(density) >= thr
+    mask = np.asarray(density) >= threshold
     labelled, n_comp = _periodic_labelling_2d(mask, periodic_rowcol)
     dilated = np.zeros_like(mask)
     for i in range(1, n_comp + 1):
@@ -568,3 +789,127 @@ def clip_labels_to_prev(labels2d, grid_x, grid_y, prev, period=(None, None)):
     labels, _ = _periodic_labelling_2d(clipped, periodic_rowcol)
     comps = components_from_labels(labels, grid_x=grid_x, grid_y=grid_y)
     return labels, comps
+
+
+
+def truncation_region(density, grids, prev, policy, hysteresis_weight, credible, dilation, periods, clip):
+    """
+    Build the accepted `Region` of one marginal (1D or 2D) from a density on ``grids``.
+
+    ``grids`` is ``(grid_x,)`` or ``(grid_x, grid_y)``; ``periods`` one physical period per axis.
+
+    Procedure: 1) zero pixels outside prev (apply indicator function, or soften it with hysteresis_weight if policy="hysteresis")
+            2) renormalise pixel values
+            3) identify hpd region with credible threshold. optionally dilate accounting for periodicity (periods)
+            4) if ``clip``, intersect with prev to enforce A_N ⊆ A_{N-1} (skipped when the intersection is empty)
+
+    Returns ``(region, status)``; ``status`` as in :func:`apply_prev_mask`.
+    """
+    reweighted_density, status = apply_prev_mask(density, prev, grids, policy=policy, hysteresis_weight=hysteresis_weight)
+    region = region_from_hpd(reweighted_density, grids, credible_level=credible, dilation_factor=dilation, periods=periods)
+    if prev is not None and clip:
+        keep = prev_keep_mask(prev, region.grids) # finds the bool grid of the previous mask, but defined on the current grid
+        regionmask = region.mask & keep
+        if regionmask.any():
+            region = Region(regionmask, region.grids, periodic=region.periodic)
+
+    return region, status
+
+
+def mode_bounds(component, pad_to_cell_edges=True):
+    """Per-axis ``(lo, hi)`` box of one mode, on cell **edges**.
+
+    :meth:`Region.bounds` reports the outer accepted *centres*, which is one
+    cell narrower than the mode actually is.  A refined subgrid built from
+    centres therefore starts life one coarse cell too small and re-loses that
+    cell every round; padding to the enclosing cell edges is what stops it.
+    Clamped to the parent grid so a mode touching the prior box cannot spill
+    outside it.
+    """
+    b = component.bounds()
+    if component.ndim == 1:
+        b = [b]
+    out = []
+    for axis, (lo, hi) in enumerate(b):
+        g = component.grids[axis]
+        half = 0.5 * abs(_axis_cell_size(g)) if pad_to_cell_edges else 0.0
+        out.append((max(float(g[0]), lo - half), min(float(g[-1]), hi + half)))
+    return out[0] if component.ndim == 1 else out
+
+
+def refine_region(region, evaluate, ngrid, prev=None, policy="hard",
+                  hysteresis_weight=0.1, credible=0.999, dilation=1.0,
+                  periods=None, clip=True):
+    """Re-derive ``region`` on one subgrid per mode (§2.2/§2.4).
+
+    ``region`` is the coarse pass's accepted set: it fixes the **topology** —
+    how many modes there are and roughly where — and nothing else.  Each of its
+    connected components is then re-evaluated on its own grid of ``ngrid``
+    points per axis spanning exactly that mode's support (no padding beyond the
+    cell edges), which is where the resolution is won: a mode covering three
+    pixels of the full-box grid gets ``ngrid`` of its own.
+
+    ``evaluate(bounds, ngrid) -> (density, grids)`` returns a **raw,
+    unnormalised** density on a fresh grid spanning ``bounds``.  Raw matters:
+    the threshold is found once by pooling every mode's density with its own
+    cell volume, so per-subgrid normalisation would hand each mode the same
+    mass however little it holds.
+
+    Returns ``(multiregion, modes)``.  ``modes`` carries each mode's grids,
+    density and the one shared ``threshold``, so plots can draw every mode's
+    contour at its native resolution against a common level.  A mode the
+    refinement finds empty is dropped — that is how a one-pixel ghost mode
+    dies.  If every mode comes back empty the coarse ``region`` is returned
+    unchanged, since proposing from nothing is worse than proposing coarsely.
+    """
+    ndim = region.ndim
+    if periods is None:
+        periods = (None,) * ndim
+
+    evaluated = []
+    for comp in region.components():
+        bounds = mode_bounds(comp)
+        density, grids = evaluate(bounds, ngrid)
+        grids = tuple(np.asarray(g, dtype=float).reshape(-1) for g in grids)
+        density = np.asarray(density, dtype=float)
+
+        # Restrict to this mode's own support (the no-padding decision: a
+        # subgrid's box can overlap a neighbouring mode, its mask must not)
+        # and, per the §2 policy, to the region the network was trained on.
+        keep = comp.contains_grid(grids)
+        if prev is not None and policy != "off":
+            keep = keep & prev_keep_mask(prev, grids)
+        alpha = float(hysteresis_weight) if policy == "hysteresis" else 0.0
+        density = density * np.where(keep, 1.0, alpha)
+
+        dv = float(np.prod([abs(_axis_cell_size(g)) for g in grids]))
+        evaluated.append({"grids": grids, "density": density,
+                          "cell_volume": dv, "keep": keep})
+
+    if not evaluated:
+        return MultiRegion.from_region(region), []
+
+    threshold = _hpd_threshold([e["density"] for e in evaluated],
+                               credible_level=credible,
+                               cell_volumes=[e["cell_volume"] for e in evaluated])
+    if not np.isfinite(threshold):
+        # the pooled density carries no mass — nothing to refine against
+        return MultiRegion.from_region(region), evaluated
+
+    parts, modes = [], []
+    for e in evaluated:
+        part = region_from_level(e["density"], e["grids"], threshold,
+                                 dilation_factor=dilation, periods=periods)
+        if clip:
+            clipped = part.mask & e["keep"]
+            if clipped.any():
+                part = Region(clipped, part.grids, periodic=part.periodic)
+        e["threshold"] = threshold
+        e["mask"] = part.mask
+        modes.append(e)
+        if part.mask.any():
+            parts.append(part)
+
+    if not parts:
+        return MultiRegion.from_region(region), modes
+    return MultiRegion(parts), modes

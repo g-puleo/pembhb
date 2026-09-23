@@ -27,6 +27,23 @@ def mask_volume_fraction(mask):
     mask = np.asarray(mask)
     return float(np.count_nonzero(mask)) / float(mask.size)
 
+def _on_any_subgrid(region, vx, vy):
+    """Whether ``(vx, vy)`` falls inside some mode's subgrid *extent*.
+
+    Separates "off the grid entirely" from "in a gap between components" —
+    both are violations, but only the second says the contour excluded the
+    truth rather than the box never covering it.
+    """
+    from pembhb.regions import origin_extent_from_grid
+
+    for part in region.parts:
+        ox, wx = origin_extent_from_grid(part.grids[0])
+        oy, wy = origin_extent_from_grid(part.grids[1])
+        if ox <= vx <= ox + wx and oy <= vy <= oy + wy:
+            return True
+    return False
+
+
 def truth_violations(true_params, prior_box, intervals_1d, masks_2d, param_keys,
                      check_idxs=None):
     """Is the observation's true parameter vector inside the next proposal?
@@ -72,11 +89,8 @@ def truth_violations(true_params, prior_box, intervals_1d, masks_2d, param_keys,
             "utils.validate_marginals should have caught this")
         covered.update((i, j))
 
-        labels, gx, gy = m["labels"], m["grid_x"], m["grid_y"]
+        region = region_of_pair(m)
         vx, vy = _val(i), _val(j)
-        # grids hold pixel centres -> nearest centre, not floor
-        col = int(round((vx - gx[0]) / (gx[1] - gx[0])))
-        row = int(round((vy - gy[0]) / (gy[1] - gy[0])))
 
         entry = {
             "name": f"{param_keys[i]}-{param_keys[j]}",
@@ -84,16 +98,20 @@ def truth_violations(true_params, prior_box, intervals_1d, masks_2d, param_keys,
             "marginal": [i, j],
             "value": [vx, vy],
         }
-        if not (0 <= row < labels.shape[0] and 0 <= col < labels.shape[1]):
-            entry["detail"] = (
-                f"off the posterior grid (row={row}, col={col}; grid is "
-                f"{labels.shape[0]}x{labels.shape[1]} spanning "
-                f"x=[{gx[0]:.6g}, {gx[-1]:.6g}], y=[{gy[0]:.6g}, {gy[-1]:.6g}])")
-            violations.append(entry)
-        elif labels[row, col] <= 0:
-            entry["detail"] = (
-                f"inside the bounding box but in a gap between components "
-                f"(pixel row={row}, col={col} is background)")
+        # Region.contains is the single membership rule: nearest pixel centre,
+        # and off-grid is not contained (never clipped onto an edge pixel).
+        if not bool(region.contains(np.array([[vx], [vy]]))[0]):
+            (bx, by) = region.bounds()
+            if _on_any_subgrid(region, vx, vy):
+                entry["detail"] = (
+                    f"inside a mode's subgrid but in a gap between components "
+                    f"(x={vx:.6g}, y={vy:.6g}; {len(region.parts)} mode(s))")
+            else:
+                entry["detail"] = (
+                    f"off the posterior grid (x={vx:.6g}, y={vy:.6g}; "
+                    f"{len(region.parts)} mode(s) spanning "
+                    f"x=[{bx[0]:.6g}, {bx[1]:.6g}], "
+                    f"y=[{by[0]:.6g}, {by[1]:.6g}])")
             violations.append(entry)
 
     for idx in sorted(set(check_idxs or ()) - covered):
@@ -176,32 +194,72 @@ def eval_posterior_1d(model, dataloader, in_param_idx, out_param_idx, ngrid_poin
 
     return grid, norm1d, inj_params[0]
 
-def _hpd_threshold(density, credible_level):
+def _hpd_threshold(densities, credible_level, cell_volumes=None):
     """
-    Return the threshold value above which a fraction credible_level of the probability density is contained. 
-    
+    Return the threshold value above which a fraction credible_level of the probability density is contained.
+
+    One threshold is shared by all grids, so mass is pooled across them before
+    thresholding (per-grid thresholds would cut every mode to the same fraction
+    of its own mass).
 
     Args:
-        density (np.array): the density array to find the HPD threshold
+        densities (np.array or list of np.array): density on one grid, or one array per grid
         credible_level (float): the desired fraction to enclose (between 0 and 1)
+        cell_volumes (None, float or list of float): cell volume of each grid;
+            None treats all cells as equal (single uniform grid)
 
     Returns:
         float: the value of the threshold.
     """
-    flat = density.ravel()
+    if isinstance(densities, np.ndarray):
+        densities = [densities]
+        if cell_volumes is not None and np.ndim(cell_volumes) == 0:
+            cell_volumes = [cell_volumes]
+    flat = np.concatenate([np.asarray(d, dtype=float).ravel() for d in densities])
     idx = np.argsort(flat)[::-1]
     sorted_density = flat[idx]
-    cum = np.cumsum(sorted_density)
+    if cell_volumes is None:
+        mass = sorted_density
+    else:
+        if len(cell_volumes) != len(densities):
+            raise ValueError(f"got {len(densities)} grids but {len(cell_volumes)} cell volumes")
+        dv = np.concatenate([np.full(np.size(d), float(v))
+                             for d, v in zip(densities, cell_volumes)])
+        mass = sorted_density * dv[idx]
+    cum = np.cumsum(mass)
+    if not cum[-1] > 0:
+        # No mass at all: dividing would give 0/0 and a threshold of 0, which
+        # accepts the whole grid. +inf accepts nothing and lets the caller
+        # notice; apply_prev_mask already guards the realistic case (zeroing
+        # that wipes the density) by returning the un-zeroed array.
+        return np.inf
     cum /= cum[-1]
     i = np.searchsorted(cum, credible_level)
     return sorted_density[min(i, len(sorted_density) - 1)]
 
 def _intervals_from_indices(indices, grid1d):
+    """Accepted index runs -> intervals in grid coordinates, on cell **edges**.
 
+    A run of n accepted cells covers n*dx of parameter space, so the interval
+    is reported from the first cell's lower edge to the last cell's upper edge
+    (centre -/+ dx/2), not centre-to-centre.  Centre-to-centre understates every
+    mode by exactly one cell on every re-derivation — 1 % at 100 px across a
+    mode, 33 % at 3 px — and compounds round after round.
+
+    Clamped to the grid's own ends: the grid spans the prior box, and a mode
+    touching its edge must not propose outside it.
+    """
     is_wrapped = np.any(np.diff(indices)>1) # finds a wrapped mode
     N_pixels = grid1d.shape[0]
+    half = 0.5 * float(grid1d[1] - grid1d[0])
+    g_lo, g_hi = float(grid1d[0]), float(grid1d[-1])
+
+    def _edges(i0, i1):
+        return [max(g_lo, float(grid1d[i0]) - half),
+                min(g_hi, float(grid1d[i1]) + half)]
+
     intervals = []
-    if is_wrapped: 
+    if is_wrapped:
         jj      = np.where(np.diff(indices)>1)[0][0]
         idx_lo1 = indices[0]
         idx_hi1 = indices[jj]
@@ -209,11 +267,11 @@ def _intervals_from_indices(indices, grid1d):
         idx_hi2 = indices[-1]
         assert idx_lo1 == 0
         assert idx_hi2 == N_pixels - 1
-        intervals.append([float(grid1d[idx_lo1]), float(grid1d[idx_hi1])])
-        intervals.append([float(grid1d[idx_lo2]), float(grid1d[idx_hi2])])
-    
-    else: 
-        intervals.append([float(grid1d[indices[0]]), float(grid1d[indices[-1]])])
+        intervals.append(_edges(idx_lo1, idx_hi1))
+        intervals.append(_edges(idx_lo2, idx_hi2))
+
+    else:
+        intervals.append(_edges(indices[0], indices[-1]))
 
     return intervals
 
@@ -526,6 +584,109 @@ def _sample_2d_from_components(components, labels, grid_x, grid_y, n, rng: np.ra
     y =np.concatenate( component_samples_y )
     return x, y, acceptance_rate
 
+def region_of_pair(entry):
+    """The accepted set of one 2D-pair entry, as a ``MultiRegion``.
+
+    Accepts the new ``{"region": MultiRegion | Region}`` form and the legacy
+    ``{"labels", "grid_x", "grid_y"}`` triple, so callers that still build the
+    old dict keep working.
+    """
+    from pembhb.regions import MultiRegion, Region
+
+    region = entry.get("region")
+    if region is None:
+        region = Region(np.asarray(entry["labels"]) > 0,
+                        (entry["grid_x"], entry["grid_y"]))
+    if isinstance(region, Region):
+        region = MultiRegion.from_region(region)
+    return region
+
+
+def _multiregion_from_labels(labels, grid_x, grid_y, periodic=(False, False)):
+    """Format-1 npz -> ``MultiRegion``: one part per label, cropped to its bbox.
+
+    Cropping loses nothing (everything outside a label's bounding box is
+    rejected anyway) and puts legacy state in the same shape as a refined one.
+    """
+    from pembhb.regions import MultiRegion, Region
+
+    labels = np.asarray(labels)
+    grid_x = np.asarray(grid_x, dtype=float)
+    grid_y = np.asarray(grid_y, dtype=float)
+    parts = []
+    for k in np.unique(labels):
+        if k == 0:
+            continue
+        m = labels == k
+        cols = np.where(m.any(axis=0))[0]
+        rows = np.where(m.any(axis=1))[0]
+        cs, ce = int(cols[0]), int(cols[-1]) + 1
+        rs, re_ = int(rows[0]), int(rows[-1]) + 1
+        # a 1-pixel span has no inferable cell size; keep a 2-pixel minimum
+        if ce - cs < 2:
+            cs, ce = max(0, ce - 2), max(2, ce)
+        if re_ - rs < 2:
+            rs, re_ = max(0, re_ - 2), max(2, re_)
+        parts.append(Region(m[rs:re_, cs:ce],
+                            (grid_x[cs:ce], grid_y[rs:re_]), periodic))
+    if not parts:
+        parts = [Region(np.zeros(labels.shape, dtype=bool),
+                        (grid_x, grid_y), periodic)]
+    return MultiRegion(parts, periodic)
+
+
+def load_pair_region(npz_path, i, j):
+    """``MultiRegion`` for one 2D pair, from either npz format, without the yaml.
+
+    For tools that open a ``truncation_round_{n}.npz`` directly.  Returns
+    ``None`` when the pair is absent.
+    """
+    from pembhb.regions import MultiRegion, Region, grid_from_origin_extent
+
+    with np.load(npz_path) as z:
+        if f"n_modes__{i}_{j}" in z:
+            periodic = tuple(bool(b) for b in z[f"periodic__{i}_{j}"])
+            parts = []
+            for k in range(int(z[f"n_modes__{i}_{j}"])):
+                mask = z[f"mask__{i}_{j}__{k}"].astype(bool)
+                ox, oy = z[f"origin__{i}_{j}__{k}"]
+                wx, wy = z[f"extent__{i}_{j}__{k}"]
+                parts.append(Region(
+                    mask,
+                    (grid_from_origin_extent(ox, wx, mask.shape[1]),
+                     grid_from_origin_extent(oy, wy, mask.shape[0])),
+                    periodic))
+            return MultiRegion(parts, periodic)
+        if f"labels__{i}_{j}" in z:
+            return _multiregion_from_labels(
+                z[f"labels__{i}_{j}"].astype(int),
+                z[f"gridx__{i}_{j}"], z[f"gridy__{i}_{j}"])
+    return None
+
+
+def rasterise_region(region, max_points=1000):
+    """``(mask, grid_x, grid_y)`` — one common grid for a possibly multi-grid region.
+
+    Plotting wants a single array.  The grid spans the union of the modes at
+    the finest pitch any of them uses, capped at ``max_points`` per axis so a
+    heavily refined mode cannot blow the array up.
+
+    For display only: re-binning a coarse mode onto a fine common grid moves
+    its edges by up to half a cell, so ``mask.sum()·dV`` can differ from
+    ``region.volume()`` by several percent.  Measure with :meth:`volume`.
+    """
+    from pembhb.regions import _axis_cell_size
+
+    (x_lo, x_hi), (y_lo, y_hi) = region.bounds()
+    out = []
+    for axis, (lo, hi) in enumerate(((x_lo, x_hi), (y_lo, y_hi))):
+        dx = min(abs(_axis_cell_size(p.grids[axis])) for p in region.parts)
+        n = int(np.clip(round((hi - lo) / dx) + 1, 2, max_points))
+        out.append(np.linspace(lo, hi, n))
+    grid_x, grid_y = out
+    return region.contains_grid((grid_x, grid_y)), grid_x, grid_y
+
+
 def save_truncation(yaml_path, npz_path, prior_box, intervals_1d, masks_2d,
                     mode="mask", extra=None):
     """Persist a round's truncation state.
@@ -537,8 +698,13 @@ def save_truncation(yaml_path, npz_path, prior_box, intervals_1d, masks_2d,
       yaml_path -- prior box, mode, 1D intervals, list of 2D pairs
       npz_path  -- per 2D pair: labels (int8) + the two 1D grid axes
 
-    Per-component intervals are NOT stored: they are rebuilt on load via
-    components_from_labels, so the array on disk cannot drift from them.
+    Per-component intervals are NOT stored: they are rebuilt on load from the
+    stored masks, so the array on disk cannot drift from them.
+
+    2D pairs are written in ``format_version: 2`` — one entry per mode, each
+    carrying its own subgrid as ``mask`` + ``origin`` (bottom-left vertex) +
+    ``extent``, so modes refined at different resolutions round-trip.  Format 1
+    (a single ``labels``/``gridx``/``gridy`` triple per pair) is still read.
     """
     import os
     import yaml as _yaml
@@ -560,17 +726,20 @@ def save_truncation(yaml_path, npz_path, prior_box, intervals_1d, masks_2d,
         _yaml.safe_dump(payload, f)
 
     if masks_2d:
-        arrays = {}
+        from pembhb.regions import origin_extent_from_grid
+
+        arrays = {"format_version": np.asarray(2)}
         for m in masks_2d:
             i, j = int(m["idx"][0]), int(m["idx"][1])
-            labels = np.asarray(m["labels"])
-            if labels.max() > 127:
-                raise ValueError(
-                    f"2D pair ({i},{j}) has {labels.max()} components; int8 "
-                    f"storage supports at most 127.")
-            arrays[f"labels__{i}_{j}"] = labels.astype(np.int8)
-            arrays[f"gridx__{i}_{j}"] = np.asarray(m["grid_x"], dtype=float)
-            arrays[f"gridy__{i}_{j}"] = np.asarray(m["grid_y"], dtype=float)
+            region = region_of_pair(m)
+            arrays[f"n_modes__{i}_{j}"] = np.asarray(len(region.parts))
+            arrays[f"periodic__{i}_{j}"] = np.asarray(region.periodic, dtype=bool)
+            for k, part in enumerate(region.parts):
+                ox, wx = origin_extent_from_grid(part.grids[0])
+                oy, wy = origin_extent_from_grid(part.grids[1])
+                arrays[f"mask__{i}_{j}__{k}"] = part.mask
+                arrays[f"origin__{i}_{j}__{k}"] = np.array([ox, oy], dtype=float)
+                arrays[f"extent__{i}_{j}__{k}"] = np.array([wx, wy], dtype=float)
         os.makedirs(os.path.dirname(npz_path) or ".", exist_ok=True)
         np.savez_compressed(npz_path, **arrays)
 
@@ -609,24 +778,39 @@ def load_truncation(yaml_path, npz_path):
                 f"2D masks for pairs {pairs}, but {npz_path} is missing. Refusing "
                 f"to fall back to the bounding box: that would resume from a "
                 f"strictly wider prior than the round it continues.")
+        from pembhb.regions import MultiRegion, Region, grid_from_origin_extent
+
         with np.load(npz_path) as z:
+            version = int(z["format_version"]) if "format_version" in z else 1
             for (i, j) in pairs:
-                keys = (f"labels__{i}_{j}", f"gridx__{i}_{j}", f"gridy__{i}_{j}")
-                missing = [k for k in keys if k not in z]
-                if missing:
-                    raise RuntimeError(
-                        f"[Truncation] {npz_path} is missing {missing} for 2D pair "
-                        f"({i},{j}) declared in {yaml_path}.")
-                labels = z[keys[0]].astype(int)
-                grid_x = z[keys[1]]
-                grid_y = z[keys[2]]
-                masks_2d.append({
-                    "idx": (i, j),
-                    "labels": labels,
-                    "grid_x": grid_x,
-                    "grid_y": grid_y,
-                    "components": components_from_labels(labels, grid_x, grid_y),
-                })
+                if version >= 2:
+                    key = f"n_modes__{i}_{j}"
+                    if key not in z:
+                        raise RuntimeError(
+                            f"[Truncation] {npz_path} (format {version}) is missing "
+                            f"{key} for 2D pair ({i},{j}) declared in {yaml_path}.")
+                    periodic = tuple(bool(b) for b in z[f"periodic__{i}_{j}"])
+                    parts = []
+                    for k in range(int(z[key])):
+                        mask = z[f"mask__{i}_{j}__{k}"].astype(bool)
+                        ox, oy = z[f"origin__{i}_{j}__{k}"]
+                        wx, wy = z[f"extent__{i}_{j}__{k}"]
+                        parts.append(Region(
+                            mask,
+                            (grid_from_origin_extent(ox, wx, mask.shape[1]),
+                             grid_from_origin_extent(oy, wy, mask.shape[0])),
+                            periodic))
+                    region = MultiRegion(parts, periodic)
+                else:
+                    keys = (f"labels__{i}_{j}", f"gridx__{i}_{j}", f"gridy__{i}_{j}")
+                    missing = [k for k in keys if k not in z]
+                    if missing:
+                        raise RuntimeError(
+                            f"[Truncation] {npz_path} is missing {missing} for 2D pair "
+                            f"({i},{j}) declared in {yaml_path}.")
+                    region = _multiregion_from_labels(
+                        z[keys[0]].astype(int), z[keys[1]], z[keys[2]])
+                masks_2d.append({"idx": (i, j), "region": region})
 
     return {"prior": prior, "mode": mode,
             "intervals_1d": intervals_1d, "masks_2d": masks_2d}
@@ -674,10 +858,11 @@ class MaskRejectSampler:
         for m in self.masks_2d:
             i, j = m["idx"]
             assert i!=4 and j!=4 #distance not supported
-            x, y, acc = _sample_2d_from_components(
-                m["components"], m["labels"], m["grid_x"], m["grid_y"], n, self.rng)
+            region = region_of_pair(m)
+            x, y = region.draw(n, self.rng)
             tmnre[i], tmnre[j] = x, y
-            print(f"{self._tag} 2D pair {m['idx']} acceptance={acc:.3f}")
+            print(f"{self._tag} 2D pair {m['idx']} "
+                  f"{len(region.parts)} mode(s), volume={region.volume():.4g}")
 
         return tmnre 
     

@@ -28,7 +28,7 @@ from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from pembhb.sky_truncation import get_main_mode_box
 from pembhb.regions import (
     Region, region_from_equal_tailed, region_from_main_mode, region_from_hpd,
-    prev_keep_mask,
+    prev_keep_mask, truncation_region
 )
 from pembhb.mask_truncation import _MASK_PERIOD_BY_NAME
 from datetime import datetime, timedelta
@@ -215,7 +215,9 @@ class PlotPosteriorCallback(Callback):
                 credible_level_2d: float = 0.997,
                 dilation_2d: float = 1.2,
                 prev_accepted: dict = None,
-                zero_policy: str = "off"):
+                zero_policy: str = "off",
+                hysteresis_weight=None,
+                monotonic: bool = False):
         self.epochs_elapsed = 0
         # §2 — the previous round's accepted set per marginal ({marginal_key:
         # {"kind": "1d"/"2d", ...}}) and the active zeroing policy. When set (and
@@ -234,6 +236,8 @@ class PlotPosteriorCallback(Callback):
         # HPD level + dilation used to build the 2D posterior region for the
         # volume ratio — matched to the truncation (analyse_posterior_2d) so the
         # numerator is the SAME accepted set the sampler will draw from next round.
+        self.credible_level_1d = credible_level_1d
+        self.dilation_1d = dilation_1d
         self.credible_level_2d = credible_level_2d
         self.dilation_2d = dilation_2d
         self.call_every_n_epochs = call_every_n_epochs
@@ -246,6 +250,9 @@ class PlotPosteriorCallback(Callback):
         self.input_idx_list = input_idx_list
         self.output_idx_list = output_idx_list
         self.n_marginals = len(input_idx_list)
+        self.hysteresis_weight = hysteresis_weight
+        # A_N ⊆ A_{N-1} clip, decided by the trainer's _monotonic_enabled.
+        self.monotonic = bool(monotonic)
         self.init_time = datetime.now()
         self.training_start_time = training_start_time if training_start_time is not None else self.init_time
         self.round_idx = round_idx
@@ -299,6 +306,69 @@ class PlotPosteriorCallback(Callback):
             return grid_total
         n = int(np.count_nonzero(prev_keep_mask(prev, grids)))
         return n if n > 0 else grid_total
+
+    def _proposal_mask(self, marginal_key, grids):
+        """Proposal (previous accepted set) on ``grids``; empty if there is none."""
+        prev = self.prev_accepted.get(marginal_key)
+        if prev is None:
+            shape = tuple(len(g) for g in reversed(grids))
+            return np.zeros(shape, dtype=bool)
+        return prev_keep_mask(prev, grids)
+
+    def _proposal_modes(self, marginal_key):
+        """Per-mode ``(exact volume, membership-on-a-grid)`` of the proposal.
+
+        The volumes are read off the proposal's **own** representation — the
+        stored intervals in 1D, each subgrid's own pitch in 2D — never by
+        resampling it onto whatever grid the posterior happens to be evaluated
+        on.  That matters once modes carry different resolutions: a rasterised
+        denominator moves a coarse mode's edges by half a cell, which is
+        percent-level on the metric that drives ``volume_ratio_early_stop``.
+
+        Returns ``[]`` when there is no mask proposal (round 1 / rectangle).
+        """
+        prev = self.prev_accepted.get(marginal_key)
+        if prev is None:
+            return []
+        if prev["kind"] == "1d":
+            return [
+                (float(hi) - float(lo),
+                 lambda grids, lo=float(lo), hi=float(hi):
+                     (np.asarray(grids[0], dtype=float) >= lo)
+                     & (np.asarray(grids[0], dtype=float) <= hi))
+                for lo, hi in prev["intervals"]
+            ]
+        return [(c.volume(), c.contains_grid)
+                for c in prev["region"].components()]
+
+    def _volume_ratio(self, marginal_key, region):
+        """``|A_N| / |A_{N-1}|`` as Σ mask·dV, plus one ratio per proposal mode.
+
+        Both measures are exact: the numerator on the accepted region's own
+        grid(s), the denominator on the proposal's own.  Falls back to
+        posterior/box when there is no proposal, or when the proposal does not
+        intersect this grid at all (otherwise the ratio would read ~0 and trip
+        the early stop on what is really a grid mismatch).
+
+        Mode ratios are ``|A_N ∩ mode_k| / |mode_k|`` in the proposal's mode
+        order; with the monotone clip on they sum back to the total.
+        """
+        post_vol = region.volume()
+        modes = self._proposal_modes(marginal_key)
+        masks = [membership(region.grids) for _, membership in modes]
+        if not any(m.any() for m in masks):
+            prop_vol = region.volume(np.ones_like(region.mask))
+            return post_vol / prop_vol, post_vol, prop_vol, []
+        prop_vol = float(sum(vol for vol, _ in modes))
+        mode_ratios = [region.volume(region.mask & m) / vol
+                       for (vol, _), m in zip(modes, masks)]
+        return post_vol / prop_vol, post_vol, prop_vol, mode_ratios
+
+    def _log_mode_ratios(self, trainer, name, mode_ratios, tag):
+        if trainer.logger is None:
+            return
+        for k, r in enumerate(mode_ratios):
+            trainer.logger.log_metrics({f"volume_ratio_mode/{name}/{k}": r}, step=tag)
 
     def _shade_suppressed_1d(self, ax, grid1d, marginal_key):
         keep = self._prev_keep_or_none(marginal_key, (grid1d,))
@@ -498,24 +568,16 @@ class PlotPosteriorCallback(Callback):
                         # Store the widest interval
                         pl_module.widest_boxes[marginal_key] = widest_interval
 
-                        # Posterior-to-prior volume ratio for the 1D marginal.
-                        # The grid spans exactly the trained prior box, so the
-                        # accepted-pixel fraction of the equal-tailed region IS
-                        # the posterior/prior width ratio (one implementation for
-                        # every marginal; see pembhb.regions).
-                        region1d = region_from_equal_tailed(
-                            norm1d, (grid[:, 0],), eps=epsilon_value,
-                            dilation=self.box_dilation_1d)
-                        # ratio = posterior pixels / sampling-proposal pixels
-                        # (NOT / full grid — see _proposal_pixels). Matters for a
-                        # multi-interval (gapped) 1D proposal, e.g. cos-ι.
-                        posterior_pixels = int(np.count_nonzero(region1d.mask))
-                        proposal_pixels = self._proposal_pixels(
-                            marginal_key, (grid[:, 0],), int(region1d.mask.size))
-                        volume_ratio = posterior_pixels / proposal_pixels
-                        _dp = float(grid[1, 0] - grid[0, 0])
-                        posterior_width = posterior_pixels * _dp
-                        prior_width = proposal_pixels * _dp
+
+                        prev = self.prev_accepted.get(marginal_key)
+                        periods = (_MASK_PERIOD_BY_NAME.get(keys[param_idx]),)
+                        region1d, _ = truncation_region(norm1d, (grid[:,0],), prev, policy=self.zero_policy, hysteresis_weight=self.hysteresis_weight,
+                                                        credible=self.credible_level_1d, periods = periods, dilation=self.dilation_1d, clip=self.monotonic)
+                        
+                        # ratio = |A_N| / |proposal| in measure, not / full grid
+                        # (see _volume_ratio).
+                        volume_ratio, posterior_width, prior_width, mode_ratios = \
+                            self._volume_ratio(marginal_key, region1d)
                         
                         # Store and log the volume ratio
                         if marginal_key not in self.volume_ratios:
@@ -525,7 +587,8 @@ class PlotPosteriorCallback(Callback):
                             'step': trainer.global_step,
                             'ratio': volume_ratio,
                             'posterior_width': posterior_width,
-                            'prior_width': prior_width
+                            'prior_width': prior_width,
+                            'mode_ratios': mode_ratios,
                         })
                         
                         # Compute differential entropy for 1D marginal
@@ -545,6 +608,7 @@ class PlotPosteriorCallback(Callback):
                             trainer.logger.log_metrics({metric_name: volume_ratio}, step=tag)
                             entropy_metric = f"diff_entropy/{keys[param_idx]}"
                             trainer.logger.log_metrics({entropy_metric: entropy}, step=tag)
+                        self._log_mode_ratios(trainer, keys[param_idx], mode_ratios, tag)
 
                         # Print diagnostic
                         param_name = keys[param_idx]
@@ -552,6 +616,7 @@ class PlotPosteriorCallback(Callback):
                             print(f"Round {self.round_idx}, {tag_kind} {tag}, {param_name}: "
                                   f"vol_ratio={volume_ratio:.4f} "
                                   f"(post={posterior_width:.3e}, prior={prior_width:.3e}), "
+                                  f"modes={[round(r, 3) for r in mode_ratios]}, "
                                   f"H={entropy:.4f} nats", flush=True)
                         
                         out = os.path.join(ROOT_DIR, "plots", self.timestamp,
@@ -612,26 +677,21 @@ class PlotPosteriorCallback(Callback):
                             # unlike the bounding-box area the old helpers used
                             # (a change of measure, not just ±1 px; it slightly
                             # shifts the 2D early-stop timing).
-                            # Full HPD posterior (ALL modes), built the same way
-                            # as the truncation/proposal (analyse_posterior_2d at
-                            # credible_level_2d/dilation_2d) — NOT the main mode
-                            # only, which undercounts a multimodal posterior and
-                            # trips the 0.5 stop early.
-                            region2d = region_from_hpd(
+                            # Numerator = the truncation's own accepted set, ALL
+                            # modes (zero outside prev → HPD → clip).
+                            region2d, _ = truncation_region(
                                 norm_2d, (gx[0, :], gy[:, 0]),
-                                credible_level=self.credible_level_2d,
-                                dilation_factor=self.dilation_2d,
+                                self.prev_accepted.get(marginal_key),
+                                policy=self.zero_policy,
+                                hysteresis_weight=self.hysteresis_weight,
+                                credible=self.credible_level_2d,
+                                dilation=self.dilation_2d,
                                 periods=(_MASK_PERIOD_BY_NAME.get(keys[in_param_idx[0]]),
-                                         _MASK_PERIOD_BY_NAME.get(keys[in_param_idx[1]])))
-                            # ratio = posterior pixels / sampling-proposal pixels
-                            # (NOT / full grid — see _proposal_pixels).
-                            posterior_pixels = int(np.count_nonzero(region2d.mask))
-                            proposal_pixels = self._proposal_pixels(
-                                marginal_key, (gx[0, :], gy[:, 0]), int(region2d.mask.size))
-                            volume_ratio = posterior_pixels / proposal_pixels
-                            cell_area = float(dp0 * dp1)
-                            posterior_area = posterior_pixels * cell_area
-                            prior_area = proposal_pixels * cell_area
+                                         _MASK_PERIOD_BY_NAME.get(keys[in_param_idx[1]])),
+                                clip=self.monotonic)
+                            # ratio = |A_N| / |proposal| in measure (see _volume_ratio).
+                            volume_ratio, posterior_area, prior_area, mode_ratios = \
+                                self._volume_ratio(marginal_key, region2d)
 
                             if marginal_key not in self.volume_ratios:
                                 self.volume_ratios[marginal_key] = []
@@ -640,7 +700,8 @@ class PlotPosteriorCallback(Callback):
                                 'step': trainer.global_step,
                                 'ratio': volume_ratio,
                                 'posterior_area': posterior_area,
-                                'prior_area': prior_area
+                                'prior_area': prior_area,
+                                'mode_ratios': mode_ratios,
                             })
 
                             entropy = self._differential_entropy_2d(norm_2d, dp0, dp1)
@@ -656,6 +717,7 @@ class PlotPosteriorCallback(Callback):
                             if trainer.logger is not None:
                                 trainer.logger.log_metrics({f"volume_ratio/{param_tag}": volume_ratio}, step=tag)
                                 trainer.logger.log_metrics({f"diff_entropy/{param_tag}": entropy}, step=tag)
+                            self._log_mode_ratios(trainer, param_tag, mode_ratios, tag)
 
                             if marginal_key == (7, 8):
                                 self._log_sky_contour_ratios(
@@ -667,6 +729,7 @@ class PlotPosteriorCallback(Callback):
                                 print(f"Round {self.round_idx}, {tag_kind} {tag}, {param_label}: "
                                       f"vol_ratio={volume_ratio:.4f} "
                                       f"(post={posterior_area:.3e}, prior={prior_area:.3e}), "
+                                      f"modes={[round(r, 3) for r in mode_ratios]}, "
                                       f"H={entropy:.4f} nats", flush=True)
                         except ValueError as ve:
                             print(f"Round {self.round_idx}, {tag_kind} {tag}, {param_label}: "

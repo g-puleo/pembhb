@@ -163,20 +163,20 @@ joint_training:
     shrink_factor: 100
   checkpoint_every_n_epochs: 10
   ae_scheduler:
-    enabled: false
+    enabled: true
     monitor: val_nre_loss
     mode: min
     factor: 0.5
     patience: 30
-    min_lr: 1.0e-07
+    min_lr: 1.0e-05
     start_epoch: 0
   nre_scheduler:
-    enabled: false
+    enabled: true
     monitor: val_nre_loss
     mode: min
     factor: 0.5
     patience: 20
-    min_lr: 1.0e-07
+    min_lr: 1.0e-05
   early_stop_criterion: volume_ratio
   accuracy_early_stop:
     patience: 90
@@ -188,7 +188,7 @@ joint_training:
     rel_tol: 0.1
     ema_alpha: 0.3
 volume_ratio_early_stop:
-  warmup_epochs: 30
+  warmup_epochs: 10
   patience: 20
   rel_tol: 0.02
   ema_alpha: 0.3
@@ -285,6 +285,16 @@ truncation:
   dilation_2d: 1.1
   ngrid_1d: 100
   ngrid_2d: 200
+  # Per-mode refinement. The coarse pass above fixes the topology (how many
+  # modes and where); with refine: true each mode is then re-evaluated on its
+  # own grid spanning exactly that mode's support, at the resolution below, and
+  # ONE threshold is found by pooling every mode's density weighted by its own
+  # cell volume. A mode spanning 3 coarse pixels gets ngrid_*_refined of its
+  # own; a mode the refinement finds empty is dropped.
+  # Cost: one extra forward pass per mode per round (seconds on the GPU).
+  refine: false
+  ngrid_1d_refined: 128
+  ngrid_2d_refined: 64
   # §2 — evaluate the network only on the region it was trained on. Before each
   # round's HPD analysis the posterior is re-weighted by the PREVIOUS round's
   # accepted set (nearest-pixel resampled onto this round's grid), because NRE's

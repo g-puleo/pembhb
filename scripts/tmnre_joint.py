@@ -55,10 +55,11 @@ from pembhb.callbacks import (
 from pembhb.utils import _ORDERED_PRIOR_KEYS as _PPKS_ORDERED_PRIOR_KEYS
 from pembhb.utils import eval_posterior_2d
 from pembhb.mask_truncation import (
-    eval_posterior_1d, analyse_posterior_1d, analyse_posterior_2d, MaskRejectSampler,
+    eval_posterior_1d, MaskRejectSampler,
     save_truncation, load_truncation, truth_violations, format_violations, _MASK_PERIOD_BY_NAME
 )
-from pembhb.regions import Region, apply_prev_mask, clip_intervals_to_prev, clip_labels_to_prev
+from pembhb.regions import (MultiRegion, apply_prev_mask,
+                            truncation_region, refine_region)
 from pembhb.diagnostics import AutoencoderDiagnosticsCallback
 
 # Physical period of the angular parameters, keyed by prior-key name (spin-basis
@@ -452,6 +453,38 @@ class SequentialTrainerJoint:
             return False
         return True
 
+    def _refine_evaluator_1d(self, in_idx, out_idx):
+        """``evaluate(bounds, n)`` for :func:`refine_region` — raw 1D ratios.
+
+        Raw, not normalised: the refined modes are pooled into one
+        volume-weighted threshold, so each must stay on the common scale.
+        """
+        def _evaluate(bounds, n):
+            lo, hi = bounds
+            logratios, _inj, grid = utils.get_logratios_grid(
+                self.dataloader_obs, self.model, ngrid_points=int(n),
+                in_param_idx=in_idx, out_param_idx=out_idx,
+                low=float(lo), high=float(hi))
+            return np.exp(logratios[0]), (grid[:, 0],)
+        return _evaluate
+
+    def _refine_evaluator_2d(self, in_idx, out_idx):
+        """``evaluate(bounds, n)`` for :func:`refine_region` — raw 2D ratios."""
+        def _evaluate(bounds, n):
+            (xlo, xhi), (ylo, yhi) = bounds
+            logratios, _inj, gx, gy = utils.get_logratios_grid_2d(
+                self.dataloader_obs, self.model, ngrid_points=int(n),
+                out_param_idx=out_idx, in_param_idx=tuple(in_idx),
+                bounds_0=(float(xlo), float(xhi)),
+                bounds_1=(float(ylo), float(yhi)))
+            return np.exp(logratios[0]), (gx[0, :], gy[:, 0])
+        return _evaluate
+
+    def _refine_conf(self, trunc_conf, key):
+        """``(enabled, ngrid)`` for per-mode refinement; off keeps the coarse set."""
+        return (bool(trunc_conf.get("refine", False)),
+                int(trunc_conf.get(key, 128)))
+
     def _mask_truncate_marginal(self, marginal_key, out_idx, prior_keys,
                             intervals_1d, masks_2d, trunc_conf):
 
@@ -465,24 +498,36 @@ class SequentialTrainerJoint:
                 in_param_idx=marginal_key[0], out_param_idx=out_idx,
                 ngrid_points=trunc_conf.get("ngrid_1d", 100))
 
-            # §2: restrict to the region the network was trained on last round.
-            norm1d = self._zero_outside_prev(marginal_key, norm1d, (grid[:, 0],),
-                                             trunc_conf)
-
+            # §2 zero outside prev → HPD + dilation → monotone clip. Shared with
+            # PlotPosteriorCallback so the volume ratio measures this same set.
             period = _MASK_PERIOD_BY_NAME.get(prior_keys[marginal_key[0]])
-            res = analyse_posterior_1d(
-                grid, norm1d,
-                credible_level=float(trunc_conf.get("credible_level_1d", 0.997)),
-                dilation_factor=float(trunc_conf.get("dilation_1d", 1.2)),
-                period=period)
+            region, status = truncation_region(
+                norm1d, (grid[:, 0],), prev,
+                policy=str(trunc_conf.get("zero_outside_prev_mask", "hard")),
+                hysteresis_weight=float(trunc_conf.get("hysteresis_weight", 0.1)),
+                credible=float(trunc_conf.get("credible_level_1d", 0.997)),
+                dilation=float(trunc_conf.get("dilation_1d", 1.2)),
+                periods=(period,),
+                clip=self._monotonic_enabled(trunc_conf))
+            if status == "degenerate":
+                print(f"[Trunc/mask/§2] {marginal_key}: previous mask has no overlap "
+                      f"with this round's grid; skipping zeroing.", flush=True)
 
-            # §2 monotonicity: clip the dilated mask back inside the previous
-            # accepted set so exclusions are permanent (A_N ⊆ A_{N-1}).
-            if self._monotonic_enabled(trunc_conf):
-                intervals = clip_intervals_to_prev(res["mask"], grid[:, 0], prev,
-                                                   period=period)
-            else:
-                intervals = res["intervals"]
+            refine, n_ref = self._refine_conf(trunc_conf, "ngrid_1d_refined")
+            if refine:
+                coarse_n = len(region.components())
+                region, _modes = refine_region(
+                    region, self._refine_evaluator_1d(marginal_key[0], out_idx),
+                    ngrid=n_ref, prev=prev,
+                    policy=str(trunc_conf.get("zero_outside_prev_mask", "hard")),
+                    hysteresis_weight=float(trunc_conf.get("hysteresis_weight", 0.1)),
+                    credible=float(trunc_conf.get("credible_level_1d", 0.997)),
+                    dilation=float(trunc_conf.get("dilation_1d", 1.2)),
+                    periods=(period,), clip=self._monotonic_enabled(trunc_conf))
+                print(f"[Trunc/refine] {param_name}: {coarse_n} coarse mode(s) -> "
+                      f"{len(region.parts)} refined at {n_ref} px each", flush=True)
+
+            intervals = region.intervals()
             intervals_1d[marginal_key[0]] = intervals
             # Record this round's accepted set for next round's §2 zeroing.
             self._prev_accepted[marginal_key] = {"kind": "1d", "intervals": intervals}
@@ -499,35 +544,45 @@ class SequentialTrainerJoint:
                 in_param_idx=marginal_key, out_param_idx=out_idx,
                 ngrid_points=trunc_conf.get("ngrid_2d", 100))
 
-            # §2: restrict to the region the network was trained on last round.
-            norm2d = self._zero_outside_prev(marginal_key, norm2d,
-                                             (gx[0, :], gy[:, 0]), trunc_conf)
-
+            # §2 zero outside prev → HPD + dilation → monotone clip. Shared with
+            # PlotPosteriorCallback so the volume ratio measures this same set.
+            grid_x, grid_y = gx[0, :], gy[:, 0]
             period = (_MASK_PERIOD_BY_NAME.get(prior_keys[marginal_key[0]]),
                       _MASK_PERIOD_BY_NAME.get(prior_keys[marginal_key[1]]))
-            labels, comps, grid_x, grid_y = analyse_posterior_2d(
-                gx, gy, norm2d, period=period,
-                credible_level=float(trunc_conf.get("credible_level_2d", 0.997)),
-                dilation_factor=float(trunc_conf.get("dilation_2d", 1.2)))
+            region, status = truncation_region(
+                norm2d, (grid_x, grid_y), prev,
+                policy=str(trunc_conf.get("zero_outside_prev_mask", "hard")),
+                hysteresis_weight=float(trunc_conf.get("hysteresis_weight", 0.1)),
+                credible=float(trunc_conf.get("credible_level_2d", 0.997)),
+                dilation=float(trunc_conf.get("dilation_2d", 1.2)),
+                periods=period,
+                clip=self._monotonic_enabled(trunc_conf))
+            if status == "degenerate":
+                print(f"[Trunc/mask/§2] {marginal_key}: previous mask has no overlap "
+                      f"with this round's grid; skipping zeroing.", flush=True)
+            refine, n_ref = self._refine_conf(trunc_conf, "ngrid_2d_refined")
+            if refine:
+                coarse_n = len(region.components())
+                region, _modes = refine_region(
+                    region, self._refine_evaluator_2d(marginal_key, out_idx),
+                    ngrid=n_ref, prev=prev,
+                    policy=str(trunc_conf.get("zero_outside_prev_mask", "hard")),
+                    hysteresis_weight=float(trunc_conf.get("hysteresis_weight", 0.1)),
+                    credible=float(trunc_conf.get("credible_level_2d", 0.997)),
+                    dilation=float(trunc_conf.get("dilation_2d", 1.2)),
+                    periods=period, clip=self._monotonic_enabled(trunc_conf))
+                print(f"[Trunc/refine] {marginal_key}: {coarse_n} coarse mode(s) -> "
+                      f"{len(region.parts)} refined at {n_ref}^2 px each", flush=True)
+            else:
+                # `region` carries the resolved periodicity; wrap it rather than
+                # rebuilding from labels, which would lose the λ seam.
+                region = MultiRegion.from_region(region)
 
-            # §2 monotonicity: clip the dilated region back inside the previous
-            # accepted set so exclusions are permanent (A_N ⊆ A_{N-1}).
-            if self._monotonic_enabled(trunc_conf):
-                labels, comps = clip_labels_to_prev(labels, grid_x, grid_y, prev,
-                                                    period=period)
-            masks_2d.append({"idx": tuple(marginal_key), "labels": labels,
-                            "grid_x": grid_x, "grid_y": grid_y, "components": comps})
-            # Record this round's accepted set (a Region for nearest-pixel
-            # resampling) for next round's §2 zeroing.
-            self._prev_accepted[marginal_key] = {
-                "kind": "2d", "region": Region(labels > 0, (grid_x, grid_y))}
-            intervals_x =[]
-            intervals_y =[]
-            for k in comps:
-                intervals_x.extend(comps[k]["x_intervals"])
-                intervals_y.extend(comps[k]["y_intervals"])
-            envelope_x = _envelope(intervals_x)
-            envelope_y = _envelope(intervals_y)
+            masks_2d.append({"idx": tuple(marginal_key), "region": region})
+            # Record this round's accepted set for next round's §2 zeroing.
+            self._prev_accepted[marginal_key] = {"kind": "2d", "region": region}
+            envelope_x = _envelope(region.intervals(0))
+            envelope_y = _envelope(region.intervals(1))
 
             widest_box = [ envelope_x[0], envelope_x[1], envelope_y[0], envelope_y[1]]
             tmp = copy.deepcopy(self.datagen_conf["prior"])
@@ -1026,9 +1081,7 @@ class SequentialTrainerJoint:
                     self._prev_accepted[(int(idx),)] = {"kind": "1d", "intervals": ivs}
                 for m in saved["masks_2d"]:
                     self._prev_accepted[tuple(m["idx"])] = {
-                        "kind": "2d",
-                        "region": Region(np.asarray(m["labels"]) > 0,
-                                         (m["grid_x"], m["grid_y"]))}
+                        "kind": "2d", "region": m["region"]}
             # Re-initialise plot tracking lists from the restored prior
         else:
             print(f"[Resume] Warning: {prior_path} not found; using prior from config. "
@@ -1566,8 +1619,12 @@ class SequentialTrainerJoint:
                 self.train_conf.get("truncation_veto", {}).get("sky_credible_level", 0.999)),
             sky_dilation=float(
                 self.train_conf.get("truncation_veto", {}).get("sky_dilation", 1.1)),
-            # 2D volume-ratio posterior region built at the same HPD level/dilation
+            # Volume-ratio posterior regions built at the same HPD level/dilation
             # as the truncation, so the ratio's numerator is the full accepted set.
+            credible_level_1d=float(
+                self.train_conf.get("truncation", {}).get("credible_level_1d", 0.997)),
+            dilation_1d=float(
+                self.train_conf.get("truncation", {}).get("dilation_1d", 1.2)),
             credible_level_2d=float(
                 self.train_conf.get("truncation", {}).get("credible_level_2d", 0.997)),
             dilation_2d=float(
@@ -1577,6 +1634,8 @@ class SequentialTrainerJoint:
             prev_accepted=self._prev_accepted,
             zero_policy=str(self.train_conf.get("truncation", {}).get(
                 "zero_outside_prev_mask", "hard")),
+            hysteresis_weight=float(self.train_conf.get("truncation",{}).get("hysteresis_weight", None)),
+            monotonic=self._monotonic_enabled(self.train_conf.get("truncation", {})),
         )
         if ae_warmup_epochs > 0:
             print(f"[PlotPosterior] skipping first {ae_warmup_epochs} epochs (AE warmup)")
