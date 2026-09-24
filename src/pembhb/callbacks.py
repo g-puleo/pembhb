@@ -78,8 +78,6 @@ class StreamReuseLogger(Callback):
             with open(self.summary_path, "a") as f:
                 f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  [epoch {trainer.current_epoch}] "
                         f"examples={examples} distinct_sims={distinct} reuse={reuse:.2f}\n")
-
-
 def _param_keys(pl_module):
     """Parameter names for the run's spin basis (slots 2,3), from dataset_info.
 

@@ -526,8 +526,12 @@ def _sample_2d_from_components(components, labels, grid_x, grid_y, n, rng: np.ra
     ks = list(components) #returns the keys of components
     w = np.array([(labels == k).sum() for k in ks], float)
     w /= w.sum()    
-    x0, dx = grid_x[0], grid_x[1]-grid_x[0]
-    y0, dy = grid_y[0], grid_y[1]-grid_y[0]
+    # Index from the cell VERTEX (grid holds centres), so floor() here lands on
+    # the same pixel Region.contains/_nearest_index reaches by rounding to the
+    # nearest centre. Using grid_x[0] as the origin offsets the two rules by
+    # half a cell and lets ~1-3% of draws fall on pixels contains() rejects.
+    dx, dy = grid_x[1] - grid_x[0], grid_y[1] - grid_y[0]
+    x0, y0 = grid_x[0] - 0.5 * dx, grid_y[0] - 0.5 * dy
     
     choices = rng.choice(len(w), size=n, p=w)
     counts = np.bincount(choices, minlength=len(w))
@@ -564,8 +568,10 @@ def _sample_2d_from_components(components, labels, grid_x, grid_y, n, rng: np.ra
         while sum(len(a) for a in xk_list)<N: 
             xk = _sample_from_intervals(component['x_intervals'], T_max, rng)   # cube never needed in 2D
             yk = _sample_from_intervals(component['y_intervals'], T_max, rng)
-            col = np.clip(((xk - x0)/dx).astype(int), 0, labels.shape[1]-1)
-            row = np.clip(((yk - y0)/dy).astype(int), 0, labels.shape[0]-1)
+            # np.floor, not astype(int): the latter truncates toward zero, so a
+            # negative coordinate would round the wrong way.
+            col = np.clip(np.floor((xk - x0)/dx).astype(int), 0, labels.shape[1]-1)
+            row = np.clip(np.floor((yk - y0)/dy).astype(int), 0, labels.shape[0]-1)
             keep = labels[row, col] == i
             accepted += keep.sum()
             sampled+=T_max

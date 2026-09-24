@@ -41,8 +41,6 @@ class RingBuffer:
             (e.g. ``params`` — tiny, and downstream callbacks read them with
             ``np.asarray`` exactly as in the HDF5 path).
         """
-        self.n = n_buffers
-        self.M = buffer_size
         self.device = device
         self.host_fields = set(host_fields)
         self.fields = {
@@ -53,7 +51,15 @@ class RingBuffer:
             ]
             for name, shape in sample_shapes.items()
         }
+        self._init_state(n_buffers, buffer_size, reuse_threshold)
 
+    def _init_state(self, n_buffers, buffer_size, reuse_threshold):
+        """Initialise the storage-agnostic synchronisation state (all the flags
+        the producer/consumer protocol below reads). Shared verbatim by the GPU
+        ring and the disk-backed :class:`DiskRingBuffer`, so the "no unseen
+        overwrite" / round-robin / reuse-threshold logic is identical."""
+        self.n = n_buffers
+        self.M = buffer_size
         self._in_use = [False] * n_buffers
         self._consumed = [0] * n_buffers  # nothing trained on yet
         self._filling = [False] * n_buffers
@@ -121,6 +127,48 @@ class RingBuffer:
                     if not self._filling[j]:
                         self._in_use[j] = True
                         return j
+                self._cond.wait()
+        return None
+
+    def acquire_readable_many(self, k):
+        """Lock ``k`` *distinct* buffers in a single atomic step and return their
+        indices (round-robin, oldest pointer first), or ``None`` if the ring was
+        stopped.
+
+        The disk consumer needs a whole epoch's worth of buffers at once
+        (``k = samples_per_epoch / buffer_size``), which ``next_readable`` cannot
+        provide: called ``k`` times in a row it only skips buffers being
+        *filled*, never ones it just handed out, so the producer finishing a fill
+        between two calls can make the round-robin wrap and return the same
+        buffer twice. Picking all ``k`` under one ``_cond`` acquisition closes
+        that race — the producer cannot change any flag in between — and skipping
+        ``_in_use`` makes the pick self-consistent.
+
+        Requires ``1 <= k <= n_buffers - 1``: at least one buffer must stay free
+        for the producer, otherwise a fill could never start.
+        """
+        k = int(k)
+        if not 1 <= k <= self.n - 1:
+            raise ValueError(
+                f"acquire_readable_many(k={k}) needs 1 <= k <= n_buffers-1 "
+                f"(n_buffers={self.n}); one buffer must stay free for the producer"
+            )
+        with self._cond:
+            while not self._stop:
+                picked = []
+                for _ in range(self.n):          # bounded scan, as in next_readable
+                    j = self._rr
+                    self._rr = (self._rr + 1) % self.n
+                    if not self._filling[j] and not self._in_use[j]:
+                        self._in_use[j] = True   # claim now: no duplicate pick
+                        picked.append(j)
+                        if len(picked) == k:
+                            return picked
+                # Fewer than k free in a full scan (only possible if a caller
+                # holds buffers from a previous epoch). Undo the partial claim so
+                # no flag leaks, then wait for a release/fill to change something.
+                for j in picked:
+                    self._in_use[j] = False
                 self._cond.wait()
         return None
 

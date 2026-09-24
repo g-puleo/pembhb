@@ -697,6 +697,11 @@ class SequentialTrainerJoint:
         from pembhb import get_torch_complex_dtype, get_torch_dtype
         from pembhb.streaming import RingBuffer, Producer, StreamingDataModule
 
+        # Disk-backed ring (buffers = HDF5 files, ~zero VRAM) vs the default
+        # GPU-resident ring. Same producer/consumer logic; see streaming_disk.py.
+        if self.train_conf["streaming"].get("storage", "gpu") == "disk":
+            return self._setup_streaming_disk(round_idx, sampler_init_kwargs)
+
         self._stream_t0 = time.time()
 
         sconf = self.train_conf["streaming"]
@@ -781,6 +786,109 @@ class SequentialTrainerJoint:
 
         # Audit sidecar (same path the HDF5 path writes) so the round-end
         # shutil.copy and resume bookkeeping keep working.
+        self.data_fname_yaml = os.path.join(
+            DATA_ROOT_DIR, TIME_OF_EXECUTION, f"simulation_round_{round_idx}.yaml")
+        os.makedirs(os.path.dirname(self.data_fname_yaml), exist_ok=True)
+        with open(self.data_fname_yaml, "w") as _f:
+            yaml.safe_dump(
+                {"conf": self.datagen_conf, "sampler_init_kwargs": sampler_init_kwargs,
+                 "streaming": dict(sconf)}, _f)
+        self.datagen_info = utils.read_config(self.data_fname_yaml)
+        assert self.data_module.median_snr > 8, "Median SNR lower than 8."
+
+    def _setup_streaming_disk(self, round_idx, sampler_init_kwargs):
+        """Disk-backed counterpart of :meth:`_setup_streaming`: buffers are
+        ``buffer_{j}.h5`` files overwritten in place (bounded disk, ~zero VRAM),
+        read one-per-epoch round-robin with ``num_workers`` workers. Same ring
+        logic and same downstream teardown (``release_active`` / ``ring.stop`` /
+        producer counters) as the GPU path; see ``streaming_disk.py``."""
+        import time
+        import torch
+        import yaml
+        from pembhb import get_torch_complex_dtype, get_torch_dtype
+        from pembhb.streaming_disk import (
+            DiskRingBuffer, DiskProducer, DiskStreamingDataModule)
+
+        self._stream_t0 = time.time()
+
+        sconf = self.train_conf["streaming"]
+        n_buffers = int(sconf.get("n_buffers", 5))
+        # buffer_size sizes each FILE; samples_per_epoch sizes the EPOCH. An
+        # epoch consumes k = samples_per_epoch / buffer_size whole buffer files
+        # (each row read exactly once, no idx%M cycling), so the two knobs are
+        # independent — unlike VRAM, disk can hold several epochs' worth.
+        M = int(sconf.get("buffer_size") or sconf.get("samples_per_epoch", 10000))
+        spe = int(sconf.get("samples_per_epoch") or M)
+        assert spe % M == 0, (
+            f"streaming.samples_per_epoch ({spe}) must be a multiple of "
+            f"streaming.buffer_size ({M}): an epoch is read as whole buffer files"
+        )
+        k_epoch = spe // M
+        assert n_buffers >= k_epoch + 1, (
+            f"streaming.n_buffers ({n_buffers}) must be >= k+1 = {k_epoch + 1} "
+            f"(k = samples_per_epoch/buffer_size = {spe}/{M}) so the producer "
+            f"always has a buffer free to refresh while an epoch is being read"
+        )
+        val_size = int(sconf.get("val_size", 2000))
+        device = self.train_conf["device"]
+
+        wp = self.datagen_conf["waveform_params"]
+        assert wp.get("domain", "fd_td") == "fd", (
+            "streaming requires the FD simulator (set waveform_params.domain='fd')"
+        )
+        round_seed = self.seed + round_idx
+        sim = MBHBSimulatorFD(
+            self.datagen_conf, sampler_init_kwargs=sampler_init_kwargs, seed=round_seed,
+            n_freq_bins=wp.get("n_freq_bins", 4096),
+            freq_spacing=wp.get("freq_spacing", "linear"),
+        )
+
+        # Per-sample shapes from a tiny host probe.
+        probe = sim.sample(2, keep_on_gpu=False)
+        C, F = probe["wave_fd"].shape[1], probe["wave_fd"].shape[2]
+        n_params = probe["parameters"].shape[0]
+
+        buffer_dir = sconf.get(
+            "buffer_dir",
+            os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION, "stream_buffers"))
+        ring = DiskRingBuffer(
+            n_buffers=n_buffers, buffer_size=M, buffer_dir=buffer_dir,
+            n_channels=C, n_freq=F, n_params=n_params,
+            reuse_threshold=sconf.get("reuse_threshold", 1),
+        )
+        producer = DiskProducer(ring, sim, gen_batch_size=int(sconf.get("gen_batch_size", 250)))
+        producer.seed_fill_all()  # blocking: give the trainer data on step 0
+
+        # Frozen validation pool (generated once, never refreshed this round).
+        vs = sim.sample(val_size, keep_on_gpu=False)
+        val_pool = {
+            "wave_fd": torch.as_tensor(vs["wave_fd"], dtype=get_torch_complex_dtype()),
+            "params": torch.as_tensor(vs["parameters"].T.copy(), dtype=get_torch_dtype()),
+        }
+
+        producer.start()
+        self._ring = ring
+        self._producer = producer
+        bs = int(self.train_conf["batch_size"])
+        print(f"[streaming][disk] epoch = {spe} distinct examples = {k_epoch} x "
+              f"buffer_size {M}; steps/epoch = {spe // bs}; n_buffers = "
+              f"{n_buffers} (disk ~{n_buffers * M} waveforms in {buffer_dir})")
+        self.data_module = DiskStreamingDataModule(
+            ring, sim, val_pool,
+            batch_size=self.train_conf["batch_size"],
+            noise_factor=self.train_conf["noise_factor"],
+            n_train_noise_realisations=self.train_conf.get("n_train_noise_realisations", 1),
+            device=device,
+            # k = spe/M buffers per epoch, each read once -> spe distinct rows.
+            samples_per_epoch=spe,
+            num_workers=int(sconf.get("num_workers", 8)),
+            prefetch_factor=int(sconf.get("prefetch_factor", 4)),
+        )
+        self.data_module._producer = producer  # so a dead producer surfaces its error
+        self.data_module.setup(stage="fit")
+        self.test_dataloader = self.data_module.test_dataloader()
+
+        # Audit sidecar (same path the HDF5 path writes).
         self.data_fname_yaml = os.path.join(
             DATA_ROOT_DIR, TIME_OF_EXECUTION, f"simulation_round_{round_idx}.yaml")
         os.makedirs(os.path.dirname(self.data_fname_yaml), exist_ok=True)

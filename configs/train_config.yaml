@@ -243,15 +243,39 @@ chain_convergence:
   require_not_threshold: true
 streaming:
   enabled: true
-  n_buffers: 5
+  # gpu  : ring of VRAM-resident chunks, an epoch cycles rows with idx % M.
+  # disk : ring of buffer_{j}.h5 files overwritten in place (~zero VRAM). An
+  #        epoch locks k whole files and reads every row exactly once.
+  storage: disk
+
+  # --- ring geometry (disk path asserts both invariants at setup) -----------
+  # k = samples_per_epoch / buffer_size   -> files the consumer reads per epoch
+  #   (1) samples_per_epoch must be an exact multiple of buffer_size
+  #   (2) n_buffers >= k + 1, so the producer always has one file free to
+  #       refresh while an epoch is being read
+  # Here: k = 35000 / 7000 = 5 files per epoch, 6 on disk, 1 always refreshable.
+  n_buffers: 6
   buffer_size: 7000
-  val_size: 1000
-  gen_batch_size: 150
   # epoch = 35000 examples = 280 steps @ bs125 = the seq train-set epoch, so all
   # epoch-based callbacks (plot/10, ppks/1, periodic) fire at the same #examples
   # cadence as the seq run. step_cadence stays off.
   samples_per_epoch: 35000
+
+  # A file becomes eligible for overwrite only once it has been consumed this
+  # many times, so every simulation is trained on 10 epochs before it is
+  # replaced. With k=5 of 6 files, the ring turns over roughly every 12 epochs.
   reuse_threshold: 10
+
+  # Producer batch, and the frozen per-round validation pool (generated once).
+  gen_batch_size: 150
+  val_size: 1000
+
+  # --- disk path only -------------------------------------------------------
+  # Where the buffer files live. Defaults under DATA_ROOT_DIR (never /u, which
+  # is quota-bound). Footprint is n_buffers * buffer_size waveforms.
+  # buffer_dir: /data/gpuleo/mbhb/<run>/stream_buffers
+  num_workers: 8
+  prefetch_factor: 4
 lambda_tau:
   enabled: true
 
