@@ -90,7 +90,7 @@ seeded `noise_fd` to a file simulated without `--store-noise`.
 | block | what it sets |
 |---|---|
 | `marginals.f` | one classifier head per entry, by parameter name: `[logMchirp]` is a 1D marginal, `[lambda, sinbeta]` the 2D sky marginal. A parameter may appear in only one marginal |
-| `architecture.data_summary` | compressor of the whitened FD data shared by all heads (default `ChannelizedMLP`; alternatives `Autoencoder`, `ROM`, …) |
+| `architecture.data_summary` | compressor of the whitened FD data shared by all heads (below) |
 | `batch_size`, `epochs`, `joint_training`, `classifier_*` | optimisation |
 | `n_train_noise_realisations` | noise realisations drawn per waveform per batch. Noise is regenerated on the fly, so each epoch sees new noise |
 | `fisher_prior` | optionally replace the round-1 prior by a Fisher-matrix box around the injection |
@@ -99,6 +99,43 @@ seeded `noise_fd` to a file simulated without `--store-noise`.
 | `streaming` | simulate **during** training (below) |
 | `truncation` | how the prior is cut between rounds (below) |
 | `precision` | `float32` or `float64` |
+
+### Data summary: `architecture.data_summary`
+
+The classifier heads do not see the raw frequency series. A learned compressor
+(the data summary) maps the observed data to a fixed-size vector that all heads
+share, and it is trained end to end with the heads. The default
+`type: ChannelizedMLP` first prepares the data:
+
+1. whitens the complex FD data by the noise ASD;
+2. splits each TDI channel into its real and imaginary part (A, E give 4 real channels);
+3. subtracts the mean whitened signal and rescales by its amplitude (fitted on the round's training data).
+
+It then encodes the result with one of two variants, chosen by `ChannelizedMLP.encoder`:
+
+| `encoder` | class | how it encodes | summary size |
+|---|---|---|---|
+| `mlp` (default) | `ChannelizedMLPCompressor` | an independent 2-layer MLP per real channel (`n_freqs → hidden_dim_per_channel → out_dim_per_channel`); outputs concatenated | `2 · n_channels · out_dim_per_channel` (256) |
+| `conv` | `ConvCompressor` | one 1D CNN over all real channels together: stride-2 conv layers (`hidden_channels`, `kernel_size`, optional residual shortcuts), then a linear layer | `conv.bottleneck_dim` (256) |
+
+`conv` shares the preprocessing and the training of `mlp`; only the encoder
+differs. The MLP's first layer sees every frequency bin at once, so its size
+grows with the grid: 12.4M parameters on the default 12036-bin grid, against
+0.54M for the CNN. The CNN mixes the channels and looks for local structure
+along frequency; each extra layer halves the length. Prefer `conv` for wide or
+fine grids (e.g. `fmax = 0.1` Hz), where the MLP becomes very large. To switch:
+
+```yaml
+architecture:
+  data_summary:
+    type: ChannelizedMLP
+    ChannelizedMLP:
+      encoder: conv
+      conv: {bottleneck_dim: 256, hidden_channels: [16, 32, 32, 64, 64, 64, 64, 64, 64],
+             kernel_size: 5, residual: true}
+```
+
+Checkpoints record the choice, so the visualisation scripts rebuild the right encoder.
 
 ### Streaming data generation
 

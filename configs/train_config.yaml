@@ -51,11 +51,19 @@ architecture:
       representation: real_imag
       n_channels: 2
       n_freqs: 4096
-      hidden_dim_per_channel: 256
-      out_dim_per_channel: 64
       whiten: true
       amplitude_normalise: true
       subtract_mean_whitened: true
+      # encoder: "mlp"  -> one MLP per real channel, outputs concatenated
+      #          "conv" -> one 1D CNN over all real channels (ConvCompressor)
+      encoder: mlp
+      hidden_dim_per_channel: 256   # mlp only
+      out_dim_per_channel: 64       # mlp only; summary = 2 * n_channels * this
+      conv:                         # conv only
+        bottleneck_dim: 256         # summary size
+        hidden_channels: [16, 32, 32, 64, 64, 64, 64, 64, 64]   # one stride-2 layer each
+        kernel_size: 5
+        residual: true
     BrutalCompression:
       Nfreqs: 1000
       lowdim: 16
