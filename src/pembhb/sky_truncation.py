@@ -550,7 +550,7 @@ def sky_box_to_prior_bounds(box, current_prior):
     else:
         current_prior["lambda"] = [lam_lo, lam_hi]
 
-    current_prior["beta"] = [beta_lo, beta_hi]
+    current_prior["sinbeta"] = [beta_lo, beta_hi]
     return current_prior
 
 
@@ -684,7 +684,7 @@ def truncate_sky_prior(model, obs_loader, out_param_idx,
     if mode == "rectangle":
         sky_box_to_prior_bounds(box, datagen_conf["prior"])
         lam_lo, lam_hi = datagen_conf["prior"]["lambda"]
-        beta_lo, beta_hi = datagen_conf["prior"]["beta"]
+        beta_lo, beta_hi = datagen_conf["prior"]["sinbeta"]
         print(f"[sky_truncation] rectangle mode: "
               f"lambda=[{lam_lo:.4f}, {lam_hi:.4f}], "
               f"beta=[{beta_lo:.4f}, {beta_hi:.4f}]")

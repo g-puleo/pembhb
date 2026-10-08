@@ -2,12 +2,16 @@
 
 Simulation-based inference for **massive black hole binaries (MBHBs) observed
 by LISA**. `pembhb` estimates the posterior marginals of a single observed
-event with **TMNRE** (Truncated Marginal Neural Ratio Estimation):
+event with **TMNRE** (Truncated Marginal Neural Ratio Estimation).
 
-1. simulate signal + noise from a prior,
-2. train a classifier per 1D / 2D marginal to tell true pairs (θ, d) from shuffled ones,
-3. use the learned ratio at the observation to cut the prior to its high-posterior region,
-4. repeat from step 1 inside the narrower prior.
+The observation (one signal + one fixed noise realisation) is generated once
+and stays the same throughout. Each round then:
+
+1. simulates training data (signal + noise) from the current prior,
+2. trains a classifier per 1D / 2D marginal to tell true pairs (θ, d) from shuffled ones,
+3. evaluates the learned posterior at the observation and cuts the prior to its high-posterior region.
+
+The next round repeats from step 1 inside the narrower prior.
 
 Waveforms are frequency-domain IMRPhenomHM signals (with higher harmonics) from
 [`bbhx`](https://github.com/mikekatz04/BBHx), projected onto the TDI A/E
@@ -52,8 +56,8 @@ python scripts/visualise_volume_from_masks.py $RUN
 | `backend` | `cuda12x` or `cpu` |
 
 The 11 parameters, in canonical order: `logMchirp` (log₁₀ M_c / M☉), `q`
-(m₁/m₂ ≥ 1), two spins, `dist` (Gpc), `phi`, `inc` (cos ι), `lambda`
-(ecliptic longitude), `beta` (sin of ecliptic latitude), `psi`, `Deltat`
+(m₁/m₂ ≥ 1), two spins, `dist` (Gpc), `phi`, `cosinc` (cos ι), `lambda`
+(ecliptic longitude), `sinbeta` (sin of ecliptic latitude), `psi`, `Deltat`
 (merger time relative to the end of the observation, days).
 
 **The grid is linear by default.** Bin spacing is `1 / T_obs` (`downsamplefactor` must stay 1: coarser grids are not supported).
@@ -85,12 +89,13 @@ seeded `noise_fd` to a file simulated without `--store-noise`.
 
 | block | what it sets |
 |---|---|
-| `marginals.f` | one classifier head per entry, by parameter name: `[logMchirp]` is a 1D marginal, `[lambda, beta]` the 2D sky marginal. A parameter may appear in only one marginal |
+| `marginals.f` | one classifier head per entry, by parameter name: `[logMchirp]` is a 1D marginal, `[lambda, sinbeta]` the 2D sky marginal. A parameter may appear in only one marginal |
 | `architecture.data_summary` | compressor of the whitened FD data shared by all heads (default `ChannelizedMLP`; alternatives `Autoencoder`, `ROM`, …) |
 | `batch_size`, `epochs`, `joint_training`, `classifier_*` | optimisation |
 | `n_train_noise_realisations` | noise realisations drawn per waveform per batch. Noise is regenerated on the fly, so each epoch sees new noise |
 | `fisher_prior` | optionally replace the round-1 prior by a Fisher-matrix box around the injection |
-| `pp_ks_early_stop`, `volume_ratio_early_stop` | per-round stopping criteria (coverage test; posterior volume stopped shrinking) |
+| `volume_ratio_early_stop` | ends a round when the posterior volume stops shrinking |
+| `calibration_monitor` | calibration diagnostics on the test pool (PP-KS D/T, λ/τ); never stops training — see §6 |
 | `streaming` | simulate **during** training (below) |
 | `truncation` | how the prior is cut between rounds (below) |
 | `precision` | `float32` or `float64` |
@@ -189,8 +194,78 @@ bounds in 1D, and the accepted-region contour in 2D.
 | `visualise_sky_truncation.py <tag> [--mcmc-file …]` | sky posterior and truncation masks per round (Mollweide), 90% sky area vs round |
 | `visualise_entropy_evolution.py <tag>` | differential entropy of each marginal vs round (and vs training time) |
 | `visualise_volume_from_masks.py <tag>` | prior volume of each marginal vs round, measured exactly on every mode's own grid from the stored truncation masks |
+| `plot_calibration_history.py <tag>`, `plot_lambda_tau.py <tag>` | training diagnostics on the test pool (§6) |
 
 `--last-round N` restricts the evolution scripts to rounds ≤ N.
+
+## 6. Training diagnostics
+
+### The test pool
+
+Every round sets aside a test pool: simulations drawn from **that round's
+prior**, each with a known true θ. With streaming, this is the frozen
+validation pool generated at the start of the round. `calibration_monitor`
+evaluates the network on its first `test_n` simulations every
+`run_every_n_epochs` epochs. These simulations are not the observation; they
+check that the posteriors are trustworthy across the current prior.
+
+**Calibration (PP-KS).** For each 1D marginal and test simulation, take the
+rank r = F_post(θ_true), i.e. the posterior mass below the true value. For a
+calibrated posterior the ranks are Uniform(0, 1). Two numbers summarise them:
+
+- **D**: the Kolmogorov–Smirnov distance of the ranks from uniform. 0 means
+  calibrated; any miscalibration raises it.
+- **T**: the fraction of ranks in the outer tails, below q or above 1−q
+  (`t_quantile`). A calibrated posterior gives T = 2q. T > 2q means
+  overconfident (the truth often falls in the tails); T < 2q means underconfident.
+
+Both are logged raw and as an EMA once `warmup_epochs` have passed (counted
+cumulatively over rounds). `d_threshold` and `t_threshold` are reference levels
+for the plots; nothing stops on them.
+
+```bash
+python scripts/plot_calibration_history.py <tag>   # D and T vs cumulative epoch, per marginal
+```
+
+**Width and bias against the Fisher bound (λ/τ).** With `lambda_tau.enabled`,
+each evaluation also stores every test simulation's posterior mean μ and std
+σ, together with the Fisher (Cramér–Rao) σ at its true θ, in
+`$PEMBHB_DATA_DIR/<tag>/lambda_tau_stats_round_<i>.h5`:
+
+- **λ = (θ_true − μ)/σ** is the pull. Calibrated, unbiased posteriors give
+  λ ~ N(0, 1).
+- **τ = σ/σ_Fisher** compares the width with the best width the data allow.
+  τ ≫ 1 means the network has not extracted all the information yet. τ < 1
+  means narrower than the Fisher bound, which is suspicious: overconfidence,
+  or a bound that breaks down (e.g. multimodal or prior-dominated directions).
+
+```bash
+python scripts/plot_lambda_tau.py <tag>   # (λ, log10 τ) contours per parameter, one per round
+```
+
+As the rounds progress, the contours should move down towards log10 τ = 0
+while staying centred on λ = 0.
+
+### TensorBoard
+
+Every round writes its own TensorBoard log; open all of a run's rounds together with
+
+```bash
+tensorboard --logdir $PEMBHB_DATA_DIR/logs/<tag>          # then open http://localhost:6006
+```
+
+On a remote machine, forward the port first, `ssh -L 6006:localhost:6006 user@host`,
+and run the command there. Lightning starts a new `version_N` each time a
+round's trainer starts; the last one is the relevant one. The `pp_ks/*`
+scalars use the cumulative epoch as the step, so they line up across rounds.
+
+| scalars | meaning |
+|---|---|
+| `train_loss`, `val_loss`, `train_accuracy`, `val_accuracy` | BCE loss and accuracy of the ratio classifier over all heads (accuracy 0.5 = no information) |
+| `train_loss_<head>`, `val_loss_<head>`, `…_accuracy_<head>` | the same per marginal head |
+| `pp_ks/D/<param>`, `pp_ks/T/<param>`, `pp_ks/{D,T}_ema/<param>` | calibration on the test pool (above); step = cumulative epoch |
+| `volume_ratio/<param>`, `volume_ratio_mode/<param>/<k>` | accepted volume of the proposed truncation vs the current prior (per mode) |
+| `diff_entropy/<param>` | differential entropy of the marginal at the observation |
 
 ## Tests
 
@@ -207,7 +282,8 @@ LR schedules.
 
 ```
 configs/      datagen_config.yaml, train_config.yaml
-scripts/      simulate_data.py, add_noise_to_obs.py, tmnre_joint.py, plot_posterior.py, visualise_*.py
+scripts/      simulate_data.py, add_noise_to_obs.py, tmnre_joint.py, plot_posterior.py,
+              visualise_*.py, plot_calibration_history.py, plot_lambda_tau.py
 src/pembhb/   simulator, sampler, data, model, autoencoder, callbacks,
               regions / mask_truncation / sky_truncation, streaming(_disk), psd_veto, utils
 patches/      bbhx compatibility patch

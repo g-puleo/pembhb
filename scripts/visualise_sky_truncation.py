@@ -192,11 +192,11 @@ def _mcmc_sky_density(mcmc_file, ngrid, cr_area):
     finer grid).  ``(None, None)`` if the file lacks the sky columns.
     """
     samples, names = load_mcmc_samples(mcmc_file)
-    if "lambda" not in names or "beta" not in names:
+    if "lambda" not in names or "sinbeta" not in names:
         print(f"[warn] {mcmc_file} lacks lambda/beta columns; skipping MCMC.")
         return None, None
     lam_s = samples[:, names.index("lambda")]
-    sinb_s = samples[:, names.index("beta")]           # stored value is sin(beta)
+    sinb_s = samples[:, names.index("sinbeta")]           # stored value is sin(beta)
 
     lam_g = np.linspace(0.0, 2.0 * np.pi, ngrid)
     sb_g = np.linspace(-1.0, 1.0, ngrid)
@@ -382,7 +382,7 @@ def _fig_final_vs_mcmc(final, inj, mcmc, cr_area, outpath,
             ax.set_xticks(np.radians([-120, -60, 0, 60, 120]))
             ax.set_yticks(np.radians([-60, -30, 0, 30, 60]))
 
-        lon, lat = to_mollweide_coords(final["gx"], final["gy"], "lambda", "beta")
+        lon, lat = to_mollweide_coords(final["gx"], final["gy"], "lambda", "sinbeta")
         nre_lvls = _levels_native(final["norm"], _CR_CONTOURS)
         ax.contour(lon, lat, final["norm"], levels=nre_lvls,
                    colors="blue", linewidths=contour_lw, zorder=4)
@@ -391,7 +391,7 @@ def _fig_final_vs_mcmc(final, inj, mcmc, cr_area, outpath,
         title = f"Sky posterior — round {final['round']}"
         if mcmc is not None:
             LAM, SB, dens, area_mcmc = mcmc
-            mlon, mlat = to_mollweide_coords(LAM, SB, "lambda", "beta")
+            mlon, mlat = to_mollweide_coords(LAM, SB, "lambda", "sinbeta")
             ax.contour(mlon, mlat, dens, levels=_levels_native(dens, _CR_CONTOURS),
                        colors="cyan", linewidths=contour_lw, zorder=3)
             handles.append(Line2D([0], [0], color="cyan", label="MCMC"))
@@ -487,7 +487,7 @@ def _fig_truncation_scheme(records, inj, mollweide, outpath, name,
                            alpha=0.16, lw=1.0, zorder=2)
         else:
             # Round 1 (or rectangle run): the box itself is the prior.
-            bx, by = _sky_box_loop(*cur["lambda"], *cur["beta"], mollweide)
+            bx, by = _sky_box_loop(*cur["lambda"], *cur["sinbeta"], mollweide)
             ax.plot(bx, by, color="0.35", lw=1.0, ls="-", zorder=2)
 
         # (2) Proposal mask for the NEXT round = end-of-r truncation.
@@ -497,13 +497,13 @@ def _fig_truncation_scheme(records, inj, mollweide, outpath, name,
                            alpha=0.32, lw=1.3, zorder=3)
         else:
             nxt = next((rr["box"] for rr in records if rr["round"] == r + 1), cur)
-            sx, sy = _sky_box_loop(*nxt["lambda"], *nxt["beta"], mollweide)
+            sx, sy = _sky_box_loop(*nxt["lambda"], *nxt["sinbeta"], mollweide)
             ax.fill(sx, sy, color="C1", alpha=0.32, zorder=3)
 
         # (3) NRE posterior contours (the density that motivated the proposal).
         if "norm" in rec:
             gx, gy = rec["gx"], rec["gy"]
-            xx, yy = (to_mollweide_coords(gx, gy, "lambda", "beta")
+            xx, yy = (to_mollweide_coords(gx, gy, "lambda", "sinbeta")
                       if mollweide else (gx, gy))
             ax.contour(xx, yy, rec["norm"],
                        levels=_levels_native(rec["norm"], _CR_CONTOURS),
@@ -525,7 +525,7 @@ def _fig_truncation_scheme(records, inj, mollweide, outpath, name,
             ext = _mask_extent(prior_mask) if prior_mask is not None else None
             if ext is None:
                 ext = (cur["lambda"][0], cur["lambda"][1],
-                       cur["beta"][0], cur["beta"][1])
+                       cur["sinbeta"][0], cur["sinbeta"][1])
             lam_lo, lam_hi, sb_lo, sb_hi = ext
             mlam = 0.05 * (lam_hi - lam_lo) or 0.05
             msb = 0.05 * (sb_hi - sb_lo) or 0.05
@@ -597,8 +597,8 @@ def _compute_final_zoom(final, mcmc_kde, cr_area, model, dataloader, ctx, ngrid_
     box = final.get("box") or {}
     if "lambda" in box:
         lam_lo, lam_hi = max(lam_lo, box["lambda"][0]), min(lam_hi, box["lambda"][1])
-    if "beta" in box:
-        sb_lo, sb_hi = max(sb_lo, box["beta"][0]), min(sb_hi, box["beta"][1])
+    if "sinbeta" in box:
+        sb_lo, sb_hi = max(sb_lo, box["sinbeta"][0]), min(sb_hi, box["sinbeta"][1])
 
     sky_idx, p0_key = ctx["sky_idx"], ctx["p0_key"]
     if p0_key == "lambda":

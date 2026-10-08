@@ -290,8 +290,8 @@ def test_sample_2d_thin_ridge_high_fill_no_nan():
 # ======================================================================
 # truth_violations
 # ======================================================================
-_KEYS = ["logMchirp", "q", "chi1", "chi2", "dist", "phi", "inc",
-         "lambda", "beta", "psi", "Deltat"]
+_KEYS = ["logMchirp", "q", "chi1", "chi2", "dist", "phi", "cosinc",
+         "lambda", "sinbeta", "psi", "Deltat"]
 
 
 @pytest.fixture
@@ -332,17 +332,17 @@ def test_tv_clean(tv_fixture):
 
 def test_tv_hole_between_components(tv_fixture):
     _, _, _, masks_2d, intervals_1d, prior_box = tv_fixture
-    v = truth_violations(_truth(**{"lambda": 0.5, "beta": 0.5}), prior_box,
+    v = truth_violations(_truth(**{"lambda": 0.5, "sinbeta": 0.5}), prior_box,
                          intervals_1d, masks_2d, _KEYS, check_idxs=[0, 1, 7, 8])
     assert len(v) == 1
     assert v[0]["kind"] == "2d-mask"
     assert v[0]["marginal"] == [7, 8]
-    assert v[0]["name"] == "lambda-beta"
+    assert v[0]["name"] == "lambda-sinbeta"
 
 
 def test_tv_offgrid_not_clipped(tv_fixture):
     labels, grid_x, grid_y, masks_2d, intervals_1d, prior_box = tv_fixture
-    v = truth_violations(_truth(**{"lambda": 1.30, "beta": 0.80}), prior_box,
+    v = truth_violations(_truth(**{"lambda": 1.30, "sinbeta": 0.80}), prior_box,
                          intervals_1d, masks_2d, _KEYS, check_idxs=[0, 1, 7, 8])
     assert len(v) == 1
     assert "off the posterior grid" in v[0]["detail"]
@@ -383,7 +383,7 @@ def test_tv_check_idxs_limits_box(tv_fixture):
 
 def test_tv_multiple_misses(tv_fixture):
     _, _, _, masks_2d, intervals_1d, prior_box = tv_fixture
-    v = truth_violations(_truth(logMchirp=5.40, q=1.5, **{"lambda": 0.5, "beta": 0.5}),
+    v = truth_violations(_truth(logMchirp=5.40, q=1.5, **{"lambda": 0.5, "sinbeta": 0.5}),
                          prior_box, intervals_1d, masks_2d, _KEYS,
                          check_idxs=[0, 1, 7, 8])
     assert len(v) == 3
@@ -505,7 +505,7 @@ def test_chieff_no_unphysical_spins(float64_precision):
     prior[keys[I_CHIDIFF]] = [-1.0, 1.0]
     prior["dist"] = [5.0, 50.0]
     prior["lambda"] = [0.0, TWO_PI]
-    prior["beta"] = [-1.0, 1.0]
+    prior["sinbeta"] = [-1.0, 1.0]
     T_OBS = 365 * 24 * 3600.0
     N = 20000
 
@@ -540,7 +540,7 @@ def test_chieff_physical_intervals_full_acceptance(float64_precision):
     prior = {k: [0.0, 1.0] for k in keys}
     prior[keys[0]] = [5.0, 6.0]; prior[keys[1]] = [0.1, 1.0]
     prior[keys[2]] = [-1.0, 1.0]; prior[keys[3]] = [-1.0, 1.0]
-    prior["dist"] = [5.0, 50.0]; prior["lambda"] = [0.0, TWO_PI]; prior["beta"] = [-1.0, 1.0]
+    prior["dist"] = [5.0, 50.0]; prior["lambda"] = [0.0, TWO_PI]; prior["sinbeta"] = [-1.0, 1.0]
     s = MaskRejectSampler(prior_bounds=prior,
                           intervals_1d={2: [[-0.2, 0.2]], 3: [[-0.1, 0.1]]}, masks_2d=[],
                           rng=np.random.default_rng([42, 3]), dist_uniform_in_volume=True,
@@ -556,7 +556,7 @@ def test_chieff_entirely_unphysical_raises(float64_precision):
     prior = {k: [0.0, 1.0] for k in keys}
     prior[keys[0]] = [5.0, 6.0]; prior[keys[1]] = [0.1, 1.0]
     prior[keys[2]] = [-1.0, 1.0]; prior[keys[3]] = [-1.0, 1.0]
-    prior["dist"] = [5.0, 50.0]; prior["lambda"] = [0.0, TWO_PI]; prior["beta"] = [-1.0, 1.0]
+    prior["dist"] = [5.0, 50.0]; prior["lambda"] = [0.0, TWO_PI]; prior["sinbeta"] = [-1.0, 1.0]
     s = MaskRejectSampler(prior_bounds=prior,
                           intervals_1d={2: [[0.95, 1.0]], 3: [[0.95, 1.0]]}, masks_2d=[],
                           rng=np.random.default_rng([42, 5]), dist_uniform_in_volume=True,
@@ -571,13 +571,13 @@ def test_chieff_entirely_unphysical_raises(float64_precision):
 def test_wiring_roundend_and_resume(float64_precision):
     prior_keys = utils.ordered_prior_keys("chi1chi2")
     IDX_MC = prior_keys.index("logMchirp")
-    IDX_LAM, IDX_BETA = prior_keys.index("lambda"), prior_keys.index("beta")
+    IDX_LAM, IDX_BETA = prior_keys.index("lambda"), prior_keys.index("sinbeta")
     assert (IDX_LAM, IDX_BETA) == (7, 8)
 
     prior = {k: [0.0, 1.0] for k in prior_keys}
     prior["logMchirp"] = [5.0, 6.0]
     prior["lambda"] = [0.0, TWO_PI]
-    prior["beta"] = [-1.0, 1.0]
+    prior["sinbeta"] = [-1.0, 1.0]
     prior["dist"] = [5.0, 50.0]
 
     # 1D bimodal logMchirp
@@ -607,7 +607,7 @@ def test_wiring_roundend_and_resume(float64_precision):
     prior["logMchirp"] = envelope(res["intervals"])
     allx = [iv for c in comps.values() for iv in c["x_intervals"]]
     ally = [iv for c in comps.values() for iv in c["y_intervals"]]
-    prior["lambda"], prior["beta"] = envelope(allx), envelope(ally)
+    prior["lambda"], prior["sinbeta"] = envelope(allx), envelope(ally)
 
     tmp = tempfile.mkdtemp()
     try:

@@ -49,7 +49,7 @@ from pembhb.utils import (
 from pembhb.callbacks import (
     PlotPosteriorCallback, VolumeRatioEarlyStopping,
     DifferentialEntropyEarlyStopping, PeriodicProgressCallback,
-    WarmupEarlyStopping, PPKSTestEarlyStopping, ChainConvergenceMonitor,
+    WarmupEarlyStopping, CalibrationMonitor, ChainConvergenceMonitor,
     compute_truncation_coverage, StreamReuseLogger,
 )
 from pembhb.utils import _ORDERED_PRIOR_KEYS as _PPKS_ORDERED_PRIOR_KEYS
@@ -1900,9 +1900,8 @@ class SequentialTrainerJoint:
                 "Expected one of: 'volume_ratio', 'differential_entropy', 'accuracy'."
             )
 
-        # Optional PP-plot KS / tail-mass overconfidence monitor (can also
-        # trigger early stopping when trigger_on_overconfidence: true).
-        pp_conf = self.train_conf.get("pp_ks_early_stop")
+        # Optional calibration monitor on the test pool (PP-KS D/T, λ/τ); never stops training.
+        pp_conf = self.train_conf.get("calibration_monitor")
         if pp_conf and pp_conf.get("enabled", False):
             from torch.utils.data import Subset, DataLoader as _DL
             test_ds = self.data_module.test
@@ -1957,26 +1956,22 @@ class SequentialTrainerJoint:
             # λ/τ may start before the trigger bookkeeping; defaults to it.
             lt_warmup = int(lt_conf.get("warmup_epochs", ppks_warmup))
             ppks_state_path = os.path.join(
-                DATA_ROOT_DIR, TIME_OF_EXECUTION, "ppks_state.yaml",
+                DATA_ROOT_DIR, TIME_OF_EXECUTION, "calibration_state.yaml",
             )
             ppks_plots_dir = os.path.join(
                 PLOTS_ROOT_DIR,
                 TIME_OF_EXECUTION,
             )
-            callbacks_list.append(PPKSTestEarlyStopping(
+            callbacks_list.append(CalibrationMonitor(
                 test_loader=ppks_loader,
                 marginals_1d_info=marginals_1d_info,
                 ngrid_points=int(pp_conf.get("ngrid_points", 50)),
                 warmup_epochs=ppks_warmup,
                 run_every_n_epochs=int(pp_conf.get("run_every_n_epochs", 1)),
-                patience=int(pp_conf.get("patience", 40)),
                 ema_alpha=float(pp_conf.get("ema_alpha", 0.3)),
                 d_threshold=float(pp_conf.get("d_threshold", 0.15)),
                 t_threshold=float(pp_conf.get("t_threshold", 0.15)),
                 t_quantile=float(pp_conf.get("t_quantile", 0.05)),
-                trigger_on_overconfidence=bool(
-                    pp_conf.get("trigger_on_overconfidence", False)
-                ),
                 print_every=int(pp_conf.get("print_every", 20)),
                 state_path=ppks_state_path,
                 round_idx=round_idx,
@@ -1995,9 +1990,7 @@ class SequentialTrainerJoint:
                       f"fisher_params={fisher_varying_params}, backend={lt_backend}, "
                       f"warmup={lt_warmup} (ppks warmup={ppks_warmup}), "
                       f"out={lt_h5_path}")
-            mode = ("trigger" if pp_conf.get("trigger_on_overconfidence", False)
-                    else "monitor")
-            print(f"[PPKS] enabled in {mode} mode "
+            print(f"[calibration] enabled "
                   f"(test_n={n_eval}, ngrid={pp_conf.get('ngrid_points', 50)}, "
                   f"cumulative_warmup={ppks_warmup}, "
                   f"state={ppks_state_path})")

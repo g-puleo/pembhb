@@ -29,10 +29,10 @@ marginals:
   - [chi_diff]
   - [dist]
   - [Deltat]
-  - [lambda, beta]
+  - [lambda, sinbeta]
   - [psi]
   - [phi]
-  - [inc]
+  - [cosinc]
 marginal_schedule: []
 periodic_bc_params:
 - 5
@@ -205,33 +205,34 @@ fisher_prior:
   - chi_diff
   - dist
   - lambda
-  - beta
+  - sinbeta
   - Deltat
   - psi
   - phi
-  - inc
+  - cosinc
   fixed_params: []
   n_sigma: 5.0
   param_n_sigma: {}
   step_frac: 0.001
-pp_ks_early_stop:
+# Calibration monitor on the first test_n simulations of the round's test pool:
+# PP-KS D/T per 1D marginal (TensorBoard pp_ks/*) and the λ/τ statistics
+# (lambda_tau_stats_round_<i>.h5). Diagnostic only: it never stops training.
+calibration_monitor:
   enabled: true
-  trigger_on_overconfidence: true
   test_n: 100
   test_batch_size: 100
   ngrid_points: 50
-  warmup_epochs: 100
+  warmup_epochs: 100       # EMA of D/T starts after this many cumulative epochs
   run_every_n_epochs: 1
-  patience: 40
   ema_alpha: 0.3
-  d_threshold: 0.2
+  d_threshold: 0.2         # reference lines in plot_calibration_history.py
   t_threshold: 0.05
-  t_quantile: 0.05
+  t_quantile: 0.05         # T = fraction of ranks in the outer 2*t_quantile
   print_every: 20
   lambda_tau:
     enabled: true
     fisher_backend: cuda12x
-    warmup_epochs: 0   # λ/τ from epoch 0; PP-KS trigger still waits for warmup_epochs
+    warmup_epochs: 0
 bnre:
   enabled: false
   lambda: 0.0

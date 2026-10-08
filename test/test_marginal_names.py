@@ -7,13 +7,13 @@ from pembhb.utils import marginal_names_to_indices, read_config, resolve_margina
 
 
 def test_names_map_to_basis_indices():
-    m = {"f": [["logMchirp"], ["chi_eff"], ["lambda", "beta"], ["Deltat"]]}
+    m = {"f": [["logMchirp"], ["chi_eff"], ["lambda", "sinbeta"], ["Deltat"]]}
     assert marginal_names_to_indices(m, "chieff_chidiff") == {"f": [[0], [2], [7, 8], [10]]}
 
 
 def test_duplicate_name_rejected():
     with pytest.raises(ValueError, match="two marginals"):
-        marginal_names_to_indices({"f": [["lambda"], ["lambda", "beta"]]}, "chieff_chidiff")
+        marginal_names_to_indices({"f": [["lambda"], ["lambda", "sinbeta"]]}, "chieff_chidiff")
 
 
 def test_unknown_name_and_indices_rejected():

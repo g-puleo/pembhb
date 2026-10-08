@@ -445,10 +445,10 @@ def main():
                    help="Stop at this round (1-indexed, inclusive).")
     p.add_argument("--ckpt-final-round", default=None,
                    help="Path to a checkpoint overriding the final round's "
-                        "truncation.ckpt (e.g. a PP-KS trigger ckpt).")
+                        "truncation.ckpt.")
     p.add_argument("--reason", default="auto",
                    help="Free-form tag for filename + suptitle. 'auto' = "
-                        "'trigger' if --ckpt-final-round is set, else 'truncation'.")
+                        "'override' if --ckpt-final-round is set, else 'truncation'.")
     p.add_argument("--zoom-mcmc-sigmas", type=float, default=5.0,
                    help="When --mcmc-file is given, also save a zoomed-in "
                         "companion figure with each subplot's y-axis "
@@ -489,7 +489,7 @@ def main():
                         "(default: same as --width-pt).")
     args = p.parse_args()
     if args.reason == "auto":
-        args.reason = "trigger" if args.ckpt_final_round else "truncation"
+        args.reason = "override" if args.ckpt_final_round else "truncation"
 
     round_dirs = find_round_dirs(args.name)
     if not round_dirs:

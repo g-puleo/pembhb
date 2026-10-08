@@ -20,8 +20,6 @@ from pembhb.utils import get_logratios_grid
 _MCMC_KEY_TO_INTERNAL = {
     "tref":     "Deltat",
     "dist_Gpc": "dist",
-    "cosinc":   "inc",
-    "sinbeta":  "beta",
 }
 
 # Constants used by the Deltat-axis transform (seconds offset from the
@@ -33,8 +31,7 @@ def load_mcmc_samples(samples_path: str):
     """Load flat MCMC samples from an HDF5 file (one dataset per parameter).
 
     Keys are renamed to the pembhb internal convention on load
-    (``tref → Deltat``, ``dist_Gpc → dist``, ``cosinc → inc``,
-    ``sinbeta → beta``).  ``Deltat`` is left in raw seconds-from-start;
+    (``tref → Deltat``, ``dist_Gpc → dist``).  ``Deltat`` is left in raw seconds-from-start;
     the caller is responsible for the time-coordinate transform.
     """
     with h5py.File(samples_path, "r") as f:

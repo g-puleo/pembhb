@@ -317,9 +317,9 @@ LABELS = {
     "chi_diff":  r"$\chi_\mathrm{diff}$",
     "dist":      r"$d_L$",
     "phi":       r"$\phi$",
-    "inc":       r"$\cos\iota$",
+    "cosinc":       r"$\cos\iota$",
     "lambda":    r"$\lambda$",
-    "beta":      r"$\sin\beta$",
+    "sinbeta":      r"$\sin\beta$",
     "psi":       r"$\psi$",
     "Deltat":    r"$\Delta t$",
 }

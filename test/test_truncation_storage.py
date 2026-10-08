@@ -203,9 +203,9 @@ def test_sampler_draws_from_every_mode_of_a_multiresolution_region():
 
 
 def test_mask_reject_sampler_accepts_a_region_entry():
-    keys = ["logMchirp", "q", "chi1", "chi2", "dist", "phi", "inc",
-            "lambda", "beta", "psi", "Deltat"]
-    span = {"inc": [-0.9, 0.9], "beta": [-0.9, 0.9], "chi1": [-0.5, 0.5],
+    keys = ["logMchirp", "q", "chi1", "chi2", "dist", "phi", "cosinc",
+            "lambda", "sinbeta", "psi", "Deltat"]
+    span = {"cosinc": [-0.9, 0.9], "sinbeta": [-0.9, 0.9], "chi1": [-0.5, 0.5],
             "chi2": [-0.5, 0.5], "dist": [1.0, 2.0]}
     prior = {k: span.get(k, [1.0, 2.0]) for k in keys}
     gx, gy = np.linspace(1.0, 2.0, 20), np.linspace(1.0, 2.0, 20)

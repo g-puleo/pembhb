@@ -22,9 +22,9 @@ prior:
   chi_diff:  [-0.97, 0.97]              # (chi1 - chi2) / 2
   dist:      [1.0, 100.0]               # luminosity distance [Gpc], uniform in volume
   phi:       [0, 6.283185307179586]     # phase
-  inc:       [-1.0, 1.0]                # cos(inclination)
+  cosinc:    [-1.0, 1.0]                # cos(inclination)
   lambda:    [0, 6.283185307179586]     # ecliptic longitude
-  beta:      [-1.0, 1.0]                # sin(ecliptic latitude)
+  sinbeta:   [-1.0, 1.0]                # sin(ecliptic latitude)
   psi:       [0, 3.14159265358979]      # polarisation angle
   Deltat:    [-2.55, -2.45]             # merger time relative to end of observation [days]
 
@@ -36,9 +36,9 @@ injection:
   chi_diff:  0.0
   dist:      15.0
   phi:       3.1415
-  inc:       0.5
+  cosinc:    0.5
   lambda:    3.14159265358979
-  beta:      0.2
+  sinbeta:   0.2
   psi:       1.0
   Deltat:    -2.50
 

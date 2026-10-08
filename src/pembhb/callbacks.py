@@ -1432,31 +1432,22 @@ class WarmupEarlyStopping(EarlyStopping):
         super()._run_early_stopping_check(trainer)
 
 
-class PPKSTestEarlyStopping(Callback):
-    """Per-marginal PP-plot KS test + tail-mass overconfidence detector.
+class CalibrationMonitor(Callback):
+    """Calibration monitor on a fixed test pool (no early stopping).
 
-    Every ``run_every_n_epochs`` epochs (default 1) the callback evaluates the
-    1-D marginal posteriors on a small held-out subset of the test split. For
-    each 1-D marginal it computes two scalars from the rank distribution
-    ``r_i = F̂_post(θ_true^i)``:
+    Every ``run_every_n_epochs`` epochs it evaluates the 1-D marginal posteriors
+    on ``test_n`` simulations of the round's test split and, per marginal, the
+    ranks ``r_i = F̂_post(θ_true^i)`` of the true values:
 
-    * ``D_t`` — one-sample Kolmogorov-Smirnov statistic against ``Uniform(0,1)``
-      (any miscalibration direction).
-    * ``T_t`` — tail mass ``P[r ∈ [0, q] ∪ [1-q, 1]]``. Expected value under
-      perfect calibration is ``2q``. Overconfident (undercovered) posteriors
-      pile ranks at the extremes → ``T_t`` rises above ``2q``. Overcovered
-      posteriors push ranks centrally → ``T_t`` falls below ``2q``. Combining
-      ``D_t`` (deviation) with ``T_t`` (direction) isolates overconfidence
-      specifically, not generic miscalibration.
+    * ``D`` — Kolmogorov-Smirnov distance of the ranks from ``Uniform(0, 1)``
+      (0 = calibrated; any miscalibration raises it).
+    * ``T`` — tail mass ``P[r ∈ [0, q] ∪ [1-q, 1]]``; ``2q`` when calibrated,
+      larger when overconfident, smaller when underconfident.
 
-    Both are EMA-smoothed per marginal. When ``trigger_on_overconfidence`` is
-    true, ``trainer.should_stop`` is set as soon as the EMA-smoothed ``D`` and
-    ``T`` exceed ``d_threshold`` and ``t_threshold`` for ``patience``
-    consecutive evaluations on **any** marginal. With the default
-    ``trigger_on_overconfidence=False`` (monitoring mode) the callback only
-    logs ``pp_ks/D/{label}`` and ``pp_ks/T/{label}`` to TensorBoard.
-
-    The ``stop_reason`` attribute records which marginal triggered the stop.
+    Both are EMA-smoothed after ``warmup_epochs`` (cumulative over rounds) and
+    logged to TensorBoard as ``pp_ks/{D,T,D_ema,T_ema}/<param>``.
+    ``d_threshold``/``t_threshold`` are reference levels for the plots only.
+    Optionally also records the λ/τ statistics (see :meth:`_update_lambda_tau`).
     """
 
     def __init__(
@@ -1466,12 +1457,10 @@ class PPKSTestEarlyStopping(Callback):
         ngrid_points: int = 50,
         warmup_epochs: int = 50,
         run_every_n_epochs: int = 1,
-        patience: int = 40,
         ema_alpha: float = 0.3,
         d_threshold: float = 0.15,
         t_threshold: float = 0.15,
         t_quantile: float = 0.05,
-        trigger_on_overconfidence: bool = False,
         print_every: int = 20,
         state_path: str | None = None,
         round_idx: int | None = None,
@@ -1493,39 +1482,29 @@ class PPKSTestEarlyStopping(Callback):
         self.marginals_1d_info = marginals_1d_info
         self.ngrid_points = ngrid_points
         self.warmup_epochs = warmup_epochs
-        # λ/τ stats may start earlier than the trigger bookkeeping; below
-        # ``warmup_epochs`` the callback runs in stats-only mode.
+        # λ/τ stats may start earlier than the EMA; below ``warmup_epochs``
+        # the callback runs in stats-only mode.
         self.lt_warmup_epochs = (warmup_epochs if lt_warmup_epochs is None
                                  else int(lt_warmup_epochs))
         self.run_every_n_epochs = max(1, int(run_every_n_epochs))
-        self.patience = patience
         self.ema_alpha = ema_alpha
         self.d_threshold = d_threshold
         self.t_threshold = t_threshold
         self.t_quantile = t_quantile
-        self.trigger_on_overconfidence = trigger_on_overconfidence
         self.print_every = print_every
 
-        # Per-marginal EMA and stall buffers are seeded from ``state_path`` if
-        # present (multi-round TMNRE), else fresh.  ``cumulative_epoch_offset``
-        # holds the sum of ``trainer.current_epoch + 1`` across all previously
-        # completed rounds — it is what makes warmup and patience meaningful
-        # across the campaign rather than reset per round.
+        # Per-marginal EMAs are seeded from ``state_path`` if present
+        # (multi-round TMNRE), else fresh.  ``cumulative_epoch_offset`` holds
+        # the sum of ``trainer.current_epoch + 1`` across all previously
+        # completed rounds, so warmup and the EMA run on the campaign axis.
         self.state_path = state_path
-        # ``plots_dir`` is the run's plots root (typically
-        # ``ROOT_DIR/plots/{TIME_OF_EXECUTION}``).  Overlay PP plots land in
-        # the ``ppks_traces`` subdirectory; at trigger time a TRIGGER copy is
-        # additionally placed at ``plots_dir`` for visibility.  None disables
-        # PP-plot output (state/log only).
+        # ``plots_dir`` is the run's plots root; overlay PP plots land in its
+        # ``ppks_traces`` subdirectory.  None disables PP-plot output.
         self.plots_dir = plots_dir
         self._ema_d: dict[str, float] = {}
         self._ema_t: dict[str, float] = {}
-        self._stall: dict[str, int] = {}
         self.history: list[dict] = []
-        self.stop_reason: str = ""
         self.cumulative_epoch_offset: int = 0
-        self.triggered: bool = False
-        self.trigger_metadata: dict | None = None
         # ``round_idx`` is human-readable bookkeeping only — it's the current
         # round number the callback is attached to.  Saved state can carry a
         # stale value from the previous round, so the ctor arg always wins
@@ -1562,10 +1541,7 @@ class PPKSTestEarlyStopping(Callback):
             s = yaml.safe_load(f) or {}
         self._ema_d = dict(s.get("ema_d", {}) or {})
         self._ema_t = dict(s.get("ema_t", {}) or {})
-        self._stall = {k: int(v) for k, v in (s.get("stall", {}) or {}).items()}
         self.cumulative_epoch_offset = int(s.get("cumulative_epoch_offset", 0))
-        self.triggered = bool(s.get("triggered", False))
-        self.trigger_metadata = s.get("trigger_metadata") or None
         self._round_idx = s.get("round_idx")
 
     def _save_state(self) -> None:
@@ -1575,10 +1551,10 @@ class PPKSTestEarlyStopping(Callback):
         payload = {
             "ema_d": {k: float(v) for k, v in self._ema_d.items()},
             "ema_t": {k: float(v) for k, v in self._ema_t.items()},
-            "stall": {k: int(v) for k, v in self._stall.items()},
             "cumulative_epoch_offset": int(self.cumulative_epoch_offset),
-            "triggered": bool(self.triggered),
-            "trigger_metadata": self.trigger_metadata,
+            "d_threshold": float(self.d_threshold),
+            "t_threshold": float(self.t_threshold),
+            "t_quantile": float(self.t_quantile),
             "round_idx": self._round_idx,
         }
         # Atomic write: tmp + rename so a kill mid-write can't corrupt state.
@@ -1591,13 +1567,15 @@ class PPKSTestEarlyStopping(Callback):
         return int(trainer.current_epoch) + int(self.cumulative_epoch_offset)
 
     def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.sanity_checking:     # would evaluate twice at the round's first step
+            return
         cum_ep = self._cum_ep(trainer)
         gate = (min(self.warmup_epochs, self.lt_warmup_epochs)
                 if self.compute_lambda_tau else self.warmup_epochs)
         if cum_ep < gate:
             return
-        # Below warmup_epochs only the λ/τ statistics are collected: no EMA,
-        # no stall counting, no trigger latch, no overlay plot.
+        # Below warmup_epochs only the raw statistics (and λ/τ) are collected:
+        # no EMA, no overlay plot.
         stats_only = cum_ep < self.warmup_epochs
         # ``run_every_n_epochs`` is keyed off the cumulative axis so the
         # cadence is stable across rounds.
@@ -1610,20 +1588,15 @@ class PPKSTestEarlyStopping(Callback):
         was_training = pl_module.training
         try:
             pl_module.eval()
-            self._evaluate_and_maybe_stop(trainer, pl_module, kstest,
-                                          stats_only=stats_only)
+            self._evaluate(trainer, pl_module, kstest, stats_only=stats_only)
         finally:
             if was_training:
                 pl_module.train()
 
-    def _evaluate_and_maybe_stop(self, trainer, pl_module, kstest,
-                                 stats_only=False):
+    def _evaluate(self, trainer, pl_module, kstest, stats_only=False):
         keys = _param_keys(pl_module)  # basis-aware parameter names
         self._lt_keys = keys  # cache for _write_lt_h5 (has no pl_module)
         per_marginal: dict[str, dict] = {}
-        # All marginals whose stall counter has reached patience this
-        # evaluation — we record every one of them, not just the first.
-        triggered_labels: list[str] = []
         # Collected for the overlay PP plot at end of the evaluation.
         ranks_per_marginal: dict[str, np.ndarray] = {}
         # {label: (param_name, mean (n_test,), std (n_test,))} for λ/τ.
@@ -1648,51 +1621,22 @@ class PPKSTestEarlyStopping(Callback):
             T = float(np.mean((ranks < q) | (ranks > 1.0 - q)))
 
             if stats_only:
-                # Raw statistics only; the EMA is left uninitialised so it
-                # still starts from the first post-warmup evaluation.
-                per_marginal[label] = {"D": D, "T": T, "stall": 0,
-                                       "violation": ""}
+                # Raw statistics only; the EMA still starts from the first
+                # post-warmup evaluation.
+                per_marginal[label] = {"D": D, "T": T}
                 continue
 
             if label not in self._ema_d:
                 self._ema_d[label] = D
                 self._ema_t[label] = T
-                self._stall[label] = 0
             else:
                 a = self.ema_alpha
                 self._ema_d[label] = a * D + (1.0 - a) * self._ema_d[label]
                 self._ema_t[label] = a * T + (1.0 - a) * self._ema_t[label]
 
-            d_ema = self._ema_d[label]
-            t_ema = self._ema_t[label]
-
-            # Symmetric tail-mass deviation: |T - 2q| > t_threshold catches
-            # narrow-biased (T → 1) AND narrow-unbiased (T → 0) overconfidence,
-            # not just the high-T direction.
-            t_baseline = 2.0 * self.t_quantile
-            d_violates = d_ema > self.d_threshold
-            t_violates = abs(t_ema - t_baseline) > self.t_threshold
-            if d_violates or t_violates:
-                self._stall[label] += 1
-                violations = []
-                if d_violates:
-                    violations.append("D")
-                if t_violates:
-                    violations.append("T")
-                violation_str = "|".join(violations)
-            else:
-                self._stall[label] = 0
-                violation_str = ""
-
-            per_marginal[label] = {
-                "D": D, "T": T, "D_ema": d_ema, "T_ema": t_ema,
-                "stall": self._stall[label],
-                "violation": violation_str,
-            }
-
-            if (self.trigger_on_overconfidence
-                    and self._stall[label] >= self.patience):
-                triggered_labels.append(label)
+            per_marginal[label] = {"D": D, "T": T,
+                                   "D_ema": self._ema_d[label],
+                                   "T_ema": self._ema_t[label]}
 
         cum_ep = self._cum_ep(trainer)
 
@@ -1706,7 +1650,6 @@ class PPKSTestEarlyStopping(Callback):
 
         if self.compute_lambda_tau:
             self._update_lambda_tau(cum_ep, moments_1d, pl_module)
-            self._check_tau_trigger(cum_ep, trainer=trainer)
 
         if trainer.logger is not None and per_marginal:
             metrics = {}
@@ -1721,24 +1664,20 @@ class PPKSTestEarlyStopping(Callback):
 
         if cum_ep % self.print_every == 0 and per_marginal:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            parts = [
-                f"{label}(D={v['D']:.3f},T={v['T']:.3f},s={v['stall']})"
-                for label, v in sorted(per_marginal.items())
-            ]
-            mode = "trigger" if self.trigger_on_overconfidence else "monitor"
-            print(f"[{ts}] [PPKS-{mode}] cumep {cum_ep} "
+            parts = [f"{label}(D={v['D']:.3f},T={v['T']:.3f})"
+                     for label, v in sorted(per_marginal.items())]
+            print(f"[{ts}] [calibration] cumep {cum_ep} "
                   f"(round={self._round_idx}, epoch_in_round="
                   f"{int(trainer.current_epoch)}): "
                   f"{', '.join(parts)}", flush=True)
 
         # Persist state at every evaluation so a kill mid-round still leaves
-        # a coherent record of EMA / stall on the cumulative axis.
+        # a coherent record of the EMA on the cumulative axis.
         self._save_state()
 
         # Overlay PP plot: one figure per evaluation, all 1D marginals on
         # the same axes.  Filename keyed by the cumulative-epoch axis so a
         # single sorted listing reads chronologically across the campaign.
-        overlay_path = None
         if self.plots_dir and ranks_per_marginal and not stats_only:
             overlay_path = os.path.join(
                 self.plots_dir, "ppks_traces",
@@ -1749,92 +1688,6 @@ class PPKSTestEarlyStopping(Callback):
                      f"epoch_in_round={int(trainer.current_epoch)}")
             pp_plot_overlay(ranks_per_marginal, overlay_path, title=title)
 
-        # MONITOR + CHECKPOINT mode: when ``trigger_on_overconfidence`` is
-        # true and at least one marginal reaches patience, we DO NOT stop
-        # training (the user's other early-stop criteria — volume_ratio,
-        # truth-missed — own the actual termination decision).  Instead we:
-        #   * write a checkpoint at the trigger point so the model state is
-        #     preserved for post-hoc inspection,
-        #   * record structured trigger metadata,
-        #   * log one clear line to stdout,
-        #   * set ``self.triggered = True`` to gate against re-firing.
-        if triggered_labels and not self.triggered:
-            t_baseline = 2.0 * self.t_quantile
-            parts = []
-            marginal_records = []
-            for lbl in triggered_labels:
-                v = per_marginal[lbl]
-                parts.append(
-                    f"{lbl}(violation={v['violation']}, "
-                    f"D_ema={v['D_ema']:.4f}/thr={self.d_threshold}, "
-                    f"T_ema={v['T_ema']:.4f} (|T-{t_baseline:.2f}|="
-                    f"{abs(v['T_ema'] - t_baseline):.4f})/thr={self.t_threshold}, "
-                    f"stall={v['stall']}/{self.patience})"
-                )
-                marginal_records.append({
-                    "name": lbl,
-                    "violation": v["violation"],
-                    "D_ema": float(v["D_ema"]),
-                    "T_ema": float(v["T_ema"]),
-                    "stall": int(v["stall"]),
-                })
-            triggered_reason = "; ".join(parts)
-            self.stop_reason = triggered_reason
-            self.triggered = True
-            self.trigger_metadata = {
-                "cumulative_epoch": int(cum_ep),
-                "round": self._round_idx,
-                "epoch_in_round": int(trainer.current_epoch),
-                "d_threshold": float(self.d_threshold),
-                "t_threshold": float(self.t_threshold),
-                "t_baseline": float(t_baseline),
-                "patience": int(self.patience),
-                "marginals": marginal_records,
-            }
-            # Save the model exactly at the would-stop point.  Path lives
-            # next to the regular round checkpoints so it surfaces in any
-            # standard checkpoint scan.
-            ckpt_dir = None
-            if trainer.checkpoint_callback is not None:
-                ckpt_dir = getattr(trainer.checkpoint_callback, "dirpath", None)
-            if ckpt_dir is None and trainer.logger is not None:
-                ckpt_dir = os.path.join(trainer.logger.log_dir, "checkpoints")
-            if ckpt_dir is not None:
-                ckpt_path = os.path.join(
-                    ckpt_dir, f"ppks_trigger_cumep_{cum_ep}.ckpt",
-                )
-                os.makedirs(ckpt_dir, exist_ok=True)
-                trainer.save_checkpoint(ckpt_path)
-                self.trigger_metadata["checkpoint_path"] = ckpt_path
-            # At trigger time, also drop a TRIGGER-named copy of the overlay
-            # PP plot at the plots root (not buried in ppks_traces/).
-            if self.plots_dir and ranks_per_marginal:
-                trigger_overlay_path = os.path.join(
-                    self.plots_dir,
-                    f"TRIGGER_cumep_{cum_ep:04d}_pp.png",
-                )
-                title = (f"P-P overlay at PPKS trigger — cum_ep={cum_ep} "
-                         f"round={self._round_idx} "
-                         f"epoch_in_round={int(trainer.current_epoch)}")
-                pp_plot_overlay(ranks_per_marginal, trigger_overlay_path,
-                                title=title)
-                self.trigger_metadata["overlay_path"] = trigger_overlay_path
-            print(f"[PPKS-TRIGGER] cumep={cum_ep} round={self._round_idx} "
-                  f"epoch_in_round={int(trainer.current_epoch)} — "
-                  f"would-stop reasons: {triggered_reason}", flush=True)
-            # Persist now so the trigger info is on disk before any further
-            # training churn.
-            self._save_state()
-    
-    def _check_tau_trigger(self, cum_ep, trainer):
-        for label, params in self._lt_stds.items():
-            for param, std_list in params.items():
-                std = std_list[-1]                       # this eval, (n_test,)
-                fis = self._lt_fisher_sigma_for(param)   # (n_test,) maybe NaN
-                tau = np.abs(std / fis)                          # or std**2/fis**2
-                # fraction below 1 → stall → marker
-                frac_below_1 = np.mean(tau<1)
-                
     # ------------------------------------------------------------ λ / τ stats
     def _lt_ensure_fisher(self):
         """Gather the test-set truths and the epoch-independent Fisher σ once."""

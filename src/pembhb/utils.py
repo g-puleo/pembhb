@@ -22,9 +22,9 @@ _ORDERED_PRIOR_KEYS = [
         "chi2",
         "dist",
         "phi",
-        "inc",
+        "cosinc",
         "lambda",
-        "beta",
+        "sinbeta",
         "psi",
         "Deltat"
     ]
@@ -1605,9 +1605,9 @@ FISHER_ABSOLUTE_STEP_DEFAULTS = {
     "chi_diff":  2.0e-5,
     "dist":      5.0e-5,   # Gpc
     "phi":       6.25e-6,  # rad
-    "inc":       1.25e-5,  # cos(inc)
+    "cosinc":       1.25e-5,  # cos(inc)
     "lambda":    2.5e-5,   # rad
-    "beta":      1.25e-5,  # sin(beta)
+    "sinbeta":      1.25e-5,  # sin(beta)
     "psi":       6.25e-6,  # rad (mod π)
     "Deltat":    5.0e-8,   # days
 }
@@ -1764,7 +1764,7 @@ def compute_fisher_matrix_waveform_deriv(
     # Only inc/beta enter the waveform through arccos/arcsin, so their TMNRE
     # coordinate (cos inc, sin beta) has a hard [-1, 1] domain; a step past the
     # edge yields NaN. Everything else tolerates a small excursion fine.
-    DOMAIN = {"inc": (-1.0, 1.0), "beta": (-1.0, 1.0)}
+    DOMAIN = {"cosinc": (-1.0, 1.0), "sinbeta": (-1.0, 1.0)}
     SAFETY = 1e-6
 
     # Per-parameter finite-difference step (TMNRE coords). We ALWAYS use the
@@ -2179,7 +2179,7 @@ def compute_fisher_sigmas_for_testset(
     # Per-(point, param) steps, mirroring compute_fisher_matrix_waveform_deriv:
     # the diagnostic step, clamped for inc/beta whose cos/sin coord lives on
     # [-1, 1] (clamp is per-point, so eps is (n_test, n)).
-    DOMAIN = {"inc": (-1.0, 1.0), "beta": (-1.0, 1.0)}
+    DOMAIN = {"cosinc": (-1.0, 1.0), "sinbeta": (-1.0, 1.0)}
     SAFETY = 1e-6
     # Column indices use the run's spin basis so chi_eff/chi_diff names resolve
     # to the right slots in true_params (which are stored in basis order).
