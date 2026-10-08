@@ -1,11 +1,10 @@
 # ============================================================================
-# Train config for the multimode (mask) truncation + §2 gap-zeroing run.
-# Based on train_phys30_mask_v1.yaml (the channelizedmlp_mask_v2 run). Key knobs
-# for the new code live in the `truncation:` block at the bottom:
-#   truncation.mode: mask                    -> HPD level set + rejection sampling
-#   truncation.zero_outside_prev_mask: hard  -> §2: zero the posterior outside the
-#                                               region the net was trained on
-# Pair with configs/datagen_phys30_chieff_maskzero.yaml.
+# Training config for scripts/tmnre_joint.py.
+#   architecture.data_summary : compressor in front of the classifier heads
+#   marginals                 : which 1D / 2D posterior marginals to learn
+#   streaming                 : simulate during training (gpu ring or disk ring)
+#   truncation                : how the prior is narrowed between rounds
+#                               (mode: mask -> HPD level set + rejection sampling)
 # ============================================================================
 batch_size: 125
 epochs: 1000
@@ -20,19 +19,20 @@ classifier_hlayersizes:
 - 128
 - 64
 keep_ckpt: true
+# One classifier head per marginal, by parameter name (see datagen_config.yaml
+# `prior`). A parameter may appear in only one marginal.
 marginals:
   f:
-  - - 0
-  - - 1
-  - - 2
-  - - 3
-  - - 4
-  - - 10
-  - - 7
-    - 8
-  - - 9
-  - - 5
-  - - 6
+  - [logMchirp]
+  - [q]
+  - [chi_eff]
+  - [chi_diff]
+  - [dist]
+  - [Deltat]
+  - [lambda, beta]
+  - [psi]
+  - [phi]
+  - [inc]
 marginal_schedule: []
 periodic_bc_params:
 - 5
@@ -67,7 +67,7 @@ architecture:
     ROM:
       load: false
       max_basis_elements: 50
-      filename: /u/g/gpuleo/pembhb/rom_td_fd.pt
+      filename: rom_td_fd.pt   # relative to the working directory
       device: cuda
       batch_train: 1000
       patience: 25
@@ -271,9 +271,9 @@ streaming:
   val_size: 1000
 
   # --- disk path only -------------------------------------------------------
-  # Where the buffer files live. Defaults under DATA_ROOT_DIR (never /u, which
-  # is quota-bound). Footprint is n_buffers * buffer_size waveforms.
-  # buffer_dir: /data/gpuleo/mbhb/<run>/stream_buffers
+  # Where the buffer files live (default: under PEMBHB_DATA_DIR).
+  # Footprint is n_buffers * buffer_size waveforms.
+  # buffer_dir: /path/to/<run>/stream_buffers
   num_workers: 8
   prefetch_factor: 4
 lambda_tau:
@@ -316,9 +316,19 @@ truncation:
   # cell volume. A mode spanning 3 coarse pixels gets ngrid_*_refined of its
   # own; a mode the refinement finds empty is dropped.
   # Cost: one extra forward pass per mode per round (seconds on the GPU).
-  refine: false
+  refine: true
   ngrid_1d_refined: 128
   ngrid_2d_refined: 64
+  # Where the mode TOPOLOGY comes from. false = re-derive it every round on the
+  # coarse grid above, so a mode's window can never be finer than one coarse
+  # cell; once a mode shrinks to a few coarse pixels the resolution is pinned
+  # there for good, because the box (the envelope of all modes, gaps included)
+  # has stopped shrinking. true = take the topology from the PREVIOUS round's
+  # modes and apply the same mode-finder recursively to each: a true mode stays
+  # one mask, a mode with internal structure splits, and every window is that
+  # mode's own support, so resolution compounds. Requires refine: true.
+  mode_tree: false
+  refine_max_depth: 4   # safety cap on the recursion; the usual exit is "nothing split"
   # §2 — evaluate the network only on the region it was trained on. Before each
   # round's HPD analysis the posterior is re-weighted by the PREVIOUS round's
   # accepted set (nearest-pixel resampled onto this round's grid), because NRE's

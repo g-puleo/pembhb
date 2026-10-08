@@ -28,13 +28,13 @@ from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.callbacks import ModelCheckpoint, Callback
 from torch.utils.data import DataLoader, Subset
 
-from pembhb.simulator import MBHBSimulatorFD_TD, MBHBSimulatorFD
+from pembhb.simulator import MBHBSimulatorFD
 from pembhb.model import JointAEInferenceNetwork
 from pembhb.autoencoder import DenoisingAutoencoder, AutoencoderWrapper, MarginalEncoderTrainer, resolve_loss_band
 from pembhb.data import MBHBDataModule, MBHBDataset, mbhb_collate_fn
 from lightning.pytorch import seed_everything
 
-from pembhb import ROOT_DIR, DATA_ROOT_DIR, set_precision
+from pembhb import ROOT_DIR, DATA_ROOT_DIR, set_precision, get_torch_dtype, get_torch_complex_dtype, PLOTS_ROOT_DIR
 from pembhb import utils
 
 # ---- reuse helpers from tmnre.py ----------------------------------------
@@ -58,8 +58,8 @@ from pembhb.mask_truncation import (
     eval_posterior_1d, MaskRejectSampler,
     save_truncation, load_truncation, truth_violations, format_violations, _MASK_PERIOD_BY_NAME
 )
-from pembhb.regions import (MultiRegion, apply_prev_mask,
-                            truncation_region, refine_region)
+from pembhb.regions import (Region, MultiRegion, _as_multiregion,
+                            apply_prev_mask, truncation_region, find_modes)
 from pembhb.diagnostics import AutoencoderDiagnosticsCallback
 
 # Physical period of the angular parameters, keyed by prior-key name (spin-basis
@@ -177,6 +177,19 @@ def _round_median_tau(lt_h5_path):
     allt = np.concatenate(taus)
     allt = allt[np.isfinite(allt)]
     return float(np.median(allt)) if allt.size else None
+
+
+def _sample_val_pool(sim, n, chunk, keep_on_gpu):
+    """Frozen validation pool on CPU, generated in ``chunk``-sized calls to bound bbhx GPU memory."""
+    waves, params = [], []
+    for off in range(0, n, chunk):
+        vs = sim.sample(min(chunk, n - off), keep_on_gpu=keep_on_gpu)
+        waves.append(torch.as_tensor(vs["wave_fd"]).cpu())
+        params.append(torch.as_tensor(vs["parameters"]).cpu().t())
+    return {
+        "wave_fd": torch.cat(waves).to(get_torch_complex_dtype()),
+        "params": torch.cat(params).contiguous().to(get_torch_dtype()),
+    }
 
 
 def _check_obs_matches_datagen(obs_path, datagen_conf):
@@ -481,9 +494,47 @@ class SequentialTrainerJoint:
         return _evaluate
 
     def _refine_conf(self, trunc_conf, key):
-        """``(enabled, ngrid)`` for per-mode refinement; off keeps the coarse set."""
-        return (bool(trunc_conf.get("refine", False)),
-                int(trunc_conf.get(key, 128)))
+        """``(enabled, ngrid, mode_tree, max_depth)`` for per-mode refinement.
+
+        ``refine`` off keeps the coarse set untouched.  ``mode_tree`` additionally
+        takes the topology from the PREVIOUS round's modes, recursively, instead
+        of re-deriving it on a fresh coarse grid spanning the whole box — which
+        is what pins the achievable resolution at one coarse cell once a mode
+        shrinks to a few pixels.
+        """
+        refine = bool(trunc_conf.get("refine", True))
+        mode_tree = bool(trunc_conf.get("mode_tree", False))
+        if mode_tree and not refine:
+            raise ValueError(
+                "truncation.mode_tree requires truncation.refine: true — the "
+                "recursion IS the per-mode refinement applied to its own output.")
+        default_ngrid = {"ngrid_1d_refined": 128, "ngrid_2d_refined": 64}[key]
+        return (refine, int(trunc_conf.get(key, default_ngrid)), mode_tree,
+                int(trunc_conf.get("refine_max_depth", 4)))
+
+    @staticmethod
+    def _seed_from_prev(prev, ngrid):
+        """Previous round's accepted set as a ``MultiRegion``, or ``None``.
+
+        This is what replaces the coarse topology pass: the modes the network was
+        actually trained on, each on its own window, so refinement compounds
+        instead of restarting from a box-wide grid.
+
+        1D rebuilds from the stored intervals, which is lossless — a leaf mode is
+        one connected component, hence a contiguous interval, so the intervals
+        ARE the per-mode windows.  2D already carries a ``MultiRegion`` (npz
+        ``format_version: 2``).
+        """
+        if not prev:
+            return None
+        if prev.get("kind") == "2d":
+            region = prev.get("region")
+            return None if region is None else _as_multiregion(region)
+        ivs = prev.get("intervals") or []
+        parts = [Region(np.ones(int(ngrid), dtype=bool),
+                        (np.linspace(float(lo), float(hi), int(ngrid)),))
+                 for lo, hi in ivs if float(hi) > float(lo)]
+        return MultiRegion(parts) if parts else None
 
     def _mask_truncate_marginal(self, marginal_key, out_idx, prior_keys,
                             intervals_1d, masks_2d, trunc_conf):
@@ -493,38 +544,44 @@ class SequentialTrainerJoint:
             # Previous round's accepted set (before it is overwritten below),
             # used for §2 zeroing and, if enabled, monotonic clipping.
             prev = self._prev_accepted.get(marginal_key)
-            grid, norm1d, _ = eval_posterior_1d(
-                self.model, self.dataloader_obs,
-                in_param_idx=marginal_key[0], out_param_idx=out_idx,
-                ngrid_points=trunc_conf.get("ngrid_1d", 100))
-
-            # §2 zero outside prev → HPD + dilation → monotone clip. Shared with
-            # PlotPosteriorCallback so the volume ratio measures this same set.
             period = _MASK_PERIOD_BY_NAME.get(prior_keys[marginal_key[0]])
-            region, status = truncation_region(
-                norm1d, (grid[:, 0],), prev,
-                policy=str(trunc_conf.get("zero_outside_prev_mask", "hard")),
-                hysteresis_weight=float(trunc_conf.get("hysteresis_weight", 0.1)),
-                credible=float(trunc_conf.get("credible_level_1d", 0.997)),
-                dilation=float(trunc_conf.get("dilation_1d", 1.2)),
-                periods=(period,),
-                clip=self._monotonic_enabled(trunc_conf))
-            if status == "degenerate":
-                print(f"[Trunc/mask/§2] {marginal_key}: previous mask has no overlap "
-                      f"with this round's grid; skipping zeroing.", flush=True)
+            refine, n_ref, mode_tree, max_depth = self._refine_conf(
+                trunc_conf, "ngrid_1d_refined")
 
-            refine, n_ref = self._refine_conf(trunc_conf, "ngrid_1d_refined")
-            if refine:
-                coarse_n = len(region.components())
-                region, _modes = refine_region(
-                    region, self._refine_evaluator_1d(marginal_key[0], out_idx),
-                    ngrid=n_ref, prev=prev,
+            region = self._seed_from_prev(prev, n_ref) if mode_tree else None
+            seeded = region is not None   # False -> coarse bootstrap below
+            if region is None:
+                # Bootstrap (round 1, or mode_tree off): coarse full-box pass.
+                # §2 zero outside prev → HPD + dilation → monotone clip. Shared
+                # with PlotPosteriorCallback so the ratio measures this same set.
+                grid, norm1d, _ = eval_posterior_1d(
+                    self.model, self.dataloader_obs,
+                    in_param_idx=marginal_key[0], out_param_idx=out_idx,
+                    ngrid_points=trunc_conf.get("ngrid_1d", 100))
+                region, status = truncation_region(
+                    norm1d, (grid[:, 0],), prev,
                     policy=str(trunc_conf.get("zero_outside_prev_mask", "hard")),
                     hysteresis_weight=float(trunc_conf.get("hysteresis_weight", 0.1)),
                     credible=float(trunc_conf.get("credible_level_1d", 0.997)),
                     dilation=float(trunc_conf.get("dilation_1d", 1.2)),
+                    periods=(period,),
+                    clip=self._monotonic_enabled(trunc_conf))
+                if status == "degenerate":
+                    print(f"[Trunc/mask/§2] {marginal_key}: previous mask has no overlap "
+                          f"with this round's grid; skipping zeroing.", flush=True)
+
+            if refine:
+                n_before = len(region.components())
+                region, _modes = find_modes(
+                    region, self._refine_evaluator_1d(marginal_key[0], out_idx),
+                    ngrid=n_ref, max_depth=(max_depth if mode_tree else 1),
+                    prev=prev,
+                    policy=str(trunc_conf.get("zero_outside_prev_mask", "hard")),
+                    credible=float(trunc_conf.get("credible_level_1d", 0.997)),
+                    dilation=float(trunc_conf.get("dilation_1d", 1.2)),
                     periods=(period,), clip=self._monotonic_enabled(trunc_conf))
-                print(f"[Trunc/refine] {param_name}: {coarse_n} coarse mode(s) -> "
+                src = "prev" if seeded else "coarse"
+                print(f"[Trunc/refine] {param_name}: {n_before} {src} mode(s) -> "
                       f"{len(region.parts)} refined at {n_ref} px each", flush=True)
 
             intervals = region.intervals()
@@ -539,39 +596,43 @@ class SequentialTrainerJoint:
         elif len(marginal_key)==2:
             inj1, inj2 = marginal_key
             prev = self._prev_accepted.get(marginal_key)
-            norm2d, _, gx, gy, _, _ = utils.eval_posterior_2d(
-                self.model, self.dataloader_obs,
-                in_param_idx=marginal_key, out_param_idx=out_idx,
-                ngrid_points=trunc_conf.get("ngrid_2d", 100))
-
-            # §2 zero outside prev → HPD + dilation → monotone clip. Shared with
-            # PlotPosteriorCallback so the volume ratio measures this same set.
-            grid_x, grid_y = gx[0, :], gy[:, 0]
             period = (_MASK_PERIOD_BY_NAME.get(prior_keys[marginal_key[0]]),
                       _MASK_PERIOD_BY_NAME.get(prior_keys[marginal_key[1]]))
-            region, status = truncation_region(
-                norm2d, (grid_x, grid_y), prev,
-                policy=str(trunc_conf.get("zero_outside_prev_mask", "hard")),
-                hysteresis_weight=float(trunc_conf.get("hysteresis_weight", 0.1)),
-                credible=float(trunc_conf.get("credible_level_2d", 0.997)),
-                dilation=float(trunc_conf.get("dilation_2d", 1.2)),
-                periods=period,
-                clip=self._monotonic_enabled(trunc_conf))
-            if status == "degenerate":
-                print(f"[Trunc/mask/§2] {marginal_key}: previous mask has no overlap "
-                      f"with this round's grid; skipping zeroing.", flush=True)
-            refine, n_ref = self._refine_conf(trunc_conf, "ngrid_2d_refined")
-            if refine:
-                coarse_n = len(region.components())
-                region, _modes = refine_region(
-                    region, self._refine_evaluator_2d(marginal_key, out_idx),
-                    ngrid=n_ref, prev=prev,
+            refine, n_ref, mode_tree, max_depth = self._refine_conf(
+                trunc_conf, "ngrid_2d_refined")
+
+            region = self._seed_from_prev(prev, n_ref) if mode_tree else None
+            seeded = region is not None   # False -> coarse bootstrap below
+            if region is None:
+                # Bootstrap (round 1, or mode_tree off): coarse full-box pass.
+                norm2d, _, gx, gy, _, _ = utils.eval_posterior_2d(
+                    self.model, self.dataloader_obs,
+                    in_param_idx=marginal_key, out_param_idx=out_idx,
+                    ngrid_points=trunc_conf.get("ngrid_2d", 100))
+                grid_x, grid_y = gx[0, :], gy[:, 0]
+                region, status = truncation_region(
+                    norm2d, (grid_x, grid_y), prev,
                     policy=str(trunc_conf.get("zero_outside_prev_mask", "hard")),
                     hysteresis_weight=float(trunc_conf.get("hysteresis_weight", 0.1)),
                     credible=float(trunc_conf.get("credible_level_2d", 0.997)),
                     dilation=float(trunc_conf.get("dilation_2d", 1.2)),
+                    periods=period,
+                    clip=self._monotonic_enabled(trunc_conf))
+                if status == "degenerate":
+                    print(f"[Trunc/mask/§2] {marginal_key}: previous mask has no overlap "
+                          f"with this round's grid; skipping zeroing.", flush=True)
+            if refine:
+                n_before = len(region.components())
+                region, _modes = find_modes(
+                    region, self._refine_evaluator_2d(marginal_key, out_idx),
+                    ngrid=n_ref, max_depth=(max_depth if mode_tree else 1),
+                    prev=prev,
+                    policy=str(trunc_conf.get("zero_outside_prev_mask", "hard")),
+                    credible=float(trunc_conf.get("credible_level_2d", 0.997)),
+                    dilation=float(trunc_conf.get("dilation_2d", 1.2)),
                     periods=period, clip=self._monotonic_enabled(trunc_conf))
-                print(f"[Trunc/refine] {marginal_key}: {coarse_n} coarse mode(s) -> "
+                src = "prev" if seeded else "coarse"
+                print(f"[Trunc/refine] {marginal_key}: {n_before} {src} mode(s) -> "
                       f"{len(region.parts)} refined at {n_ref}^2 px each", flush=True)
             else:
                 # `region` carries the resolved periodicity; wrap it rather than
@@ -622,21 +683,17 @@ class SequentialTrainerJoint:
                 size_gb = os.path.getsize(prev_h5) / 1024**3
                 os.remove(prev_h5)
                 print(f"[disk] deleted previous round dataset ({size_gb:.1f} GiB): {prev_h5}")
-        domain = self.datagen_conf.get("waveform_params", {}).get("domain", "fd_td")
         # Each round gets a distinct but deterministic seed
         round_seed = self.seed + round_idx
-        if domain == "fd":
-            wp = self.datagen_conf["waveform_params"]
-            sim = MBHBSimulatorFD(
-                self.datagen_conf,
-                sampler_init_kwargs=sampler_init_kwargs,
-                seed=round_seed,
-                n_freq_bins=wp.get("n_freq_bins", 4096),
-                freq_spacing=wp.get("freq_spacing", "linear"),
-                sampler=sampler,
-            )
-        else:
-            sim = MBHBSimulatorFD_TD(self.datagen_conf, sampler_init_kwargs=sampler_init_kwargs, seed=round_seed, sampler=sampler)
+        wp = self.datagen_conf["waveform_params"]
+        sim = MBHBSimulatorFD(
+            self.datagen_conf,
+            sampler_init_kwargs=sampler_init_kwargs,
+            seed=round_seed,
+            n_freq_bins=wp.get("n_freq_bins", 4096),
+            freq_spacing=wp.get("freq_spacing", "linear"),
+            sampler=sampler,
+        )
         N_simulations = 50000
         batch_size_generation = 100
         if not os.path.exists(fname_h5):
@@ -700,7 +757,7 @@ class SequentialTrainerJoint:
         # Disk-backed ring (buffers = HDF5 files, ~zero VRAM) vs the default
         # GPU-resident ring. Same producer/consumer logic; see streaming_disk.py.
         if self.train_conf["streaming"].get("storage", "gpu") == "disk":
-            return self._setup_streaming_disk(round_idx, sampler_init_kwargs)
+            return self._setup_streaming_disk(round_idx, sampler_init_kwargs, sampler=sampler)
 
         self._stream_t0 = time.time()
 
@@ -711,9 +768,6 @@ class SequentialTrainerJoint:
         device = self.train_conf["device"]
 
         wp = self.datagen_conf["waveform_params"]
-        assert wp.get("domain", "fd_td") == "fd", (
-            "streaming requires the FD simulator (set waveform_params.domain='fd')"
-        )
         round_seed = self.seed + round_idx
         sim = MBHBSimulatorFD(
             self.datagen_conf, sampler_init_kwargs=sampler_init_kwargs, seed=round_seed,
@@ -755,13 +809,8 @@ class SequentialTrainerJoint:
         producer.seed_fill_all()  # blocking: give the trainer data on step 0
 
         # Frozen validation pool (generated once, never refreshed this round).
-        vs = sim.sample(val_size, keep_on_gpu=True)
-        # Frozen val/test pool on CPU (small; matches HDF5 raw-batch semantics
-        # so callbacks reading it via np.asarray work unchanged).
-        val_pool = {
-            "wave_fd": vs["wave_fd"].cpu(),
-            "params": torch.as_tensor(vs["parameters"]).t().contiguous().to(get_torch_dtype()),
-        }
+        # Kept on CPU so callbacks reading it via np.asarray work unchanged.
+        val_pool = _sample_val_pool(sim, val_size, producer.gen_batch_size, keep_on_gpu=True)
 
         producer.start()
         self._ring = ring
@@ -796,7 +845,7 @@ class SequentialTrainerJoint:
         self.datagen_info = utils.read_config(self.data_fname_yaml)
         assert self.data_module.median_snr > 8, "Median SNR lower than 8."
 
-    def _setup_streaming_disk(self, round_idx, sampler_init_kwargs):
+    def _setup_streaming_disk(self, round_idx, sampler_init_kwargs, sampler=None):
         """Disk-backed counterpart of :meth:`_setup_streaming`: buffers are
         ``buffer_{j}.h5`` files overwritten in place (bounded disk, ~zero VRAM),
         read one-per-epoch round-robin with ``num_workers`` workers. Same ring
@@ -833,14 +882,12 @@ class SequentialTrainerJoint:
         device = self.train_conf["device"]
 
         wp = self.datagen_conf["waveform_params"]
-        assert wp.get("domain", "fd_td") == "fd", (
-            "streaming requires the FD simulator (set waveform_params.domain='fd')"
-        )
         round_seed = self.seed + round_idx
         sim = MBHBSimulatorFD(
             self.datagen_conf, sampler_init_kwargs=sampler_init_kwargs, seed=round_seed,
             n_freq_bins=wp.get("n_freq_bins", 4096),
             freq_spacing=wp.get("freq_spacing", "linear"),
+            sampler=sampler,
         )
 
         # Per-sample shapes from a tiny host probe.
@@ -860,11 +907,7 @@ class SequentialTrainerJoint:
         producer.seed_fill_all()  # blocking: give the trainer data on step 0
 
         # Frozen validation pool (generated once, never refreshed this round).
-        vs = sim.sample(val_size, keep_on_gpu=False)
-        val_pool = {
-            "wave_fd": torch.as_tensor(vs["wave_fd"], dtype=get_torch_complex_dtype()),
-            "params": torch.as_tensor(vs["parameters"].T.copy(), dtype=get_torch_dtype()),
-        }
+        val_pool = _sample_val_pool(sim, val_size, producer.gen_batch_size, keep_on_gpu=False)
 
         producer.start()
         self._ring = ring
@@ -1028,7 +1071,7 @@ class SequentialTrainerJoint:
         Round >1: reuse the module from the previous round; re-fit whitening
         defensively (cheap; depends only on ASD + T_obs).
         """
-        from pembhb.autoencoder import ChannelizedMLPCompressor
+        from pembhb.autoencoder import ChannelizedMLPCompressor, ConvCompressor
 
         cfg = self.train_conf["architecture"]["data_summary"]["ChannelizedMLP"]
         device = cfg.get("device", self.train_conf["device"])
@@ -1043,17 +1086,23 @@ class SequentialTrainerJoint:
             n_freqs = cfg.get("n_freqs", 4096)
 
         if self._autoencoder is None or round_idx == 1 or not self._transfer_data_summary():
-            compressor = ChannelizedMLPCompressor(
+            common = dict(
                 n_channels=cfg.get("n_channels", 2),
                 n_freqs=n_freqs,
-                hidden_dim_per_channel=cfg.get("hidden_dim_per_channel", 256),
-                out_dim_per_channel=cfg.get("out_dim_per_channel", 64),
                 representation=cfg.get("representation", "real_imag"),
                 whiten=cfg.get("whiten", True),
                 amplitude_normalise=cfg.get("amplitude_normalise", True),
                 subtract_mean_whitened=cfg.get("subtract_mean_whitened", True),
                 dropout=cfg.get("dropout", 0.0),
             )
+            if cfg.get("encoder", "mlp") == "conv":
+                compressor = ConvCompressor(**common, **cfg.get("conv", {}))
+            else:
+                compressor = ChannelizedMLPCompressor(
+                    **common,
+                    hidden_dim_per_channel=cfg.get("hidden_dim_per_channel", 256),
+                    out_dim_per_channel=cfg.get("out_dim_per_channel", 64),
+                )
             compressor = compressor.to(device)
             self._autoencoder = compressor
             self._fit_data_normalisation(self._autoencoder)
@@ -1481,6 +1530,23 @@ class SequentialTrainerJoint:
     # Joint training
     # -----------------------------------------------------------------
 
+    def _filter_carried_opt_state(self, state_by_name, transferred, encoder_transferred):
+        """Keep AdamW state only for params whose weights were carried over:
+        the encoder (if transferred) and the transferred classifier heads."""
+        keep_prefixes = []
+        if encoder_transferred:
+            keep_prefixes.append("encoder_model.")
+        transferred = {tuple(k) for k in transferred}
+        for domain, marginal_list in self.model.marginals_dict.items():
+            for pos, marginal in enumerate(marginal_list):
+                if tuple(marginal) in transferred:
+                    keep_prefixes.append(f"logratios_model_dict.{domain}.classifiers.{pos}.")
+        carried = {n: st for n, st in state_by_name.items()
+                   if n.startswith(tuple(keep_prefixes))}
+        print(f"[opt-carry] carrying {len(carried)} / {len(state_by_name)} param states "
+              f"(encoder={encoder_transferred}, heads={len(transferred)})", flush=True)
+        return carried
+
     def _train_joint(self, round_idx):
         """Train encoder + NRE jointly for this round (AE or ME mode)."""
         ds_type = self.train_conf["architecture"]["data_summary"].get("type", "Autoencoder")
@@ -1625,10 +1691,17 @@ class SequentialTrainerJoint:
             encoder_trains_via_nre=(ds_type == "ChannelizedMLP"),
         )
         self.model.to(device)
+        transferred = []
         if reinit_selective and old_model is not None:
-            transfer_classifier_weights(old_model, self.model, skip_keys=reinit_keys)
+            transferred = transfer_classifier_weights(old_model, self.model, skip_keys=reinit_keys)
         elif transfer_classifier and old_model is not None:
-            transfer_classifier_weights(old_model, self.model)
+            transferred = transfer_classifier_weights(old_model, self.model)
+        if old_model is not None:
+            self.model.epoch_offset = getattr(old_model, "cum_epoch_end", 0)
+        if (joint_conf.get("carry_optimizer_state", False) and old_model is not None
+                and getattr(old_model, "opt_state_by_name", None)):
+            self.model.carry_in = self._filter_carried_opt_state(
+                old_model.opt_state_by_name, transferred, transfer_data_summary)
         self.model.train()
 
         # ---- Callbacks --------------------------------------------------
@@ -1887,7 +1960,8 @@ class SequentialTrainerJoint:
                 DATA_ROOT_DIR, TIME_OF_EXECUTION, "ppks_state.yaml",
             )
             ppks_plots_dir = os.path.join(
-                ROOT_DIR, "plots", TIME_OF_EXECUTION,
+                PLOTS_ROOT_DIR,
+                TIME_OF_EXECUTION,
             )
             callbacks_list.append(PPKSTestEarlyStopping(
                 test_loader=ppks_loader,
@@ -1912,6 +1986,7 @@ class SequentialTrainerJoint:
                 datagen_conf=self.datagen_conf,
                 fisher_varying_params=fisher_varying_params,
                 fisher_backend=lt_backend,
+                fisher_chunk_size=int(lt_conf.get("chunk_size", 25)),
                 lt_h5_path=lt_h5_path,
                 lt_warmup_epochs=lt_warmup,
             ))
@@ -1927,6 +2002,10 @@ class SequentialTrainerJoint:
                   f"cumulative_warmup={ppks_warmup}, "
                   f"state={ppks_state_path})")
 
+        if self.train_conf.get("profile_gpu_memory", False):
+            from pembhb.callbacks import GPUMemoryProfiler
+            callbacks_list.insert(0, GPUMemoryProfiler(callbacks_list))
+
         streaming = self.train_conf.get("streaming", {}).get("enabled", False)
         trainer = Trainer(
             logger=logger,
@@ -1936,6 +2015,7 @@ class SequentialTrainerJoint:
             enable_progress_bar=False,
             callbacks=callbacks_list,
             gradient_clip_val=enc_conf.get("gradient_clip_val", None),
+            accumulate_grad_batches=self.train_conf.get("accumulate_grad_batches", 1),
             # Streaming reads one ring buffer per epoch: reload the dataloader
             # every epoch so StreamingDataModule can rotate to the next buffer.
             reload_dataloaders_every_n_epochs=1 if streaming else 0,
@@ -2008,7 +2088,11 @@ class SequentialTrainerJoint:
             self._entropy_history.setdefault(k, []).append(float(h))
         # Round-end empirical coverage of each marginal's truncation box over the
         # (up to) 1000-sample val pool — drives the truncation veto in run().
+        torch.cuda.reset_peak_memory_stats()
         self._last_coverage = self._compute_round_coverage(round_idx)
+        if self.train_conf.get("profile_gpu_memory", False):
+            print(f"[GPUMem] round {round_idx} coverage peak alloc GB: "
+                  f"{torch.cuda.max_memory_allocated() / 2**30:.2f}", flush=True)
         self._persist_round_state(round_idx)
         opt = self.model.optimizers()
         if isinstance(opt, list):
@@ -2159,9 +2243,13 @@ class SequentialTrainerJoint:
                         name = "-".join(prior_keys[j] for j in marginal_key)
                         print(f"[Trunc/mask] round {i}: {name} (head {out_idx}) ...",
                               flush=True)
+                        torch.cuda.reset_peak_memory_stats()
                         self._mask_truncate_marginal(
                             marginal_key, out_idx, prior_keys,
                             intervals_1d, masks_2d, trunc_conf)
+                        if self.train_conf.get("profile_gpu_memory", False):
+                            print(f"[GPUMem] round {i} truncation {name} peak alloc GB: "
+                                  f"{torch.cuda.max_memory_allocated() / 2**30:.2f}", flush=True)
 
                     elif len(marginal) == 1:
                         param_name = prior_keys[marginal[0]]
@@ -2348,6 +2436,7 @@ if __name__ == "__main__":
 
     train_config = utils.read_config(os.path.join(ROOT_DIR, "configs", train_config_filename))
     datagen_config = utils.read_config(os.path.join(ROOT_DIR, "configs", datagen_config_filename))
+    utils.resolve_marginal_names(train_config, datagen_config.get("spin_param_basis", "chi1chi2"))
 
     # Activate the configured precision (default: float32)
     set_precision(train_config.get("precision", "float32"))

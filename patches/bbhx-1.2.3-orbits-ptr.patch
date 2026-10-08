@@ -1,0 +1,39 @@
+--- a/bbhx/response/fastfdresponse.py
++++ b/bbhx/response/fastfdresponse.py
+@@ -16,6 +16,7 @@
+ # along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ from __future__ import annotations
+ 
++import ctypes
+ import numpy as np
+ 
+ from ..utils.constants import *
+@@ -130,6 +131,19 @@
+         else:
+             self._orbits = orbits
+         self._orbits.configure(linear_interp_setup=True)
++        # Cache C++ orbit object and extract its integer pointer for the Cython layer.
++        # pycppdetector recreates OrbitsWrap on every access, so call it once and
++        # keep references alive to prevent GC of the underlying C++ pointer.
++        _pycppdetector = self._orbits.pycppdetector
++        self._orbits_pycppdetector = _pycppdetector   # keeps OrbitsWrap alive
++        self._orbits_cpp = _pycppdetector.orbits       # OrbitsCPU or OrbitsGPU
++        # Extract the raw Orbits* integer pointer from the pybind11 wrapper.
++        # pybind11 simple layout: the C++ value pointer lives at offset 16
++        # (right after the 16-byte PyObject header) of the Python wrapper object.
++        self._orbits_ptr = ctypes.cast(
++            id(self._orbits_cpp) + 16,
++            ctypes.POINTER(ctypes.c_size_t),
++        )[0]
+         assert self._orbits.backend.name.split("_")[-1] == self.backend.name.split("_")[-1]
+ 
+     @property
+@@ -469,7 +483,7 @@
+             length,
+             num_bin_all,
+             includes_amps,
+-            self.orbits,
++            self._orbits_ptr,
+         )
+ 
+         # adjust input phase arrays in-place

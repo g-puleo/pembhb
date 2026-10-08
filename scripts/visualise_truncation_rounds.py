@@ -7,7 +7,8 @@ held constant from round r to r+1. Each panel is an offset from the truth on a
 symlog scale, so the prior-wide early rounds and the narrow final ones are both
 legible. MCMC, if provided, is only compared against in the last-round figure.
 
-2-D contour evolution lives in ``visualise_2d_truncation.py``.
+Single-round figures (and the shared evaluation code) live in ``plot_posterior.py``;
+sky evolution in ``visualise_sky_truncation.py``.
 
 Figures are paper-styled: a ``--rows`` x ``--cols`` grid (default 2x6) at
 ``--width-pt`` (default \\textwidth = 2 x 246 pt) and ``--fontsize`` (10),
@@ -26,41 +27,38 @@ import os
 
 import matplotlib.pyplot as plt
 import numpy as np
-from torch.utils.data import DataLoader, Subset
 
-from pembhb import ROOT_DIR
-from pembhb.data import MBHBDataset
-from pembhb.utils import mbhb_collate_fn
+from pembhb import ROOT_DIR, PLOTS_ROOT_DIR
+from pembhb.utils import compute_fisher_prior_bounds
 
 from _visualise_common import (
     DATA_ROOT_DIR,
+    resolve_obs_path,
+    build_obs_dataloader,
     find_round_dirs,
-    load_model,
-    load_prior_box,
     load_duration_weeks,
-    get_all_marginals,
-    find_out_param_idx,
     register_ckpt_override,
-    compute_normalised_posterior,
-    keys_for_model,
-    detect_basis,
     PT_PER_INCH,
     TEXTWIDTH_PT,
     latex_label,
     apply_paper_style,
     save_figure,
 )
-from viz_helpers import (
-    load_mcmc_samples,
-    eval_nre_1d,
-    marginalise_2d_to_1d,
-    deltat_axis_transforms,
-    eval_mcmc_kde_1d,
+from viz_helpers import eval_mcmc_kde_1d
+from plot_posterior import (
+    DEFAULT_ROWS,
+    DEFAULT_COLS,
+    _panel_title,
+    _grid_layout,
+    _place_legend,
+    _axis_transforms_for,
+    evaluate_round,
+    load_mcmc,
+    plot_1d_posteriors,
 )
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from matplotlib.ticker import MaxNLocator, NullLocator, SymmetricalLogLocator
-from pembhb.sampler import chi12_to_chieff_chidiff
 
 
 # ---------------------------------------------------------------------------
@@ -73,24 +71,6 @@ BAND_ALPHA = {0.99: 0.20, 0.90: 0.38, 0.50: 0.70}
 
 # Half-width of the symlog linear region, in units of the last round's 99% band.
 SYMLOG_LINTHRESH_FACTOR = 5.0
-
-# Curve/ground-truth linewidth in plot_last_round_vs_mcmc's panels + legend.
-LAST_ROUND_LW = 1.5
-
-# Panel titles for the parameters that carry a unit. Everything else falls back
-# to ``latex_label`` (dimensionless: q, spins, cos(iota), sin(beta), logMchirp).
-UNIT_LABELS = {
-    "dist":   r"$d_L\,[\mathrm{Gpc}]$",
-    "phi":    r"$\phi\,[\mathrm{rad}]$",
-    "lambda": r"$\lambda\,[\mathrm{rad}]$",
-    "psi":    r"$\psi\,[\mathrm{rad}]$",
-    "Deltat": r"$\Delta t\,[\mathrm{s}]$",
-}
-
-
-def _panel_title(label: str) -> str:
-    return UNIT_LABELS.get(label, latex_label(label))
-
 
 def _symlog_ticks(linthresh, y_lo, y_hi, max_per_side=2):
     """Sparse tick list for a symlog axis: 0 plus a couple of decades a side.
@@ -130,101 +110,49 @@ def _equal_tailed_interval(grid, density, level):
             float(np.interp(1.0 - tail, cdf, grid)))
 
 
-def _maybe_remap_mcmc_to_basis(samples, names, basis: str):
-    """If *basis* is ``"chieff_chidiff"`` and MCMC carries ``(chi1, chi2, q)``,
-    derive ``(chi_eff, chi_diff)`` and replace the chi1/chi2 columns in place.
-
-    No-op otherwise. Returns ``(samples, names)``.
-    """
-    if basis != "chieff_chidiff":
-        return samples, names
-    need = {"chi1", "chi2", "q"}
-    if not need.issubset(names):
-        return samples, names
-    i1, i2, iq = names.index("chi1"), names.index("chi2"), names.index("q")
-    q = samples[:, iq]; c1 = samples[:, i1]; c2 = samples[:, i2]
-    chi_eff, chi_diff = chi12_to_chieff_chidiff(q, c1, c2)
-    samples = samples.copy()
-    samples[:, i1] = chi_eff
-    samples[:, i2] = chi_diff
-    names = list(names); names[i1] = "chi_eff"; names[i2] = "chi_diff"
-    print(f"[mcmc] remapped chi1,chi2 → chi_eff,chi_diff to match NRE basis")
-    return samples, names
-
-
-# ---------------------------------------------------------------------------
-# Parameter listing — every dim the model can produce a 1-D marginal for
-# ---------------------------------------------------------------------------
-
-def _iter_param_marginals(model):
-    """Yield ``(param_label, source_dim, in_idx, out_idx, axis_to_keep)``
-    for every parameter the model has at least one head for.
-
-    Preference: native 1-D head over 2-D-derived. When a parameter is only
-    inside a 2-D head, yield it with source_dim=2 and axis_to_keep set to
-    the axis (0 or 1) of that head whose marginalisation produces it.
-    """
-    keys = keys_for_model(model)
-    one_d = {}
-    two_d_only = {}
-    for label, ndim, in_idx, out_idx in get_all_marginals(model):
-        if ndim == 1:
-            one_d[in_idx] = (label, 1, in_idx, out_idx, None)
-        else:
-            for axis, p in enumerate(in_idx):
-                if p in one_d:
-                    continue
-                two_d_only.setdefault(
-                    p, (keys[p], 2, in_idx, out_idx, axis)
-                )
-    # Emit in canonical parameter order so subplots are in a predictable order.
-    for p_idx in range(len(keys)):
-        if p_idx in one_d:
-            yield one_d[p_idx]
-        elif p_idx in two_d_only:
-            yield two_d_only[p_idx]
-
-
-def _eval_1d_marginal(model, dataloader, param_info, prior_box, ngrid):
-    """Evaluate the 1-D marginal density for one parameter.
-
-    Returns (grid_1d, norm1d, inj_value) or None if the marginal is not
-    present in this model (e.g. introduced only in a later round).
-    """
-    label, source_dim, in_idx, _, axis_to_keep = param_info
-    out_idx = find_out_param_idx(model, in_idx)
-    if out_idx is None:
-        return None
-    if source_dim == 1:
-        low, high = prior_box[label]
-        return eval_nre_1d(model, dataloader, in_idx, out_idx, low, high, ngrid)
-    # 2-D head → marginalise.
-    p0, p1 = in_idx
-    keys = keys_for_model(model)
-    bounds_0 = prior_box[keys[p0]]
-    bounds_1 = prior_box[keys[p1]]
-    norm2d, inj_params, gx, gy = compute_normalised_posterior(
-        dataloader, model, in_idx, out_idx, bounds_0, bounds_1,
-        ngrid_points=ngrid,
-    )
-    return marginalise_2d_to_1d(norm2d[0], gx, gy, axis_to_keep, inj_params[0])
-
-
 # ---------------------------------------------------------------------------
 # Main figure
 # ---------------------------------------------------------------------------
 
-DEFAULT_ROWS, DEFAULT_COLS = 2, 6
+def _fisher_sigmas(round_dirs, obs_path, labels, basis, datagen_config=None):
+    """Cramer-Rao 1-sigma per parameter, as a ``{label: sigma}`` dict.
 
+    Obtained by asking :func:`compute_fisher_prior_bounds` for a **1-sigma**
+    box and halving its width, so the Gaussian overlay uses exactly the same
+    Fisher matrix the ``fisher_prior`` run option would build.
 
-def _grid_layout(n_panels: int, rows: int = DEFAULT_ROWS,
-                 cols: int = DEFAULT_COLS) -> tuple:
-    """Requested (rows, cols), growing rows if the run has more marginals."""
-    if n_panels > rows * cols:
-        rows = int(np.ceil(n_panels / cols))
-        print(f"[layout] {n_panels} panels exceed the requested grid; "
-              f"using {rows}x{cols}.")
-    return rows, cols
+    ``datagen_config`` defaults to the run's own round-1 sidecar
+    (``simulation_round_1.yaml``), so the waveform settings match the run
+    rather than whatever is currently in ``configs/``.
+    """
+    import yaml as _yaml
+
+    if datagen_config is None:
+        side = os.path.join(round_dirs[0], "simulation_round_1.yaml")
+        if not os.path.exists(side):
+            raise FileNotFoundError(
+                f"No datagen config given and {side} is missing; pass "
+                f"--fisher-datagen-config explicitly.")
+        with open(side, encoding="utf-8") as fh:
+            conf = (_yaml.safe_load(fh) or {}).get("conf")
+        if conf is None:
+            raise ValueError(f"{side} has no 'conf' block.")
+    else:
+        with open(datagen_config, encoding="utf-8") as fh:
+            conf = _yaml.safe_load(fh)
+        conf = conf.get("conf", conf)
+
+    bounds = compute_fisher_prior_bounds(
+        datagen_config=conf,
+        observation_file=obs_path,
+        event_idx=0,
+        varying_params=list(labels),
+        fixed_params=[],
+        n_sigma=1.0,
+        param_n_sigma=None,
+        spin_param_basis=basis,
+    )
+    return {k: 0.5 * (float(v[1]) - float(v[0])) for k, v in bounds.items()}
 
 
 def _resolve_param_subset(all_params, requested):
@@ -253,24 +181,6 @@ def _resolve_param_subset(all_params, requested):
     return subset
 
 
-def _axis_transforms_for(label: str, inj_val: float | None,
-                          duration_weeks: float | None,
-                          mcmc_samples_path: str | None):
-    """Return (nre_to_y, mcmc_to_y, y_label) for one parameter.
-
-    For ``Deltat``, both sides are mapped to "seconds offset from true merger"
-    (see :func:`viz_helpers.deltat_axis_transforms`). For other parameters,
-    identity transforms are used.
-    """
-    if label == "Deltat" and inj_val is not None and duration_weeks is not None:
-        nre_to_y, mcmc_to_y, y_label, _ = deltat_axis_transforms(
-            inj_val, duration_weeks, mcmc_samples_path,
-        )
-        return nre_to_y, mcmc_to_y, y_label
-    identity = lambda v: np.asarray(v, dtype=float)
-    return identity, identity, label
-
-
 def _compute_round_data(round_dirs, dataloader, ngrid_1d, mcmc_samples_path):
     """Load each round's model exactly once and evaluate every 1-D marginal.
 
@@ -293,34 +203,19 @@ def _compute_round_data(round_dirs, dataloader, ngrid_1d, mcmc_samples_path):
     params = None
     nre_basis = "chi1chi2"
     for r_idx, rd in enumerate(round_dirs, start=1):
-        model = load_model(os.path.join(rd, "checkpoints"))   # ONE load / round
-        prior_box = load_prior_box(rd, r_idx)
-        round_params = list(_iter_param_marginals(model))
-        densities = {}
-        for pi in round_params:
-            densities[pi[0]] = _eval_1d_marginal(
-                model, dataloader, pi, prior_box, ngrid_1d)
+        _, round_params, densities, prior_box, nre_basis = evaluate_round(
+            rd, r_idx, dataloader, ngrid_1d)
         per_round_densities.append(densities)
         per_round_priors.append(prior_box)
         # Later rounds can introduce marginals, so the last round's list is the
-        # canonical superset used for panel layout (matches prior behaviour).
+        # canonical superset used for panel layout.
         params = round_params
-        nre_basis = detect_basis(getattr(model, "bounds_trained", {}) or {})
-        print(f"[round {r_idx}] "
-              f"{sum(v is not None for v in densities.values())}"
-              f"/{len(round_params)} marginals evaluated.")
 
     if not params:
         raise RuntimeError("Model has no 1-D-recoverable marginals.")
 
     duration_weeks = load_duration_weeks(round_dirs[0], 1)
-
-    mcmc_samples = mcmc_param_names = None
-    if mcmc_samples_path:
-        mcmc_samples, mcmc_param_names = load_mcmc_samples(mcmc_samples_path)
-        mcmc_samples, mcmc_param_names = _maybe_remap_mcmc_to_basis(
-            mcmc_samples, mcmc_param_names, nre_basis,
-        )
+    mcmc_samples, mcmc_param_names = load_mcmc(mcmc_samples_path, nre_basis)
 
     return {
         "params": params,
@@ -330,6 +225,8 @@ def _compute_round_data(round_dirs, dataloader, ngrid_1d, mcmc_samples_path):
         "mcmc_samples": mcmc_samples,
         "mcmc_param_names": mcmc_param_names,
         "n_rounds": n_rounds,
+        "round_numbers": list(range(1, n_rounds + 1)),
+        "nre_basis": nre_basis,
     }
 
 
@@ -362,7 +259,7 @@ def plot_interval_evolution(
     (posterior-narrow) are then both legible in one panel — on a linear axis
     the last ~30 rounds collapse onto the truth line.
 
-    MCMC is not drawn here (see :func:`plot_last_round_vs_mcmc`); when
+    MCMC is not drawn here (see :func:`plot_posterior.plot_1d_posteriors`); when
     ``zoom_sigmas`` is given the MCMC spread is still used to size the window.
 
     ``zoom_sigmas`` (float) clips each panel's y-axis to a window centered on
@@ -527,178 +424,18 @@ def _finish_grid(axes, n_panels: int, rows: int, cols: int, xlabel: str) -> None
         axes[k // cols, k % cols].set_xlabel(xlabel)
 
 
-def _place_legend(fig, axes, handles, n_panels: int, rows: int,
-                  cols: int) -> None:
-    """Put the legend in the blank cells of a ragged last row, else in a single
-    row underneath the figure.
-
-    The layout is frozen first (``draw`` then a null layout engine) so the
-    legend can be anchored in figure coordinates without constrained_layout
-    reserving space for it — reserving space would stretch the column it sits
-    in and break the uniform panel grid.
-    """
-    n_free = rows * cols - n_panels
-    if n_free < 1:
-        fig.legend(handles=handles, loc="outside lower center",
-                   ncol=len(handles), frameon=False, handlelength=1.6,
-                   columnspacing=1.4, borderaxespad=0.0)
-        return
-
-    r0, c0 = n_panels // cols, n_panels % cols
-    first = axes[r0, c0]
-    last = axes[rows - 1, cols - 1]
-    fig.canvas.draw()
-    p0, p1 = first.get_position(), last.get_position()
-    fig.set_layout_engine("none")
-    # The hidden cell draws no tick labels, so its left gutter is free space —
-    # claim it, otherwise the legend is squeezed into ~60% of the column.
-    x0 = p0.x0
-    if c0 > 0:
-        x0 = axes[r0, c0 - 1].get_position().x1 + 0.006
-    rect = (x0, p1.y0, p1.x1 - x0, p0.y1 - p1.y0)
-
-    # Shrink until the legend fits inside the free cells: at these panel widths
-    # the default size spills over the neighbouring axes.
-    fontsize = plt.rcParams["axes.labelsize"]   # match the axis labels
-    for _ in range(4):
-        leg = fig.legend(handles=handles, loc="center", frameon=False,
-                         handlelength=1.0, handletextpad=0.4, borderpad=0.1,
-                         labelspacing=0.5, borderaxespad=0.0,
-                         fontsize=fontsize, bbox_to_anchor=rect,
-                         bbox_transform=fig.transFigure)
-        fig.canvas.draw()
-        bb = leg.get_window_extent().transformed(fig.transFigure.inverted())
-        scale = min(rect[2] / bb.width, rect[3] / bb.height)
-        if scale >= 0.99 or fontsize <= 4.0:
-            break
-        leg.remove()
-        fontsize = max(4.0, fontsize * 0.98 * scale)
-    print(f"[legend] fontsize {fontsize:.1f} pt "
-          f"(axis labels: {plt.rcParams['axes.labelsize']:.1f} pt)")
-
-
-def plot_last_round_vs_mcmc(
-    data: dict,
-    mcmc_samples_path: str | None,
-    outdir: str,
-    ngrid_1d: int = 200,
-    reason: str = "truncation",
-    width_pt: float = TEXTWIDTH_PT,
-    height_in: float | None = None,
-    rows: int = DEFAULT_ROWS,
-    cols: int = DEFAULT_COLS,
-):
-    """One panel per marginal: the last-round NRE 1-D posterior and the
-    corresponding MCMC posterior overlaid on the same axis. Consumes the
-    precomputed *data* (see :func:`_compute_round_data`) — no model is loaded
-    here.
-
-    All curves are drawn as densities over the *display* coordinate produced by
-    :func:`_axis_transforms_for` (identity for most parameters; "seconds offset
-    from true merger" for ``Deltat``) and each is renormalised to unit area over
-    the shared window so their shapes are directly comparable. The true
-    (injection) value is a red dashed line.
-    """
-    os.makedirs(outdir, exist_ok=True)
-    params = data["params"]
-    if len(params) > 1:
-        # Panel [0,0] has no left neighbour to lend its title overhang room
-        # to, so a wide title there (e.g. "log10(Mc/Msun)", typically first
-        # in the canonical order) clips against the figure's outer edge at
-        # large --fontsize. [0,1] has neighbours on both sides -- swap the
-        # first two panels' content so the wide title lands there instead.
-        params = [params[1], params[0]] + list(params[2:])
-    last_densities = data["per_round_densities"][-1]
-    duration_weeks = data["duration_weeks"]
-    mcmc_samples = data["mcmc_samples"]
-    mcmc_param_names = data["mcmc_param_names"]
-    n_rounds = data["n_rounds"]
-
-    if mcmc_samples is None:
-        print("[warn] no MCMC samples; drawing NRE last-round marginals only.")
-
-    rows, cols = _grid_layout(len(params), rows, cols)
-    width_in = width_pt / PT_PER_INCH
-    fig, axes = plt.subplots(
-        rows, cols, squeeze=False, constrained_layout=True,
-        figsize=(width_in, height_in or 1.45 * rows + 0.55),
-    )
-
-    for idx, pi in enumerate(params):
-        label = pi[0]
-        ax = axes[idx // cols, idx % cols]
-        res = last_densities.get(label)
-        if res is None:
-            ax.set_visible(False)
-            continue
-        grid_1d, norm1d, inj = res
-        nre_to_x, mcmc_to_x, x_label = _axis_transforms_for(
-            label, inj, duration_weeks, mcmc_samples_path,
-        )
-        x_grid = nre_to_x(grid_1d)
-        dx = abs(float(x_grid[1] - x_grid[0]))  # uniform (linear transform)
-
-        y_nre = norm1d / max(np.sum(norm1d) * dx, 1e-300)
-        ax.plot(x_grid, y_nre, color="C0", lw=LAST_ROUND_LW)
-        ax.fill_between(x_grid, y_nre, alpha=0.2, color="C0")
-
-        if mcmc_samples is not None and label in mcmc_param_names:
-            mvals = eval_mcmc_kde_1d(
-                mcmc_samples, mcmc_param_names, label, x_grid,
-                sample_transform=mcmc_to_x,
-            )
-            if mvals is not None:
-                mvals = mvals / max(np.sum(mvals) * dx, 1e-300)
-                ax.plot(x_grid, mvals, color="grey", lw=LAST_ROUND_LW)
-                ax.fill_between(x_grid, mvals, alpha=0.15, color="grey")
-
-        mu_disp = float(nre_to_x(np.array([inj]))[0])
-        ax.axvline(mu_disp, color="red", ls="--", lw=LAST_ROUND_LW)
-        title = _panel_title(label)
-        ax.set_title(title, pad=3)
-        ax.set_yticks([])
-        ax.xaxis.set_major_locator(MaxNLocator(nbins=2))
-
-    for k in range(len(params), rows * cols):
-        axes[k // cols, k % cols].set_visible(False)
-
-    handles = [
-        Line2D([0], [0], color="C0", lw=LAST_ROUND_LW, label=f"NRE\n(round {n_rounds})"),
-        Line2D([0], [0], color="red", ls="--", lw=LAST_ROUND_LW, label="ground truth"),
-    ]
-    if mcmc_samples is not None:
-        handles.insert(1, Line2D([0], [0], color="grey", lw=LAST_ROUND_LW, label="MCMC"))
-    _place_legend(fig, axes, handles, len(params), rows, cols)
-    return save_figure(
-        fig, outdir, f"round_{n_rounds}_last_posterior_vs_mcmc_{reason}",
-    )
-
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
-def _build_dataloader(data_path: str) -> DataLoader:
-    ds = MBHBDataset(data_path, cache_in_memory=False)
-    if not ds.has_stored_noise:
-        print(f"[warn] {data_path} has no stored 'noise_fd'; posteriors will use "
-              f"freshly-drawn noise on every call.")
-    return DataLoader(
-        Subset(ds, indices=[0]),
-        batch_size=1, shuffle=False,
-        collate_fn=lambda b: mbhb_collate_fn(
-            b, ds.noise_scale, noise_factor=1.0, noise_shuffling=False,
-        ),
-    )
-
 
 def main():
     p = argparse.ArgumentParser(
         description="Plot 1-D posterior violin evolution across TMNRE rounds.",
     )
     p.add_argument("name", help="Run name / TIME_OF_EXECUTION.")
-    p.add_argument("--data-path", required=True,
-                   help="Observation HDF5 (preferably with stored noise_fd).")
+    p.add_argument("--data-path", default=None,
+                   help="Observation HDF5 (default: the run's observation_used.yaml; "
+                        "a different observation raises).")
     p.add_argument("--mcmc-file", default=None,
                    help="Optional flat MCMC samples HDF5 for reference violin "
                         "and ±1σ band.")
@@ -739,6 +476,14 @@ def main():
                    help="Column count for the --params figure (default: "
                         "len(--params)+1, one free cell reserved for the legend "
                         "at the end of the single default row).")
+    p.add_argument("--fisher", action="store_true",
+                   help="Overlay the Fisher (Cramer-Rao) Gaussian N(truth, "
+                        "sigma_FIM) on the last-round 1-D posteriors. Uses the "
+                        "same FIM that the fisher_prior run option builds.")
+    p.add_argument("--fisher-datagen-config", default=None,
+                   help="Datagen config for the FIM (default: the run's own "
+                        "round-1 sidecar simulation_round_1.yaml, so the "
+                        "waveform settings match the run).")
     p.add_argument("--params-width-pt", type=float, default=None,
                    help="Figure width in points for the --params figure "
                         "(default: same as --width-pt).")
@@ -761,11 +506,11 @@ def main():
     if args.ckpt_final_round:
         register_ckpt_override(round_dirs[-1], args.ckpt_final_round)
 
-    dataloader = _build_dataloader(args.data_path)
+    args.data_path = resolve_obs_path(args.name, args.data_path)
+    dataloader = build_obs_dataloader(args.data_path)
 
     outdir = os.path.join(
-        ROOT_DIR,
-        "plots",
+        PLOTS_ROOT_DIR,
         args.name + (f"_upto_round_{args.last_round}" if args.last_round else ""),
     )
 
@@ -774,6 +519,19 @@ def main():
     data = _compute_round_data(
         round_dirs, dataloader, args.ngrid_1d, args.mcmc_file,
     )
+
+    fisher_sigmas = None
+    if args.fisher:
+        basis = data["nre_basis"]          # derived from the model's trained bounds
+        labels = [pi[0] for pi in data["params"]]
+        print(f"[fisher] computing the Fisher matrix for {len(labels)} parameter(s) ...")
+        fisher_sigmas = _fisher_sigmas(
+            round_dirs, args.data_path, labels, basis,
+            datagen_config=args.fisher_datagen_config,
+        )
+        for k in labels:
+            sg = fisher_sigmas.get(k)
+            print(f"[fisher]   sigma({k}) = {sg:.6g}" if sg else f"[fisher]   sigma({k}) = n/a")
 
     apply_paper_style(args.fontsize)
     style = dict(width_pt=args.width_pt, height_in=args.height_in,
@@ -804,12 +562,12 @@ def main():
         )
 
     # Last-round posterior vs MCMC, one overlaid panel per marginal.
-    plot_last_round_vs_mcmc(
+    plot_1d_posteriors(
         data=data,
         mcmc_samples_path=args.mcmc_file,
         outdir=outdir,
-        ngrid_1d=args.ngrid_1d,
-        reason=args.reason,
+        stem=f"round_{data['n_rounds']}_last_posterior_vs_mcmc_{args.reason}",
+        fisher_sigmas=fisher_sigmas,
         **{**style, "height_in": args.mcmc_height_in or args.height_in},
     )
 

@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 #from line_profiler import profile
 import torch.nn as nn
 from torch import nn
-from pembhb import ROOT_DIR, get_torch_dtype
+from pembhb import ROOT_DIR, get_torch_dtype, PLOTS_ROOT_DIR
 
 class ReducedOrderModel:
     """Reduced-order model for frequency-domain (complex) waveform data.
@@ -73,7 +73,7 @@ class ReducedOrderModel:
 
             if debugging:
                 self.plot_dir_debug = os.path.join(
-                    ROOT_DIR, "plots",
+                    PLOTS_ROOT_DIR,
                     "debug_plots_{time}".format(time=time.strftime("%Y%m%d-%H%M%S")))
                 os.makedirs(self.plot_dir_debug, exist_ok=True)
 

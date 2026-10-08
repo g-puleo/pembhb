@@ -3,8 +3,10 @@ import torch
 import numpy as np
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
-print(f"ROOT_DIR: {ROOT_DIR}")
-DATA_ROOT_DIR = "/data/gpuleo/mbhb"
+# Simulations, logs and checkpoints (large). Override with PEMBHB_DATA_DIR.
+DATA_ROOT_DIR = os.environ.get("PEMBHB_DATA_DIR", os.path.join(ROOT_DIR, "data"))
+# Training-time and visualisation plots. Override with PEMBHB_PLOTS_DIR.
+PLOTS_ROOT_DIR = os.environ.get("PEMBHB_PLOTS_DIR", os.path.join(ROOT_DIR, "plots"))
 
 # Low-frequency floor [Hz] for the FD frequency grid and SNR computation.
 # The actual fmin used is ``max(FMIN_FLOOR, 1/T_obs)`` — i.e. this floor

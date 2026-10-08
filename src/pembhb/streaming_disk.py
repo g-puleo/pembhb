@@ -111,7 +111,7 @@ class DiskRingBuffer(RingBuffer):
 
     def read_field(self, j, name):
         """Read a full field off buffer ``j`` (used for normalisation stats)."""
-        with h5py.File(self.paths[j], "r") as f:
+        with h5py.File(self.paths[j], "r", locking=False) as f:
             return np.asarray(f[name][()])
 
 
@@ -134,6 +134,23 @@ class DiskProducer(Producer):
             chunk["wave_td"] = np.asarray(sample["wave_td"])
         return chunk
 
+    def _host_out(self):
+        """Reusable pinned host buffer for one sub-batch of ``wave_fd`` (CUDA only).
+
+        Pageable device->host copies plus a CPU-side cast took ~8 s per 150
+        full-band waveforms under host-memory pressure; into pinned memory the
+        copy is ~0.03 s. ``None`` on a CPU backend.
+        """
+        if not hasattr(self, "_pinned"):
+            self._pinned = None
+            if str(getattr(self.sim, "backend_name", "")).startswith("cuda"):
+                import cupy as cp
+                shape, dt = self.ring._specs["wave_fd"]
+                full = (self.gen_batch_size, *shape)
+                mem = cp.cuda.alloc_pinned_memory(int(np.prod(full)) * np.dtype(dt).itemsize)
+                self._pinned = np.frombuffer(mem, dtype=dt, count=int(np.prod(full))).reshape(full)
+        return self._pinned
+
     def _fill(self, j):
         # Write a brand-new tmp file (no reader can have it open) then atomically
         # swap it in. Avoids the same-process r+/read-only open conflict.
@@ -152,7 +169,8 @@ class DiskProducer(Producer):
                 if self.ring._stop:
                     return False
                 n = min(gb, M - off)
-                chunk = self._chunk(self.sim.sample(n, keep_on_gpu=False))
+                chunk = self._chunk(self.sim.sample(n, keep_on_gpu=False,
+                                                    host_out=self._host_out()))
                 for name, ds in dsets.items():
                     ds[off:off + n] = chunk[name]
         finally:
@@ -199,7 +217,7 @@ class DiskBufferDataset(Dataset):
     def __init__(self, paths, has_td=False, length=None):
         self.paths = [paths] if isinstance(paths, str) else list(paths)
         self.has_td = has_td
-        with h5py.File(self.paths[0], "r") as f:
+        with h5py.File(self.paths[0], "r", locking=False) as f:
             self.M = f["wave_fd"].shape[0]      # rows per file (all equal)
         self.total = self.M * len(self.paths)   # distinct rows available
         self.length = int(length) if length else self.total
@@ -208,7 +226,7 @@ class DiskBufferDataset(Dataset):
     def _file(self, b):
         f = self._files.get(b)
         if f is None:
-            f = self._files[b] = h5py.File(self.paths[b], "r")
+            f = self._files[b] = h5py.File(self.paths[b], "r", locking=False)
         return f
 
     def __len__(self):

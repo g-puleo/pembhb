@@ -12,7 +12,7 @@ If necessary, you should try to remind the users of the risks of letting an agen
 
 `pembhb` is a **Simulation-Based Inference (SBI)** framework for Bayesian parameter estimation of Massive Black Hole Binaries (MBHBs) observed by the LISA space detector. It implements **TMNRE** (Truncated Marginal Neural Ratio Estimation), a likelihood-free inference method that trains neural classifiers to estimate posterior marginals.
 
-`bbhx` and `lisaanalysistools` appear as git submodules but are installed via pip — ignore the submodule directories entirely.
+`bbhx` and `lisaanalysistools` are installed via pip and need a one-file patch to bbhx — see `INSTALL.md` and `patches/`. Any local `BBHx/` / `LISAanalysistools/` checkouts are gitignored; ignore them.
 
 ## Commands
 
@@ -36,7 +36,7 @@ The pipeline follows: **Simulator → Data → Model → TMNRE**
 
 ### 1. Simulator (`src/pembhb/simulator.py`)
 
-`MBHBSimulatorFD_TD` generates synthetic MBHB gravitational wave signals. It takes the 11 physical parameters (log chirp mass, mass ratio, two spins, distance, phase, inclination, ecliptic longitude/latitude, polarization, merger time offset `Deltat`), calls `bbhx` for frequency-domain waveforms, adds realistic LISA noise using the Sangria noise model, and returns both frequency-domain (FD) and time-domain (TD) representations across TDI channels (AET).
+`MBHBSimulatorFD` generates synthetic MBHB gravitational wave signals (the old FD+TD simulator was removed). It takes the 11 physical parameters (log chirp mass, mass ratio, two spins, distance, phase, inclination, ecliptic longitude/latitude, polarization, merger time offset `Deltat`), calls `bbhx` for frequency-domain waveforms on a linear or log grid (`fmax` is required; PSD-null bins are deleted, `psd_veto.py`), and colours LISA noise with the Sangria model. The `t`/`ft` marginal domains and `d_t` arguments in `model.py` are vestigial: `d_t` is always `None`.
 
 Key methods: `sample()` draws from the prior and generates one datum; `sample_and_store()` batches this to HDF5.
 
@@ -87,7 +87,7 @@ Both scripts implement **prior truncation**: after each round the prior bounds a
 The primary training entry point. Run from the repo root:
 
 ```bash
-/data/gpuleo/envs/lisa_pip/bin/python scripts/tmnre_joint.py \
+python scripts/tmnre_joint.py \
     [--train-config FILENAME] \   # default: train_config.yaml (inside configs/)
     [--n_rounds N]            \   # default: 10
     --obs-path /path/to/obs_*_withnoise.h5 \   # MUST contain stored noise_fd
@@ -108,8 +108,9 @@ window drifts with each evaluation, defeating the purpose of TMNRE.
 To produce a usable obs file:
 
 ```bash
-python scripts/add_noise_to_obs.py /path/to/obs_*.h5
-# → writes obs_*_withnoise.h5 (same waveform, with stored noise_fd)
+python scripts/simulate_data.py --n 1 --injection --store-noise --fname obs.h5 --seed 0
+# or, for an existing noiseless file:
+python scripts/add_noise_to_obs.py --input obs.h5 --output obs_withnoise.h5
 ```
 
 The obs path used for each run is auto-logged to
@@ -119,7 +120,7 @@ recovered later without parsing stdout.
 To **resume** a previous run (auto-detects last completed round from checkpoints):
 
 ```bash
-/data/gpuleo/envs/lisa_pip/bin/python scripts/tmnre_joint.py \
+python scripts/tmnre_joint.py \
     --resume 20260331_autoencoder_joint_v1 \
     [--n_rounds N] \
     NAME   # ignored when --resume is used
@@ -144,14 +145,24 @@ This tag (with literal `/` separators) is the directory key for all outputs (dat
 
 Two YAML config files control everything:
 
-- `configs/datagen_config.yaml` — waveform channels, noise model, duration/dt, prior bounds for all 11 parameters, hardware backend (`cuda12x` or `cpu`)
+- `configs/datagen_config.yaml` — waveform channels, noise model, duration, frequency grid (`fmin`/`fmax`/spacing), prior bounds for all 11 parameters, `injection` (ground truth for the obs), hardware backend (`cuda12x` or `cpu`)
 - `configs/train_config.yaml` — batch size, epochs, learning rate, precision (`float32`/`float64`), data summary type and architecture, marginals specification, Fisher prior, early stopping
+
+### Truncation grid refinement (default ON)
+
+With `truncation.mode: mask`, each round's HPD analysis first runs on the coarse grid (`ngrid_1d: 100`, `ngrid_2d: 200`), then **re-evaluates every accepted mode on its own refined subgrid** (`MultiRegion`, `refine_region`). This lifts the coarse-grid resolution ceiling once a mode shrinks to a few pixels.
+
+- `truncation.refine` defaults to `true` (`_refine_conf` in `scripts/tmnre_joint.py`). Set `refine: false` explicitly to reproduce older runs (e.g. maskzero, maskzero_aecosine).
+- Defaults when unset: `ngrid_1d_refined: 128`, `ngrid_2d_refined: 64`, `refine_max_depth: 4`.
+- `truncation.mode_tree: true` (recursive per-mode topology) requires `refine: true`; default off.
+- Read from the config every round, so toggling it applies on `--resume`.
 
 ## Training Output & Nomenclature
 
 All outputs are keyed by `TIME_OF_EXECUTION`. Two root directories:
-- `DATA_ROOT_DIR` = `/data/gpuleo/mbhb/`
-- `ROOT_DIR` = repo root (`/u/g/gpuleo/pembhb/`)
+- `DATA_ROOT_DIR` = `$PEMBHB_DATA_DIR` (default `<repo>/data`)
+- `PLOTS_ROOT_DIR` = `$PEMBHB_PLOTS_DIR` (default `<repo>/plots`)
+- `ROOT_DIR` = repo root
 
 ### Simulation data — `DATA_ROOT_DIR/{TIME_OF_EXECUTION}/`
 
@@ -176,7 +187,7 @@ Lightning creates a new `version_N` subdirectory each time the trainer starts. T
 | `checkpoints/epoch=*.ckpt` | Best checkpoint (monitored: `val_loss`) — loaded by `--resume` |
 | `simulation_round_{i}.yaml` | Copy of the datagen sidecar |
 
-### Plots — `ROOT_DIR/plots/{TIME_OF_EXECUTION}/`
+### Plots — `PLOTS_ROOT_DIR/{TIME_OF_EXECUTION}/`
 
 | File pattern | Contents |
 |--------------|----------|
@@ -201,4 +212,4 @@ All modules query this on instantiation.
 - **Noise weighting:** GW inner product `⟨a|b⟩ = Re[Σ aₖ* bₖ · 4Δfₖ / Sₙ(fₖ)]` used in ROM; ASD stored per-sample in HDF5.
 - **Parameter ordering:** `_ORDERED_PRIOR_KEYS` in `simulator.py` defines the canonical 11-parameter order used throughout.
 - **Train/val/test split:** 70/25/5 (hardcoded in `MBHBDataModule`).
-- Data files and logs are written to `/data/gpuleo/mbhb/` (external path configured in scripts).
+- Data files and logs are written to `DATA_ROOT_DIR` (`$PEMBHB_DATA_DIR`).

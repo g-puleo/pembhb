@@ -1,55 +1,50 @@
+# Data-generation config: frequency grid, noise model, prior, injection.
+# The observation and the training simulations MUST share `waveform_params`
+# (tmnre_joint.py aborts on any mismatch against the obs sidecar YAML).
+
 waveform_params:
-  channels: "AE"
-  modes:  [[2,2], [2,1], [3,3], [3,2], [4,4], [4,3]]
-  noise: "sangria"
-  duration: 1 # weeks # USED TO SET df=1/duration
-  dt: 100 # seconds #IGNORED BY THE CURRENT CODE 
-  # FD-only settings (used when domain="fd"; ignored for "fd_td")
-  domain: "fd"          # "fd" for FD-only simulator, "fd_td" for FD+TD (default)
-  n_freq_bins: 4096        # number of frequency bins (FD-only; used for freq_spacing="log" only)
-  freq_spacing: "linear"   # "linear" or "log" (FD-only)
-  # Lower edge of the FD grid (Hz). Effective fmin is max(this, 1/T_obs).
-  # Defaults to FMIN_FLOOR (1e-4) when omitted. Use 1.0e-5 to reproduce
-  # the pre-60db969 baseline grid.
-  fmin: 1.0e-4
-  fmax: 2.0e-2
-  downsamplefactor: 1    # match obs_fmin1e-4_fmax2e-2_ds1 grid (12036 bins, 1-week T_obs)
-  #psd_fmin_mask: 5.0e-5 # restore the low freq cutoff. 
-  
+  channels: "AE"                                   # TDI channels (subset of "AET")
+  modes: [[2,2], [2,1], [3,3], [3,2], [4,4], [4,3]] # bbhx PhenomHM harmonics
+  noise: "sangria"                                 # lisatools sensitivity model
+  duration: 1                                      # observation length [weeks]; sets df = 1/T_obs
+  freq_spacing: "linear"                           # "linear" or "log"
+  n_freq_bins: 4096                                # only used when freq_spacing = "log"
+  fmin: 1.0e-4                                     # [Hz]; effective fmin = max(fmin, 1/T_obs)
+  fmax: 2.0e-2                                     # [Hz]; required, must be <= 0.1 (PSD-veto reference grid)
+  downsamplefactor: 1                              # must be 1 (grid step = 1/T_obs); other values raise
+
+# Training prior (uniform box). Round 1 of tmnre_joint.py may replace the
+# varying parameters with a Fisher-matrix prior (see train_config.yaml).
 prior:
-  # Pinned to the injection truth for observation generation (simulate_data.py).
-  # Fisher overrides these for the varying params at TMNRE round 1 anyway.
-  "logMchirp": [5.9,6.1]
-  "q":         [1, 5]
-  "chi_eff":   [-0.97, 0.97]        # effective aligned spin (slot 2; basis chieff_chidiff)
-  "chi_diff":  [-0.97, 0.97]        # differential spin (chi1-chi2)/2 (slot 3)
-  "dist":      [1.0, 100.0]                                      # Gpc (sampled uniformly in dist^3)
-  "phi":       [0, 6.283185307179586]                                  # phase at coalescence (phimid, matches obs)
-  "inc":       [-1.0, 1.0]                                        # cos inclination
-  "lambda":    [0, 6.283185307179586]            # ecliptic longitude
-  "beta":      [-1.0, 1.0]        # sin ecliptic latitude
-  "psi":       [0,3.14159265358979]                                        # polarization angle in [0, pi]
-  "Deltat":    [-2.55, -2.45]        # t_merger from end of observation (days)
+  logMchirp: [5.9, 6.1]                 # log10 chirp mass [Msun]
+  q:         [1, 5]                     # mass ratio m1/m2 >= 1
+  chi_eff:   [-0.97, 0.97]              # effective aligned spin
+  chi_diff:  [-0.97, 0.97]              # (chi1 - chi2) / 2
+  dist:      [1.0, 100.0]               # luminosity distance [Gpc], uniform in volume
+  phi:       [0, 6.283185307179586]     # phase
+  inc:       [-1.0, 1.0]                # cos(inclination)
+  lambda:    [0, 6.283185307179586]     # ecliptic longitude
+  beta:      [-1.0, 1.0]                # sin(ecliptic latitude)
+  psi:       [0, 3.14159265358979]      # polarisation angle
+  Deltat:    [-2.55, -2.45]             # merger time relative to end of observation [days]
 
-  # "logMchirp": [6.0, 6.0]
-  # "q":         [3.00, 3.00]
-  # "chi_eff":      [0.0, 0.0]
-  # "chi_diff":      [0.0, 0.0]
-  # "dist":      [15.0, 15.0]                                      # Gpc (sampled uniformly in dist^3)
-  # "phi":       [3.1415, 3.1415]                                        # phase at coalescence
-  # "inc":       [0.5, 0.5]                                        # cos inclination
-  # "lambda":    [3.14159265358979, 3.14159265358979]            # ecliptic longitude
-  # "beta":      [0.2, 0.2]        # sin ecliptic latitude
-  # "psi":       [1.0,1.0]                                        # polarization angle in [0, pi]
-  # "Deltat":    [-2.50, -2.50]        # t_merger from end of observation (days)
+# Ground truth for the observation; used by `simulate_data.py --injection`.
+injection:
+  logMchirp: 6.0
+  q:         3.0
+  chi_eff:   0.0
+  chi_diff:  0.0
+  dist:      15.0
+  phi:       3.1415
+  inc:       0.5
+  lambda:    3.14159265358979
+  beta:      0.2
+  psi:       1.0
+  Deltat:    -2.50
 
-# Spin sampling basis (slots 2,3 of the prior).
-#   "chi1chi2"        (legacy): prior keys are "chi1","chi2".
-#   "chieff_chidiff"  : prior keys are "chi_eff","chi_diff"; the sampler inverts
-#                       to (chi1,chi2) for bbhx and rejects draws with |chi|>1.
-# The two spin bounds in the prior block above must be keyed to match this.
+# Spin basis for prior slots 2,3:
+#   "chieff_chidiff": keys chi_eff, chi_diff (converted to chi1, chi2 for bbhx; |chi|>1 rejected)
+#   "chi1chi2":       keys chi1, chi2
 spin_param_basis: "chieff_chidiff"
 
-backend: "cuda12x"
-
-
+backend: "cuda12x"   # bbhx/lisatools backend: "cuda12x", "cuda11x" or "cpu"

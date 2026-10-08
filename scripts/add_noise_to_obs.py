@@ -15,10 +15,13 @@ where ``filtered_asd`` zeros bins below ``FMIN_FLOOR`` Hz.
 
 Usage
 -----
-    /data/gpuleo/envs/lisa_pip/bin/python scripts/add_noise_to_obs.py \
-        --input  /data/gpuleo/mbhb/obs_logfreq_q3_t.h5 \
-        --output /data/gpuleo/mbhb/obs_logfreq_q3_t_noisy.h5 \
+    python scripts/add_noise_to_obs.py \
+        --input  obs.h5 \
+        --output obs_withnoise.h5 \
         --seed   0
+
+New observations can skip this step: ``simulate_data.py --store-noise``
+writes ``noise_fd`` directly.
 """
 
 import argparse
@@ -48,7 +51,6 @@ def add_noise_to_obs(input_path: str, output_path: str, seed: int = 0,
         asd = src["asd"][()]                        # (n_ch, n_freqs)
         freqs = src["frequencies"][()]              # (n_freqs,)
 
-        T = float(src.attrs["observation_duration_SI"])
 
         N, n_ch, n_freqs = wave_fd.shape
         assert asd.shape == (n_ch, n_freqs), "asd shape inconsistent with wave_fd"
@@ -59,7 +61,7 @@ def add_noise_to_obs(input_path: str, output_path: str, seed: int = 0,
         filtered_asd[:, freqs < FMIN_FLOOR] = 0.0
 
         # noise_scale = filtered_asd / sqrt(4 * df) — same formula as collate fn
-        noise_scale = filtered_asd / np.sqrt(4.0  / T)   # (n_ch, n_freqs)
+        noise_scale = filtered_asd / np.sqrt(4.0 * src["df"][()])   # (n_ch, n_freqs)
 
         rng = np.random.default_rng(seed)
         re = rng.standard_normal(size=(N, n_ch, n_freqs)).astype(asd.dtype)

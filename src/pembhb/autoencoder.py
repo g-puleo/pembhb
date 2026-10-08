@@ -1499,19 +1499,7 @@ class ChannelizedMLPCompressor(nn.Module):
         self.idx_lowerbound = 0
         self.idx_upperbound = n_freqs
 
-        def _make_block():
-            layers = [
-                nn.Linear(n_freqs, hidden_dim_per_channel),
-                nn.ReLU(),
-            ]
-            if self.dropout > 0.0:
-                layers.append(nn.Dropout(self.dropout))
-            layers.append(nn.Linear(hidden_dim_per_channel, out_dim_per_channel))
-            return nn.Sequential(*layers)
-
-        self.channel_blocks = nn.ModuleList(
-            _make_block() for _ in range(self.n_real_channels)
-        )
+        self.channel_blocks = self._build_encoder()
 
         # Normalisation buffers (same shapes/semantics as DenoisingAutoencoder)
         self.register_buffer(
@@ -1527,6 +1515,15 @@ class ChannelizedMLPCompressor(nn.Module):
             "mean_whitened",
             torch.zeros(self.n_real_channels, n_freqs, dtype=get_torch_dtype()),
         )
+
+    def _build_encoder(self):
+        def _make_block():
+            layers = [nn.Linear(self.n_freqs, self.hidden_dim_per_channel), nn.ReLU()]
+            if self.dropout > 0.0:
+                layers.append(nn.Dropout(self.dropout))
+            layers.append(nn.Linear(self.hidden_dim_per_channel, self.out_dim_per_channel))
+            return nn.Sequential(*layers)
+        return nn.ModuleList(_make_block() for _ in range(self.n_real_channels))
 
     # ------------------------------------------------------------------
     # Complex → real conversion (real_imag only)
@@ -1625,3 +1622,23 @@ class ChannelizedMLPCompressor(nn.Module):
     def forward(self, x_norm: torch.Tensor) -> torch.Tensor:
         """Same as :meth:`encode`; kept for API parity with DenoisingAutoencoder."""
         return self.encode(x_norm)
+
+
+class ConvCompressor(ChannelizedMLPCompressor):
+    """ChannelizedMLPCompressor with the per-channel MLPs replaced by a ConvEncoder."""
+
+    def __init__(self, n_channels, n_freqs, bottleneck_dim=256,
+                 hidden_channels=(16, 32, 32, 64, 64, 64, 64, 64, 64),
+                 kernel_size=5, residual=True, **kw):
+        object.__setattr__(self, "_conv_args",
+                           (bottleneck_dim, tuple(hidden_channels), kernel_size, residual))
+        super().__init__(n_channels, n_freqs, **kw)
+        self.bottleneck_dim = bottleneck_dim
+
+    def _build_encoder(self):
+        bottleneck_dim, hidden_channels, kernel_size, residual = self._conv_args
+        return ConvEncoder(self.n_real_channels, self.n_freqs, bottleneck_dim,
+                           hidden_channels, kernel_size, 2, self.dropout, residual)
+
+    def encode(self, x_norm):
+        return self.channel_blocks(x_norm)

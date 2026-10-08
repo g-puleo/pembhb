@@ -2,7 +2,7 @@ import os
 import yaml
 import numpy as np
 import torch
-from pembhb import ROOT_DIR, get_numpy_dtype
+from pembhb import ROOT_DIR, get_numpy_dtype, PLOTS_ROOT_DIR
 from pembhb.utils import (
     _ORDERED_PRIOR_KEYS,
     ordered_prior_keys,
@@ -78,6 +78,73 @@ class StreamReuseLogger(Callback):
             with open(self.summary_path, "a") as f:
                 f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  [epoch {trainer.current_epoch}] "
                         f"examples={examples} distinct_sims={distinct} reuse={reuse:.2f}\n")
+
+
+def _cupy_pool_gb():
+    try:
+        import cupy
+        return cupy.get_default_memory_pool().total_bytes() / 2**30
+    except Exception:
+        return float("nan")
+
+
+class GPUMemoryProfiler(Callback):
+    """Per-phase peak of ``torch.cuda.max_memory_allocated`` (GB), printed each epoch.
+
+    Phases: the train step, the val step, and every epoch-level hook of the other
+    callbacks (wrapped in place). bbhx allocates through CuPy's pool, which torch
+    does not see, so that pool's size is printed alongside. Place first in the list.
+    """
+
+    WRAPPED_HOOKS = ("on_validation_epoch_end", "on_train_epoch_end", "on_train_end")
+
+    def __init__(self, callbacks):
+        self.peaks = {}
+        for cb in callbacks:
+            for hook in self.WRAPPED_HOOKS:
+                if getattr(type(cb), hook) is not getattr(Callback, hook):
+                    setattr(cb, hook, self._wrap(f"{type(cb).__name__}.{hook}", getattr(cb, hook)))
+
+    def _record(self, name):
+        gb = torch.cuda.max_memory_allocated() / 2**30
+        self.peaks[name] = max(self.peaks.get(name, 0.0), gb)
+
+    def _wrap(self, name, fn):
+        def wrapped(*args, **kwargs):
+            torch.cuda.reset_peak_memory_stats()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                self._record(name)
+        return wrapped
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        torch.cuda.reset_peak_memory_stats()
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        self._record("train_step")
+
+    def on_validation_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx=0):
+        torch.cuda.reset_peak_memory_stats()
+
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+        self._record("val_step")
+
+    def _dump(self, label):
+        if self.peaks:
+            parts = ", ".join(f"{k}={v:.2f}" for k, v in sorted(self.peaks.items(), key=lambda kv: -kv[1]))
+            print(f"[GPUMem] {label} peak alloc GB: {parts} | "
+                  f"torch reserved={torch.cuda.memory_reserved() / 2**30:.2f} "
+                  f"cupy pool={_cupy_pool_gb():.2f}", flush=True)
+        self.peaks = {}
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        self._dump(f"epoch {trainer.current_epoch - 1}")
+
+    def on_train_end(self, trainer, pl_module):
+        self._dump(f"epoch {trainer.current_epoch} (last)")
+
+
 def _param_keys(pl_module):
     """Parameter names for the run's spin basis (slots 2,3), from dataset_info.
 
@@ -473,7 +540,7 @@ class PlotPosteriorCallback(Callback):
             # root stays scannable when the cadence (call_every_n_epochs)
             # produces many figures.
             os.makedirs(
-                os.path.join(ROOT_DIR, "plots", self.timestamp,
+                os.path.join(PLOTS_ROOT_DIR, self.timestamp,
                              "posterior_evolution"),
                 exist_ok=True,
             )
@@ -490,7 +557,7 @@ class PlotPosteriorCallback(Callback):
         if not self._step.should_fire(trainer.global_step):
             return
         os.makedirs(
-            os.path.join(ROOT_DIR, "plots", self.timestamp, "posterior_evolution"),
+            os.path.join(PLOTS_ROOT_DIR, self.timestamp, "posterior_evolution"),
             exist_ok=True,
         )
         # mid-batch the model is in train mode (dropout active) -> eval for the
@@ -617,7 +684,7 @@ class PlotPosteriorCallback(Callback):
                                   f"modes={[round(r, 3) for r in mode_ratios]}, "
                                   f"H={entropy:.4f} nats", flush=True)
                         
-                        out = os.path.join(ROOT_DIR, "plots", self.timestamp,
+                        out = os.path.join(PLOTS_ROOT_DIR, self.timestamp,
                                           "posterior_evolution",
                                           f"posterior_round_{self.round_idx}_{tag_kind}_{tag}_{keys[param_idx]}.pdf")
                         fig.savefig(out, bbox_inches="tight")
@@ -635,7 +702,7 @@ class PlotPosteriorCallback(Callback):
                         fontsize=10,
                     )
 
-                    out = os.path.join(ROOT_DIR, "plots", self.timestamp,
+                    out = os.path.join(PLOTS_ROOT_DIR, self.timestamp,
                                       "posterior_evolution",
                                       f"posterior_round_{self.round_idx}_{tag_kind}_{tag}_{keys[in_param_idx[0]]}_{keys[in_param_idx[1]]}.pdf")
                     param_names = [keys[in_param_idx[0]], keys[in_param_idx[1]]]
@@ -1161,11 +1228,9 @@ def compute_truncation_coverage(
 
     * 1D: equal-tailed ``[eps_1d/2, 1-eps_1d/2]`` interval
       (:func:`~pembhb.regions.region_from_equal_tailed`).
-    * 2D: highest-mass HPD component (:func:`~pembhb.regions.region_from_main_mode`),
-      with each axis's periodicity resolved from its parameter name — so this now
-      works for **any** 2D marginal, not just the sky ``(7,8)`` pair (the old code
-      applied sky main-mode logic to every 2D marginal, the bug its own docstring
-      admitted).
+    * 2D: all components of the HPD level set (:func:`~pembhb.regions.region_from_hpd`),
+      as mask-mode truncation keeps them, with each axis's periodicity resolved
+      from its parameter name.
 
     Membership is the true accepted-mask test, not a bounding-box test: a truth
     that lands in a gap between components (inside the box but outside the mask)
@@ -1197,7 +1262,7 @@ def compute_truncation_coverage(
         n_total = norm2d.shape[0]
         n_inside = 0
         for s in range(n_total):
-            region = region_from_main_mode(
+            region = region_from_hpd(
                 norm2d[s], (gx_1d, gy_1d),
                 credible_level=sky_credible_level, dilation_factor=sky_dilation,
                 periods=periods)
@@ -1416,6 +1481,7 @@ class PPKSTestEarlyStopping(Callback):
         datagen_conf: dict | None = None,
         fisher_varying_params: list | None = None,
         fisher_backend: str = "cpu",
+        fisher_chunk_size: int = 25,
         lt_h5_path: str | None = None,
         lt_warmup_epochs: int | None = None,
     ):
@@ -1477,6 +1543,7 @@ class PPKSTestEarlyStopping(Callback):
         self.datagen_conf = datagen_conf
         self.fisher_varying_params = fisher_varying_params or []
         self.fisher_backend = fisher_backend
+        self.fisher_chunk_size = int(fisher_chunk_size)
         self.lt_h5_path = lt_h5_path
         self._lt_keys = _ORDERED_PRIOR_KEYS  # basis-aware names, set on first eval
         self._lt_truth_full = None        # (n_test, 11) true params, lazy
@@ -1782,12 +1849,13 @@ class PPKSTestEarlyStopping(Callback):
 
         if self.fisher_varying_params and self.datagen_conf is not None:
             print(f"[λτ] computing Fisher σ for {self._lt_truth_full.shape[0]} "
-                  f"test points (backend={self.fisher_backend}) ...", flush=True)
+                  f"test points (backend={self.fisher_backend}, chunk={self.fisher_chunk_size}) ...", flush=True)
             self._lt_fisher_sigmas, self._lt_fisher_order = (
                 compute_fisher_sigmas_for_testset(
                     self.datagen_conf, self._lt_truth_full,
                     self.fisher_varying_params, wave_fd_check=wave0,
                     backend=self.fisher_backend,
+                    chunk_size=self.fisher_chunk_size,
                 )
             )
         else:

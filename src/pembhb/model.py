@@ -1,5 +1,6 @@
 import torch
 import os
+import math
 import time
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -1120,6 +1121,23 @@ class SingleGroupReduceLROnPlateau(torch.optim.lr_scheduler.ReduceLROnPlateau):
             pg["lr"] = new_lr
 
 
+class CosineWarmRestartMult:
+    """LambdaLR multiplier: cosine from 1 to eta_min/lr_max over ``T_0`` epochs,
+    then restart. ``epoch_offset`` makes it a function of the cumulative epoch,
+    so the schedule runs across TMNRE rounds instead of resetting each round."""
+
+    def __init__(self, lr_max, eta_min, T_0, epoch_offset=0):
+        self.lr_max = float(lr_max)
+        self.eta_min = float(eta_min)
+        self.T_0 = int(T_0)
+        self.epoch_offset = int(epoch_offset)
+
+    def __call__(self, epoch):
+        t = ((self.epoch_offset + epoch) % self.T_0) / self.T_0
+        lr = self.eta_min + 0.5 * (self.lr_max - self.eta_min) * (1 + math.cos(math.pi * t))
+        return lr / self.lr_max
+
+
 class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
     """Joint training of an encoder (AE or ME) and NRE classifier heads.
 
@@ -1216,6 +1234,13 @@ class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
         self.ae_weight_decay = ae_weight_decay
         self.ae_warmup_epochs = ae_warmup_epochs
         self.freeze_ae_after_warmup = freeze_ae_after_warmup
+
+        # Cross-round state, set by the driver before fit and persisted in the
+        # checkpoint so --resume continues the schedule.
+        self.epoch_offset = 0          # cumulative epochs before this round
+        self.cum_epoch_end = 0         # cumulative epochs after this round
+        self.carry_in = None           # {param_name: AdamW state} to load
+        self.opt_state_by_name = None  # {param_name: AdamW state} at round end
 
         # Backward-compat: if new dict-style scheduler configs are not
         # provided, derive one from the deprecated scalar args.  Old behaviour
@@ -1441,6 +1466,21 @@ class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
         Used by ``utils.get_logratios_grid`` and posterior evaluation.
         Bottleneck(s) are detached so this is safe inside a training loop.
         """
+        return self.logratios_from_summary(self._encode_detached(d_f), d_t, parameters)
+
+    def encode_summary(self, d_f):
+        """Data summary for a fixed observation; reuse it across a parameter grid."""
+        return self._encode_detached(d_f)
+
+    @staticmethod
+    def expand_summary(summary, n):
+        """Broadcast a batch-1 summary (tensor, or dict for ME) to ``n`` rows."""
+        if isinstance(summary, dict):
+            return {k: v.expand(n, -1) for k, v in summary.items()}
+        return summary.expand(n, -1)
+
+    def logratios_from_summary(self, summary, d_t, parameters):
+        """Classifier heads only, given ``summary`` from :meth:`encode_summary`."""
         normalised_parameters = (parameters - self.param_mean) / self.param_std
         reparametrised_withbc_params = reparametrise_periodic_bc(normalised_parameters, self.periodic_bc_params, self.periodic_bc_k)
         if len(self.periodic_bc_params) > 0:
@@ -1450,7 +1490,7 @@ class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
             )
 
         if self._is_me:
-            bottleneck_dict = self._encode_detached(d_f)
+            bottleneck_dict = summary
             logratios_list = []
             for domain, pos, remapped_marginal, original_marginal in self._marginal_order:
                 bottleneck = torch.cat(
@@ -1460,10 +1500,8 @@ class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
                 input_data = torch.cat([bottleneck, reparametrised_withbc_params[:, remapped_marginal]], dim=-1)
                 logratios_list.append(classifier(input_data))
         else:
-            # when 
-            bottleneck = self._encode_detached(d_f)
-            # non detached if the channelized MLP is being used. 
-            features_dict = {"ft": None, "f": bottleneck, "t": d_t}
+            # non detached if the channelized MLP is being used.
+            features_dict = {"ft": None, "f": summary, "t": d_t}
             logratios_list = []
             for key in self.logratios_model_dict.keys():
                 logratios_list.append(
@@ -1687,6 +1725,74 @@ class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
     # Optimizers (two parameter groups, single optimizer)
     # ------------------------------------------------------------------
 
+    def _build_global_lr_schedule(self, optimizer):
+        """Whole-optimiser LR schedule from ``joint_training.lr_schedule``.
+
+        When its ``type`` is anything but ``plateau`` this REPLACES the two
+        per-group plateau schedulers: ``OneCycleLR`` and the cosine family drive
+        every param group at once, so mixing them with per-group plateau steps
+        would have two things writing the same ``lr``. Each group keeps its own
+        base LR (``lr_ae`` / ``lr_nre``); the schedule scales them together.
+
+        Stepped per OPTIMISER STEP, not per epoch -- these shape the LR over the
+        whole run and need the finer granularity. Returns ``None`` when no global
+        schedule is configured, leaving the existing behaviour untouched.
+        """
+        cfg = ((self.hparams.get("train_conf") or {}).get("joint_training", {})
+               or {}).get("lr_schedule") or {}
+        kind = str(cfg.get("type", "plateau")).lower()
+        if kind in ("", "none", "plateau"):
+            return None
+
+        total = int(getattr(self.trainer, "estimated_stepping_batches", 0) or 0)
+        if total <= 0:
+            raise RuntimeError(
+                f"lr_schedule.type={kind!r} needs the total step count, but "
+                f"trainer.estimated_stepping_batches is {total}.")
+        warm_frac = float(cfg.get("warmup_frac", 0.05))
+        min_lr = float(cfg.get("min_lr", 1e-6))
+        S = torch.optim.lr_scheduler
+
+        if kind == "onecycle":
+            mult = float(cfg.get("max_lr_mult", 10.0))
+            sched = S.OneCycleLR(
+                optimizer,
+                max_lr=[g["lr"] * mult for g in optimizer.param_groups],
+                total_steps=total,
+                pct_start=warm_frac,
+                div_factor=float(cfg.get("div_factor", 25.0)),
+                final_div_factor=float(cfg.get("final_div_factor", 1e4)),
+            )
+        elif kind == "cosine":
+            warm = max(1, int(warm_frac * total))
+            sched = S.SequentialLR(
+                optimizer,
+                schedulers=[
+                    S.LinearLR(optimizer,
+                               start_factor=float(cfg.get("warmup_start_factor", 1e-2)),
+                               total_iters=warm),
+                    S.CosineAnnealingLR(optimizer, T_max=max(1, total - warm),
+                                        eta_min=min_lr),
+                ],
+                milestones=[warm],
+            )
+        elif kind == "warm_restarts":
+            sched = S.CosineAnnealingWarmRestarts(
+                optimizer,
+                T_0=max(1, int(float(cfg.get("t0_frac", 0.25)) * total)),
+                T_mult=int(cfg.get("t_mult", 2)),
+                eta_min=min_lr,
+            )
+        else:
+            raise ValueError(
+                f"joint_training.lr_schedule.type={kind!r} not recognised; "
+                f"expected one of: plateau, onecycle, cosine, warm_restarts.")
+
+        print(f"[lr_schedule] {kind}: {total} total steps, warmup_frac={warm_frac}, "
+              f"base lrs={[g['lr'] for g in optimizer.param_groups]}", flush=True)
+        return {"scheduler": sched, "interval": "step", "frequency": 1,
+                "name": f"lr-{kind}"}
+
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
             [
@@ -1701,6 +1807,34 @@ class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
                 },
             ],
         )
+
+        if self.carry_in:
+            self._load_carried_opt_state(optimizer)
+
+        global_sched = self._build_global_lr_schedule(optimizer)
+        ae_cos = self.ae_scheduler_config.get("type") == "cosine_warm_restarts"
+        if global_sched is not None:
+            if ae_cos:
+                raise ValueError("ae_scheduler.type=cosine_warm_restarts conflicts "
+                                 "with joint_training.lr_schedule")
+            return [optimizer], [global_sched]
+
+        if ae_cos:
+            # LambdaLR rewrites every group's lr each step, so a per-group
+            # plateau on the NRE group would be overwritten.
+            if self.nre_scheduler_config.get("enabled", True):
+                raise ValueError("ae_scheduler.type=cosine_warm_restarts requires "
+                                 "nre_scheduler.enabled: false")
+            cfg = self.ae_scheduler_config
+            mult = CosineWarmRestartMult(self.lr_ae, cfg.get("eta_min", 1e-6),
+                                         cfg.get("T_0", 200), self.epoch_offset)
+            sched = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lr_lambda=[mult, lambda e: 1.0])
+            print(f"[ae_scheduler] cosine_warm_restarts T_0={mult.T_0} "
+                  f"eta_min={mult.eta_min:.1e} epoch_offset={self.epoch_offset} "
+                  f"-> lr_ae={self.lr_ae * mult(0):.3e}", flush=True)
+            return [optimizer], [{"scheduler": sched, "interval": "epoch",
+                                  "frequency": 1, "name": "lr-ae"}]
 
         scheduler_configs = []
         for cfg, group_idx, label in (
@@ -1731,6 +1865,43 @@ class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
         # Multiple schedulers attached to a single optimizer: Lightning expects
         # ([optimizer], [lr_scheduler_config, ...]).
         return [optimizer], scheduler_configs
+
+    # ------------------------------------------------------------------
+    # Cross-round optimizer state / cumulative epoch
+    # ------------------------------------------------------------------
+
+    def _load_carried_opt_state(self, optimizer):
+        n_loaded = 0
+        for name, p in self.named_parameters():
+            st = self.carry_in.get(name)
+            if st is None or st["exp_avg"].shape != p.shape:
+                continue
+            # AdamW keeps `step` on CPU (non-capturable); moments go to p.device.
+            optimizer.state[p] = {
+                k: (v if k == "step" else v.to(device=p.device, dtype=p.dtype))
+                for k, v in st.items()
+            }
+            n_loaded += 1
+        print(f"[opt-carry] loaded AdamW state for {n_loaded} param tensors", flush=True)
+
+    def on_train_end(self):
+        self.cum_epoch_end = int(self.epoch_offset) + int(self.trainer.current_epoch)
+        opt = self.trainer.optimizers[0]
+        names = {id(p): n for n, p in self.named_parameters()}
+        self.opt_state_by_name = {
+            names[id(p)]: {k: (v.detach().cpu().clone() if torch.is_tensor(v) else v)
+                           for k, v in st.items()}
+            for p, st in opt.state.items() if id(p) in names
+        }
+
+    def on_save_checkpoint(self, checkpoint):
+        checkpoint["cum_epoch_end"] = int(self.cum_epoch_end)
+        if self.opt_state_by_name is not None:
+            checkpoint["opt_state_by_name"] = self.opt_state_by_name
+
+    def on_load_checkpoint(self, checkpoint):
+        self.cum_epoch_end = int(checkpoint.get("cum_epoch_end", 0))
+        self.opt_state_by_name = checkpoint.get("opt_state_by_name")
 
     # ------------------------------------------------------------------
     # Helpers (for compatibility with existing utils / callbacks)
@@ -1770,7 +1941,7 @@ class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
         """
         from pembhb.autoencoder import (
             DenoisingAutoencoder, MarginalEncoderTrainer,
-            ChannelizedMLPCompressor,
+            ChannelizedMLPCompressor, ConvCompressor,
         )
         device = map_location or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -1790,7 +1961,19 @@ class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
                 for k, v in state_dict.items()
             }
 
-        if ds_type == "ChannelizedMLP":
+        if ds_type == "ChannelizedMLP" and hp["train_conf"]["architecture"]["data_summary"]["ChannelizedMLP"].get("encoder", "mlp") == "conv":
+            cm_conf = hp["train_conf"]["architecture"]["data_summary"]["ChannelizedMLP"]
+            dummy_encoder = ConvCompressor(
+                n_channels=cm_conf.get("n_channels", 2),
+                n_freqs=state_dict["encoder_model.mean_whitened"].shape[-1],
+                representation=cm_conf.get("representation", "real_imag"),
+                whiten=cm_conf.get("whiten", True),
+                amplitude_normalise=cm_conf.get("amplitude_normalise", True),
+                subtract_mean_whitened=cm_conf.get("subtract_mean_whitened", True),
+                dropout=cm_conf.get("dropout", 0.0),
+                **cm_conf.get("conv", {}),
+            )
+        elif ds_type == "ChannelizedMLP":
             cm_conf = hp["train_conf"]["architecture"]["data_summary"]["ChannelizedMLP"]
             # Infer (n_freqs, hidden, out) per block directly from the state-dict
             # so a config that drifted from the checkpoint can't break loading.
@@ -1942,7 +2125,8 @@ class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
             raise RuntimeError(
                 f"Unexpected state_dict mismatch. missing={missing_real}, "
                 f"unexpected={unexpected_real}"
-            )        
+            )
+        model.on_load_checkpoint(raw)
         model.to(device)
         model.eval()
         return model

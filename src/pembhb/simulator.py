@@ -1,16 +1,13 @@
 import copy
 import os
-import sys
 
 import h5py
 import numpy as np
 import yaml
-from scipy.signal.windows import tukey
 from tqdm import tqdm
 
 from bbhx.waveformbuild import BBHWaveformFD
-from bbhx.utils.constants import MTSUN_SI, PC_SI, YRSID_SI
-from bbhx.utils.transform import LISA_to_SSB
+from bbhx.utils.constants import MTSUN_SI, YRSID_SI
 import lisatools.sensitivity as lisasens
 from lisatools.detector import EqualArmlengthOrbits
 from lisatools.sensitivity import get_sensitivity
@@ -49,315 +46,8 @@ def ajith_transition_frequencies(m1_msun, m2_msun):
         out[name] = (a * eta**2 + b * eta + c) / denom
     return out
 
-class MBHBSimulatorFD_TD:
-
-    def __init__(self, conf, sampler_init_kwargs, seed=0, sampler=None):
-        raise NotImplementedError(
-            "MBHBSimulatorFD_TD is no longer supported. Use MBHBSimulatorFD "
-            "(set waveform_params.domain='fd' in datagen_config.yaml)."
-        )
-        self.rng = np.random.default_rng(seed)
-        self.sampler = sampler if sampler is not None else UniformSampler(**sampler_init_kwargs, rng=self.rng)
-        self.backend_name = conf.get("backend", "cpu")
-
-        self.dt = conf["waveform_params"]["dt"] 
-        self.channels = conf["waveform_params"]["channels"]
-        # maps "AET" to [0,1,2], "TEA" to [2,0,1]: 
-        self.channel_map = {ch: i for i, ch in enumerate(self.channels)}
-        self.channels_idx = [self.channel_map[ch] for ch in self.channels]
-        self.n_channels = len(self.channels)
-        self.modes = conf["waveform_params"]["modes"]
-
-        self.t_max = conf["waveform_params"]["t_max"] * 24 * 3600  # user-provided max merger time (convert to seconds)
-        self.t_obs_start_SI = 0
-        self.t_obs_end_SI = conf["waveform_params"]["duration"] * 7 * 24 * 3600
-        self.n_time = int(self.t_obs_end_SI / self.dt)
-
-        # waveform FD grid (TD_wrapper logic)
-        n_fft = int(2**np.ceil(np.log2(max(self.n_time, self.t_max/self.dt))))
-        self.n_fft = n_fft
-        self.df = 1.0 / (n_fft * self.dt)
-        self.freqs_pos = np.fft.rfftfreq(n_fft, d=self.dt)[1:]    # positive
-        self.n_freqs_pos = len(self.freqs_pos)
-        # noise ASD grid
-        self.asd = self._build_asd(conf)
-        self.filtered_asd = self.asd.copy()
-        self.filtered_asd[:, self.freqs_pos < FMIN_FLOOR] = 0
-
-        self.window = tukey(self.n_time, alpha=0.0005)
-        orbits = EqualArmlengthOrbits(force_backend=self.backend_name)
-        orbits.configure(linear_interp_setup=True)
-
-        resp_kwargs = {
-            "TDItag": "AET",
-            "rescaled": False,
-            "orbits": orbits
-        }
-
-        self.wfd = BBHWaveformFD(
-            amp_phase_kwargs=dict(run_phenomd=False),
-            response_kwargs=resp_kwargs,
-            force_backend=self.backend_name
-        )
-        self.xp = self.wfd.xp
-        self.info = {
-            "backend": self.backend_name,
-            "seed": seed,
-            "conf": conf,
-            "sampler_init_kwargs": sampler_init_kwargs,
-            "dt": self.dt,
-            "channels": list(self.channels),
-            "n_channels": len(self.channels),
-            "n_time_pt_noise":  self.n_time,
-            "df": self.df,
-            "f_len": len(self.freqs_pos)
-        }
-        t0 = self.t_obs_start_SI / YRSID_SI
-        t1 = self.t_obs_end_SI / YRSID_SI
-        # Convert freqs to appropriate backend (important for GPU)
-        freqs_backend = self.xp.asarray(self.freqs_pos)
-        self.waveform_kwargs = {
-            "t_obs_start": t0,
-            "t_obs_end": t1,
-            "freqs": freqs_backend,
-            "modes": self.modes,
-            "direct": False,
-            "fill": True,
-            "compress": True,
-            "squeeze": False,
-            "length": 1024
-        }
-    # -----------------------------------------
-    def _build_asd(self, conf):
-        asd = np.zeros((len(self.channels), len(self.freqs_pos)))
-        psd_kwargs = {"model": conf["waveform_params"]["noise"], "return_type": "ASD"}
-        sens_map = {
-            "A": lisasens.A1TDISens,
-            "E": lisasens.E1TDISens,
-            "T": lisasens.T1TDISens,
-        }
-        for i, ch in enumerate(self.channels):
-            asd[i] = get_sensitivity(self.freqs_pos, sens_fn=sens_map[ch], **psd_kwargs)
-        return asd
-
-    # -----------------------------------------
-    def _noise_pos(self, n_obs):
-        z = (self.rng.normal(size=(n_obs, len(self.channels), len(self.freqs_pos)))
-             + 1j * self.rng.normal(size=(n_obs, len(self.channels), len(self.freqs_pos))))
-        # interpolate ASD onto waveform freq grid
-        return z * (self.filtered_asd/ np.sqrt(4 * self.df))[None, :, :]
-
-    # -----------------------------------------
-    def _two_sided(self, pos):
-        dc = np.zeros(pos.shape[:-1] + (1,), dtype=pos.dtype)
-        pos2 = np.concatenate([dc, pos], axis=2)
-        neg = np.flip(pos2[..., 1:].conj(), axis=2)
-        return np.concatenate([pos2, neg], axis=2)
-
-    # -----------------------------------------
-    def _waveform_fd(self, inj):
-        # Pass NumPy arrays — BBHx internally handles GPU conversion.
-        # Pre-converting to CuPy breaks its isinstance(Tobs, np.ndarray) check.
-        return self.wfd(*inj, **self.waveform_kwargs)
-
-    # -----------------------------------------
-    def generate(self, inj):
-        inj = inj.copy()
-        n_obs = inj.shape[1]
-
-        # insert f_ref=0
-        #inj = np.insert(inj, 6, np.zeros(n_obs), axis=0)
-
-        wave_pos = self._waveform_fd(inj)
-        if hasattr(wave_pos, "get"):
-            wave_pos = wave_pos.get()
-        wave_pos = wave_pos.astype(np.complex64)
-        wave_pos = wave_pos[:, self.channels_idx,:]
-
-        wave_two = self._two_sided(wave_pos)
-        wave_td = np.fft.ifft(wave_two, axis=2).real / self.dt
-        wave_td = wave_td[..., :self.n_time]
-
-        return wave_pos, wave_td
-
-    # -----------------------------------------
-    def sample(self, N):
-        z, inj = self.sampler.sample(N, self.t_obs_end_SI)
-
-        wave_fd, wave_td = self.generate(z)
-        return {
-            "parameters": inj,
-            "bbhx_parameters": z,
-            "wave_fd": wave_fd,
-            "wave_td": wave_td
-        }
-
-    def sample_and_store(self, filename:str, N:int, batch_size=None,
-                         store_noise: bool = False, noise_seed: int = 0):
-        """Sample N samples and store them in an HDF5 file.
-
-        :param filename: name of the file to store the samples
-        :type filename: str
-        :param N: number of samples to generate
-        :type N: int
-        :param batch_size: number of samples to generate in each batch, defaults to 1000
-        :type batch_size: int, optional
-        :param store_noise: if True, also draw and persist a fixed noise
-            realisation per sample under the ``noise_fd`` HDF5 dataset.  The
-            draw uses an independent RNG seeded by ``noise_seed`` so signal
-            and noise sampling are decoupled.
-        :param noise_seed: seed for the noise RNG when ``store_noise=True``.
-        :return: None
-        """
-        if batch_size is None:
-            batch_size = max(1,int(N/10.0))
-
-        noise_rng = np.random.default_rng(noise_seed) if store_noise else None
-        # Use the same colouring formula as _noise_pos / mbhb_collate_fn so
-        # stored noise is statistically identical to on-the-fly noise.
-        noise_scale_np = self.filtered_asd / np.sqrt(4 * self.df)
-
-        with h5py.File(filename, "a") as f:
-            _np_real = get_numpy_dtype()
-            _np_complex = get_numpy_complex_dtype()
-            source_params = f.create_dataset("source_parameters", shape=(N, 11), dtype=_np_real)
-            bbhx_params = f.create_dataset("bbhx_parameters", shape=(N, 12), dtype=_np_real)
-            sample_frequencies = f.create_dataset("frequencies", data=self.freqs_pos, dtype=_np_real)
-            sample_times_SI = f.create_dataset("times_SI", data=np.arange(0, self.n_time)*self.dt, dtype=_np_real)
-            wave_fd = f.create_dataset("wave_fd", shape=(N, self.n_channels, self.n_freqs_pos), dtype=_np_complex)
-            wave_td = f.create_dataset("wave_td", shape=(N, self.n_channels, self.n_time), dtype=_np_real)
-            snr = f.create_dataset("snr", shape = (N,), dtype=_np_real)
-            asd_dataset = f.create_dataset("asd", data=self.asd, dtype=_np_real)
-            if store_noise:
-                noise_fd_ds = f.create_dataset(
-                    "noise_fd",
-                    shape=(N, self.n_channels, self.n_freqs_pos),
-                    dtype=_np_complex,
-                )
-                f.attrs["noise_seed"] = int(noise_seed)
-            print("Sampling and storing simulations to ", filename)
-            maximum_timedomain = 0
-
-            for i in tqdm(range(0, N, batch_size)):
-                batch_end = min(i + batch_size, N)
-                batch_size_actual = batch_end - i
-                out = self.sample(batch_size_actual)
-                z_samples = out["parameters"]
-                wave_fd_batch = out["wave_fd"]
-                wave_td_batch = out["wave_td"]
-                bbhx_params_batch = out["bbhx_parameters"].T
-                current_max_td = np.max( np.abs(wave_td_batch) )
-                #for normalisation purpose and easy access during training, store the maximum value across the time domain data
-                if current_max_td > maximum_timedomain:
-                    maximum_timedomain = current_max_td
-                # SNR is matched-filter (waveform-only) rather than noisy-data SNR
-                snr_batch = self.get_SNR_FD(wave_fd_batch)
-                source_params[i:batch_end] = z_samples.T # Reshape to (batch_size, 11) instead of (11, batch_size)
-                wave_fd[i:batch_end] = wave_fd_batch
-                wave_td[i:batch_end] = wave_td_batch
-                bbhx_params[i:batch_end] = bbhx_params_batch
-                snr[i:batch_end] = snr_batch
-                if store_noise:
-                    z = (noise_rng.normal(size=(batch_size_actual, self.n_channels, self.n_freqs_pos))
-                         + 1j * noise_rng.normal(size=(batch_size_actual, self.n_channels, self.n_freqs_pos)))
-                    noise_fd_ds[i:batch_end] = (z * noise_scale_np[None, :, :]).astype(_np_complex)
-        # print all shapes
-            print("HDF5 dataset shapes (current state):")
-            for dname in ["source_parameters", "frequencies", "times_SI",
-                        "wave_fd", "wave_td", "noise_fd", "snr", "asd"]:
-                if dname in f:
-                    ds = f[dname]
-                    print(f"  {dname}: shape={tuple(ds.shape)}, dtype={ds.dtype}")
-                else:
-                    print(f"  {dname}: MISSING")
-        self.info["td_max"] = maximum_timedomain
-        self.save_info_yaml( filename=filename, overwrite=True )
-
-    def save_info_yaml(self, filename: str = None, overwrite: bool = False, indent: int = 2):
-        """
-        Save self.info['conf'] and self.info['sampler_init_kwargs'] as a YAML file.
-        If filename is None a timestamped file in ROOT_DIR will be created.
-
-        :param filename: target h5 path (used to derive .yaml). If no extension provided it's used directly.
-        :param overwrite: allow overwriting existing file
-        :param indent: yaml indent level
-        :return: path to written yaml file
-        """
-        if filename is None:
-            yamlpath = os.path.join(ROOT_DIR, f"simulator_info_{int(time.time())}.yaml")
-        else:
-            # derive yaml path from provided filename (strip .h5 if present)
-            yamlpath = filename.removesuffix(".h5")
-            if not yamlpath.lower().endswith(".yaml"):
-                yamlpath = yamlpath + ".yaml"
-
-        if os.path.exists(yamlpath) and not overwrite:
-            raise FileExistsError(f"File '{yamlpath}' already exists. Pass overwrite=True to replace it.")
-
-        def _convert(obj):
-            # handle common numpy types and containers
-            if isinstance(obj, np.ndarray):
-                return obj.tolist()
-            if isinstance(obj, (np.integer, np.floating, np.bool_)):
-                return obj.item()
-            if isinstance(obj, complex):
-                return {"real": obj.real, "imag": obj.imag}
-            if isinstance(obj, dict):
-                return {k: _convert(v) for k, v in obj.items()}
-            if isinstance(obj, (list, tuple)):
-                return [_convert(v) for v in obj]
-            # fallback to string for unsupported objects
-            return obj if isinstance(obj, (str, int, float, bool, type(None))) else str(obj)
-
-        # Reconcile: ensure conf["prior"] always reflects the actual
-        # sampling bounds used to generate the data.  The authoritative
-        # source is sampler_init_kwargs["prior_bounds"].
-        sik = self.info.get("sampler_init_kwargs", {})
-        if "prior_bounds" in sik:
-            conf_copy = copy.deepcopy(self.info.get("conf", {}))
-            conf_copy["prior"] = copy.deepcopy(sik["prior_bounds"])
-        else:
-            conf_copy = self.info.get("conf", {})
-
-        # Extract the two fields requested and convert
-        payload = {
-            "conf": _convert(conf_copy),
-            "sampler_init_kwargs": _convert(sik),
-            "td_max": _convert(self.info.get("td_max", None))
-        }
-
-        # Write YAML
-        with open(yamlpath, "w") as fh:
-            yaml.safe_dump(payload, fh, sort_keys=False, default_flow_style=False, indent=indent)
-
-        return yamlpath
-            
-    def get_SNR_FD(self,
-        signal
-        ):
-        """
-        Obtain the SNR of a signal in frequency domain.
-
-        :param signal: data in frequency domain, output by bbhx with shape (n_samples, n_channels, n_freqs)
-        :type signal: np.array
-        :return: SNR values with shape (n_samples,)
-        :rtype: np.array
-        """
-        
-        high_pass_idx =  (self.freqs_pos >= FMIN_FLOOR)
-        data_over_asd = signal[..., high_pass_idx] / self.asd[..., high_pass_idx]
-        data_over_asd_conj = data_over_asd.conj()
-        prod = data_over_asd * data_over_asd_conj
-        weighted = prod * self.df 
-        summed = np.sum(weighted, axis=(1, 2))
-        real_part = summed.real
-        SNR2 = real_part * 4.0
-        
-        return np.sqrt(SNR2)
-
 # =========================================================================
-# Shared helper functions (used by MBHBSimulatorFD; MBHBSimulatorFD_TD
-# keeps its own inline implementations untouched)
+# Shared helper functions
 # =========================================================================
 
 _SENS_MAP = {
@@ -437,14 +127,14 @@ def setup_bbhx(backend):
 class MBHBSimulatorFD:
     """Frequency-domain-only MBHB simulator with linear or log frequency grids.
 
-    Unlike MBHBSimulatorFD_TD this class never computes an IFFT and supports
-    non-uniform (e.g. logarithmic) frequency spacing.
+    Supports uniform (linear) or logarithmic frequency spacing; no IFFT is
+    ever computed.
     """
 
     def __init__(self, conf, sampler_init_kwargs, seed=0,
                  n_freq_bins=4096, freq_spacing="linear", sampler=None):
         """
-        :param conf: datagen config dict (same format as MBHBSimulatorFD_TD)
+        :param conf: datagen config dict (see configs/datagen_config.yaml)
         :param sampler_init_kwargs: dict with 'prior_bounds' key
         :param seed: RNG seed
         :param n_freq_bins: number of frequency bins (default 4096)
@@ -461,7 +151,6 @@ class MBHBSimulatorFD:
         self.n_channels = len(self.channels)
         self.modes = conf["waveform_params"]["modes"]
 
-        dt = conf["waveform_params"]["dt"]
         self.t_obs_start_SI = 0
         self.t_obs_end_SI = conf["waveform_params"]["duration"] * WEEK_SI
         self.obs_length = self.t_obs_end_SI - self.t_obs_start_SI
@@ -471,7 +160,7 @@ class MBHBSimulatorFD:
         # 1/T_obs; whichever is *larger* wins, so the grid never extends below
         # max(requested_fmin, 1/T_obs) and there are no PSD-masked dead bins
         # to worry about downstream.
-        self.fmax = conf["waveform_params"].get("fmax", 1.0 / (2.0 * dt))
+        self.fmax = conf["waveform_params"]["fmax"]
         if self.fmax > REF_FMAX:
             raise ValueError(
                 f"fmax={self.fmax:g} exceeds the PSD-veto reference grid "
@@ -486,6 +175,11 @@ class MBHBSimulatorFD:
             # the user thin the grid when df would otherwise produce too many
             # bins. n_freq_bins becomes a consequence of the grid, not an input.
             downsamplefactor = conf["waveform_params"].get("downsamplefactor", 1)
+            if downsamplefactor != 1:
+                raise NotImplementedError(
+                    f"downsamplefactor={downsamplefactor}: only 1 is supported "
+                    "(coarser grids mis-scale the noise by sqrt(downsamplefactor))."
+                )
             df = 1.0 / self.obs_length
             step = downsamplefactor * df
             self.freqs = np.arange(self.fmin, self.fmax, step)
@@ -564,13 +258,19 @@ class MBHBSimulatorFD:
         
 
     # -----------------------------------------
-    def generate(self, inj, keep_on_gpu=False):
+    def generate(self, inj, keep_on_gpu=False, host_out=None):
         """Generate FD waveform for a batch of injections.
 
         :param inj: injection parameters, shape (n_params, n_obs)
         :param keep_on_gpu: if True, skip the device->host copy and return a
             torch CUDA tensor (zero-copy from the cupy result via dlpack).
             Requires a CUDA backend. Used by the streaming producer.
+        :param host_out: optional pinned host array of shape
+            ``(>= n_obs, n_channels, n_freq_bins)`` in the complex dtype. On a CUDA
+            backend the cast and channel slice run on the GPU and the result is
+            copied straight into ``host_out[:n_obs]``, which is returned (a view,
+            overwritten by the next call). Avoids pageable host allocations,
+            which dominate generation time when host memory is under pressure.
         :return: wave_fd — shape (n_obs, n_channels, n_freq_bins); numpy array
             (``keep_on_gpu=False``) or torch CUDA tensor (``keep_on_gpu=True``).
         """
@@ -578,6 +278,12 @@ class MBHBSimulatorFD:
         n_obs = inj.shape[1]
 
         wave = self.wfd(*inj, **self.waveform_kwargs)
+
+        if host_out is not None and hasattr(wave, "get"):
+            dev = wave[:, self.channels_idx, :].astype(get_numpy_complex_dtype())
+            out = host_out[:n_obs]
+            dev.get(out=out)
+            return out
 
         if keep_on_gpu:
             if not hasattr(wave, "get"):
@@ -599,16 +305,17 @@ class MBHBSimulatorFD:
         return wave
 
     # -----------------------------------------
-    def sample(self, N, keep_on_gpu=False):
+    def sample(self, N, keep_on_gpu=False, host_out=None):
         """Draw N samples from the prior and simulate FD data.
 
         :param N: number of samples
         :param keep_on_gpu: forwarded to :meth:`generate`; when True the
             returned ``wave_fd`` is a torch CUDA tensor.
+        :param host_out: forwarded to :meth:`generate` (pinned output buffer).
         :return: dict with keys 'parameters', 'bbhx_parameters', 'wave_fd'
         """
         z, inj = self.sampler.sample(N, self.t_obs_end_SI)
-        wave_fd = self.generate(z, keep_on_gpu=keep_on_gpu)
+        wave_fd = self.generate(z, keep_on_gpu=keep_on_gpu, host_out=host_out)
         return {
             "parameters": inj,
             "bbhx_parameters": z,
@@ -715,7 +422,7 @@ class MBHBSimulatorFD:
 
     # -----------------------------------------
     def save_info_yaml(self, filename: str = None, overwrite: bool = False, indent: int = 2):
-        """Save simulation metadata as YAML (same format as MBHBSimulatorFD_TD)."""
+        """Save simulation metadata as a YAML sidecar next to ``filename``."""
         if filename is None:
             yamlpath = os.path.join(ROOT_DIR, f"simulator_info_{int(os.times()[4])}.yaml")
         else:
@@ -828,15 +535,3 @@ class DummySimulator:
                 data_fd_batch = out["data_fd"]
                 source_params[i:batch_end] = z_samples
                 data_fd[i:batch_end] = data_fd_batch
-
-
-
-
-if __name__ == "__main__":
-    from pembhb.utils import read_config
-    datagen_config_filename = "datagen_config.yaml"
-    datagen_config = read_config(os.path.join(ROOT_DIR, datagen_config_filename))
-    sampler_init_kwargs={"prior_bounds": datagen_config["prior"]}
-
-    simulator = MBHBSimulatorFD_TD(conf=datagen_config, sampler_init_kwargs=sampler_init_kwargs, seed=42)
-    simulator.sample_and_store(filename=os.path.join(ROOT_DIR, "data", "pippo-pertica-palla.h5"), N=1000, batch_size=100)

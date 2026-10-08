@@ -2,7 +2,7 @@ import yaml
 import copy
 import torch
 import os 
-from pembhb import ROOT_DIR, get_torch_dtype, FMIN_FLOOR
+from pembhb import ROOT_DIR, get_torch_dtype, FMIN_FLOOR, PLOTS_ROOT_DIR
 import numpy as np
 # from pembhb.data import MBHBDataset, mbhb_collate_fn
 from glob import glob
@@ -207,6 +207,10 @@ def get_logratios_grid(dataloader: torch.utils.data.DataLoader, model: 'Inferenc
             for obs_idx in range(batch_size):
                 single_fd = data_fd[obs_idx:obs_idx + 1]  # [1, C, F]
                 single_td = data_td[obs_idx:obs_idx + 1] if has_td else None
+                # The observation is fixed across the grid: encode it once and
+                # sweep only the classifier heads (if the model supports it).
+                summary = (model.encode_summary(single_fd)
+                           if hasattr(model, "logratios_from_summary") else None)
 
                 logratios_chunks = []
                 for start in range(0, ngrid_points, grid_chunk_size):
@@ -215,7 +219,12 @@ def get_logratios_grid(dataloader: torch.utils.data.DataLoader, model: 'Inferenc
                     chunk_size = end - start
                     chunk_fd = single_fd.expand(chunk_size, -1, -1)
                     chunk_td = single_td.expand(chunk_size, -1, -1) if has_td else None
-                    logits = model(chunk_fd, chunk_td, chunk_grid)[:, out_param_idx]
+                    if summary is not None:
+                        logits = model.logratios_from_summary(
+                            model.expand_summary(summary, chunk_size), chunk_td, chunk_grid,
+                        )[:, out_param_idx]
+                    else:
+                        logits = model(chunk_fd, chunk_td, chunk_grid)[:, out_param_idx]
                     logratios_chunks.append(logits.detach().cpu())
 
                 obs_logratios = torch.cat(logratios_chunks, dim=0)  # [ngrid_points]
@@ -309,6 +318,10 @@ def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'Infer
             for obs_idx in range(batch_size):
                 single_fd = data_fd[obs_idx:obs_idx + 1]   # [1, C, F]
                 single_td = data_td[obs_idx:obs_idx + 1] if has_td else None
+                # The observation is fixed across the grid: encode it once and
+                # sweep only the classifier heads (if the model supports it).
+                summary = (model.encode_summary(single_fd)
+                           if hasattr(model, "logratios_from_summary") else None)
 
                 logratios_chunks = []
                 for start in range(0, n_total, grid_chunk_size):
@@ -318,7 +331,12 @@ def get_logratios_grid_2d(dataloader: torch.utils.data.DataLoader, model: 'Infer
                     # expand is a view — no memory allocation until forward pass
                     chunk_fd = single_fd.expand(chunk_size, -1, -1)
                     chunk_td = single_td.expand(chunk_size, -1, -1) if has_td else None
-                    logits = model(chunk_fd, chunk_td, chunk_grid)[:, out_param_idx]
+                    if summary is not None:
+                        logits = model.logratios_from_summary(
+                            model.expand_summary(summary, chunk_size), chunk_td, chunk_grid,
+                        )[:, out_param_idx]
+                    else:
+                        logits = model(chunk_fd, chunk_td, chunk_grid)[:, out_param_idx]
                     logratios_chunks.append(logits.detach().cpu())
 
                 obs_logratios = torch.cat(logratios_chunks, dim=0)  # [n_total]
@@ -561,7 +579,7 @@ def pp_plot( dataloader, model , in_param_idx: int, name: str, out_param_idx: in
     :type inj_param_idx: int
     :param name: name of the plot, defaults to None
     :type name: str, optional
-    :param output_dir: directory to save the plot to. Defaults to ROOT_DIR/plots.
+    :param output_dir: directory to save the plot to. Defaults to PLOTS_ROOT_DIR.
     :type output_dir: str, optional
     :param device: device to run inference on. Defaults to CUDA if available.
     :type device: torch.device, optional
@@ -580,7 +598,7 @@ def pp_plot( dataloader, model , in_param_idx: int, name: str, out_param_idx: in
     ax.grid(visible=True)
     if name is not None:
         if output_dir is None:
-            output_dir = os.path.join(ROOT_DIR, "plots")
+            output_dir = PLOTS_ROOT_DIR
         os.makedirs(output_dir, exist_ok=True)
         fig.savefig(os.path.join(output_dir, f"{name}_pp_plot.png"))
     plt.close()
@@ -627,7 +645,7 @@ def pp_plot_2d(dataloader, model,  in_param_idx: tuple, out_idx: int, name: str,
     ax.grid(visible=True)
     if name is not None:
         if output_dir is None:
-            output_dir = os.path.join(ROOT_DIR, "plots")
+            output_dir = PLOTS_ROOT_DIR
         os.makedirs(output_dir, exist_ok=True)
         fig.savefig(os.path.join(output_dir, f"{name}_pp_plot_2d.png"))
     plt.close()
@@ -2299,6 +2317,7 @@ def transfer_classifier_weights(old_model, new_model, skip_keys=None):
     if reinit:
         print(f"[transfer] Reinitialised (below volume-ratio threshold) classifiers for {reinit}")
     print(f"[transfer] Freshly initialised (new marginal) classifiers for {brand_new}")
+    return transferred
 
 
 def resolve_marginals_for_round(train_conf: dict, round_idx: int) -> dict:
@@ -2319,6 +2338,40 @@ def resolve_marginals_for_round(train_conf: dict, round_idx: int) -> dict:
         if round_idx >= entry["from_round"]:
             active = entry["marginals"]
     return active
+
+
+def marginal_names_to_indices(marginals_config: dict, spin_param_basis: str) -> dict:
+    """Map ``{domain: [[name, ...], ...]}`` to parameter indices.
+
+    Names are those of ``ordered_prior_keys(spin_param_basis)``. A name may
+    appear in only one marginal.
+    """
+    keys = ordered_prior_keys(spin_param_basis)
+    seen = {}
+    out = {}
+    for domain, marginal_list in marginals_config.items():
+        resolved = []
+        for marginal in marginal_list:
+            idx = []
+            for name in marginal:
+                if not isinstance(name, str):
+                    raise TypeError(f"marginals must be given by parameter name, got {name!r}; valid names: {keys}")
+                if name not in keys:
+                    raise ValueError(f"unknown parameter {name!r} in marginals; valid names: {keys}")
+                if name in seen:
+                    raise ValueError(f"parameter {name!r} appears in two marginals: {seen[name]} and {list(marginal)}")
+                seen[name] = list(marginal)
+                idx.append(keys.index(name))
+            resolved.append(idx)
+        out[domain] = resolved
+    return out
+
+
+def resolve_marginal_names(train_conf: dict, spin_param_basis: str) -> None:
+    """In place: convert ``marginals`` and every ``marginal_schedule`` entry to indices."""
+    train_conf["marginals"] = marginal_names_to_indices(train_conf["marginals"], spin_param_basis)
+    for entry in train_conf.get("marginal_schedule") or []:
+        entry["marginals"] = marginal_names_to_indices(entry["marginals"], spin_param_basis)
 
 
 def validate_marginals(marginals_config: dict):

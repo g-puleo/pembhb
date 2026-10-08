@@ -17,12 +17,17 @@ import pytest
 import torch
 
 import pembhb
-pembhb.set_precision("float64")
 from pembhb.streaming import RingBuffer  # noqa: E402
 from pembhb.streaming_disk import (  # noqa: E402
     DiskProducer, DiskRingBuffer, DiskStreamingDataModule)
 
 C, F, P = 3, 8, 5
+
+
+@pytest.fixture(autouse=True)
+def _float64():
+    pembhb.set_precision("float64")
+    yield
 
 
 class FakeSim:
@@ -36,7 +41,7 @@ class FakeSim:
         self._k = 0     # bumped per call -> distinguishable wave fills (overwrite test)
         self._row = 0   # running global row id -> every row unique (distinct test)
 
-    def sample(self, n, keep_on_gpu=False):
+    def sample(self, n, keep_on_gpu=False, host_out=None):
         self._k += 1
         # parameters shape (n_params, n); params[p, i] = globally-unique row id.
         ids = np.arange(self._row, self._row + n, dtype=float)

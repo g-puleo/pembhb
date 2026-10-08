@@ -208,3 +208,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# pembhb outputs (defaults of PEMBHB_DATA_DIR / PEMBHB_PLOTS_DIR)
+/data/
+/plots/
+test/output/
+*.h5
+*.ckpt
+*.bak_*
+.lr_find_*
+# bbhx / lisaanalysistools are installed from pip (see INSTALL.md)
+/BBHx/
+/LISAanalysistools/
+/src/RoMAE/
+.gitmodules

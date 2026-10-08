@@ -35,7 +35,6 @@ class MBHBDataset(Dataset):
                 self.asd = torch.tensor(asd_np, device="cpu", dtype=get_torch_dtype())
                 # Pre-compute noise_scale = ASD / sqrt(4 * df) for on-the-fly noise
                 # generation.
-                T_obs_total = f.attrs["observation_duration_SI"]
                 psd_fmin_mask = float(f.attrs.get("psd_fmin_mask", 0.0))
                 if psd_fmin_mask > 0:
                     freqs_np = f["frequencies"][()]
@@ -43,8 +42,9 @@ class MBHBDataset(Dataset):
                     asd_for_noise[:, freqs_np < psd_fmin_mask] = 0.0
                 else:
                     asd_for_noise = asd_np
+                # per-bin df: non-uniform on log / veto-gapped grids
                 self.noise_scale = torch.tensor(
-                    asd_for_noise / np.sqrt(4.0 / T_obs_total), dtype=get_torch_dtype()
+                    asd_for_noise / np.sqrt(4.0 * f["df"][()]), dtype=get_torch_dtype()
                 )
             else:
                 raise ValueError("Dataset file must contain 'asd', but doesn't.")

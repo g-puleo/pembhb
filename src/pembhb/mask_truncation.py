@@ -848,6 +848,7 @@ class MaskRejectSampler:
         # samples uniformly in distance, a linear interval draw is the match.
         self.dist_uniform_in_volume = dist_uniform_in_volume
         self.round_idx = round_idx
+        self._warned_dist_2d = False
         self._tag = ("[MaskRejectSampler]" if round_idx is None
                      else f"[MaskRejectSampler r{round_idx}]")
 
@@ -863,7 +864,15 @@ class MaskRejectSampler:
         # 3) 2D pairs -> per-component draw + mask reject
         for m in self.masks_2d:
             i, j = m["idx"]
-            assert i!=4 and j!=4 #distance not supported
+            # A 2D pair draws BOTH axes uniformly over the mask, so a volumetric
+            # axis inside a pair loses its p(d) ~ d^2 prior: the base sampler's
+            # volumetric draw for dist is overwritten below. That is deliberate
+            # here (dist is wanted uniform in d), but it is silent, so say it.
+            if _DIST_IDX in (i, j) and self.dist_uniform_in_volume and not self._warned_dist_2d:
+                self._warned_dist_2d = True
+                print(f"{self._tag} NOTE: dist is in the 2D pair {m['idx']}, so it is "
+                      f"sampled UNIFORM IN d over the mask, not uniform in volume — "
+                      f"prior_dist_volumetric no longer applies to it.", flush=True)
             region = region_of_pair(m)
             x, y = region.draw(n, self.rng)
             tmnre[i], tmnre[j] = x, y

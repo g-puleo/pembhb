@@ -837,17 +837,27 @@ def mode_bounds(component, pad_to_cell_edges=True):
     return out[0] if component.ndim == 1 else out
 
 
+def _as_multiregion(region):
+    """``MultiRegion`` for either input type; a ``MultiRegion`` passes through."""
+    return region if isinstance(region, MultiRegion) else MultiRegion.from_region(region)
+
+
 def refine_region(region, evaluate, ngrid, prev=None, policy="hard",
-                  hysteresis_weight=0.1, credible=0.999, dilation=1.0,
-                  periods=None, clip=True):
+                  credible=0.999, dilation=1.0, periods=None, clip=True):
     """Re-derive ``region`` on one subgrid per mode (§2.2/§2.4).
 
-    ``region`` is the coarse pass's accepted set: it fixes the **topology** —
-    how many modes there are and roughly where — and nothing else.  Each of its
-    connected components is then re-evaluated on its own grid of ``ngrid``
-    points per axis spanning exactly that mode's support (no padding beyond the
-    cell edges), which is where the resolution is won: a mode covering three
-    pixels of the full-box grid gets ``ngrid`` of its own.
+    ``region`` fixes the **topology** — how many modes there are and roughly
+    where — and nothing else.  Each of its connected components is re-evaluated
+    on its own grid of ``ngrid`` points per axis spanning exactly that mode's
+    support (no padding beyond the cell edges), which is where the resolution is
+    won: a mode covering three pixels of the grid it came from gets ``ngrid`` of
+    its own.
+
+    ``region`` may be a :class:`Region` (the coarse pass's output) **or** a
+    :class:`MultiRegion` — feeding this function's own output back in is the
+    recursive step, and the windows tighten by construction because each
+    component then lives on its part's already-fine grid.  See
+    :func:`find_modes`.
 
     ``evaluate(bounds, ngrid) -> (density, grids)`` returns a **raw,
     unnormalised** density on a fresh grid spanning ``bounds``.  Raw matters:
@@ -879,22 +889,21 @@ def refine_region(region, evaluate, ngrid, prev=None, policy="hard",
         keep = comp.contains_grid(grids)
         if prev is not None and policy != "off":
             keep = keep & prev_keep_mask(prev, grids)
-        alpha = float(hysteresis_weight) if policy == "hysteresis" else 0.0
-        density = density * np.where(keep, 1.0, alpha)
+        density = density * keep
 
         dv = float(np.prod([abs(_axis_cell_size(g)) for g in grids]))
         evaluated.append({"grids": grids, "density": density,
                           "cell_volume": dv, "keep": keep})
 
     if not evaluated:
-        return MultiRegion.from_region(region), []
+        return _as_multiregion(region), []
 
     threshold = _hpd_threshold([e["density"] for e in evaluated],
                                credible_level=credible,
                                cell_volumes=[e["cell_volume"] for e in evaluated])
     if not np.isfinite(threshold):
         # the pooled density carries no mass — nothing to refine against
-        return MultiRegion.from_region(region), evaluated
+        return _as_multiregion(region), evaluated
 
     parts, modes = [], []
     for e in evaluated:
@@ -911,5 +920,34 @@ def refine_region(region, evaluate, ngrid, prev=None, policy="hard",
             parts.append(part)
 
     if not parts:
-        return MultiRegion.from_region(region), modes
+        return _as_multiregion(region), modes
     return MultiRegion(parts), modes
+
+
+def find_modes(region, evaluate, ngrid, max_depth=4, tol=1e-3, **kw):
+    """Recursive mode finding: apply :func:`refine_region` to its own output.
+
+    The same algorithm at every level — a mode is re-evaluated on its own
+    support, and if what comes back is still one connected component it is a
+    true mode; if it breaks into several, each becomes a mode in its own right
+    and is examined the same way.  Modes therefore form a tree, and because each
+    level's window is that mode's own support the resolution compounds instead of
+    being reset to a grid spanning the whole box.
+
+    Stops at the fixed point — when a pass changes neither the number of modes
+    nor the accepted volume by more than ``tol`` (relative).  Splitting alone is
+    **not** the right stopping rule: a pass that merely tightens the windows can
+    be what makes the next pass able to resolve a split at all, so the recursion
+    has to keep going while the region is still moving.  ``max_depth`` caps the
+    work.  Returns ``(multiregion, modes)`` exactly as :func:`refine_region`.
+    """
+    region = _as_multiregion(region)
+    modes = []
+    n_prev, v_prev = len(region.components()), region.volume()
+    for _ in range(max(1, int(max_depth))):
+        region, modes = refine_region(region, evaluate, ngrid, **kw)
+        n, v = len(region.components()), region.volume()
+        if n == n_prev and abs(v - v_prev) <= tol * max(v_prev, 1e-300):
+            break
+        n_prev, v_prev = n, v
+    return region, modes
