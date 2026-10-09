@@ -151,8 +151,8 @@ class MBHBSimulatorFD:
         self.n_channels = len(self.channels)
         self.modes = conf["waveform_params"]["modes"]
 
-        self.t_obs_start_SI = 0
-        self.t_obs_end_SI = conf["waveform_params"]["duration"] * WEEK_SI
+        self.t_obs_start_SI = conf["waveform_params"].get("t_obs_start", 0.0) * DAY_SI
+        self.t_obs_end_SI = self.t_obs_start_SI + conf["waveform_params"]["duration"] * WEEK_SI
         self.obs_length = self.t_obs_end_SI - self.t_obs_start_SI
 
         # Frequency grid — free from FFT constraints. The requested fmin
@@ -380,6 +380,7 @@ class MBHBSimulatorFD:
             f.attrs["fmax"] = self.fmax
             f.attrs["psd_fmin_mask"] = self.psd_fmin_mask if self.psd_fmin_mask is not None else 0.0
             f.attrs["observation_duration_SI"] = self.obs_length
+            f.attrs["observation_start_SI"] = self.t_obs_start_SI
             # Record the spin sampling basis so the meaning of source_parameters
             # slots 2,3 is self-describing (chi1/chi2 vs chi_eff/chi_diff).
             # MaskRejectSampler wraps the real sampler in .base_sampler.

@@ -1,0 +1,105 @@
+--- a/bbhx/waveformbuild.py	2026-10-08 16:42:40.326194604 +0200
++++ b/bbhx/waveformbuild.py	2026-10-08 16:43:30.226324970 +0200
+@@ -526,6 +526,7 @@
+             freqs=freqs_temp,
+             out_buffer=out_buffer,
+             modes=modes,
++            t_start=t_start,
+             Tobs=Tobs,
+             direct=direct,
+         )
+--- a/bbhx/waveforms/phenomhm.py	2026-10-08 16:42:40.331194517 +0200
++++ b/bbhx/waveforms/phenomhm.py	2026-10-08 16:45:24.855327274 +0200
+@@ -506,7 +506,19 @@
+             self.xp.asarray(t_ref)[:, None, None], (1, self.num_modes, self.length)
+         ).flatten()
+ 
+-    def __call__(self, *args, Tobs=None, direct=False, **kwargs):
++    def _per_mode(self, x, name):
++        """Broadcast a scalar / (num_bin_all,) / (num_bin_all, num_modes) time to per-mode shape."""
++        if isinstance(x, float):
++            return self.xp.full((self.num_bin_all, self.num_modes), x)
++        if isinstance(x, np.ndarray) and x.ndim == 1:
++            assert x.shape[0] == self.num_bin_all
++            return self.xp.repeat(self.xp.asarray(x)[:, None], self.num_modes, axis=-1)
++        if isinstance(x, np.ndarray) and x.ndim == 2:
++            assert x.shape == (self.num_bin_all, self.num_modes)
++            return self.xp.asarray(x)
++        raise ValueError(f"{name} entered incorrectly.")
++
++    def __call__(self, *args, t_start=0.0, Tobs=None, direct=False, **kwargs):
+ 
+         self.run_wave(*args, **kwargs)
+ 
+@@ -514,15 +526,19 @@
+         if not direct:
+             # TODO: must check if this is accurate enough!!!!!!!
+ 
+-            # PURPOSE: NEED TO REMOVE FREQUENCIES WHERE ORBIT INFO DOES NOT EXIST
+-            # get start of available information
++            # Trim the sparse grid to frequencies emitted inside the observation
++            # window t_start < t(f) < t_start + Tobs (Tobs is the duration).
++            # Clamp at 0: the SSB-frame start can be slightly negative, where
++            # no orbit information exists.
++            t_start = self.xp.maximum(self._per_mode(t_start, "t_start"), 0.0)
+ 
+-            fix = self.tf.min(axis=-1) < 0.0
++            fix = self.tf.min(axis=-1) < t_start
+             f_min = self.freqs_shaped.min(axis=-1)
+ 
+             if self.xp.any(fix):
+                 windows_of_interest = self.xp.argwhere(
+-                    (0.0 < self.tf[fix, 1:]) & (0.0 > self.tf[fix, :-1])
++                    (t_start[fix][:, None] < self.tf[fix, 1:])
++                    & (t_start[fix][:, None] > self.tf[fix, :-1])
+                 )
+ 
+                 if windows_of_interest.shape[0] != fix.sum():
+@@ -549,32 +565,23 @@
+                 m = (y2 - y1) / (x2 - x1)
+                 b = y1
+ 
+-                f_min_new = m * (0.0 - x1) + b
++                f_min_new = m * (t_start[fix] - x1) + b
+                 f_min[fix] = f_min_new
+ 
+             if Tobs is None:
+                 # will default to tf bound
+                 Tobs = self.xp.full((self.num_bin_all, self.num_modes), 1e300)
+-            elif isinstance(Tobs, float):
+-                Tobs = self.xp.full((self.num_bin_all, self.num_modes), Tobs)
+-            elif isinstance(Tobs, np.ndarray) and Tobs.ndim == 1:
+-                assert Tobs.shape[0] == self.num_bin_all
+-                Tobs = self.xp.repeat(
+-                    self.xp.asarray(Tobs)[:, None], self.num_modes, axis=-1
+-                )
+-            elif isinstance(Tobs, np.ndarray) and Tobs.ndim == 2:
+-                Tobs = self.xp.asarray(Tobs)
+-                assert Tobs.shape == (self.num_bin_all, self.num_modes)
+             else:
+-                raise ValueError("Tobs entered incorrectly.")
++                Tobs = self._per_mode(Tobs, "Tobs")
++            t_end = t_start + Tobs
+ 
+-            fix = self.tf.max(axis=-1) > Tobs
++            fix = self.tf.max(axis=-1) > t_end
+             f_max = self.freqs_shaped.max(axis=-1)
+ 
+             if self.xp.any(fix):
+                 windows_of_interest = self.xp.argwhere(
+-                    (Tobs[fix][:, None] < self.tf[fix, 1:])
+-                    & (Tobs[fix][:, None] > self.tf[fix, :-1])
++                    (t_end[fix][:, None] < self.tf[fix, 1:])
++                    & (t_end[fix][:, None] > self.tf[fix, :-1])
+                 )
+ 
+                 if windows_of_interest.shape[0] != fix.sum():
+@@ -601,7 +608,7 @@
+                 m = (y2 - y1) / (x2 - x1)
+                 b = y1
+ 
+-                f_max_new = m * (Tobs[fix] - x1) + b
++                f_max_new = m * (t_end[fix] - x1) + b
+ 
+                 f_max[fix] = f_max_new
+ 
