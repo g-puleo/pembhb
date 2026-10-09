@@ -35,12 +35,9 @@ python scripts/simulate_data.py --n 1 --injection --store-noise \
 # 2. TMNRE, 10 rounds
 python scripts/tmnre_joint.py --obs-path $PEMBHB_DATA_DIR/obs.h5 --n_rounds 10 my_run
 
-# 3. inspect (RUN is printed at start-up, e.g. 2026/10/08/channelizedmlp_my_run)
-./scripts/plot_posterior.py --run-name $RUN --proposal      # last round's posterior
-python scripts/visualise_truncation_rounds.py $RUN          # evolution across rounds
-python scripts/visualise_sky_truncation.py    $RUN
-python scripts/visualise_entropy_evolution.py $RUN
-python scripts/visualise_volume_from_masks.py $RUN
+# 3. inspect: every figure of §5-§6 (RUN is printed at start-up,
+#    e.g. 2026/10/08/channelizedmlp_my_run)
+./scripts/show_results.sh $RUN [--mcmc-file mcmc.h5]
 ```
 
 ---
@@ -158,18 +155,26 @@ file and splits it 70/25/5 into train/validation/test.
 
 ### Truncation
 
-`truncation.mode: mask` (recommended) works like this. The NRE posterior at the
-observation is evaluated on a grid for each marginal. The highest-posterior-density
-region at `credible_level_1d` / `credible_level_2d` is extracted, then split
-into connected modes; sky periodicity in λ is handled. The next round samples
-the union of those modes by rejection.
+`truncation.mode: mask` (recommended) works like this. Round r's network was
+trained on round r−1's accepted set, its **domain**. So its posterior at the
+observation is only trusted there; outside, the density is set to zero.
 
-- `refine: true` re-evaluates every mode on its own subgrid (`ngrid_*_refined`),
-  so once a mode shrinks to a few coarse pixels the resolution no longer limits it.
-- `mode_tree: true` (experimental) takes the mode structure from the previous
-  round and splits it recursively. It requires `refine: true`.
-- `zero_outside_prev_mask` only trusts the network where it was trained, i.e.
-  inside the previous round's region.
+1. **Round 1** has no domain. A coarse grid over the prior box (`ngrid_1d` /
+   `ngrid_2d`) finds the first modes.
+2. **From round 2 on**, each mode of the domain is evaluated on its own grid of
+   `ngrid_1d_refined` / `ngrid_2d_refined` cells per axis. One HPD level at
+   `credible_level_1d` / `credible_level_2d`, normalised over the whole domain,
+   gives the new accepted set and its modes. λ periodicity is handled.
+3. The next round samples the union of the modes by rejection.
+
+The proposal keeps at least `credible_level` of the posterior (normalised over
+the domain); this fraction is logged as `truncation/kept/<param>`. Because the
+next round's windows are this round's modes, resolution sharpens from round to
+round. The region stops shrinking once the network's posterior stops narrowing
+relative to its domain. That is the fixed point of the rule, not a stall.
+
+A mode that wraps around λ = 0/2π is evaluated on a window spanning the full
+period, i.e. at coarser resolution than the other modes.
 
 `mode: rectangle` keeps the legacy behaviour, which shrinks a box per parameter.
 
@@ -216,12 +221,17 @@ The figures go to `posterior_round_<N>/` (default: the last round):
 
 - `posterior_1d`: every 1D marginal, optionally against MCMC;
 - `sky_zoom` (+ `_lonlat`): the sky posterior re-evaluated on a fine grid over its credible region;
-- `modes_<param>`: written when the round's truncation found several modes and
-  `truncation.refine` was on. Each mode is plotted on its own refined grid;
-  1D panels give each mode's posterior mass.
+- `posterior_1d` greys out what lies outside the region the round was trained on
+  (round N−1's accepted set). There the network extrapolates, and the pipeline
+  zeroes the density before truncating.
+- `modes_<param>`: written when that region has several modes and
+  `truncation.refine` was on. Each mode is plotted on its own refined grid with its
+  posterior mass. Masses are normalised over the region, so they sum to 1.
 
-`--proposal` overlays what this posterior proposed for the next round: interval
-bounds in 1D, and the accepted-region contour in 2D.
+`--proposal` overlays what this posterior proposes for the next round (round N's
+accepted set, the prior of round N+1): interval bounds in 1D, and the
+accepted-region contour in 2D. The per-mode figures also give the fraction of the
+posterior the proposal keeps. With a 0.999 HPD truncation, that fraction should be at least 0.999.
 
 **Evolution across rounds**
 
@@ -234,6 +244,11 @@ bounds in 1D, and the accepted-region contour in 2D.
 | `plot_calibration_history.py <tag>`, `plot_lambda_tau.py <tag>` | training diagnostics on the test pool (§6) |
 
 `--last-round N` restricts the evolution scripts to rounds ≤ N.
+
+**Everything at once:** `scripts/show_results.sh <tag> [--round N] [--mcmc-file FILE] [--no-proposal]`
+runs all the scripts above and those of §6, then prints where the figures went and
+the TensorBoard command. `--round N` plots round N's posterior and the evolution
+up to N. A step that fails is reported and the rest still run (about a minute on a GPU).
 
 ## 6. Training diagnostics
 

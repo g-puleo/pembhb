@@ -51,11 +51,11 @@ def test_mode_bounds_pads_to_cell_edges():
 
 
 def test_mode_bounds_clamps_at_the_prior_box_edge():
-    g = np.linspace(-1.0, 1.0, 201)
+    g = -1.0 + (np.arange(200) + 0.5) * 0.01             # cell centres tiling [-1, 1]
     comp = Region(g <= -0.9, (g,))                      # touches the box edge
     lo, hi = mode_bounds(comp)
-    assert lo == pytest.approx(-1.0)                    # not -1.005
-    assert hi > -0.9
+    assert lo == pytest.approx(-1.0)                    # the box edge, not a centre
+    assert hi == pytest.approx(-0.9)
 
 
 def test_mode_bounds_2d_is_per_axis():

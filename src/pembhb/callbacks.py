@@ -25,7 +25,6 @@ from pembhb.utils import (
 from torch.utils.data import DataLoader
 from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
-from pembhb.sky_truncation import get_main_mode_box
 from pembhb.regions import (
     Region, region_from_equal_tailed, region_from_main_mode, region_from_hpd,
     prev_keep_mask, truncation_region
@@ -268,70 +267,90 @@ class PeriodicProgressCallback(Callback):
         self._print_status(trainer, pl_module, suffix="[done]")
 
 
-class PlotPosteriorCallback(Callback):
-    def __init__(self, timestamp: str, obs_loader: DataLoader, input_idx_list: list, output_idx_list: list, round_idx: int , call_every_n_epochs=1, training_start_time: datetime = None, print_every: int = 20, warmup_epochs: int = 0, call_every_n_steps=None, warmup_steps=None, 
-                 box_dilation_1d: float = 1.0, 
-                 eps_1d: float = 1e-4, 
-                 sky_credible_level: float = 0.999, 
-                 sky_dilation: float = 1.1,
-                 truncation_mode: str = "rectangle",
-                credible_level_1d: float = 0.997,
-                dilation_1d: float = 1.2,
-                credible_level_2d: float = 0.997,
-                dilation_2d: float = 1.2,
-                prev_accepted: dict = None,
-                zero_policy: str = "off",
-                hysteresis_weight=None,
-                monotonic: bool = False):
-        self.epochs_elapsed = 0
-        # §2 — the previous round's accepted set per marginal ({marginal_key:
-        # {"kind": "1d"/"2d", ...}}) and the active zeroing policy. When set (and
-        # not "off"), the posterior plots shade the region OUTSIDE the previous
-        # mask, where _mask_truncate_marginal zeroes / down-weights the density
-        # before this round's HPD analysis (see pembhb.regions.apply_prev_mask).
-        self.prev_accepted = prev_accepted or {}
-        self.zero_policy = str(zero_policy)
-        # Box-construction params — single source of truth is the run's
-        # truncation_veto config, so the boxes written into widest_boxes match
-        # the ones the coverage veto measures (see _compute_round_coverage).
-        self.box_dilation_1d = box_dilation_1d
-        self.eps_1d = eps_1d
-        self.sky_credible_level = sky_credible_level
-        self.sky_dilation = sky_dilation
-        # HPD level + dilation used to build the 2D posterior region for the
-        # volume ratio — matched to the truncation (analyse_posterior_2d) so the
-        # numerator is the SAME accepted set the sampler will draw from next round.
-        self.credible_level_1d = credible_level_1d
-        self.dilation_1d = dilation_1d
-        self.credible_level_2d = credible_level_2d
-        self.dilation_2d = dilation_2d
+class _CadencedCallback(Callback):
+    """Fires ``_fire(trainer, pl_module, tag, tag_is_step)`` every
+    ``call_every_n_epochs`` validation epochs (after ``warmup_epochs``), or every
+    ``call_every_n_steps`` global steps when step cadence is on, and once more at
+    the end of training."""
+
+    def __init__(self, call_every_n_epochs=1, warmup_epochs=0,
+                 call_every_n_steps=None, warmup_steps=None):
         self.call_every_n_epochs = call_every_n_epochs
-        # Opt-in global-step cadence; None -> unchanged epoch behaviour.
+        self.warmup_epochs = warmup_epochs
         self._step = _StepCadence(call_every_n_steps)
         self.warmup_steps = warmup_steps
+        self.epochs_elapsed = 0
+
+    def _fire(self, trainer, pl_module, tag, tag_is_step):
+        raise NotImplementedError
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if self._step.enabled:
+            return  # step-mode: handled in on_train_batch_end
+        if trainer.current_epoch < self.warmup_epochs:
+            return
+        self.epochs_elapsed += 1
+        if (self.epochs_elapsed - 2) % self.call_every_n_epochs == 0:
+            self._fire(trainer, pl_module, trainer.current_epoch, False)
+
+    def _fire_in_eval(self, trainer, pl_module):
+        # mid-batch the model is in train mode (dropout active) -> eval for the
+        # diagnostic forward passes, then restore.
+        was_training = pl_module.training
+        pl_module.eval()
+        try:
+            with torch.no_grad():
+                self._fire(trainer, pl_module, trainer.global_step, True)
+        finally:
+            if was_training:
+                pl_module.train()
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if not self._step.enabled:
+            return
+        if self.warmup_steps is not None and trainer.global_step < self.warmup_steps:
+            return
+        if not self._step.should_fire(trainer.global_step):
+            return
+        self._fire_in_eval(trainer, pl_module)
+
+    def on_train_end(self, trainer, pl_module):
+        if self._step.enabled:
+            self._fire_in_eval(trainer, pl_module)
+        else:
+            self.on_validation_epoch_end(trainer, pl_module)
+
+
+class PlotPosteriorCallback(_CadencedCallback):
+    """Figures of the posterior at the observation during training.
+
+    Writes ``posterior_evolution/posterior_round_<r>_<epoch|step>_<tag>_<param>.pdf``
+    and shades where the density is zeroed outside the previous round's accepted
+    set (§2). Metrics and the proposal live in :class:`TruncationMonitor`.
+    """
+
+    def __init__(self, timestamp: str, obs_loader: DataLoader, input_idx_list: list,
+                 output_idx_list: list, round_idx: int, call_every_n_epochs=1,
+                 training_start_time: datetime = None, print_every: int = 20,
+                 warmup_epochs: int = 0, call_every_n_steps=None, warmup_steps=None,
+                 box_dilation_1d: float = 1.0, eps_1d: float = 1e-4,
+                 prev_accepted: dict = None, zero_policy: str = "off"):
+        super().__init__(call_every_n_epochs, warmup_epochs, call_every_n_steps, warmup_steps)
+        # §2 — the domain per marginal ({marginal_key: {"kind": "1d"/"2d", ...}}),
+        # shared with the Truncator, and the active zeroing policy.
+        self.prev_accepted = prev_accepted if prev_accepted is not None else {}
+        self.zero_policy = str(zero_policy)
+        self.box_dilation_1d = box_dilation_1d
+        self.eps_1d = eps_1d
         self.print_every = print_every
         self.timestamp = timestamp
         self.obs_loader = obs_loader
         self.input_idx_list = input_idx_list
         self.output_idx_list = output_idx_list
         self.n_marginals = len(input_idx_list)
-        self.hysteresis_weight = hysteresis_weight
-        # A_N ⊆ A_{N-1} clip, decided by the trainer's _monotonic_enabled.
-        self.monotonic = bool(monotonic)
         self.init_time = datetime.now()
         self.training_start_time = training_start_time if training_start_time is not None else self.init_time
         self.round_idx = round_idx
-        self.warmup_epochs = warmup_epochs
-        # Storage for volume ratio diagnostics
-        self.volume_ratios = {}
-        # Storage for differential entropy diagnostics
-        self.differential_entropies = {}
-    
-    # Posterior/prior volume ratios are now `Region.volume_fraction()` — the
-    # posterior grid spans exactly the trained prior box, so the accepted-pixel
-    # fraction *is* the posterior/prior ratio, with one implementation for 1D and
-    # 2D (rectangle or mask). The four `_compute_*_volume_*` helpers this replaced
-    # are gone; see `pembhb.regions`.
 
     # ------------------------------------------------------------------
     # §2 — visualise where the posterior is zeroed / down-weighted before
@@ -351,89 +370,6 @@ class PlotPosteriorCallback(Callback):
         if prev is None:
             return None
         return prev_keep_mask(prev, grids)
-
-    def _proposal_pixels(self, marginal_key, grids, grid_total):
-        """Pixel count of the mask actually sampled from this round.
-
-        The volume ratio is the early-stop metric ``posterior / proposal``.  In
-        mask mode the sampling proposal is the PREVIOUS round's accepted set, an
-        irregular mask that can fill only a fraction of its own bounding box — so
-        dividing by the full grid (``mask.size``) understates the ratio and it
-        never rises to 1 even when the posterior has converged to the proposal.
-        Here the denominator is the proposal mask itself, resampled onto the
-        current grid.  Falls back to the full grid when there is no mask proposal
-        (round 1, rectangle mode, or a previous mask that does not overlap this
-        grid), where posterior/box is the correct measure.  This is independent
-        of the §2 zero policy: the sampler uses the mask regardless.
-        """
-        prev = self.prev_accepted.get(marginal_key)
-        if prev is None:
-            return grid_total
-        n = int(np.count_nonzero(prev_keep_mask(prev, grids)))
-        return n if n > 0 else grid_total
-
-    def _proposal_mask(self, marginal_key, grids):
-        """Proposal (previous accepted set) on ``grids``; empty if there is none."""
-        prev = self.prev_accepted.get(marginal_key)
-        if prev is None:
-            shape = tuple(len(g) for g in reversed(grids))
-            return np.zeros(shape, dtype=bool)
-        return prev_keep_mask(prev, grids)
-
-    def _proposal_modes(self, marginal_key):
-        """Per-mode ``(exact volume, membership-on-a-grid)`` of the proposal.
-
-        The volumes are read off the proposal's **own** representation — the
-        stored intervals in 1D, each subgrid's own pitch in 2D — never by
-        resampling it onto whatever grid the posterior happens to be evaluated
-        on.  That matters once modes carry different resolutions: a rasterised
-        denominator moves a coarse mode's edges by half a cell, which is
-        percent-level on the metric that drives ``volume_ratio_early_stop``.
-
-        Returns ``[]`` when there is no mask proposal (round 1 / rectangle).
-        """
-        prev = self.prev_accepted.get(marginal_key)
-        if prev is None:
-            return []
-        if prev["kind"] == "1d":
-            return [
-                (float(hi) - float(lo),
-                 lambda grids, lo=float(lo), hi=float(hi):
-                     (np.asarray(grids[0], dtype=float) >= lo)
-                     & (np.asarray(grids[0], dtype=float) <= hi))
-                for lo, hi in prev["intervals"]
-            ]
-        return [(c.volume(), c.contains_grid)
-                for c in prev["region"].components()]
-
-    def _volume_ratio(self, marginal_key, region):
-        """``|A_N| / |A_{N-1}|`` as Σ mask·dV, plus one ratio per proposal mode.
-
-        Both measures are exact: the numerator on the accepted region's own
-        grid(s), the denominator on the proposal's own.  Falls back to
-        posterior/box when there is no proposal, or when the proposal does not
-        intersect this grid at all (otherwise the ratio would read ~0 and trip
-        the early stop on what is really a grid mismatch).
-
-        Mode ratios are ``|A_N ∩ mode_k| / |mode_k|`` in the proposal's mode
-        order; with the monotone clip on they sum back to the total.
-        """
-        post_vol = region.volume()
-        modes = self._proposal_modes(marginal_key)
-        masks = [membership(region.grids) for _, membership in modes]
-        if not any(m.any() for m in masks):
-            prop_vol = region.volume(np.ones_like(region.mask))
-            return post_vol / prop_vol, post_vol, prop_vol, []
-        prop_vol = float(sum(vol for vol, _ in modes))
-        mode_ratios = [region.volume(region.mask & m) / vol
-                       for (vol, _), m in zip(modes, masks)]
-        return post_vol / prop_vol, post_vol, prop_vol, mode_ratios
-
-    def _log_mode_ratios(self, trainer, name, mode_ratios, tag):
-        if trainer.logger is None:
-            return
-        for k, r in enumerate(mode_ratios):
-            trainer.logger.log_metrics({f"volume_ratio_mode/{name}/{k}": r}, step=tag)
 
     def _shade_suppressed_1d(self, ax, grid1d, marginal_key):
         keep = self._prev_keep_or_none(marginal_key, (grid1d,))
@@ -515,6 +451,108 @@ class PlotPosteriorCallback(Callback):
                       f"width_ratio={w_ratio:.3f}, height_ratio={h_ratio:.3f}",
                       flush=True)
 
+    def _fire(self, trainer, pl_module, tag, tag_is_step):
+        tag_kind = "step" if tag_is_step else "epoch"
+        outdir = os.path.join(PLOTS_ROOT_DIR, self.timestamp, "posterior_evolution")
+        os.makedirs(outdir, exist_ok=True)
+        train_time = datetime.now() - self.training_start_time
+        td_trunc = train_time - timedelta(microseconds=train_time.microseconds)
+        title = f"Round {self.round_idx} - {tag_kind} {tag} - training time={td_trunc}s"
+        keys = _param_keys(pl_module)  # basis-aware parameter names
+        for in_param_idx, out_param_idx in zip(self.input_idx_list, self.output_idx_list):
+            marginal_key = tuple(in_param_idx)
+            if len(in_param_idx) == 1:
+                param_idx = in_param_idx[0]
+                fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+                fig.suptitle(title, fontsize=10)
+                try:
+                    interval, norm1d, grid, inj_params = get_widest_interval_1d(
+                        pl_module, self.obs_loader, in_param_idx=param_idx,
+                        out_param_idx=out_param_idx, eps=self.eps_1d,
+                        dilation=self.box_dilation_1d)
+                    g = grid.flatten()
+                    ax.plot(g, norm1d, 'b-', linewidth=1.5)
+                    ax.axvline(inj_params[0], color='r', linestyle='--', label='Injection')
+                    ax.axvline(interval[0], color='g', linestyle=':', label=f'{100*(1-self.eps_1d):.2f}% CI')
+                    ax.axvline(interval[1], color='g', linestyle=':')
+                    ax.fill_between(g, 0, norm1d, where=(g >= interval[0]) & (g <= interval[1]),
+                                    alpha=0.3, color='green')
+                    self._shade_suppressed_1d(ax, grid[:, 0], marginal_key)
+                    ax.set_xlabel(keys[param_idx])
+                    ax.set_ylabel('Posterior density')
+                    ax.legend()
+                    fig.savefig(os.path.join(
+                        outdir, f"posterior_round_{self.round_idx}_{tag_kind}_{tag}_{keys[param_idx]}.pdf"),
+                        bbox_inches="tight")
+                except Exception as e:
+                    print(f"Error plotting 1D marginal for {keys[param_idx]}: {e}")
+                finally:
+                    plt.close(fig)
+            elif len(in_param_idx) == 2:
+                fig, ax = plt.subplots(1, 1, figsize=(4, 4))
+                fig.tight_layout()
+                fig.suptitle(title, fontsize=10)
+                names = [keys[in_param_idx[0]], keys[in_param_idx[1]]]
+                label = "-".join(names)
+                try:
+                    norm_2d, inj_params, gx, gy, dp0, dp1 = eval_posterior_2d(
+                        pl_module, self.obs_loader, in_param_idx, out_param_idx)
+                    posterior_heatmap_2d(gx, gy, norm_2d, inj_params[0], ax, names)
+                    self._shade_suppressed_2d(ax, gx, gy, marginal_key)
+                    # matplotlib raises ValueError when contour levels are not
+                    # strictly increasing (flat / degenerate posteriors): keep
+                    # the heatmap and skip the contours.
+                    try:
+                        levels, labels = contour_levels(norm_2d)
+                        _, cs = contour_boxes(gx, gy, norm_2d, levels, ax=ax)
+                        ax.clabel(cs, fmt={lev: f"{p:.3f}" for lev, p in zip(levels, labels)},
+                                  fontsize=8)
+                        if marginal_key == (7, 8):
+                            self._log_sky_contour_ratios(norm_2d, gx, gy, dp0, dp1,
+                                                         trainer, "_".join(names))
+                    except ValueError as ve:
+                        print(f"Round {self.round_idx}, {tag_kind} {tag}, {label}: "
+                              f"contour overlay failed ({ve}); saving heatmap without contours.",
+                              flush=True)
+                    fig.savefig(os.path.join(
+                        outdir, f"posterior_round_{self.round_idx}_{tag_kind}_{tag}_{names[0]}_{names[1]}.pdf"),
+                        bbox_inches="tight")
+                finally:
+                    plt.close(fig)
+
+    def on_train_end(self, trainer, pl_module):
+        super().on_train_end(trainer, pl_module)
+        print(f"Total training time: {datetime.now() - self.init_time}")
+
+
+class TruncationMonitor(_CadencedCallback):
+    """The proposal the round would make now, and the metrics that end a round.
+
+    At each fire: ``truncator.propose`` (the same call the round end makes, not
+    committed), the ``volume_ratio`` of each marginal's proposal against its
+    domain (:func:`pembhb.truncator.volume_ratio`) and the differential entropy
+    of each marginal at the observation. ``volume_ratios`` and
+    ``differential_entropies`` (lists of per-fire dicts, keyed by marginal) are
+    what ``VolumeRatioEarlyStopping`` / ``DifferentialEntropyEarlyStopping`` and
+    the trainer read; ``latest`` is the last proposal.
+    """
+
+    def __init__(self, truncator, obs_loader, marginals, prior, round_idx,
+                 call_every_n_epochs=1, warmup_epochs=0, call_every_n_steps=None,
+                 warmup_steps=None, print_every=20, eps_1d=1e-4, box_dilation_1d=1.0):
+        super().__init__(call_every_n_epochs, warmup_epochs, call_every_n_steps, warmup_steps)
+        self.truncator = truncator
+        self.obs_loader = obs_loader
+        self.marginals = [(tuple(k), int(o)) for k, o in marginals]   # (marginal_key, out_idx)
+        self.prior = prior
+        self.round_idx = round_idx
+        self.print_every = print_every
+        self.eps_1d = eps_1d
+        self.box_dilation_1d = box_dilation_1d
+        self.volume_ratios = {}
+        self.differential_entropies = {}
+        self.latest = None
+
     @staticmethod
     def _differential_entropy_1d(norm1d, dp):
         """Differential entropy H = -int p log p dx (nats) via Riemann sum."""
@@ -529,297 +567,70 @@ class PlotPosteriorCallback(Callback):
             log_p = np.where(norm2d > 0, np.log(norm2d), 0.0)
         return -float(np.sum(norm2d * log_p * dp0 * dp1))
 
-    def on_validation_epoch_end(self, trainer, pl_module):
-        if self._step.enabled:
-            return  # step-mode: handled in on_train_batch_end
-        if trainer.current_epoch < self.warmup_epochs:
-            return
+    def _coarse_entropy(self, pl_module, key, out_idx):
+        """Differential entropy on the coarse box-wide grid, and that density."""
+        if len(key) == 1:
+            _, norm1d, grid, _ = get_widest_interval_1d(
+                pl_module, self.obs_loader, in_param_idx=key[0], out_param_idx=out_idx,
+                eps=self.eps_1d, dilation=self.box_dilation_1d)
+            return (self._differential_entropy_1d(norm1d, float(grid[1, 0] - grid[0, 0])),
+                    norm1d, (grid[:, 0],))
+        norm_2d, _, gx, gy, dp0, dp1 = eval_posterior_2d(pl_module, self.obs_loader, key, out_idx)
+        return (self._differential_entropy_2d(norm_2d, dp0, dp1),
+                norm_2d, (gx[0, :], gy[:, 0]))
 
-        if self.epochs_elapsed == 0:
-            # Posterior-evolution PDFs go in a subfolder so the run's plots
-            # root stays scannable when the cadence (call_every_n_epochs)
-            # produces many figures.
-            os.makedirs(
-                os.path.join(PLOTS_ROOT_DIR, self.timestamp,
-                             "posterior_evolution"),
-                exist_ok=True,
-            )
-
-        self.epochs_elapsed += 1
-        if (self.epochs_elapsed-2) % self.call_every_n_epochs == 0:
-            self._compute_and_plot(trainer, pl_module, trainer.current_epoch, False)
-
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if not self._step.enabled:
-            return
-        if self.warmup_steps is not None and trainer.global_step < self.warmup_steps:
-            return
-        if not self._step.should_fire(trainer.global_step):
-            return
-        os.makedirs(
-            os.path.join(PLOTS_ROOT_DIR, self.timestamp, "posterior_evolution"),
-            exist_ok=True,
-        )
-        # mid-batch the model is in train mode (dropout active) -> eval for the
-        # diagnostic forward passes, then restore.
-        was_training = pl_module.training
-        pl_module.eval()
-        try:
-            with torch.no_grad():
-                self._compute_and_plot(trainer, pl_module, trainer.global_step, True)
-        finally:
-            if was_training:
-                pl_module.train()
-
-    def _compute_and_plot(self, trainer, pl_module, tag, tag_is_step):
-        """Posterior diagnostics + plots on the observation, tagged by ``tag``
-        (epoch or global step). Sets ``pl_module.widest_boxes`` and appends
-        step/epoch-keyed entries to volume_ratios / differential_entropies."""
+    def _fire(self, trainer, pl_module, tag, tag_is_step):
+        from pembhb.truncator import box_volume, volume_ratio
         tag_kind = "step" if tag_is_step else "epoch"
         do_print = tag_is_step or (trainer.current_epoch % self.print_every == 0)
-        if True:
-            #print("plotting posteriors on observed data")
-            train_time = datetime.now() - self.training_start_time
-            td_trunc = train_time - timedelta(microseconds=train_time.microseconds)
-            title_plot = f"training time={td_trunc}s"
-            keys = _param_keys(pl_module)  # basis-aware parameter names
-            # plot the posterior on the observed data , using the current model
-            for i in range(self.n_marginals):
-                in_param_idx = self.input_idx_list[i]
-                out_param_idx = self.output_idx_list[i]
-
-                # Initialize widest_boxes dict if not present
-                if not hasattr(pl_module, 'widest_boxes'):
-                    pl_module.widest_boxes = {}
-                marginal_key = tuple(in_param_idx)
-
-                if len(in_param_idx) == 1:
-                    # Handle 1D marginals
-                    param_idx = in_param_idx[0]
-                    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
-                    fig.suptitle(
-                        f"Round {self.round_idx} - {tag_kind} {tag} - {title_plot}",
-                        fontsize=10,
-                    )
-                    
-                    try:
-                        epsilon_value = self.eps_1d
-                        widest_interval, norm1d, grid, inj_params = get_widest_interval_1d(
-                            pl_module,
-                            self.obs_loader,
-                            in_param_idx=param_idx,
-                            out_param_idx=out_param_idx,
-                            eps=epsilon_value,
-                            dilation=self.box_dilation_1d,
-                        )
-                        
-                        # Plot
-                        ax.plot(grid.flatten(), norm1d, 'b-', linewidth=1.5)
-                        ax.axvline(inj_params[0], color='r', linestyle='--', label='Injection')
-                        ax.axvline(widest_interval[0], color='g', linestyle=':', label=f'{100*(1-epsilon_value):.2f}% CI')
-                        ax.axvline(widest_interval[1], color='g', linestyle=':')
-                        ax.fill_between(grid.flatten(), 0, norm1d,
-                                       where=(grid.flatten() >= widest_interval[0]) & (grid.flatten() <= widest_interval[1]),
-                                       alpha=0.3, color='green')
-                        # §2: shade the band outside the previous round's mask,
-                        # where the density is zeroed / down-weighted before the
-                        # HPD analysis (only when §2 is active and a prev mask
-                        # exists — i.e. from round 2 onward).
-                        self._shade_suppressed_1d(ax, grid[:, 0], marginal_key)
-                        ax.set_xlabel(keys[param_idx])
-                        ax.set_ylabel('Posterior density')
-                        ax.legend()
-                        
-                        # Store the widest interval
-                        pl_module.widest_boxes[marginal_key] = widest_interval
-
-
-                        prev = self.prev_accepted.get(marginal_key)
-                        periods = (_MASK_PERIOD_BY_NAME.get(keys[param_idx]),)
-                        region1d, _ = truncation_region(norm1d, (grid[:,0],), prev, policy=self.zero_policy, hysteresis_weight=self.hysteresis_weight,
-                                                        credible=self.credible_level_1d, periods = periods, dilation=self.dilation_1d, clip=self.monotonic)
-                        
-                        # ratio = |A_N| / |proposal| in measure, not / full grid
-                        # (see _volume_ratio).
-                        volume_ratio, posterior_width, prior_width, mode_ratios = \
-                            self._volume_ratio(marginal_key, region1d)
-                        
-                        # Store and log the volume ratio
-                        if marginal_key not in self.volume_ratios:
-                            self.volume_ratios[marginal_key] = []
-                        self.volume_ratios[marginal_key].append({
-                            'epoch': trainer.current_epoch,
-                            'step': trainer.global_step,
-                            'ratio': volume_ratio,
-                            'posterior_width': posterior_width,
-                            'prior_width': prior_width,
-                            'mode_ratios': mode_ratios,
-                        })
-                        
-                        # Compute differential entropy for 1D marginal
-                        dp = float(grid[1, 0] - grid[0, 0])
-                        entropy = self._differential_entropy_1d(norm1d, dp)
-                        if marginal_key not in self.differential_entropies:
-                            self.differential_entropies[marginal_key] = []
-                        self.differential_entropies[marginal_key].append({
-                            'epoch': trainer.current_epoch,
-                            'step': trainer.global_step,
-                            'entropy': entropy,
-                        })
-
-                        # Log metrics to tensorboard if logger exists
-                        if trainer.logger is not None:
-                            metric_name = f"volume_ratio/{keys[param_idx]}"
-                            trainer.logger.log_metrics({metric_name: volume_ratio}, step=tag)
-                            entropy_metric = f"diff_entropy/{keys[param_idx]}"
-                            trainer.logger.log_metrics({entropy_metric: entropy}, step=tag)
-                        self._log_mode_ratios(trainer, keys[param_idx], mode_ratios, tag)
-
-                        # Print diagnostic
-                        param_name = keys[param_idx]
-                        if do_print:
-                            print(f"Round {self.round_idx}, {tag_kind} {tag}, {param_name}: "
-                                  f"vol_ratio={volume_ratio:.4f} "
-                                  f"(post={posterior_width:.3e}, prior={prior_width:.3e}), "
-                                  f"modes={[round(r, 3) for r in mode_ratios]}, "
-                                  f"H={entropy:.4f} nats", flush=True)
-                        
-                        out = os.path.join(PLOTS_ROOT_DIR, self.timestamp,
-                                          "posterior_evolution",
-                                          f"posterior_round_{self.round_idx}_{tag_kind}_{tag}_{keys[param_idx]}.pdf")
-                        fig.savefig(out, bbox_inches="tight")
-                    except Exception as e:
-                        print(f"Error plotting 1D marginal for {keys[param_idx]}: {e}")
-                    finally:
-                        plt.close(fig)
-
-                elif len(in_param_idx) == 2:
-                    # Handle 2D marginals
-                    fig, ax = plt.subplots(1, 1, figsize=(4, 4))
-                    fig.tight_layout()
-                    fig.suptitle(
-                        f"Round {self.round_idx} - {tag_kind} {tag} - {title_plot}",
-                        fontsize=10,
-                    )
-
-                    out = os.path.join(PLOTS_ROOT_DIR, self.timestamp,
-                                      "posterior_evolution",
-                                      f"posterior_round_{self.round_idx}_{tag_kind}_{tag}_{keys[in_param_idx[0]]}_{keys[in_param_idx[1]]}.pdf")
-                    param_names = [keys[in_param_idx[0]], keys[in_param_idx[1]]]
-                    param_label = f"{keys[in_param_idx[0]]}-{keys[in_param_idx[1]]}"
-
-                    try:
-                        # Baseline heatmap — always produced, independent of contour levels.
-                        norm_2d, inj_params, gx, gy, dp0, dp1 = eval_posterior_2d(pl_module, self.obs_loader, in_param_idx, out_param_idx)
-                        posterior_heatmap_2d(gx, gy, norm_2d, inj_params[0], ax, param_names)
-                        # §2: overlay the region outside the previous round's mask
-                        # (zeroed / down-weighted before this round's analysis).
-                        self._shade_suppressed_2d(ax, gx, gy, marginal_key)
-
-                        # Contour overlay + contour-derived diagnostics (best effort).
-                        # matplotlib raises ValueError when contour thresholds are
-                        # non-strictly-increasing (flat / degenerate posteriors); in
-                        # that case we keep the heatmap and skip the rest.
-                        try:
-                            levels, labels = contour_levels(norm_2d)
-                            boxes_overlay, cs = contour_boxes(gx, gy, norm_2d, levels, ax=ax)
-                            fmt = {lev: f"{p:.3f}" for lev, p in zip(levels, labels)}
-                            ax.clabel(cs, fmt=fmt, fontsize=8)
-
-                            if marginal_key == (7, 8):
-                                box = get_main_mode_box(gx, gy, norm_2d, credible_level=self.sky_credible_level, dilation_factor=self.sky_dilation)
-                                widest_box = (box['lam'][0], box['lam'][1], box['beta'][0], box['beta'][1])
-                                is_wrapped = box["is_wrapped"]
-                            else:
-                                widest_box = boxes_overlay[0]
-                                is_wrapped = False
-
-                            pl_module.widest_boxes[marginal_key] = widest_box
-
-                            # Posterior-to-prior area ratio via Region. This is
-                            # the true accepted-MASK fraction of the dominant
-                            # mode — correct for wrapped / non-rectangular modes,
-                            # unlike the bounding-box area the old helpers used
-                            # (a change of measure, not just ±1 px; it slightly
-                            # shifts the 2D early-stop timing).
-                            # Numerator = the truncation's own accepted set, ALL
-                            # modes (zero outside prev → HPD → clip).
-                            region2d, _ = truncation_region(
-                                norm_2d, (gx[0, :], gy[:, 0]),
-                                self.prev_accepted.get(marginal_key),
-                                policy=self.zero_policy,
-                                hysteresis_weight=self.hysteresis_weight,
-                                credible=self.credible_level_2d,
-                                dilation=self.dilation_2d,
-                                periods=(_MASK_PERIOD_BY_NAME.get(keys[in_param_idx[0]]),
-                                         _MASK_PERIOD_BY_NAME.get(keys[in_param_idx[1]])),
-                                clip=self.monotonic)
-                            # ratio = |A_N| / |proposal| in measure (see _volume_ratio).
-                            volume_ratio, posterior_area, prior_area, mode_ratios = \
-                                self._volume_ratio(marginal_key, region2d)
-
-                            if marginal_key not in self.volume_ratios:
-                                self.volume_ratios[marginal_key] = []
-                            self.volume_ratios[marginal_key].append({
-                                'epoch': trainer.current_epoch,
-                                'step': trainer.global_step,
-                                'ratio': volume_ratio,
-                                'posterior_area': posterior_area,
-                                'prior_area': prior_area,
-                                'mode_ratios': mode_ratios,
-                            })
-
-                            entropy = self._differential_entropy_2d(norm_2d, dp0, dp1)
-                            if marginal_key not in self.differential_entropies:
-                                self.differential_entropies[marginal_key] = []
-                            self.differential_entropies[marginal_key].append({
-                                'epoch': trainer.current_epoch,
-                                'step': trainer.global_step,
-                                'entropy': entropy,
-                            })
-
-                            param_tag = f"{keys[in_param_idx[0]]}_{keys[in_param_idx[1]]}"
-                            if trainer.logger is not None:
-                                trainer.logger.log_metrics({f"volume_ratio/{param_tag}": volume_ratio}, step=tag)
-                                trainer.logger.log_metrics({f"diff_entropy/{param_tag}": entropy}, step=tag)
-                            self._log_mode_ratios(trainer, param_tag, mode_ratios, tag)
-
-                            if marginal_key == (7, 8):
-                                self._log_sky_contour_ratios(
-                                    norm_2d, gx, gy, dp0, dp1,
-                                    trainer, param_tag,
-                                )
-
-                            if do_print:
-                                print(f"Round {self.round_idx}, {tag_kind} {tag}, {param_label}: "
-                                      f"vol_ratio={volume_ratio:.4f} "
-                                      f"(post={posterior_area:.3e}, prior={prior_area:.3e}), "
-                                      f"modes={[round(r, 3) for r in mode_ratios]}, "
-                                      f"H={entropy:.4f} nats", flush=True)
-                        except ValueError as ve:
-                            print(f"Round {self.round_idx}, {tag_kind} {tag}, {param_label}: "
-                                  f"contour overlay failed ({ve}); saving heatmap without contours.",
-                                  flush=True)
-
-                        fig.savefig(out, bbox_inches="tight")
-                    finally:
-                        plt.close(fig)
-
-    def on_train_end(self, trainer, pl_module):
-        # Final diagnostic pass. In step-mode on_validation_epoch_end is a no-op,
-        # so compute directly (with the eval()/no_grad() wrap).
-        if self._step.enabled:
-            was_training = pl_module.training
-            pl_module.eval()
+        keys = _param_keys(pl_module)
+        tr = self.truncator
+        proposal = tr.propose(pl_module, self.obs_loader, self.marginals, self.prior)
+        self.latest = proposal
+        for key, out_idx in self.marginals:
+            name = "-".join(keys[i] for i in key)
+            tb_name = name if len(key) == 1 else "_".join(keys[i] for i in key)
             try:
-                with torch.no_grad():
-                    self._compute_and_plot(trainer, pl_module, trainer.global_step, True)
-            finally:
-                if was_training:
-                    pl_module.train()
-        else:
-            self.on_validation_epoch_end(trainer, pl_module)
-        print(f"Total training time: {datetime.now() - self.init_time}")
+                entropy, density, grids = self._coarse_entropy(pl_module, key, out_idx)
+                region = proposal.regions.get(key)
+                if region is None:
+                    # rectangle mode: the posterior's HPD region on the coarse grid
+                    names = [keys[i] for i in key]
+                    region, _ = truncation_region(
+                        density, grids, None, policy="off", hysteresis_weight=None,
+                        credible=float(tr.conf.get("credible_level_1d" if len(key) == 1
+                                                   else "credible_level_2d", 0.997)),
+                        dilation=float(tr.conf.get("dilation_1d" if len(key) == 1
+                                                   else "dilation_2d", 1.2)),
+                        periods=tuple(_MASK_PERIOD_BY_NAME.get(n) for n in names),
+                        clip=False)
+                ratio, post_vol, prop_vol, mode_ratios = volume_ratio(
+                    region, tr.prev_accepted.get(key), box_volume(self.prior, key, keys))
+            except ValueError as ve:
+                print(f"Round {self.round_idx}, {tag_kind} {tag}, {name}: "
+                      f"truncation metric failed ({ve}).", flush=True)
+                continue
+            self.volume_ratios.setdefault(key, []).append({
+                'epoch': trainer.current_epoch, 'step': trainer.global_step,
+                'ratio': ratio, 'posterior_volume': post_vol, 'prior_volume': prop_vol,
+                'mode_ratios': mode_ratios})
+            self.differential_entropies.setdefault(key, []).append({
+                'epoch': trainer.current_epoch, 'step': trainer.global_step,
+                'entropy': entropy})
+            kept = proposal.kept.get(key)
+            if trainer.logger is not None:
+                metrics = {f"volume_ratio/{tb_name}": ratio, f"diff_entropy/{tb_name}": entropy}
+                if kept is not None:
+                    metrics[f"truncation/kept/{tb_name}"] = kept
+                metrics.update({f"volume_ratio_mode/{tb_name}/{k}": r
+                                for k, r in enumerate(mode_ratios)})
+                trainer.logger.log_metrics(metrics, step=tag)
+            if do_print:
+                print(f"Round {self.round_idx}, {tag_kind} {tag}, {name}: "
+                      f"vol_ratio={ratio:.4f} (post={post_vol:.3e}, prior={prop_vol:.3e}), "
+                      f"modes={[round(r, 3) for r in mode_ratios]}, "
+                      + ("" if kept is None else f"kept={kept:.5f}, ")
+                      + f"H={entropy:.4f} nats", flush=True)
 
 
 class VolumeRatioEarlyStopping(Callback):
@@ -876,9 +687,9 @@ class VolumeRatioEarlyStopping(Callback):
         # truncation has stopped shrinking the prior.
         self.stopped_via: str = ""
 
-    def _find_plot_callback(self, trainer) -> "PlotPosteriorCallback | None":
+    def _find_plot_callback(self, trainer) -> "TruncationMonitor | None":
         for cb in trainer.callbacks:
-            if isinstance(cb, PlotPosteriorCallback):
+            if isinstance(cb, TruncationMonitor):
                 return cb
         return None
 
@@ -1058,9 +869,9 @@ class DifferentialEntropyEarlyStopping(Callback):
         self.ema_history: list[dict] = []
         self.stop_reason: str = ""
 
-    def _find_plot_callback(self, trainer) -> "PlotPosteriorCallback | None":
+    def _find_plot_callback(self, trainer) -> "TruncationMonitor | None":
         for cb in trainer.callbacks:
-            if isinstance(cb, PlotPosteriorCallback):
+            if isinstance(cb, TruncationMonitor):
                 return cb
         return None
 

@@ -123,33 +123,19 @@ def test_2d_prev_none_is_identity():
 # ----------------------------------------------------------------------
 # trainer flag semantics: default off; only active under the 'hard' policy
 # ----------------------------------------------------------------------
-def _load_trainer():
-    import importlib.util
-    import os
-    import pytest
-    spec = importlib.util.spec_from_file_location(
-        "tmnre_joint_under_test",
-        os.path.join(os.path.dirname(__file__), "..", "scripts", "tmnre_joint.py"))
-    mod = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(mod)
-    except Exception as exc:                              # heavy optional deps
-        pytest.skip(f"tmnre_joint import unavailable: {exc}")
-    return mod
-
-
 def test_monotonic_flag_semantics():
-    import types
-    mod = _load_trainer()
-    fn = mod.SequentialTrainerJoint._monotonic_enabled
-    obj = types.SimpleNamespace(_monotonic_warned=False)
+    from pembhb.truncator import Truncator
+
+    def flag(conf):
+        tr = Truncator(dict(conf, mode="mask"), {}, [])
+        return tr.monotonic(), tr
 
     # default: off
-    assert fn(obj, {}) is False
+    assert flag({})[0] is False
     # on + hard -> active
-    assert fn(obj, {"enforce_monotonic_regions": True,
-                    "zero_outside_prev_mask": "hard"}) is True
+    assert flag({"enforce_monotonic_regions": True,
+                 "zero_outside_prev_mask": "hard"})[0] is True
     # on + non-hard -> ignored (no-op) and warns once
-    assert fn(obj, {"enforce_monotonic_regions": True,
-                    "zero_outside_prev_mask": "hysteresis"}) is False
-    assert obj._monotonic_warned is True
+    on, tr = flag({"enforce_monotonic_regions": True,
+                   "zero_outside_prev_mask": "hysteresis"})
+    assert on is False and tr._monotonic_warned is True

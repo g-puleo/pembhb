@@ -68,7 +68,9 @@ def load_history(run_name: str):
         raise SystemExit(f"No rounds found for run {run_name} under {DATA_ROOT_DIR}/logs.")
     labels = sorted({lbl for ea in accs for lbl in _labels(ea)})
     if not labels:
-        raise SystemExit("No pp_ks/D/* scalars found: was calibration_monitor enabled?")
+        print("No calibration evaluations logged yet: the run is shorter than "
+              "calibration_monitor.warmup_epochs, or the monitor was off. Nothing to plot.")
+        raise SystemExit(0)
 
     out = {lbl: {k: [] for k in ("epoch", "D", "T", "D_ema", "T_ema")} for lbl in labels}
     round_ends = []
@@ -103,9 +105,16 @@ def main():
     ap.add_argument("run_tag", help="run tag (TIME_OF_EXECUTION)")
     args = ap.parse_args()
 
-    with open(os.path.join(DATA_ROOT_DIR, args.run_tag, "calibration_state.yaml")) as f:
+    run_dir = os.path.join(DATA_ROOT_DIR, args.run_tag)
+    state_path = os.path.join(run_dir, "calibration_state.yaml")
+    if not os.path.exists(state_path):          # runs before the rename
+        state_path = os.path.join(run_dir, "ppks_state.yaml")
+    with open(state_path) as f:
         state = yaml.safe_load(f)
-    d_thr, t_thr, q = state["d_threshold"], state["t_threshold"], state["t_quantile"]
+    # older state files did not record the reference levels: use the defaults
+    d_thr = state.get("d_threshold", 0.2)
+    t_thr = state.get("t_threshold", 0.05)
+    q = state.get("t_quantile", 0.05)
     t_base = 2.0 * q
 
     hist, round_ends = load_history(args.run_tag)

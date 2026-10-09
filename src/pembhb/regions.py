@@ -529,7 +529,10 @@ def _effective_periodic(grid1d, period):
     if period is None:
         return False
     g = np.asarray(grid1d, dtype=float)
-    return bool(np.isclose(g[-1] - g[0], period))
+    span = g[-1] - g[0]
+    # edge-centred grids (linspace over the box) span the period; cell-centred
+    # ones (refined windows) span it minus one cell
+    return bool(np.isclose(span, period) or np.isclose(span + abs(g[1] - g[0]), period))
 
 
 def region_from_hpd(density, grids, credible_level, dilation_factor=1.0,
@@ -823,8 +826,8 @@ def mode_bounds(component, pad_to_cell_edges=True):
     cell narrower than the mode actually is.  A refined subgrid built from
     centres therefore starts life one coarse cell too small and re-loses that
     cell every round; padding to the enclosing cell edges is what stops it.
-    Clamped to the parent grid so a mode touching the prior box cannot spill
-    outside it.
+    Clamped to the parent grid's outer cell edges, so a mode touching the prior
+    box cannot spill outside it (grids hold cell centres tiling the box).
     """
     b = component.bounds()
     if component.ndim == 1:
@@ -832,8 +835,10 @@ def mode_bounds(component, pad_to_cell_edges=True):
     out = []
     for axis, (lo, hi) in enumerate(b):
         g = component.grids[axis]
-        half = 0.5 * abs(_axis_cell_size(g)) if pad_to_cell_edges else 0.0
-        out.append((max(float(g[0]), lo - half), min(float(g[-1]), hi + half)))
+        cell = 0.5 * abs(_axis_cell_size(g))
+        half = cell if pad_to_cell_edges else 0.0
+        # clamp to the grid's outer cell edges (grids hold cell centres)
+        out.append((max(float(g[0]) - cell, lo - half), min(float(g[-1]) + cell, hi + half)))
     return out[0] if component.ndim == 1 else out
 
 
@@ -843,7 +848,8 @@ def _as_multiregion(region):
 
 
 def refine_region(region, evaluate, ngrid, prev=None, policy="hard",
-                  credible=0.999, dilation=1.0, periods=None, clip=True):
+                  credible=0.999, dilation=1.0, periods=None, clip=True,
+                  threshold=None):
     """Re-derive ``region`` on one subgrid per mode (§2.2/§2.4).
 
     ``region`` fixes the **topology** — how many modes there are and roughly
@@ -864,6 +870,9 @@ def refine_region(region, evaluate, ngrid, prev=None, policy="hard",
     the threshold is found once by pooling every mode's density with its own
     cell volume, so per-subgrid normalisation would hand each mode the same
     mass however little it holds.
+
+    ``threshold`` (raw density units) skips the HPD search and cuts at that
+    level — :func:`find_modes` passes the first pass's level to the deeper ones.
 
     Returns ``(multiregion, modes)``.  ``modes`` carries each mode's grids,
     density and the one shared ``threshold``, so plots can draw every mode's
@@ -898,9 +907,10 @@ def refine_region(region, evaluate, ngrid, prev=None, policy="hard",
     if not evaluated:
         return _as_multiregion(region), []
 
-    threshold = _hpd_threshold([e["density"] for e in evaluated],
-                               credible_level=credible,
-                               cell_volumes=[e["cell_volume"] for e in evaluated])
+    if threshold is None:
+        threshold = _hpd_threshold([e["density"] for e in evaluated],
+                                   credible_level=credible,
+                                   cell_volumes=[e["cell_volume"] for e in evaluated])
     if not np.isfinite(threshold):
         # the pooled density carries no mass — nothing to refine against
         return _as_multiregion(region), evaluated
@@ -924,30 +934,45 @@ def refine_region(region, evaluate, ngrid, prev=None, policy="hard",
     return MultiRegion(parts), modes
 
 
-def find_modes(region, evaluate, ngrid, max_depth=4, tol=1e-3, **kw):
+def find_modes(region, evaluate, ngrid, max_depth=4, tol=1e-3, stats=None, **kw):
     """Recursive mode finding: apply :func:`refine_region` to its own output.
 
-    The same algorithm at every level — a mode is re-evaluated on its own
-    support, and if what comes back is still one connected component it is a
-    true mode; if it breaks into several, each becomes a mode in its own right
-    and is examined the same way.  Modes therefore form a tree, and because each
-    level's window is that mode's own support the resolution compounds instead of
-    being reset to a grid spanning the whole box.
+    The first pass evaluates every mode of ``region`` on its own grid and fixes
+    ONE level: the ``credible`` HPD level of the density pooled over those
+    windows — i.e. normalised over ``region`` (restricted to ``prev``). Deeper
+    passes re-evaluate each accepted mode on a tighter window and cut at that
+    same level: they sharpen edges and resolve splits, but never re-normalise
+    over their own output (which would remove another 1−credible each depth).
 
     Stops at the fixed point — when a pass changes neither the number of modes
     nor the accepted volume by more than ``tol`` (relative).  Splitting alone is
     **not** the right stopping rule: a pass that merely tightens the windows can
-    be what makes the next pass able to resolve a split at all, so the recursion
-    has to keep going while the region is still moving.  ``max_depth`` caps the
-    work.  Returns ``(multiregion, modes)`` exactly as :func:`refine_region`.
+    be what makes the next pass able to resolve a split at all.  ``max_depth``
+    caps the work.  Returns ``(multiregion, modes)`` exactly as
+    :func:`refine_region`; if ``stats`` is a dict it receives ``threshold`` and
+    ``kept``: the posterior mass inside the final region over the mass of the
+    domain, both on the first pass's grids.
     """
     region = _as_multiregion(region)
-    modes = []
+    modes, first = [], None
+    threshold = None
     n_prev, v_prev = len(region.components()), region.volume()
     for _ in range(max(1, int(max_depth))):
-        region, modes = refine_region(region, evaluate, ngrid, **kw)
+        region, modes = refine_region(region, evaluate, ngrid, threshold=threshold, **kw)
+        if threshold is None and modes and "threshold" in modes[0]:
+            threshold, first = modes[0]["threshold"], modes
         n, v = len(region.components()), region.volume()
         if n == n_prev and abs(v - v_prev) <= tol * max(v_prev, 1e-300):
             break
         n_prev, v_prev = n, v
+    if stats is not None:
+        stats["threshold"] = threshold
+        stats["kept"] = None
+        if first:
+            # both integrals on the first pass's grids (one quadrature): the
+            # final region's membership is tested there
+            total = sum(float(np.sum(e["density"])) * e["cell_volume"] for e in first)
+            inside = sum(float(np.sum(e["density"] * region.contains_grid(e["grids"])))
+                         * e["cell_volume"] for e in first)
+            stats["kept"] = inside / total if total > 0 else None
     return region, modes

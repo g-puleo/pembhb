@@ -170,12 +170,21 @@ def load_duration_weeks(round_dir: str, round_number: int) -> float:
     return float(wf["duration"])
 
 
+# Runs made before the 2026-10-09 rename store these parameter names.
+LEGACY_PARAM_NAMES = {"inc": "cosinc", "beta": "sinbeta"}
+
+
+def rename_legacy_params(d: dict) -> dict:
+    """Map pre-rename parameter keys (``inc``, ``beta``) to current names."""
+    return {LEGACY_PARAM_NAMES.get(k, k): v for k, v in d.items()}
+
+
 def load_prior_box(round_dir: str, round_number: int) -> dict:
     """Return {param: (low, high)} from the round's sidecar YAML."""
     with open(_sidecar_yaml_path(round_dir, round_number)) as f:
         conf = yaml.safe_load(f)
     prior = conf.get("prior") or conf["conf"]["prior"]
-    return {k: tuple(v) for k, v in prior.items()}
+    return rename_legacy_params({k: tuple(v) for k, v in prior.items()})
 
 
 # ---------------------------------------------------------------------------

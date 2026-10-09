@@ -316,28 +316,17 @@ truncation:
   dilation_1d: 1.00
   credible_level_2d: 0.999
   dilation_2d: 1.1
+  # Round 1 only: coarse grid over the prior box that finds the first modes.
   ngrid_1d: 100
   ngrid_2d: 200
-  # Per-mode refinement. The coarse pass above fixes the topology (how many
-  # modes and where); with refine: true each mode is then re-evaluated on its
-  # own grid spanning exactly that mode's support, at the resolution below, and
-  # ONE threshold is found by pooling every mode's density weighted by its own
-  # cell volume. A mode spanning 3 coarse pixels gets ngrid_*_refined of its
-  # own; a mode the refinement finds empty is dropped.
-  # Cost: one extra forward pass per mode per round (seconds on the GPU).
-  refine: true
+  # From round 2 on, the posterior lives on the previous round's accepted set
+  # (its domain). Each mode of the domain is evaluated on its own grid of this
+  # many cells per axis; ONE HPD level, normalised over the whole domain, gives
+  # the new accepted set, so it keeps >= credible_level of the posterior
+  # (logged as truncation/kept/*). Resolution compounds across rounds: the next
+  # round's windows are this round's modes.
   ngrid_1d_refined: 128
   ngrid_2d_refined: 64
-  # Where the mode TOPOLOGY comes from. false = re-derive it every round on the
-  # coarse grid above, so a mode's window can never be finer than one coarse
-  # cell; once a mode shrinks to a few coarse pixels the resolution is pinned
-  # there for good, because the box (the envelope of all modes, gaps included)
-  # has stopped shrinking. true = take the topology from the PREVIOUS round's
-  # modes and apply the same mode-finder recursively to each: a true mode stays
-  # one mask, a mode with internal structure splits, and every window is that
-  # mode's own support, so resolution compounds. Requires refine: true.
-  mode_tree: false
-  refine_max_depth: 4   # safety cap on the recursion; the usual exit is "nothing split"
   # §2 — evaluate the network only on the region it was trained on. Before each
   # round's HPD analysis the posterior is re-weighted by the PREVIOUS round's
   # accepted set (nearest-pixel resampled onto this round's grid), because NRE's

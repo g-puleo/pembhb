@@ -12,7 +12,7 @@ If necessary, you should try to remind the users of the risks of letting an agen
 
 `pembhb` is a **Simulation-Based Inference (SBI)** framework for Bayesian parameter estimation of Massive Black Hole Binaries (MBHBs) observed by the LISA space detector. It implements **TMNRE** (Truncated Marginal Neural Ratio Estimation), a likelihood-free inference method that trains neural classifiers to estimate posterior marginals.
 
-`bbhx` and `lisaanalysistools` are installed via pip and need a one-file patch to bbhx — see `INSTALL.md` and `patches/`. Any local `BBHx/` / `LISAanalysistools/` checkouts are gitignored; ignore them.
+`bbhx` and `lisaanalysistools` are installed via pip and need two patches to bbhx (orbit pointer; observation-window start for `waveform_params.t_obs_start > 0`) — see `INSTALL.md` and `patches/`. Any local `BBHx/` / `LISAanalysistools/` checkouts are gitignored; ignore them.
 
 ## Commands
 
@@ -148,14 +148,24 @@ Two YAML config files control everything:
 - `configs/datagen_config.yaml` — waveform channels, noise model, duration, frequency grid (`fmin`/`fmax`/spacing), prior bounds for all 11 parameters, `injection` (ground truth for the obs), hardware backend (`cuda12x` or `cpu`)
 - `configs/train_config.yaml` — batch size, epochs, learning rate, precision (`float32`/`float64`), data summary type and architecture, marginals specification, Fisher prior, early stopping
 
-### Truncation grid refinement (default ON)
+### Truncation (`src/pembhb/truncator.py`)
 
-With `truncation.mode: mask`, each round's HPD analysis first runs on the coarse grid (`ngrid_1d: 100`, `ngrid_2d: 200`), then **re-evaluates every accepted mode on its own refined subgrid** (`MultiRegion`, `refine_region`). This lifts the coarse-grid resolution ceiling once a mode shrinks to a few pixels.
+`Truncator.propose` builds a round's proposal; it is shared by the round end
+(`tmnre_joint.py`) and `TruncationMonitor` (callbacks.py), which computes the
+early-stop metrics (`volume_ratio`, entropy, `truncation/kept`).
+`PlotPosteriorCallback` only draws figures.
 
-- `truncation.refine` defaults to `true` (`_refine_conf` in `scripts/tmnre_joint.py`). Set `refine: false` explicitly to reproduce older runs (e.g. maskzero, maskzero_aecosine).
-- Defaults when unset: `ngrid_1d_refined: 128`, `ngrid_2d_refined: 64`, `refine_max_depth: 4`.
-- `truncation.mode_tree: true` (recursive per-mode topology) requires `refine: true`; default off.
-- Read from the config every round, so toggling it applies on `--resume`.
+With `truncation.mode: mask`, round r's posterior lives on round r−1's accepted
+set (the domain). Each domain mode is evaluated on its own cell-centred grid
+(`ngrid_1d_refined: 128`, `ngrid_2d_refined: 64`); one HPD level normalised
+over the domain gives the proposal, in one pass of `regions.find_modes`. Only
+round 1 uses the coarse box grid (`ngrid_1d`, `ngrid_2d`). The proposal keeps
+≥ `credible_level` of the domain-normalised posterior (`Proposal.kept`).
+
+- No `refine`, `mode_tree` or `refine_max_depth` keys any more: deeper passes
+  re-test domain membership on misaligned grids and dropped mass at the domain
+  edge (sky round 11 of the conv run: kept 0.9998 → 0.9945 at depth 4).
+- A mode wrapping λ = 0/2π gets a full-period window (coarser).
 
 ## Training Output & Nomenclature
 

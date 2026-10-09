@@ -29,6 +29,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from pembhb import DATA_ROOT_DIR, PLOTS_ROOT_DIR
+from _visualise_common import LEGACY_PARAM_NAMES
 
 
 def _round_of(path):
@@ -58,12 +59,14 @@ def load_stats(run_tag, data_root=DATA_ROOT_DIR):
             for label in f:
                 if label == "cum_ep":
                     continue
-                for param, pg in f[label].items():
+                for param_on_disk, pg in f[label].items():
+                    param = LEGACY_PARAM_NAMES.get(param_on_disk, param_on_disk)
                     mean = pg["posterior_mean"][:]          # (n_eval, n_test)
                     std = pg["posterior_std"][:]
                     lam = (pg["ground_truth"][:][None, :] - mean) / std
                     tau = np.abs(std / pg["fisher_sigma"][:][None, :])
-                    d = acc.setdefault((label, param), {"cum_ep": [], "round": [],
+                    key = ("__".join(LEGACY_PARAM_NAMES.get(n, n) for n in label.split("__")), param)
+                    d = acc.setdefault(key, {"cum_ep": [], "round": [],
                                                         "lambda": [], "tau": []})
                     d["cum_ep"].append(cum_ep)
                     d["round"].append(np.full(cum_ep.shape, rnd))

@@ -246,13 +246,13 @@ def _intervals_from_indices(indices, grid1d):
     mode by exactly one cell on every re-derivation — 1 % at 100 px across a
     mode, 33 % at 3 px — and compounds round after round.
 
-    Clamped to the grid's own ends: the grid spans the prior box, and a mode
-    touching its edge must not propose outside it.
+    Clamped to the grid's outer cell edges: grids hold cell centres tiling
+    the window, and a mode touching its edge must not propose outside it.
     """
     is_wrapped = np.any(np.diff(indices)>1) # finds a wrapped mode
     N_pixels = grid1d.shape[0]
     half = 0.5 * float(grid1d[1] - grid1d[0])
-    g_lo, g_hi = float(grid1d[0]), float(grid1d[-1])
+    g_lo, g_hi = float(grid1d[0]) - half, float(grid1d[-1]) + half
 
     def _edges(i0, i1):
         return [max(g_lo, float(grid1d[i0]) - half),
@@ -290,7 +290,8 @@ def analyse_posterior_1d(grid, norm1d, credible_level=0.99999,
     thr = _hpd_threshold(norm1d, credible_level=credible_level)
     mask = norm1d>=thr
     # label the modes ensuring periodic bc if needed
-    periodic = (period is not None) and bool( np.isclose(grid1d[-1] - grid1d[0], period))
+    from pembhb.regions import _effective_periodic
+    periodic = _effective_periodic(grid1d, period)
     labelled , n_modes = _periodic_labelling(mask, periodic)
     dilated = np.zeros_like(mask)
     
@@ -351,8 +352,9 @@ def _periodic_labelling( mask , periodic):
 def analyse_posterior_2d(grid2d_x, grid2d_y,  norm2d, period: tuple, credible_level=0.999, dilation_factor=1.1):
     grid_x = grid2d_x[0,:]
     grid_y = grid2d_y[:,0]
-    period_x = (period[0] is not None) and bool( np.isclose(grid_x[-1] - grid_x[0], period[0]))
-    period_y = (period[1] is not None) and bool( np.isclose(grid_y[-1] - grid_y[0], period[1]))
+    from pembhb.regions import _effective_periodic
+    period_x = _effective_periodic(grid_x, period[0])
+    period_y = _effective_periodic(grid_y, period[1])
     periodic = (period_y, period_x)
     threshold = _hpd_threshold(norm2d, credible_level)
     mask = norm2d >= threshold

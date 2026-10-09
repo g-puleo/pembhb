@@ -147,28 +147,3 @@ def test_cos_iota_gap_stays_closed_with_hard_zero():
     keep = prev_keep_mask(_round1_inc_intervals(), (g,))
     grown = ndimage.binary_dilation(keep, iterations=1)
     assert np.all(res["mask"][~grown] == False)
-
-
-# ----------------------------------------------------------------------
-# the trainer wrapper delegates to apply_prev_mask (plumbing check)
-# ----------------------------------------------------------------------
-def test_trainer_wrapper_delegates(monkeypatch):
-    import types
-    import importlib.util
-    import os
-    spec = importlib.util.spec_from_file_location(
-        "tmnre_joint_under_test",
-        os.path.join(os.path.dirname(__file__), "..", "scripts", "tmnre_joint.py"))
-    mod = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(mod)
-    except Exception as exc:                              # heavy optional deps
-        pytest.skip(f"tmnre_joint import unavailable: {exc}")
-
-    g = np.linspace(-1, 1, 101)
-    obj = types.SimpleNamespace(
-        _prev_accepted={(6,): {"kind": "1d", "intervals": [[-0.5, 0.5]]}})
-    out = mod.SequentialTrainerJoint._zero_outside_prev(
-        obj, (6,), np.ones_like(g), (g,), {"zero_outside_prev_mask": "hard"})
-    keep = (g >= -0.5) & (g <= 0.5)
-    assert np.all(out[~keep] == 0.0) and np.all(out[keep] > 0.0)

@@ -13,7 +13,7 @@ from pembhb.regions import MultiRegion, Region
 
 
 def _part_1d(lo, hi, n, mask=None, periodic=(False,)):
-    g = np.linspace(lo, hi, n)
+    g = lo + (np.arange(n) + 0.5) * (hi - lo) / n
     m = np.ones(n, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
     return Region(m, (g,), periodic)
 
@@ -96,9 +96,9 @@ def test_region_volume_fraction_default_is_unchanged():
 
 def test_bounds_and_intervals_span_every_part():
     mr = _two_modes_1d()
-    lo, hi = mr.bounds()
-    assert lo == pytest.approx(0.2)
-    assert hi == pytest.approx(0.8)
+    lo, hi = mr.bounds()                       # outermost accepted centres
+    assert lo == pytest.approx(0.2 + 0.05 / 41)
+    assert hi == pytest.approx(0.8 - 0.05 / 11)
     ivs = sorted(mr.intervals(0))
     assert len(ivs) == 2
     assert ivs[0][0] == pytest.approx(0.2) and ivs[0][1] == pytest.approx(0.3)
@@ -116,7 +116,7 @@ def test_components_splits_a_part_that_refinement_broke_in_two():
 def test_empty_part_does_not_break_bounds():
     empty = _part_1d(0.5, 0.6, 11, mask=np.zeros(11, dtype=bool))
     mr = MultiRegion([empty, _part_1d(0.2, 0.3, 41)])
-    assert mr.bounds()[0] == pytest.approx(0.2)
+    assert mr.bounds()[0] == pytest.approx(0.2 + 0.05 / 41)
     assert mr.volume() == pytest.approx(mr.parts[1].volume())
 
 

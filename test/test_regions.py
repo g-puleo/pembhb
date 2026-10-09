@@ -25,7 +25,8 @@ TWO_PI = 2 * np.pi
 # fixtures / helpers
 # ----------------------------------------------------------------------
 def _grid(lo, hi, n):
-    return np.linspace(lo, hi, n)
+    """n cell centres tiling [lo, hi] (the pipeline's grid convention)."""
+    return lo + (np.arange(n) + 0.5) * (hi - lo) / n
 
 
 def _norm1d(d, g):

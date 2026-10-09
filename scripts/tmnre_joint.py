@@ -47,7 +47,7 @@ from pembhb.utils import (
     apply_pipeline_section,
 )
 from pembhb.callbacks import (
-    PlotPosteriorCallback, VolumeRatioEarlyStopping,
+    PlotPosteriorCallback, TruncationMonitor, VolumeRatioEarlyStopping,
     DifferentialEntropyEarlyStopping, PeriodicProgressCallback,
     WarmupEarlyStopping, CalibrationMonitor, ChainConvergenceMonitor,
     compute_truncation_coverage, StreamReuseLogger,
@@ -58,17 +58,13 @@ from pembhb.mask_truncation import (
     eval_posterior_1d, MaskRejectSampler,
     save_truncation, load_truncation, truth_violations, format_violations, _MASK_PERIOD_BY_NAME
 )
-from pembhb.regions import (Region, MultiRegion, _as_multiregion,
-                            apply_prev_mask, truncation_region, find_modes)
+from pembhb.truncator import Truncator
 from pembhb.diagnostics import AutoencoderDiagnosticsCallback
 
 # Physical period of the angular parameters, keyed by prior-key name (spin-basis
 # independent — only slots 2,3 change with basis). Used to gate periodic mask
 # handling: analyse_posterior_* only treats an axis as periodic when its grid
 # still spans the full period (an already-truncated interior window is not).
-def _envelope( intervals):
-    return [min(lo for lo, _ in intervals), max(hi for _, hi in intervals)]
-
 def get_timestamp():
     return datetime.now().strftime("%Y/%m/%d")
 
@@ -395,15 +391,12 @@ class SequentialTrainerJoint:
         # {marginal_tuple: (coverage, n_inside, n_total)}; drives the truncation
         # veto. Recomputed each round, so no resume state needed.
         self._last_coverage = {}
-        # §2 (evaluate the network only on the mask it was trained on): the
-        # accepted set of each marginal from the PREVIOUS round, used to zero the
-        # posterior outside it before this round's HPD analysis. 1D stores the
-        # sub-intervals (exact membership); 2D stores a Region for nearest-pixel
-        # resampling onto the new grid. Populated by _mask_truncate_marginal and
-        # rebuilt on --resume from the saved truncation. See _zero_outside_prev.
-        self._prev_accepted = {}
-        # §2 monotonicity: warn only once if the flag is set under a non-hard policy.
-        self._monotonic_warned = False
+        # Truncation: owns the domain (previous round's accepted set, used for
+        # §2 zeroing) and the proposal procedure shared with TruncationMonitor.
+        self.truncator = Truncator(
+            self.train_conf.get("truncation", {}),
+            self.train_conf.get("truncation_veto", {}),
+            utils.ordered_prior_keys(self.datagen_conf.get("spin_param_basis", "chi1chi2")))
         self._current_normalisation = None
         cc_conf = self.train_conf.get("chain_convergence", {})
         self.chain_monitor = None
@@ -422,236 +415,6 @@ class SequentialTrainerJoint:
             print(f"[ChainConv] enabled: eps_nats={cc_conf.get('eps_nats', 0.05)}, "
                   f"patience={cc_conf.get('patience', 2)}, tau_gate={_tg}")
 
-
-    # ------------------------
-    # Truncation helpers
-
-    def _zero_outside_prev(self, marginal_key, density, grids, trunc_conf):
-        """§2: down-weight the posterior outside the region the network was
-        *trained* on last round, before this round's HPD analysis.
-
-        Thin wrapper over :func:`pembhb.regions.apply_prev_mask` (which holds the
-        policy + re-weighting logic) that supplies the previous round's accepted
-        set and logs the degenerate no-overlap case.  ``grids`` is ``(grid_x,)``
-        (1D) or ``(grid_x, grid_y)`` (2D) of the CURRENT round.
-        """
-        new, status = apply_prev_mask(
-            density, self._prev_accepted.get(marginal_key), grids,
-            policy=str(trunc_conf.get("zero_outside_prev_mask", "hard")),
-            hysteresis_weight=float(trunc_conf.get("hysteresis_weight", 0.1)))
-        if status == "degenerate":
-            # The previous mask does not intersect this round's grid at all;
-            # zeroing would leave nothing to threshold. Leave the density
-            # untouched and let truth_violations / the veto catch a bad window.
-            print(f"[Trunc/mask/§2] {marginal_key}: previous mask has no overlap "
-                  f"with this round's grid; skipping zeroing.", flush=True)
-        return new
-
-    def _monotonic_enabled(self, trunc_conf):
-        """§2 monotonicity flag: once a region is excluded it stays excluded
-        (``A_N := A_N ∩ A_{N-1}``), preventing the post-zeroing dilation from
-        re-opening the previous boundary.  Only meaningful with the ``hard`` zero
-        policy; a no-op (with a one-time warning) under ``hysteresis``/``off``,
-        which are deliberately recoverable.
-        """
-        if not bool(trunc_conf.get("enforce_monotonic_regions", False)):
-            return False
-        policy = str(trunc_conf.get("zero_outside_prev_mask", "hard"))
-        if policy != "hard":
-            if not self._monotonic_warned:
-                print(f"[Trunc/mask/§2] enforce_monotonic_regions ignored: it "
-                      f"requires zero_outside_prev_mask='hard' but policy is "
-                      f"{policy!r}.", flush=True)
-                self._monotonic_warned = True
-            return False
-        return True
-
-    def _refine_evaluator_1d(self, in_idx, out_idx):
-        """``evaluate(bounds, n)`` for :func:`refine_region` — raw 1D ratios.
-
-        Raw, not normalised: the refined modes are pooled into one
-        volume-weighted threshold, so each must stay on the common scale.
-        """
-        def _evaluate(bounds, n):
-            lo, hi = bounds
-            logratios, _inj, grid = utils.get_logratios_grid(
-                self.dataloader_obs, self.model, ngrid_points=int(n),
-                in_param_idx=in_idx, out_param_idx=out_idx,
-                low=float(lo), high=float(hi))
-            return np.exp(logratios[0]), (grid[:, 0],)
-        return _evaluate
-
-    def _refine_evaluator_2d(self, in_idx, out_idx):
-        """``evaluate(bounds, n)`` for :func:`refine_region` — raw 2D ratios."""
-        def _evaluate(bounds, n):
-            (xlo, xhi), (ylo, yhi) = bounds
-            logratios, _inj, gx, gy = utils.get_logratios_grid_2d(
-                self.dataloader_obs, self.model, ngrid_points=int(n),
-                out_param_idx=out_idx, in_param_idx=tuple(in_idx),
-                bounds_0=(float(xlo), float(xhi)),
-                bounds_1=(float(ylo), float(yhi)))
-            return np.exp(logratios[0]), (gx[0, :], gy[:, 0])
-        return _evaluate
-
-    def _refine_conf(self, trunc_conf, key):
-        """``(enabled, ngrid, mode_tree, max_depth)`` for per-mode refinement.
-
-        ``refine`` off keeps the coarse set untouched.  ``mode_tree`` additionally
-        takes the topology from the PREVIOUS round's modes, recursively, instead
-        of re-deriving it on a fresh coarse grid spanning the whole box — which
-        is what pins the achievable resolution at one coarse cell once a mode
-        shrinks to a few pixels.
-        """
-        refine = bool(trunc_conf.get("refine", True))
-        mode_tree = bool(trunc_conf.get("mode_tree", False))
-        if mode_tree and not refine:
-            raise ValueError(
-                "truncation.mode_tree requires truncation.refine: true — the "
-                "recursion IS the per-mode refinement applied to its own output.")
-        default_ngrid = {"ngrid_1d_refined": 128, "ngrid_2d_refined": 64}[key]
-        return (refine, int(trunc_conf.get(key, default_ngrid)), mode_tree,
-                int(trunc_conf.get("refine_max_depth", 4)))
-
-    @staticmethod
-    def _seed_from_prev(prev, ngrid):
-        """Previous round's accepted set as a ``MultiRegion``, or ``None``.
-
-        This is what replaces the coarse topology pass: the modes the network was
-        actually trained on, each on its own window, so refinement compounds
-        instead of restarting from a box-wide grid.
-
-        1D rebuilds from the stored intervals, which is lossless — a leaf mode is
-        one connected component, hence a contiguous interval, so the intervals
-        ARE the per-mode windows.  2D already carries a ``MultiRegion`` (npz
-        ``format_version: 2``).
-        """
-        if not prev:
-            return None
-        if prev.get("kind") == "2d":
-            region = prev.get("region")
-            return None if region is None else _as_multiregion(region)
-        ivs = prev.get("intervals") or []
-        parts = [Region(np.ones(int(ngrid), dtype=bool),
-                        (np.linspace(float(lo), float(hi), int(ngrid)),))
-                 for lo, hi in ivs if float(hi) > float(lo)]
-        return MultiRegion(parts) if parts else None
-
-    def _mask_truncate_marginal(self, marginal_key, out_idx, prior_keys,
-                            intervals_1d, masks_2d, trunc_conf):
-
-        if len(marginal_key)==1:
-            param_name = prior_keys[marginal_key[0]]
-            # Previous round's accepted set (before it is overwritten below),
-            # used for §2 zeroing and, if enabled, monotonic clipping.
-            prev = self._prev_accepted.get(marginal_key)
-            period = _MASK_PERIOD_BY_NAME.get(prior_keys[marginal_key[0]])
-            refine, n_ref, mode_tree, max_depth = self._refine_conf(
-                trunc_conf, "ngrid_1d_refined")
-
-            region = self._seed_from_prev(prev, n_ref) if mode_tree else None
-            seeded = region is not None   # False -> coarse bootstrap below
-            if region is None:
-                # Bootstrap (round 1, or mode_tree off): coarse full-box pass.
-                # §2 zero outside prev → HPD + dilation → monotone clip. Shared
-                # with PlotPosteriorCallback so the ratio measures this same set.
-                grid, norm1d, _ = eval_posterior_1d(
-                    self.model, self.dataloader_obs,
-                    in_param_idx=marginal_key[0], out_param_idx=out_idx,
-                    ngrid_points=trunc_conf.get("ngrid_1d", 100))
-                region, status = truncation_region(
-                    norm1d, (grid[:, 0],), prev,
-                    policy=str(trunc_conf.get("zero_outside_prev_mask", "hard")),
-                    hysteresis_weight=float(trunc_conf.get("hysteresis_weight", 0.1)),
-                    credible=float(trunc_conf.get("credible_level_1d", 0.997)),
-                    dilation=float(trunc_conf.get("dilation_1d", 1.2)),
-                    periods=(period,),
-                    clip=self._monotonic_enabled(trunc_conf))
-                if status == "degenerate":
-                    print(f"[Trunc/mask/§2] {marginal_key}: previous mask has no overlap "
-                          f"with this round's grid; skipping zeroing.", flush=True)
-
-            if refine:
-                n_before = len(region.components())
-                region, _modes = find_modes(
-                    region, self._refine_evaluator_1d(marginal_key[0], out_idx),
-                    ngrid=n_ref, max_depth=(max_depth if mode_tree else 1),
-                    prev=prev,
-                    policy=str(trunc_conf.get("zero_outside_prev_mask", "hard")),
-                    credible=float(trunc_conf.get("credible_level_1d", 0.997)),
-                    dilation=float(trunc_conf.get("dilation_1d", 1.2)),
-                    periods=(period,), clip=self._monotonic_enabled(trunc_conf))
-                src = "prev" if seeded else "coarse"
-                print(f"[Trunc/refine] {param_name}: {n_before} {src} mode(s) -> "
-                      f"{len(region.parts)} refined at {n_ref} px each", flush=True)
-
-            intervals = region.intervals()
-            intervals_1d[marginal_key[0]] = intervals
-            # Record this round's accepted set for next round's §2 zeroing.
-            self._prev_accepted[marginal_key] = {"kind": "1d", "intervals": intervals}
-            widest_interval = _envelope(intervals)
-            tmp = copy.deepcopy(self.datagen_conf["prior"])
-            tmp[param_name] = [widest_interval[0], widest_interval[1]]
-            self.datagen_conf["prior"] = tmp
-
-        elif len(marginal_key)==2:
-            inj1, inj2 = marginal_key
-            prev = self._prev_accepted.get(marginal_key)
-            period = (_MASK_PERIOD_BY_NAME.get(prior_keys[marginal_key[0]]),
-                      _MASK_PERIOD_BY_NAME.get(prior_keys[marginal_key[1]]))
-            refine, n_ref, mode_tree, max_depth = self._refine_conf(
-                trunc_conf, "ngrid_2d_refined")
-
-            region = self._seed_from_prev(prev, n_ref) if mode_tree else None
-            seeded = region is not None   # False -> coarse bootstrap below
-            if region is None:
-                # Bootstrap (round 1, or mode_tree off): coarse full-box pass.
-                norm2d, _, gx, gy, _, _ = utils.eval_posterior_2d(
-                    self.model, self.dataloader_obs,
-                    in_param_idx=marginal_key, out_param_idx=out_idx,
-                    ngrid_points=trunc_conf.get("ngrid_2d", 100))
-                grid_x, grid_y = gx[0, :], gy[:, 0]
-                region, status = truncation_region(
-                    norm2d, (grid_x, grid_y), prev,
-                    policy=str(trunc_conf.get("zero_outside_prev_mask", "hard")),
-                    hysteresis_weight=float(trunc_conf.get("hysteresis_weight", 0.1)),
-                    credible=float(trunc_conf.get("credible_level_2d", 0.997)),
-                    dilation=float(trunc_conf.get("dilation_2d", 1.2)),
-                    periods=period,
-                    clip=self._monotonic_enabled(trunc_conf))
-                if status == "degenerate":
-                    print(f"[Trunc/mask/§2] {marginal_key}: previous mask has no overlap "
-                          f"with this round's grid; skipping zeroing.", flush=True)
-            if refine:
-                n_before = len(region.components())
-                region, _modes = find_modes(
-                    region, self._refine_evaluator_2d(marginal_key, out_idx),
-                    ngrid=n_ref, max_depth=(max_depth if mode_tree else 1),
-                    prev=prev,
-                    policy=str(trunc_conf.get("zero_outside_prev_mask", "hard")),
-                    credible=float(trunc_conf.get("credible_level_2d", 0.997)),
-                    dilation=float(trunc_conf.get("dilation_2d", 1.2)),
-                    periods=period, clip=self._monotonic_enabled(trunc_conf))
-                src = "prev" if seeded else "coarse"
-                print(f"[Trunc/refine] {marginal_key}: {n_before} {src} mode(s) -> "
-                      f"{len(region.parts)} refined at {n_ref}^2 px each", flush=True)
-            else:
-                # `region` carries the resolved periodicity; wrap it rather than
-                # rebuilding from labels, which would lose the λ seam.
-                region = MultiRegion.from_region(region)
-
-            masks_2d.append({"idx": tuple(marginal_key), "region": region})
-            # Record this round's accepted set for next round's §2 zeroing.
-            self._prev_accepted[marginal_key] = {"kind": "2d", "region": region}
-            envelope_x = _envelope(region.intervals(0))
-            envelope_y = _envelope(region.intervals(1))
-
-            widest_box = [ envelope_x[0], envelope_x[1], envelope_y[0], envelope_y[1]]
-            tmp = copy.deepcopy(self.datagen_conf["prior"])
-            tmp[prior_keys[inj1]] = [widest_box[0], widest_box[1]]
-            tmp[prior_keys[inj2]] = [widest_box[2], widest_box[3]]
-            self.datagen_conf["prior"] = tmp
-        else:
-            raise ValueError (f"marginal_key has len {len(marginal_key)} but 1 or 2 was expected.")
 
     # -----------------------------------------------------------------
     # Data generation (same as SequentialTrainer)
@@ -1234,11 +997,7 @@ class SequentialTrainerJoint:
                 # §2: rebuild the previous round's accepted set so the resumed
                 # run zeroes the posterior outside the region it was trained on,
                 # exactly as an uninterrupted run would.
-                for idx, ivs in saved["intervals_1d"].items():
-                    self._prev_accepted[(int(idx),)] = {"kind": "1d", "intervals": ivs}
-                for m in saved["masks_2d"]:
-                    self._prev_accepted[tuple(m["idx"])] = {
-                        "kind": "2d", "region": m["region"]}
+                self.truncator.restore(saved)
             # Re-initialise plot tracking lists from the restored prior
         else:
             print(f"[Resume] Warning: {prior_path} not found; using prior from config. "
@@ -1781,49 +1540,40 @@ class SequentialTrainerJoint:
                 return int(warmup_epochs_value) * steps_per_seq_epoch
             return None
 
+        veto_conf = self.train_conf.get("truncation_veto", {})
+        cadence = dict(call_every_n_epochs=10, warmup_epochs=ae_warmup_epochs,
+                       call_every_n_steps=call_every_n_steps,
+                       warmup_steps=_warmup_steps_for(ae_warmup_epochs))
         plot_posterior_callback = PlotPosteriorCallback(
             timestamp=TIME_OF_EXECUTION,
             obs_loader=self.dataloader_obs,
             input_idx_list=self.model.marginals_list,
             output_idx_list=list(range(len(self.model.marginals_list))),
             round_idx=round_idx,
-            call_every_n_epochs=10,
             training_start_time=self.training_start,
-            warmup_epochs=ae_warmup_epochs,
-            call_every_n_steps=call_every_n_steps,
-            warmup_steps=_warmup_steps_for(ae_warmup_epochs),
-            box_dilation_1d=float(
-                self.train_conf.get("truncation_veto", {}).get("dilation_1d", 1.0)),
-            eps_1d=float(
-                self.train_conf.get("truncation_veto", {}).get("eps_1d", 1e-4)),
-            sky_credible_level=float(
-                self.train_conf.get("truncation_veto", {}).get("sky_credible_level", 0.999)),
-            sky_dilation=float(
-                self.train_conf.get("truncation_veto", {}).get("sky_dilation", 1.1)),
-            # Volume-ratio posterior regions built at the same HPD level/dilation
-            # as the truncation, so the ratio's numerator is the full accepted set.
-            credible_level_1d=float(
-                self.train_conf.get("truncation", {}).get("credible_level_1d", 0.997)),
-            dilation_1d=float(
-                self.train_conf.get("truncation", {}).get("dilation_1d", 1.2)),
-            credible_level_2d=float(
-                self.train_conf.get("truncation", {}).get("credible_level_2d", 0.997)),
-            dilation_2d=float(
-                self.train_conf.get("truncation", {}).get("dilation_2d", 1.2)),
-            # §2: let the posterior plots shade the region outside the previous
-            # round's trained mask (where the density is zeroed / down-weighted).
-            prev_accepted=self._prev_accepted,
-            zero_policy=str(self.train_conf.get("truncation", {}).get(
-                "zero_outside_prev_mask", "hard")),
-            hysteresis_weight=float(self.train_conf.get("truncation",{}).get("hysteresis_weight", None)),
-            monotonic=self._monotonic_enabled(self.train_conf.get("truncation", {})),
+            box_dilation_1d=float(veto_conf.get("dilation_1d", 1.0)),
+            eps_1d=float(veto_conf.get("eps_1d", 1e-4)),
+            # §2: shade the region outside the previous round's trained mask
+            prev_accepted=self.truncator.prev_accepted,
+            zero_policy=self.truncator.policy,
+            **cadence,
+        )
+        truncation_monitor = TruncationMonitor(
+            self.truncator, self.dataloader_obs,
+            marginals=[(tuple(m), k) for k, m in enumerate(self.model.marginals_list)],
+            prior=copy.deepcopy(self.datagen_conf["prior"]),
+            round_idx=round_idx,
+            box_dilation_1d=float(veto_conf.get("dilation_1d", 1.0)),
+            eps_1d=float(veto_conf.get("eps_1d", 1e-4)),
+            **cadence,
         )
         if ae_warmup_epochs > 0:
             print(f"[PlotPosterior] skipping first {ae_warmup_epochs} epochs (AE warmup)")
 
-        # Early stopping callback (reads from PlotPosteriorCallback)
+        # The early stops read TruncationMonitor's history, so it comes first.
         callbacks_list = [checkpoint_callback,
                           periodic_checkpoint_callback,
+                          truncation_monitor,
                           plot_posterior_callback,
                           PeriodicProgressCallback(print_every=20, label="Joint",
                                                    print_every_n_steps=print_every_n_steps)]
@@ -2070,14 +1820,14 @@ class SequentialTrainerJoint:
             if isinstance(cb, VolumeRatioEarlyStopping):
                 self._last_stopped_via = cb.stopped_via
         self._last_marginal_entropies = _round_marginal_entropies(
-            plot_posterior_callback,
+            truncation_monitor,
             keys=utils.ordered_prior_keys(
                 self.datagen_conf.get("spin_param_basis", "chi1chi2")))
         self._last_median_tau = _round_median_tau(locals().get("lt_h5_path"))
-        self._last_volume_ratios = _round_volume_ratios(plot_posterior_callback)
+        self._last_volume_ratios = _round_volume_ratios(truncation_monitor)
         # Append this round's final entropy per marginal to the cross-round
         # history that drives entropy-plateau (cold-restart) reinit.
-        for k, h in _round_entropies(plot_posterior_callback).items():
+        for k, h in _round_entropies(truncation_monitor).items():
             self._entropy_history.setdefault(k, []).append(float(h))
         # Round-end empirical coverage of each marginal's truncation box over the
         # (up to) 1000-sample val pool — drives the truncation veto in run().
@@ -2104,9 +1854,6 @@ class SequentialTrainerJoint:
         os.makedirs(os.path.dirname(logfile), exist_ok=True)
         with open(logfile, "a") as _lf:
             _lf.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  {summary}\n")
-
-        if hasattr(self.model, "widest_boxes"):
-            print(f"Widest boxes after training: {self.model.widest_boxes}")
 
         # Copy YAML sidecar to log directory
         shutil.copy(self.data_fname_yaml, logger.log_dir)
@@ -2179,40 +1926,11 @@ class SequentialTrainerJoint:
             veto_enabled = veto_conf.get("enabled", False)
             min_cov = float(veto_conf.get("min_coverage", 0.95))
             vetoed_this_round = []   # marginals whose truncation was skipped
-            # Per-marginal truncation gate: only narrow the prior for marginals
-            # whose round-final posterior/prior ratio actually reached the 0.5
-            # threshold. The `should_stop` from VolumeRatioEarlyStopping ends the
-            # round as soon as the first marginal crosses, but the others keep
-            # their (wide) prior and continue training in the next round.
-            trunc_threshold = float(self.train_conf.get("volume_ratio_early_stop", {}).get(
-                "min_ratio_threshold", 0.5))
-            trunc_keys = {k for k, r in self._last_volume_ratios.items()
-                          if r <= trunc_threshold}
-            # Truncation mode: "rectangle" (legacy widest_boxes) or "mask"
-            # (HPD level-set + rejection sampling). Default keeps old behaviour.
-            trunc_conf = self.train_conf.get("truncation", {})
-            truncation_mode = trunc_conf.get("mode", "rectangle")
-            if truncation_mode not in ("rectangle", "mask"):
-                raise ValueError(f"truncation.mode must be 'rectangle' or 'mask', "
-                                 f"got {truncation_mode!r}")
-            # Accumulated by _mask_truncate_marginal; consumed after the loop by
-            # the sampler, save_truncation and truth_violations.
-            intervals_1d, masks_2d = {}, []
+            truncation_mode = self.truncator.mode
+            to_truncate = []    # (marginal_key, out_idx) not vetoed this round
             for key, marginal_list in self.train_conf["marginals"].items():
                 for marginal in marginal_list:
                     marginal_key = tuple(marginal)
-
-                    # This part of code is commented out because i want to keep the truncaiton veto inactive. 
-                    
-                    # if marginal_key not in trunc_keys:
-                    #     name = "-".join(prior_keys[j] for j in marginal_key)
-                    #     ratio = self._last_volume_ratios.get(marginal_key, float("nan"))
-                    #     print(f"[Trunc] round {i}: keeping prior for {name} "
-                    #           f"(vol_ratio {ratio:.4f} > {trunc_threshold}); "
-                    #           f"not truncatable yet.", flush=True)
-                    #     out_idx += 1
-                    #     continue
-
                     cov_entry = self._last_coverage.get(marginal_key)
                     if (veto_enabled and cov_entry is not None
                             and cov_entry[0] < min_cov):
@@ -2227,56 +1945,15 @@ class SequentialTrainerJoint:
                             "n_inside": int(cov_entry[1]),
                             "n_total": int(cov_entry[2]),
                         })
-                        out_idx += 1
-                        continue
-
-                    if truncation_mode == "mask":
-                        # Mask path subsumes the sky special case: the sky pair
-                        # is just a 2D marginal with lambda periodic.
-                        name = "-".join(prior_keys[j] for j in marginal_key)
-                        print(f"[Trunc/mask] round {i}: {name} (head {out_idx}) ...",
-                              flush=True)
-                        torch.cuda.reset_peak_memory_stats()
-                        self._mask_truncate_marginal(
-                            marginal_key, out_idx, prior_keys,
-                            intervals_1d, masks_2d, trunc_conf)
-                        if self.train_conf.get("profile_gpu_memory", False):
-                            print(f"[GPUMem] round {i} truncation {name} peak alloc GB: "
-                                  f"{torch.cuda.max_memory_allocated() / 2**30:.2f}", flush=True)
-
-                    elif len(marginal) == 1:
-                        param_name = prior_keys[marginal[0]]
-                        if hasattr(self.model, "widest_boxes") and marginal_key in self.model.widest_boxes:
-                            widest_interval = self.model.widest_boxes[marginal_key]
-                            tmp = copy.deepcopy(self.datagen_conf["prior"])
-                            tmp[param_name] = [widest_interval[0], widest_interval[1]]
-                            self.datagen_conf["prior"] = tmp
-                        else:
-                            print(f"Warning: No widest_interval for 1D marginal {marginal_key} ({param_name})")
-
-                    elif len(marginal) == 2:
-                        inj1, inj2 = marginal
-                        if marginal_key == (7, 8):  # sky marginal  
-                            print("truncating sky prior using pembhb.sky_truncation.truncate_sky_prior() ...")
-                            from pembhb.sky_truncation import truncate_sky_prior
-                            _, sky_info = truncate_sky_prior(
-                                self.model, self.dataloader_obs, out_param_idx=out_idx,
-                                datagen_conf=self.datagen_conf,
-                                mode="rectangle",
-                                credible_level=float(veto_conf.get("sky_credible_level", 0.999)),
-                                dilation_factor=float(veto_conf.get("sky_dilation", 1.1)),
-                            )
-                        elif hasattr(self.model, "widest_boxes") and marginal_key in self.model.widest_boxes: 
-                            print(f"Updating prior for 2D marginal {marginal_key} using widest box from model ...")
-                            widest_box = self.model.widest_boxes[marginal_key]
-                            tmp = copy.deepcopy(self.datagen_conf["prior"])
-                            tmp[prior_keys[inj1]] = [widest_box[0], widest_box[1]]
-                            tmp[prior_keys[inj2]] = [widest_box[2], widest_box[3]]
-                            self.datagen_conf["prior"] = tmp
-                        else:
-                            print(f"Warning: No widest_box for 2D marginal {marginal_key}")
-
+                    else:
+                        to_truncate.append((marginal_key, out_idx))
                     out_idx += 1
+            proposal = self.truncator.propose(
+                self.model, self.dataloader_obs, to_truncate,
+                self.datagen_conf["prior"], verbose=True)
+            self.truncator.commit(proposal)
+            self.datagen_conf["prior"] = proposal.prior
+            intervals_1d, masks_2d = proposal.intervals_1d, proposal.masks_2d
 
             print(f"Updated prior after round {i}: {self.datagen_conf['prior']}")
 

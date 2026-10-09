@@ -185,9 +185,10 @@ def get_logratios_grid(dataloader: torch.utils.data.DataLoader, model: 'Inferenc
     else:
         prior_trained_dict = model.hparams["dataset_info"]["conf"]["prior"]
     _keys = ordered_prior_keys(_sik.get("spin_param_basis", "chi1chi2"))
-    prior_bounds = prior_trained_dict[_keys[in_param_idx]]
-    low = low if low is not None else prior_bounds[0]
-    high = high if high is not None else prior_bounds[1]
+    if low is None or high is None:
+        prior_bounds = prior_trained_dict[_keys[in_param_idx]]
+        low = low if low is not None else prior_bounds[0]
+        high = high if high is not None else prior_bounds[1]
     grid = torch.linspace(low, high, ngrid_points).to(device).reshape(-1, 1)
     zero_pad1d = torch.zeros(ngrid_points, 10, device=device)
     grid_padded = torch.cat((zero_pad1d[:, :in_param_idx], grid, zero_pad1d[:, in_param_idx:]), dim=1)  # Shape: [ngrid_points, 11]

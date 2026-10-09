@@ -74,7 +74,7 @@ def test_analyse_1d_bimodal():
 
 
 def test_analyse_1d_wrapped_splits():
-    g = np.linspace(0.0, TWO_PI, 100)
+    g = (np.arange(100) + 0.5) * TWO_PI / 100   # cell centres tiling [0, 2pi]
     d = np.exp(4.0 * np.cos(g))          # peak at 0 == 2pi
     res = analyse_posterior_1d(g.reshape(-1, 1), _norm1d(d, g), period=TWO_PI,
                                credible_level=0.99)
@@ -710,7 +710,7 @@ def test_physical_bounds_hold_when_a_mode_saturates_the_box_edge():
     rng = np.random.default_rng(0)
 
     # face-on/face-off: density piled against both cos(iota) edges, dilation on
-    g = np.linspace(-1.0, 1.0, 100)
+    g = -1.0 + (np.arange(100) + 0.5) * 0.02     # cell centres tiling [-1, 1]
     d = np.exp(-0.5 * ((g - 1.0) / 0.05) ** 2) + np.exp(-0.5 * ((g + 1.0) / 0.05) ** 2)
     r = region_from_hpd(d / d.sum(), (g,), credible_level=0.9999, dilation_factor=1.5)
     ivs = r.intervals(0)
@@ -720,7 +720,8 @@ def test_physical_bounds_hold_when_a_mode_saturates_the_box_edge():
     assert np.all(np.abs(x) <= 1.0)
 
     # a sky mode pressed against sin(beta) = +1
-    gx, gy = np.linspace(0.0, TWO_PI, 80), np.linspace(-1.0, 1.0, 80)
+    gx = (np.arange(80) + 0.5) * TWO_PI / 80           # cell centres
+    gy = -1.0 + (np.arange(80) + 0.5) * 2.0 / 80
     MX, MY = np.meshgrid(gx, gy, indexing="xy")
     d2 = np.exp(-0.5 * (((MX - 3.0) / 0.3) ** 2 + ((MY - 1.0) / 0.08) ** 2))
     r2 = region_from_hpd(d2 / d2.sum(), (gx, gy), credible_level=0.999,
@@ -746,8 +747,8 @@ def test_dist_in_a_2d_pair_is_sampled_uniform_in_d(float64_precision):
     from pembhb.regions import Region
 
     lo, hi = 1.0, 100.0
-    g_inc = np.linspace(-1.0, 1.0, 60)
-    g_dist = np.linspace(lo, hi, 60)
+    g_inc = -1.0 + (np.arange(60) + 0.5) * 2.0 / 60          # cell centres
+    g_dist = lo + (np.arange(60) + 0.5) * (hi - lo) / 60
     region = Region(np.ones((60, 60), dtype=bool), (g_inc, g_dist))
 
     rng = np.random.default_rng(0)

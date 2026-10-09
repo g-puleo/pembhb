@@ -44,6 +44,7 @@ from pembhb.mask_truncation import load_pair_region
 
 from _visualise_common import (
     DATA_ROOT_DIR,
+    rename_legacy_params,
     find_round_dirs,
     load_model,
     keys_for_model,
@@ -108,7 +109,7 @@ def _initial_box(name):
     with open(os.path.join(DATA_ROOT_DIR, name, "simulation_round_1.yaml")) as f:
         conf = yaml.safe_load(f)
     prior = conf.get("prior") or conf["conf"]["prior"]
-    return {k: (float(v[0]), float(v[1])) for k, v in prior.items()}
+    return rename_legacy_params({k: (float(v[0]), float(v[1])) for k, v in prior.items()})
 
 
 def collect_mask_volumes(name, keys, last_round=None):
@@ -316,7 +317,8 @@ def main():
     else:
         print("  global volume is monotone non-increasing (intersection was a no-op).")
 
-    cum_h = None if args.no_time_axis else cumulative_train_hours(round_dirs)
+    # a round still training has a log dir but no truncation yet
+    cum_h = None if args.no_time_axis else cumulative_train_hours(round_dirs[:len(rounds)])
     apply_paper_style(args.fontsize, uniform=True)
     plot_global(rounds, ratio_global, cum_h, outdir, args.width_pt, args.fontsize)
     plot_per_marginal(rounds, labels, ratio, cum_h, outdir, args.width_pt,

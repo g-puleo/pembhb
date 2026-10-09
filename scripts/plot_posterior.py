@@ -11,11 +11,13 @@ Figures (``$PEMBHB_PLOTS_DIR/<run>/posterior_round_<N>/``):
 * ``sky_zoom.pdf`` / ``sky_zoom_lonlat.pdf`` — the (lambda, sin beta) posterior
   re-evaluated on a fine grid over its credible region (as in
   ``visualise_sky_truncation.py``), optionally against MCMC;
-* ``modes_<param>.pdf`` — when the round's truncation found several modes and
-  ``truncation.refine`` was on, each mode on its own refined grid.
+* ``modes_<param>.pdf`` — when the region round N was trained on (round N-1's
+  accepted set) has several modes, refined: the posterior on each mode's own
+  grid, with its mass normalised over that region (the masses sum to 1).
 
 ``--proposal`` overlays the truncation this posterior produced, i.e. the prior
-of round N+1: interval bounds in 1-D, the accepted-region contour in 2-D.
+of round N+1: interval bounds in 1-D, the accepted-region contour in 2-D, and
+in the per-mode figures the fraction of the posterior it keeps.
 
 The observation defaults to the one recorded in ``observation_used.yaml``;
 passing a different one raises. The same evaluation/plotting code builds the
@@ -31,12 +33,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import yaml
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 from matplotlib.ticker import MaxNLocator
 
 from pembhb import PLOTS_ROOT_DIR
 from pembhb.mask_truncation import load_truncation, region_of_pair
 from pembhb.sampler import chi12_to_chieff_chidiff
-from pembhb.utils import eval_posterior_2d
+from pembhb.utils import get_logratios_grid, get_logratios_grid_2d
 
 from _visualise_common import (
     DATA_ROOT_DIR,
@@ -289,6 +292,7 @@ def plot_1d_posteriors(
     cols: int = DEFAULT_COLS,
     fisher_sigmas: dict | None = None,
     proposal_1d: dict | None = None,
+    support_1d: dict | None = None,
 ):
     """One panel per marginal: round ``round_idx``'s NRE 1-D posterior (default:
     the last round in *data*) and the corresponding MCMC posterior overlaid on
@@ -296,7 +300,9 @@ def plot_1d_posteriors(
     no model is loaded here.
 
     ``proposal_1d`` (``{label: [[lo, hi], ...]}``) draws the truncation this
-    posterior proposes for the next round as vertical bounds.
+    posterior proposes for the next round as vertical bounds. ``support_1d``
+    (same form) is the region the round was trained on; the rest of the panel,
+    where the network extrapolates and the pipeline zeroes the density, is greyed.
 
     All curves are drawn as densities over the *display* coordinate produced by
     :func:`_axis_transforms_for` (identity for most parameters; "seconds offset
@@ -367,6 +373,12 @@ def plot_1d_posteriors(
             fvals = fvals / max(np.sum(fvals) * dx, 1e-300)
             ax.plot(x_grid, fvals, color="C1", ls="-.", lw=LAST_ROUND_LW)
 
+        support = (support_1d or {}).get(label)
+        if support:
+            edges = [float(grid_1d[0])] + [v for iv in sorted(support) for v in iv] + [float(grid_1d[-1])]
+            for g0, g1 in zip(edges[0::2], edges[1::2]):
+                if g1 > g0:
+                    ax.axvspan(*nre_to_x(np.array([g0, g1])), color="0.85", lw=0, zorder=0)
         for lo, hi in (proposal_1d or {}).get(label, []):
             for v in (lo, hi):
                 ax.axvline(float(nre_to_x(np.array([v]))[0]), color="C2", ls=":", lw=1.0)
@@ -390,6 +402,8 @@ def plot_1d_posteriors(
     if fisher_sigmas:
         handles.append(Line2D([0], [0], color="C1", ls="-.", lw=LAST_ROUND_LW,
                               label="Fisher (CRLB)"))
+    if support_1d:
+        handles.append(Patch(facecolor="0.85", label="not trained on\n(zeroed)"))
     if proposal_1d:
         handles.append(Line2D([0], [0], color="C2", ls=":", lw=1.0,
                               label="next-round\nproposal"))
@@ -429,63 +443,156 @@ def refine_enabled(round_dir):
     return bool(trunc.get("refine", False))
 
 
-def plot_modes_1d(model, dataloader, label, in_idx, intervals, ngrid, coarse,
-                  outdir, round_number):
-    """One panel per mode: the posterior on that mode's own interval."""
+MASS_NGRID_1D = 2000   # points per interval
+MASS_NGRID_2D = 256    # points per axis and window
+
+# The posterior of round r lives on round r-1's accepted set (its domain: the
+# network was trained there, and the pipeline zeroes the density outside it
+# before truncating). The per-mode figures show the modes of that domain, with
+# their posterior masses normalised over it, so they sum to 1. Round r's own
+# accepted set (the proposal, i.e. round r+1's prior) is only overlaid, together
+# with the fraction of the posterior it keeps. Integrals are of the unnormalised
+# ratio exp(log r), so densities evaluated on different grids share one
+# normalisation.
+
+def _log_integral(lr, cell, weight=None):
+    lr = np.asarray(lr, dtype=float)
+    w = np.ones_like(lr) if weight is None else np.asarray(weight, dtype=float)
+    if not w.any():
+        return -np.inf
+    m = lr[w > 0].max()
+    return m + np.log(np.sum(np.exp(lr - m) * w) * cell)
+
+
+def _intersect(a, b):
+    out = []
+    for a0, a1 in a:
+        for b0, b1 in b:
+            lo, hi = max(a0, b0), min(a1, b1)
+            if hi > lo:
+                out.append((lo, hi))
+    return out
+
+
+def _log_integral_1d(model, dataloader, in_idx, out_idx, intervals, n):
+    """log ∫ r dθ over a union of disjoint intervals."""
+    terms = []
+    for lo, hi in intervals:
+        lr, _, _ = get_logratios_grid(dataloader, model, n, in_param_idx=in_idx,
+                                      out_param_idx=out_idx, low=lo, high=hi)
+        # analytic spacing: in float32 a narrow grid's points can coincide
+        terms.append(_log_integral(np.asarray(lr)[0], (hi - lo) / (n - 1)))
+    return np.logaddexp.reduce(terms) if terms else -np.inf
+
+
+def domain_masses_1d(model, dataloader, in_idx, domain, n, proposal=None):
+    """Posterior mass of each interval of ``domain`` (they sum to 1), and the
+    mass the ``proposal`` intervals keep (None without a proposal)."""
     out_idx = find_out_param_idx(model, in_idx)
-    grid_c, dens_c, inj = coarse
-    dp = grid_c[1] - grid_c[0]
-    fig, axes = plt.subplots(1, len(intervals), squeeze=False,
-                             figsize=(2.6 * len(intervals), 2.2), constrained_layout=True)
-    for k, (lo, hi) in enumerate(intervals):
+    log_m = [_log_integral_1d(model, dataloader, in_idx, out_idx, [iv], n) for iv in domain]
+    log_z = np.logaddexp.reduce(log_m)
+    masses = [float(np.exp(v - log_z)) for v in log_m]
+    kept = None
+    if proposal:
+        kept = float(np.exp(_log_integral_1d(model, dataloader, in_idx, out_idx,
+                                             _intersect(proposal, domain), n) - log_z))
+    return masses, kept
+
+
+def _eval_window_2d(model, dataloader, pair, bx, by, n):
+    """``(log r, gx, gy, cell)`` on an n×n grid, rows = 2nd param, cols = 1st param."""
+    i, j = pair
+    out_idx = find_out_param_idx(model, (i, j))
+    swap = out_idx is None
+    if swap:
+        out_idx = find_out_param_idx(model, (j, i))
+    idx, b0, b1 = ((j, i), by, bx) if swap else ((i, j), bx, by)
+    lr, _, gx, gy = get_logratios_grid_2d(dataloader, model, n, out_param_idx=out_idx,
+                                          in_param_idx=idx, bounds_0=b0, bounds_1=b1)
+    lr, gx, gy = np.asarray(lr)[0], np.asarray(gx), np.asarray(gy)
+    if swap:
+        lr, gx, gy = lr.T, gy.T, gx.T
+    cell = (bx[1] - bx[0]) / (n - 1) * (by[1] - by[0]) / (n - 1)
+    return lr, gx[0, :], gy[:, 0], cell
+
+
+def _part_window(part):
+    return ((float(part.grids[0].min()), float(part.grids[0].max())),
+            (float(part.grids[1].min()), float(part.grids[1].max())))
+
+
+def domain_masses_2d(model, dataloader, pair, domain, n, proposal=None):
+    """Posterior mass of each part of the ``domain`` region (they sum to 1), and
+    the mass the ``proposal`` region keeps (None without a proposal)."""
+    log_m, log_k = [], []
+    for part in domain.parts:
+        lr, gx, gy, cell = _eval_window_2d(model, dataloader, pair, *_part_window(part), n)
+        w = part.contains_grid((gx, gy))
+        log_m.append(_log_integral(lr, cell, w))
+        if proposal is not None:
+            log_k.append(_log_integral(lr, cell, w & proposal.contains_grid((gx, gy))))
+    log_z = np.logaddexp.reduce(log_m)
+    masses = [float(np.exp(v - log_z)) for v in log_m]
+    kept = float(np.exp(np.logaddexp.reduce(log_k) - log_z)) if log_k else None
+    return masses, kept
+
+
+def _kept_note(kept):
+    return "" if kept is None else f"\nnext-round proposal (green) keeps {kept:.4f} of the posterior"
+
+
+def plot_modes_1d(model, dataloader, label, in_idx, domain, masses, kept, proposal,
+                  ngrid, inj, outdir, round_number):
+    """One panel per interval of the domain: the posterior on that interval."""
+    out_idx = find_out_param_idx(model, in_idx)
+    fig, axes = plt.subplots(1, len(domain), squeeze=False,
+                             figsize=(2.6 * len(domain), 2.2), constrained_layout=True)
+    for k, ((lo, hi), mass) in enumerate(zip(domain, masses)):
         ax = axes[0, k]
         grid, dens, _ = eval_nre_1d(model, dataloader, in_idx, out_idx, lo, hi, ngrid)
-        mass = float(np.sum(dens_c[(grid_c >= lo) & (grid_c <= hi)]) * dp)
         ax.plot(grid, dens, color="C0", lw=1.5)
         ax.fill_between(grid, dens, alpha=0.2, color="C0")
+        for p_lo, p_hi in _intersect(proposal or [], [(lo, hi)]):
+            for v in (p_lo, p_hi):
+                ax.axvline(v, color="C2", ls=":", lw=1.2)
         if lo <= inj <= hi:
             ax.axvline(inj, color="red", ls="--", lw=1.5)
         ax.set_title(f"mode {k + 1}: mass {mass:.3f}", pad=3)
         ax.set_xlabel(_panel_title(label))
         ax.set_yticks([])
         ax.xaxis.set_major_locator(MaxNLocator(nbins=3))
-    fig.suptitle(f"round {round_number}: {len(intervals)} modes of {latex_label(label)}")
+    fig.suptitle(f"round {round_number}: {latex_label(label)} on the {len(domain)} "
+                 f"modes it was trained on{_kept_note(kept)}")
     return save_figure(fig, outdir, f"modes_{label}")
 
 
-def plot_modes_2d(model, dataloader, pair, region, keys, ngrid, inj, outdir,
-                  round_number, show_proposal):
-    """One panel per mode: the posterior on that mode's own refined subgrid."""
+def plot_modes_2d(model, dataloader, pair, domain, masses, kept, proposal, keys, ngrid,
+                  inj, outdir, round_number):
+    """One panel per part of the domain: the posterior on that part's subgrid."""
     i, j = pair
-    out_idx = find_out_param_idx(model, (i, j))
-    swap = out_idx is None
-    if swap:
-        out_idx = find_out_param_idx(model, (j, i))
-    parts = region.parts
+    parts = domain.parts
     fig, axes = plt.subplots(1, len(parts), squeeze=False,
                              figsize=(3.0 * len(parts), 2.8), constrained_layout=True)
-    for k, part in enumerate(parts):
+    for k, (part, mass) in enumerate(zip(parts, masses)):
         ax = axes[0, k]
-        bx = (float(part.grids[0].min()), float(part.grids[0].max()))
-        by = (float(part.grids[1].min()), float(part.grids[1].max()))
-        idx, b0, b1 = ((j, i), by, bx) if swap else ((i, j), bx, by)
-        norm2d, _, gx, gy = eval_posterior_2d(model, dataloader, idx, out_idx,
-                                              ngrid_points=ngrid, bounds_0=b0,
-                                              bounds_1=b1, keep_batch_dim=True)
-        norm = norm2d[0]
-        if swap:
-            gx, gy, norm = gy.T, gx.T, norm.T
-        ax.pcolormesh(gx, gy, norm, shading="auto", cmap="Blues")
-        if show_proposal:
-            ax.contour(part.grids[0], part.grids[1], part.mask.astype(float),
-                       levels=[0.5], colors="C2", linewidths=1.2)
+        bx, by = _part_window(part)
+        lr, gx, gy, _ = _eval_window_2d(model, dataloader, pair, bx, by, ngrid)
+        inside = part.contains_grid((gx, gy))
+        ax.pcolormesh(gx, gy, np.where(inside, np.exp(lr - lr[inside].max()), np.nan),
+                      shading="auto", cmap="Blues")
+        ax.contour(gx, gy, inside.astype(float), levels=[0.5], colors="0.4",
+                   linewidths=1.0, linestyles="dashed")
+        if proposal is not None:
+            acc = proposal.contains_grid((gx, gy)).astype(float)
+            if acc.any():
+                ax.contour(gx, gy, acc, levels=[0.5], colors="C2", linewidths=1.2)
         if inj is not None and bx[0] <= inj[0] <= bx[1] and by[0] <= inj[1] <= by[1]:
             ax.plot(inj[0], inj[1], "r+", markersize=9, markeredgewidth=1.5)
-        ax.set_title(f"mode {k + 1}", pad=3)
+        ax.set_title(f"mode {k + 1}: mass {mass:.3f}", pad=3)
         ax.set_xlabel(latex_label(keys[i]))
         ax.set_ylabel(latex_label(keys[j]))
-    fig.suptitle(f"round {round_number}: {len(parts)} modes of "
-                 f"({latex_label(keys[i])}, {latex_label(keys[j])})")
+    fig.suptitle(f"round {round_number}: ({latex_label(keys[i])}, {latex_label(keys[j])}) "
+                 f"on the {len(parts)} modes it was trained on{_kept_note(kept)}")
     return save_figure(fig, outdir, f"modes_{keys[i]}_{keys[j]}")
 
 
@@ -566,6 +673,8 @@ def main():
     keys = keys_for_model(model)
     mcmc_samples, mcmc_names = load_mcmc(args.mcmc_file, basis)
     intervals, regions = load_proposal(name, r, keys)
+    # the domain round r was trained on = round r-1's accepted set
+    prev_intervals, prev_regions = load_proposal(name, r - 1, keys) if r > 1 else ({}, {})
 
     data = {
         "params": params,
@@ -577,7 +686,8 @@ def main():
     }
     plot_1d_posteriors(data, args.mcmc_file, outdir, "posterior_1d",
                        width_pt=args.width_pt, rows=args.rows, cols=args.cols,
-                       proposal_1d=intervals if args.proposal else None)
+                       proposal_1d=intervals if args.proposal else None,
+                       support_1d=prev_intervals or None)
 
     sky_region = regions.get((7, 8))
     inj_sky = None
@@ -587,23 +697,36 @@ def main():
                            proposal_region=sky_region if args.proposal else None,
                            fontsize=args.fontsize)
 
-    multi_1d = {lbl: ivs for lbl, ivs in intervals.items() if len(ivs) > 1}
-    multi_2d = {pair: reg for pair, reg in regions.items() if len(reg.parts) > 1}
-    if (multi_1d or multi_2d) and not refine_enabled(rd):
-        print("[modes] several modes found but truncation.refine was off: "
+    # Per-mode figures: modes of the domain (round r-1's accepted set), when it
+    # has several and they were refined.
+    multi_1d = {lbl: ivs for lbl, ivs in prev_intervals.items() if len(ivs) > 1}
+    multi_2d = {pair: reg for pair, reg in prev_regions.items() if len(reg.parts) > 1}
+    if (multi_1d or multi_2d) and not refine_enabled(round_dirs[-2]):
+        print("[modes] the domain has several modes but truncation.refine was off: "
               "no refined per-mode grids to show.")
     elif multi_1d or multi_2d:
         by_label = {pi[0]: pi for pi in params}
-        for label, ivs in multi_1d.items():
+        for label, domain in multi_1d.items():
             pi = by_label.get(label)
             if pi is None or pi[1] != 1 or densities.get(label) is None:
                 continue
-            plot_modes_1d(model, dataloader, label, pi[2], ivs, args.ngrid_mode,
-                          densities[label], outdir, r)
-        for pair, reg in multi_2d.items():
+            proposal = intervals.get(label) if args.proposal else None
+            masses, kept = domain_masses_1d(model, dataloader, pi[2], domain,
+                                            MASS_NGRID_1D, proposal)
+            print(f"[modes] {label}: masses {np.round(masses, 4).tolist()}"
+                  + ("" if kept is None else f", proposal keeps {kept:.4f}"))
+            plot_modes_1d(model, dataloader, label, pi[2], domain, masses, kept, proposal,
+                          args.ngrid_mode, densities[label][2], outdir, r)
+        for pair, domain in multi_2d.items():
+            i, j = pair
+            proposal = regions.get(pair) if args.proposal else None
+            masses, kept = domain_masses_2d(model, dataloader, pair, domain,
+                                            MASS_NGRID_2D, proposal)
+            print(f"[modes] {keys[i]}-{keys[j]}: masses {np.round(masses, 4).tolist()}"
+                  + ("" if kept is None else f", proposal keeps {kept:.4f}"))
             inj = inj_sky if pair == (7, 8) else None
-            plot_modes_2d(model, dataloader, pair, reg, keys, args.ngrid_mode,
-                          inj, outdir, r, args.proposal)
+            plot_modes_2d(model, dataloader, pair, domain, masses, kept, proposal, keys,
+                          args.ngrid_mode, inj, outdir, r)
     print(f"[done] figures in {outdir}")
 
 
