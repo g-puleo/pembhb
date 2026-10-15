@@ -1523,11 +1523,16 @@ class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
             all_data_t = None
         parameters = batch["source_parameters"]
 
-        all_data_f = torch.cat((data_f, data_f), dim=0)
+        # Both halves share the same data: encode once, repeat the summary.
+        summary = self._encode_detached(data_f)
+        if isinstance(summary, dict):
+            summary = {k: torch.cat((v, v), dim=0) for k, v in summary.items()}
+        else:
+            summary = torch.cat((summary, summary), dim=0)
         scrambled_params = torch.roll(parameters, shifts=1, dims=0)
         all_params = torch.cat((parameters, scrambled_params), dim=0)
 
-        all_logits = self(all_data_f, all_data_t, all_params)
+        all_logits = self.logratios_from_summary(summary, all_data_t, all_params)
 
         shape_half = (all_logits.shape[0] // 2, all_logits.shape[1])
         labels = torch.cat(
