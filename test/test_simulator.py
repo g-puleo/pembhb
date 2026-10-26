@@ -110,3 +110,81 @@ def test_training_noise_scale_matches_stored(sim, tmp_path):
     ds = MBHBDataset(fname)
     np.testing.assert_allclose(ds.noise_scale.numpy(),
                                sim.filtered_asd / np.sqrt(4 * sim.df), rtol=1e-5)
+
+
+# --- td block: DFT grid, round trip, tapered noise ------------------------------------
+
+def _td(conf, t_obs_start=0.0, **td):
+    c = copy.deepcopy(conf)
+    wp = c["waveform_params"]
+    del wp["fmax"]
+    wp["t_obs_start"] = t_obs_start
+    wp["td"] = dict(dict(dt=100.0, round_trip=False, bbhx_length=1024), **td)
+    return c
+
+
+def _pinned(conf):
+    inj = conf["injection"]
+    return {k: [float(inj[k]), float(inj[k])] for k in conf["prior"]}
+
+
+def test_td_grid(conf):
+    s = _build(_td(conf))
+    f = np.fft.rfftfreq(s.n_time, s.dt)
+    np.testing.assert_array_equal(s.freqs, f[s.keep_idx])
+    assert s.fmax == 0.5 / 100.0 and s.freqs[-1] < s.fmax and s.freqs[0] >= conf["waveform_params"]["fmin"]
+    np.testing.assert_allclose(s.df, 1 / s.obs_length)
+
+
+def test_td_rejects_fmax_and_taper_without_round_trip(conf):
+    c = _td(conf)
+    c["waveform_params"]["fmax"] = 3e-3
+    with pytest.raises(ValueError):
+        _build(c)
+    with pytest.raises(ValueError):
+        _build(_td(conf, taper_days=1.0))
+    with pytest.raises(ValueError):           # generation window before t = 0
+        _build(_td(conf, round_trip=True, lookback_days=7, taper_days=0))
+
+
+def test_round_trip_identity(conf):
+    # lookback 0, no taper: irfft -> rfft on the same grid is the identity
+    plain = _build(_td(conf), prior=_pinned(conf)).sample(1)["wave_fd"]
+    rt = _build(_td(conf, round_trip=True, lookback_days=0, taper_days=0), prior=_pinned(conf)).sample(1)["wave_fd"]
+    assert np.max(np.abs(rt - plain)) < 1e-6 * np.max(np.abs(plain))
+
+
+def test_tapered_noise_statistics():
+    from pembhb.tapered_noise import TaperedNoise, tukey
+    import torch
+    n, ramp = 512, 64
+    w = tukey(n, ramp)
+    keep = np.arange(20, 200)
+    tn = TaperedNoise(np.ones((1, n // 2 + 1)), w, keep, dt=1.0)
+    z = tn.draw(4000, dtype=torch.float64, generator=torch.Generator().manual_seed(0)).numpy()[:, 0]
+    W2 = np.fft.fft(w ** 2)
+    assert abs(np.mean(z.real ** 2) - np.mean(w ** 2)) < 0.03
+    adj = np.mean(z.real[:, :-1] * z.real[:, 1:] + z.imag[:, :-1] * z.imag[:, 1:]) / 2 / np.mean(w ** 2)
+    assert abs(adj - (W2[1] / W2[0]).real) < 0.02
+    z2 = tn.draw(4000, dtype=torch.float64, generator=torch.Generator().manual_seed(0)).numpy()[:, 0]
+    np.testing.assert_array_equal(z, z2)
+
+
+def test_round_trip_taper_store_and_collate(conf, tmp_path):
+    import torch
+    from pembhb.utils import mbhb_collate_fn, materialize_gpu_noise
+    s = _build(_td(conf, t_obs_start=7.0, round_trip=True, lookback_days=7, taper_days=0.5))
+    assert s.noise_model is not None and 0.5 < s.taper_w2 < 1
+    fname = str(tmp_path / "rt.h5")
+    s.sample_and_store(fname, N=2, batch_size=2, store_noise=True, noise_seed=1)
+    ds = MBHBDataset(fname)
+    assert ds.noise_model is not None
+    np.testing.assert_allclose(ds.noise_scale.numpy(), s.asd / np.sqrt(4 * s.df), rtol=1e-5)
+    items = [{"wave_fd": torch.zeros(s.n_channels, s.n_freq_bins, dtype=torch.complex64),
+              "params": torch.zeros(11)} for _ in range(64)]
+    ns = ds.noise_scale.float()
+    for gpu_noise in (False, True):
+        b = materialize_gpu_noise(mbhb_collate_fn(items, ns, 1.0, gpu_noise=gpu_noise, noise_model=ds.noise_model))
+        white = b["noise_fd"] / ns
+        assert white.shape == (64, s.n_channels, s.n_freq_bins)
+        assert abs(white.real.pow(2).mean().item() - 1) < 0.1     # unit variance after the effective ASD

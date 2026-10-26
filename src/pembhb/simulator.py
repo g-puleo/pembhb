@@ -16,10 +16,13 @@ from pembhb import ROOT_DIR, FMIN_FLOOR
 from pembhb import get_numpy_dtype, get_numpy_complex_dtype
 from pembhb.sampler import UniformSampler
 from pembhb.psd_veto import bin_widths, bands_to_mask, reference_veto_bands, REF_FMAX
+from pembhb.tapered_noise import TaperedNoise, tukey
 
 
 WEEK_SI = 7 * 24 * 3600
 DAY_SI = 24 * 3600
+# lowest bbhx frequency on the round-trip generation grid (below every mode's switch-on)
+F_GEN_MIN = 3e-5
 
 
 # Ajith+ 2008 (arXiv:0710.2335) phenomenological IMR coefficients for the
@@ -125,10 +128,15 @@ def setup_bbhx(backend):
 # =========================================================================
 
 class MBHBSimulatorFD:
-    """Frequency-domain-only MBHB simulator with linear or log frequency grids.
+    """MBHB simulator returning FD data on linear or log frequency grids.
 
-    Supports uniform (linear) or logarithmic frequency spacing; no IFFT is
-    ever computed.
+    Without ``waveform_params.td`` no FFT is computed: bbhx is evaluated on
+    fmin + j/T (linear) or a log grid. With ``td`` the grid is the DFT grid
+    k/T of the cut [t_obs_start, t_obs_end], up to 1/(2 dt), and with
+    ``td.round_trip`` bbhx runs on [t_obs_start - lookback, t_obs_end], then
+    irfft -> cut -> optional Tukey -> rfft (``td_signal`` + ``cut_to_fd``).
+    The MCMC / likelihood scripts call bbhx with ``waveform_kwargs`` directly
+    and do not see the round trip.
     """
 
     def __init__(self, conf, sampler_init_kwargs, seed=0,
@@ -160,7 +168,15 @@ class MBHBSimulatorFD:
         # 1/T_obs; whichever is *larger* wins, so the grid never extends below
         # max(requested_fmin, 1/T_obs) and there are no PSD-masked dead bins
         # to worry about downstream.
-        self.fmax = conf["waveform_params"]["fmax"]
+        td = conf["waveform_params"].get("td")
+        if td is not None:
+            if "fmax" in conf["waveform_params"]:
+                raise ValueError("waveform_params.fmax is set by td.dt (fmax = 1/(2 dt)); remove it.")
+            if freq_spacing != "linear":
+                raise ValueError("td requires freq_spacing: linear (the DFT grid k/T)")
+            self.fmax = 0.5 / td["dt"]
+        else:
+            self.fmax = conf["waveform_params"]["fmax"]
         if self.fmax > REF_FMAX:
             raise ValueError(
                 f"fmax={self.fmax:g} exceeds the PSD-veto reference grid "
@@ -169,8 +185,23 @@ class MBHBSimulatorFD:
         fmin_request = conf["waveform_params"].get("fmin", FMIN_FLOOR)
         self.fmin = max(fmin_request, 1.0 / self.obs_length)
         self.freq_spacing = freq_spacing
+        self.td = td
+        self.round_trip = bool(td and td["round_trip"])
+        if td is not None and not self.round_trip and td.get("taper_days", 0):
+            raise ValueError("td.taper_days needs td.round_trip: true (the taper acts in the time domain)")
+        self.noise_model = None
+        self.taper_w2 = 1.0
 
-        if freq_spacing == "linear":
+        if td is not None:
+            # DFT grid of the cut window: f_k = k / T_obs, k/T < 1/(2 dt) (Nyquist bin is real-only)
+            self.dt = float(td["dt"])
+            self.n_time = int(round(self.obs_length / self.dt))
+            f_dft = np.fft.rfftfreq(self.n_time, self.dt)
+            self.keep_idx = np.flatnonzero((f_dft >= self.fmin) & (f_dft < self.fmax))
+            self.freqs = f_dft[self.keep_idx]
+            self.n_freq_bins = len(self.freqs)
+            step = 1.0 / self.obs_length
+        elif freq_spacing == "linear":
             # df = 1/T_obs is the natural FFT spacing; downsamplefactor lets
             # the user thin the grid when df would otherwise produce too many
             # bins. n_freq_bins becomes a consequence of the grid, not an input.
@@ -193,26 +224,38 @@ class MBHBSimulatorFD:
             raise ValueError(f"freq_spacing must be 'linear' or 'log', got '{freq_spacing}'")
 
         # Drop bins inside the TDI nulls: the PSD collapses there but the
-        # splined response does not, so 1/S diverges. Deleting them leaves a
-        # gap that bin_widths bridges, so no interpolation is needed.
+        # splined response does not, so 1/S diverges. On a linear grid the
+        # deleted bins are just missing data: no interpolation is needed.
         self.psd_veto_bands = reference_veto_bands(
             self.channels, conf["waveform_params"]["noise"]
         )
         vetoed = bands_to_mask(self.freqs, self.psd_veto_bands)
         if vetoed.any():
             self.freqs = self.freqs[~vetoed]
+            if td is not None:
+                self.keep_idx = self.keep_idx[~vetoed]
             self.n_freq_bins = len(self.freqs)
             print(f"[MBHBSimulatorFD] PSD veto: dropped {vetoed.sum()} bins "
                   f"across {len(self.psd_veto_bands)} TDI-null bands.")
 
         # Per-bin frequency widths for inner products and noise colouring.
-        self.df = bin_widths(self.freqs)
+        # Linear grid: each kept bin is one DFT coefficient of width 1/T, also
+        # next to a veto gap (widening it would count one noise draw many times).
+        if freq_spacing == "linear":
+            self.df = np.full(self.freqs.size, step)
+        else:
+            self.df = bin_widths(self.freqs)
+
+        noise_model = conf["waveform_params"]["noise"]
+        if self.round_trip:
+            self._setup_round_trip(td, noise_model)
 
         # ASD. The grid starts at fmin >= FMIN_FLOOR by construction, so no
         # masking is needed; ``filtered_asd`` is kept as an alias for the
         # raw ``asd`` for backward compatibility with downstream consumers.
-        noise_model = conf["waveform_params"]["noise"]
-        self.asd = build_asd(self.freqs, self.channels, noise_model)
+        # With a taper, the ASD is the effective one of the tapered noise,
+        # sqrt(<w^2>) * ASD, so noise_scale / whitening / SNR keep unit variance.
+        self.asd = build_asd(self.freqs, self.channels, noise_model) * np.sqrt(self.taper_w2)
         self.filtered_asd = self.asd.copy()
         self.psd_fmin_mask = conf["waveform_params"].get("psd_fmin_mask", None)
         if self.psd_fmin_mask is not None:
@@ -228,19 +271,19 @@ class MBHBSimulatorFD:
         self.wfd = setup_bbhx(self.backend_name)
         self.xp = self.wfd.xp
 
-        t0 = self.t_obs_start_SI / YRSID_SI
-        t1 = self.t_obs_end_SI / YRSID_SI
-        freqs_backend = self.xp.asarray(self.freqs)
+        # bbhx window: the cut itself, or [t_obs_start - lookback, t_obs_end] for the round trip
+        t_bbhx_start = self.t_gen_start_SI if self.round_trip else self.t_obs_start_SI
+        freqs_bbhx = self.f_gen[self.gen_band] if self.round_trip else self.freqs
         self.waveform_kwargs = {
-            "t_obs_start": t0,
-            "t_obs_end": t1,
-            "freqs": freqs_backend,
+            "t_obs_start": t_bbhx_start / YRSID_SI,
+            "t_obs_end": self.t_obs_end_SI / YRSID_SI,
+            "freqs": self.xp.asarray(freqs_bbhx),
             "modes": self.modes,
             "direct": False,
             "fill": True,
             "compress": True,
             "squeeze": False,
-            "length": 1024,
+            "length": td.get("bbhx_length", 4096) if td is not None else 1024,
         }
 
         self.info = {
@@ -254,8 +297,81 @@ class MBHBSimulatorFD:
             "n_freq_bins": self.n_freq_bins,
             "fmin": float(self.fmin),
             "fmax": float(self.fmax),
+            "taper_w2": self.taper_w2,
         }
-        
+
+    # -----------------------------------------
+    def _setup_round_trip(self, td, noise_model):
+        """Generation grid [t_obs_start - lookback, t_obs_end], taper and the matching noise model."""
+        self.t_gen_start_SI = self.t_obs_start_SI - td["lookback_days"] * DAY_SI
+        if self.t_gen_start_SI < 0:
+            raise ValueError(
+                f"t_obs_start - lookback = {self.t_gen_start_SI / DAY_SI:.2f} d < 0: the orbit table "
+                "starts at t = 0. Shift the timeline by one year (t_obs_start += 365.2422 d; the "
+                "orbits are periodic in YRSID_SI)."
+            )
+        self.n_gen = int(round((self.t_obs_end_SI - self.t_gen_start_SI) / self.dt))
+        self.t_gen_start_SI = self.t_obs_end_SI - self.n_gen * self.dt
+        self.f_gen = np.fft.rfftfreq(self.n_gen, self.dt)
+        # full band before the cut: zeroing vetoed / sub-fmin bins here would ring into the kept ones
+        self.gen_band = np.flatnonzero(self.f_gen >= F_GEN_MIN)
+        self.chunk = int(td.get("chunk", 8))
+        self.window = tukey(self.n_time, int(round(td["taper_days"] * DAY_SI / self.dt)))
+        self.taper_w2 = float(np.mean(self.window ** 2))
+        if td["taper_days"] > 0:
+            f_dft = np.fft.rfftfreq(self.n_time, self.dt)
+            sigma = np.zeros((self.n_channels, f_dft.size))
+            sigma[:, 1:] = build_asd(f_dft[1:], self.channels, noise_model) * np.sqrt(self.obs_length / 4)
+            self.noise_model = TaperedNoise(sigma, self.window, self.keep_idx, self.dt)
+        self._dev_cache = None
+
+    def td_signal(self, inj, t_start):
+        """bbhx on the full band of the DFT grid of [t_start, t_obs_end] -> irfft.
+
+        :param inj: bbhx parameters, shape (12, B)
+        :return: (B, n_channels, n) time series at dt on the backend; sample j is at
+            t_obs_end - (n - j) dt. ``t_start`` is rounded to a whole number of samples.
+        """
+        xp = self.xp
+        n = int(round((self.t_obs_end_SI - t_start) / self.dt))
+        t_start = self.t_obs_end_SI - n * self.dt
+        f = np.fft.rfftfreq(n, self.dt)
+        band = np.flatnonzero(f >= F_GEN_MIN)
+        kw = dict(self.waveform_kwargs, freqs=xp.asarray(f[band]), t_obs_start=t_start / YRSID_SI)
+        h = self.wfd(*inj.copy(), **kw)[:, self.channels_idx]
+        H = xp.zeros(h.shape[:2] + (f.size,), dtype=complex)
+        H[..., xp.asarray(band)] = h * xp.exp(2j * np.pi * xp.asarray(f[band]) * t_start)
+        return xp.fft.irfft(H, n=n, axis=-1) / self.dt
+
+    def cut_to_fd(self, x):
+        """Last T_obs of x (ending at t_obs_end) -> taper -> dt * rfft -> kept bins, absolute-time phase."""
+        xp = np if isinstance(x, np.ndarray) else self.xp
+        if xp is np:
+            win, keep, phase = self.window, self.keep_idx, np.exp(-2j * np.pi * self.freqs * self.t_obs_start_SI)
+        else:
+            if self._dev_cache is None:
+                self._dev_cache = (xp.asarray(self.window), xp.asarray(self.keep_idx),
+                                   xp.exp(-2j * np.pi * xp.asarray(self.freqs) * self.t_obs_start_SI))
+            win, keep, phase = self._dev_cache
+        X = self.dt * xp.fft.rfft(x[..., -self.n_time:] * win, axis=-1)
+        return X[..., keep] * phase
+
+    def _device_waveform(self, inj):
+        """(n_obs, n_channels, n_freq_bins) on the backend, before any host copy.
+
+        Heterodyne hook: a binning step on this fine grid goes between here and generate()'s tail.
+        """
+        if not self.round_trip:
+            return self.wfd(*inj.copy(), **self.waveform_kwargs)[:, self.channels_idx]
+        parts = [self.cut_to_fd(self.td_signal(inj[:, i:i + self.chunk], self.t_gen_start_SI))
+                 for i in range(0, inj.shape[1], self.chunk)]
+        return parts[0] if len(parts) == 1 else self.xp.concatenate(parts, axis=0)
+
+    def waveform(self, bbhx_params):
+        """Noise-free FD waveforms for bbhx parameters (12, B), as a numpy array (B, C, F)."""
+        wave = self._device_waveform(bbhx_params)
+        return np.asarray(wave.get() if hasattr(wave, "get") else wave)
+
 
     # -----------------------------------------
     def generate(self, inj, keep_on_gpu=False, host_out=None):
@@ -274,13 +390,12 @@ class MBHBSimulatorFD:
         :return: wave_fd — shape (n_obs, n_channels, n_freq_bins); numpy array
             (``keep_on_gpu=False``) or torch CUDA tensor (``keep_on_gpu=True``).
         """
-        inj = inj.copy()
         n_obs = inj.shape[1]
 
-        wave = self.wfd(*inj, **self.waveform_kwargs)
+        wave = self._device_waveform(inj)
 
         if host_out is not None and hasattr(wave, "get"):
-            dev = wave[:, self.channels_idx, :].astype(get_numpy_complex_dtype())
+            dev = wave.astype(get_numpy_complex_dtype())
             out = host_out[:n_obs]
             dev.get(out=out)
             return out
@@ -294,15 +409,11 @@ class MBHBSimulatorFD:
             import torch
             from pembhb import get_torch_complex_dtype
             wave = torch.from_dlpack(wave)  # zero-copy cupy -> torch (stays on GPU)
-            wave = wave.to(get_torch_complex_dtype())
-            return wave[:, self.channels_idx, :]
+            return wave.to(get_torch_complex_dtype())
 
         if hasattr(wave, "get"):
             wave = wave.get()
-        wave = wave.astype(get_numpy_complex_dtype())
-        wave = wave[:, self.channels_idx, :]
-
-        return wave
+        return wave.astype(get_numpy_complex_dtype())
 
     # -----------------------------------------
     def sample(self, N, keep_on_gpu=False, host_out=None):
@@ -337,89 +448,101 @@ class MBHBSimulatorFD:
         :param store_noise: if True, also draw and persist a fixed noise
             realisation per sample under the ``noise_fd`` HDF5 dataset.  The
             draw uses an independent RNG seeded by ``noise_seed`` so signal
-            and noise sampling are decoupled.
+            and noise sampling are decoupled. With a taper, the noise goes
+            through ``noise_model`` (tapered circle noise).
         :param noise_seed: seed for the noise RNG when ``store_noise=True``.
         """
         if batch_size is None:
             batch_size = max(1, int(N / 10.0))
 
-        _np_real = get_numpy_dtype()
-        _np_complex = get_numpy_complex_dtype()
-
         noise_rng = np.random.default_rng(noise_seed) if store_noise else None
-        # Use the same colouring formula as mbhb_collate_fn so stored noise
-        # is statistically identical to on-the-fly noise.
-        noise_scale_np = self.filtered_asd / np.sqrt(4 * self.df)
+        noise_gen = None
+        if store_noise and self.noise_model is not None:
+            import torch
+            noise_gen = torch.Generator().manual_seed(int(noise_seed))
 
         with h5py.File(filename, "a") as f:
-            source_params = f.create_dataset("source_parameters", shape=(N, 11), dtype=_np_real)
-            bbhx_params = f.create_dataset("bbhx_parameters", shape=(N, 12), dtype=_np_real)
-            f.create_dataset("frequencies", data=self.freqs, dtype=_np_real)
-            f.create_dataset("df", data=self.df, dtype=_np_real)
-            wave_fd = f.create_dataset("wave_fd", shape=(N, self.n_channels, self.n_freq_bins), dtype=_np_complex)
-            snr = f.create_dataset("snr", shape=(N,), dtype=_np_real)
-            f_isco = f.create_dataset("f_ISCO", shape=(N,), dtype=_np_real)
-            f_merger_ds = f.create_dataset("f_merger", shape=(N,), dtype=_np_real)
-            f_ring_ds = f.create_dataset("f_ring", shape=(N,), dtype=_np_real)
-            sigma_ds = f.create_dataset("sigma", shape=(N,), dtype=_np_real)
-            f_cut_ds = f.create_dataset("f_cut", shape=(N,), dtype=_np_real)
-            f.create_dataset("asd", data=self.asd, dtype=_np_real)
-            
+            ds = self._create_datasets(f, N, store_noise)
             if store_noise:
-                noise_fd_ds = f.create_dataset(
-                    "noise_fd",
-                    shape=(N, self.n_channels, self.n_freq_bins),
-                    dtype=_np_complex,
-                )
                 f.attrs["noise_seed"] = int(noise_seed)
-
-            # Store metadata as HDF5 attributes
-            f.attrs["freq_spacing"] = self.freq_spacing
-            f.attrs["n_freq_bins"] = self.n_freq_bins
-            f.attrs["fmin"] = self.fmin
-            f.attrs["fmax"] = self.fmax
-            f.attrs["psd_fmin_mask"] = self.psd_fmin_mask if self.psd_fmin_mask is not None else 0.0
-            f.attrs["observation_duration_SI"] = self.obs_length
-            f.attrs["observation_start_SI"] = self.t_obs_start_SI
-            # Record the spin sampling basis so the meaning of source_parameters
-            # slots 2,3 is self-describing (chi1/chi2 vs chi_eff/chi_diff).
-            # MaskRejectSampler wraps the real sampler in .base_sampler.
-            _spin_sampler = getattr(self.sampler, "base_sampler", self.sampler)
-            f.attrs["spin_param_basis"] = getattr(_spin_sampler, "spin_param_basis", "chi1chi2")
             print("Sampling and storing FD-only simulations to", filename)
             for i in tqdm(range(0, N, batch_size)):
                 batch_end = min(i + batch_size, N)
-                batch_size_actual = batch_end - i
-                out = self.sample(batch_size_actual)
-                bbhx_params_batch = out["bbhx_parameters"].T
-                source_params[i:batch_end] = out["parameters"].T
-                bbhx_params[i:batch_end] = bbhx_params_batch
-                wave_fd[i:batch_end] = out["wave_fd"]
-                # SNR is matched-filter (waveform-only) rather than noisy-data SNR
-                snr[i:batch_end] = self.get_SNR_FD(out["wave_fd"])
-                M_tot = bbhx_params_batch[:, 0] + bbhx_params_batch[:, 1]
-                f_isco[i:batch_end] = (1.0 / np.pi) * np.sqrt(1.0 / 216.0) * 203025.44672808357 / M_tot
-                trans = ajith_transition_frequencies(
-                    bbhx_params_batch[:, 0], bbhx_params_batch[:, 1]
-                )
-                f_merger_ds[i:batch_end] = trans["f_merger"]
-                f_ring_ds[i:batch_end] = trans["f_ring"]
-                sigma_ds[i:batch_end] = trans["sigma"]
-                f_cut_ds[i:batch_end] = trans["f_cut"]
-                if store_noise:
-                    z = (noise_rng.normal(size=(batch_size_actual, self.n_channels, self.n_freq_bins))
-                         + 1j * noise_rng.normal(size=(batch_size_actual, self.n_channels, self.n_freq_bins)))
-                    noise_fd_ds[i:batch_end] = (z * noise_scale_np[None, :, :]).astype(_np_complex)
+                out = self.sample(batch_end - i)
+                noise = self.draw_noise(batch_end - i, noise_rng, noise_gen) if store_noise else None
+                self._write_batch(ds, i, out["parameters"], out["bbhx_parameters"], out["wave_fd"], noise)
 
             print("HDF5 dataset shapes (current state):")
             for dname in ["source_parameters", "frequencies", "df",
                           "wave_fd", "noise_fd", "snr", "f_ISCO",
                           "f_merger", "f_ring", "sigma", "f_cut", "asd"]:
                 if dname in f:
-                    ds = f[dname]
-                    print(f"  {dname}: shape={tuple(ds.shape)}, dtype={ds.dtype}")
+                    print(f"  {dname}: shape={tuple(f[dname].shape)}, dtype={f[dname].dtype}")
 
         self.save_info_yaml(filename=filename, overwrite=True)
+
+    def draw_noise(self, n, rng=None, generator=None):
+        """(n, C, F) noise as numpy: tapered circle noise with a taper, else the diagonal draw
+        ``(re + j im) * filtered_asd / sqrt(4 df)`` used by mbhb_collate_fn."""
+        if self.noise_model is not None:
+            import torch
+            z = self.noise_model.draw(n, dtype=torch.float64, generator=generator)
+            return z.numpy().astype(get_numpy_complex_dtype())
+        rng = rng if rng is not None else self.rng
+        shape = (n, self.n_channels, self.n_freq_bins)
+        z = rng.normal(size=shape) + 1j * rng.normal(size=shape)
+        return (z * (self.filtered_asd / np.sqrt(4 * self.df))[None]).astype(get_numpy_complex_dtype())
+
+    def _create_datasets(self, f, N, store_noise):
+        """Create the HDF5 layout read by MBHBDataset (shared by sample_and_store and obs builders)."""
+        _np_real = get_numpy_dtype()
+        _np_complex = get_numpy_complex_dtype()
+        shape = (N, self.n_channels, self.n_freq_bins)
+        ds = {
+            "source_parameters": f.create_dataset("source_parameters", shape=(N, 11), dtype=_np_real),
+            "bbhx_parameters": f.create_dataset("bbhx_parameters", shape=(N, 12), dtype=_np_real),
+            "wave_fd": f.create_dataset("wave_fd", shape=shape, dtype=_np_complex),
+        }
+        for name in ("snr", "f_ISCO", "f_merger", "f_ring", "sigma", "f_cut"):
+            ds[name] = f.create_dataset(name, shape=(N,), dtype=_np_real)
+        if store_noise:
+            ds["noise_fd"] = f.create_dataset("noise_fd", shape=shape, dtype=_np_complex)
+        f.create_dataset("frequencies", data=self.freqs, dtype=_np_real)
+        f.create_dataset("df", data=self.df, dtype=_np_real)
+        f.create_dataset("asd", data=self.asd, dtype=_np_real)
+        if self.noise_model is not None:
+            self.noise_model.to_h5(f)
+
+        f.attrs["freq_spacing"] = self.freq_spacing
+        f.attrs["n_freq_bins"] = self.n_freq_bins
+        f.attrs["fmin"] = self.fmin
+        f.attrs["fmax"] = self.fmax
+        f.attrs["psd_fmin_mask"] = self.psd_fmin_mask if self.psd_fmin_mask is not None else 0.0
+        f.attrs["observation_duration_SI"] = self.obs_length
+        f.attrs["observation_start_SI"] = self.t_obs_start_SI
+        f.attrs["taper_w2"] = self.taper_w2
+        # Record the spin sampling basis so the meaning of source_parameters
+        # slots 2,3 is self-describing (chi1/chi2 vs chi_eff/chi_diff).
+        # MaskRejectSampler wraps the real sampler in .base_sampler.
+        _spin_sampler = getattr(self.sampler, "base_sampler", self.sampler)
+        f.attrs["spin_param_basis"] = getattr(_spin_sampler, "spin_param_basis", "chi1chi2")
+        return ds
+
+    def _write_batch(self, ds, i, params, bbhx_params, wave_fd, noise_fd=None):
+        """Write one batch at rows [i, i + B). params (11, B), bbhx_params (12, B), wave_fd (B, C, F)."""
+        j = i + wave_fd.shape[0]
+        bb = bbhx_params.T
+        ds["source_parameters"][i:j] = params.T
+        ds["bbhx_parameters"][i:j] = bb
+        ds["wave_fd"][i:j] = wave_fd
+        # SNR is matched-filter (waveform-only) rather than noisy-data SNR
+        ds["snr"][i:j] = self.get_SNR_FD(wave_fd)
+        ds["f_ISCO"][i:j] = (1.0 / np.pi) * np.sqrt(1.0 / 216.0) * 203025.44672808357 / (bb[:, 0] + bb[:, 1])
+        trans = ajith_transition_frequencies(bb[:, 0], bb[:, 1])
+        for name in ("f_merger", "f_ring", "sigma", "f_cut"):
+            ds[name][i:j] = trans[name]
+        if noise_fd is not None:
+            ds["noise_fd"][i:j] = noise_fd
 
     # -----------------------------------------
     def save_info_yaml(self, filename: str = None, overwrite: bool = False, indent: int = 2):

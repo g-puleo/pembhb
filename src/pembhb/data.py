@@ -1,6 +1,7 @@
 from torch.utils.data import Dataset, random_split, DataLoader, Subset 
 import lightning as L
 from pembhb.utils import mbhb_collate_fn, parse_periodic_bc_spec
+from pembhb.tapered_noise import TaperedNoise
 from pembhb import get_torch_dtype, get_torch_complex_dtype
 import torch
 import numpy as np
@@ -48,6 +49,8 @@ class MBHBDataset(Dataset):
                 )
             else:
                 raise ValueError("Dataset file must contain 'asd', but doesn't.")
+            # Tapered circle noise for round-trip files with a taper (None otherwise).
+            self.noise_model = TaperedNoise.from_h5(f)
 
             # TD params (dt, n_time) needed for on-the-fly TD noise via IFFT
             if self.has_td and "times_SI" in f:
@@ -315,7 +318,8 @@ class MBHBDataModule( L.LightningDataModule ):
                           collate_fn=lambda b: mbhb_collate_fn(b, noise_scale, self.noise_factor,
                                                                 noise_shuffling=shuffle, td_params=td_params,
                                                                 n_noise_realisations=self.n_train_noise_realisations,
-                                                                gpu_noise=self.gpu_noise),
+                                                                gpu_noise=self.gpu_noise,
+                                                                noise_model=self.full_dataset.noise_model),
                           **extra)
 
     def val_dataloader(self, shuffle=True):
@@ -326,7 +330,8 @@ class MBHBDataModule( L.LightningDataModule ):
                           pin_memory=pin_memory,
                           collate_fn=lambda b: mbhb_collate_fn(b, noise_scale, self.noise_factor,
                                                                 noise_shuffling=False, td_params=td_params,
-                                                                gpu_noise=self.gpu_noise),
+                                                                gpu_noise=self.gpu_noise,
+                                                                noise_model=self.full_dataset.noise_model),
                           **extra)
 
     def test_dataloader(self):
@@ -337,7 +342,8 @@ class MBHBDataModule( L.LightningDataModule ):
                           pin_memory=pin_memory,
                           collate_fn=lambda b: mbhb_collate_fn(b, noise_scale, self.noise_factor,
                                                                 noise_shuffling=False, td_params=td_params,
-                                                                gpu_noise=self.gpu_noise),
+                                                                gpu_noise=self.gpu_noise,
+                                                                noise_model=self.full_dataset.noise_model),
                           **extra)
 
 class DummyDataset(Dataset):

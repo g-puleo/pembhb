@@ -519,7 +519,8 @@ class StreamingDataModule(L.LightningDataModule):
     def _collate(self, shuffle, n_noise, noise_scale):
         nf, td = self.noise_factor, self.td_params
         return lambda b: mbhb_collate_fn(b, noise_scale, nf, noise_shuffling=shuffle, td_params=td,
-                                         n_noise_realisations=n_noise, gpu_noise=True)
+                                         n_noise_realisations=n_noise, gpu_noise=True,
+                                         noise_model=self.sim.noise_model)
 
     def _acquire(self):
         """Lock the next buffer round-robin and remember it (safety-net for

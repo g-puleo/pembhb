@@ -1,0 +1,283 @@
+# Smoke test of the round-trip simulator (datagen_maskzero_rt_1w.yaml): train_config_60kstudy.yaml with
+# 3 epochs and a tiny disk ring. Not for science.
+batch_size: 125
+epochs: 3
+precision: float32
+transform_fd: log
+noise_factor: 1.0
+delete_prev_round_h5: true
+n_train_noise_realisations: 2
+classifier_hlayersizes:
+- 256
+- 256
+- 128
+- 64
+keep_ckpt: true
+marginals:
+  f:
+  - - logMchirp
+  - - q
+  - - chi_eff
+  - - chi_diff
+  - - dist
+  - - Deltat
+  - - lambda
+    - sinbeta
+  - - psi
+  - - phi
+  - - cosinc
+marginal_schedule: []
+periodic_bc_params:
+- 5
+- 7
+device: cuda
+architecture:
+  gradnorm:
+    enabled: false
+    alpha: 1
+    learning_rate: 0.0005
+    common_params: linear_f
+  data_summary:
+    type: ChannelizedMLP
+    ChannelizedMLP:
+      device: cuda
+      representation: real_imag
+      n_channels: 2
+      n_freqs: 4096
+      whiten: true
+      amplitude_normalise: true
+      subtract_mean_whitened: true
+      encoder: mlp
+      hidden_dim_per_channel: 256
+      out_dim_per_channel: 64
+      conv:
+        bottleneck_dim: 256
+        hidden_channels:
+        - 16
+        - 32
+        - 32
+        - 64
+        - 64
+        - 64
+        - 64
+        - 64
+        - 64
+        kernel_size: 5
+        residual: true
+    BrutalCompression:
+      Nfreqs: 1000
+      lowdim: 16
+      in_channels: 4
+    PeregrineModel:
+      n_channels: 2
+      n_timesteps: 6048
+      n_freqs: 4096
+    ROM:
+      load: false
+      max_basis_elements: 50
+      filename: rom_td_fd.pt
+      device: cuda
+      batch_train: 1000
+      patience: 25
+      freq_split_idx: 2048
+      high_freq_only: true
+    Autoencoder:
+      load: false
+      finetune_previous: true
+      filename: ''
+      device: cuda
+      architecture: conv
+      representation: real_imag
+      n_channels: 2
+      n_freqs: 4096
+      bottleneck_dim: 128
+      hidden_channels:
+      - 32
+      - 64
+      - 128
+      - 256
+      - 256
+      kernel_size: 3
+      stride: 2
+      dropout: 0.0
+      residual: false
+      decoder_post_fc_bn: false
+      subtract_mean_whitened: true
+      compressor_window: null
+      ae_output_target: compressed
+      whiten: true
+      amplitude_normalise: true
+      lr: 0.001
+      weight_decay: 1.0e-05
+      epochs: 500
+      scheduler_patience: 10
+      scheduler_factor: 0.3
+      early_stop_patience: 20
+      log_name: autoencoder
+    MarginalEncoder:
+      load: false
+      finetune_previous: true
+      filename: ''
+      device: cuda
+      representation: real_imag
+      n_channels: 2
+      n_freqs: 4096
+      bottleneck_dim: 200
+      hidden_channels:
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 512
+      - 512
+      kernel_size: 5
+      stride: 2
+      dropout: 0.0
+      residual: true
+      regressor_hidden_sizes:
+      - 128
+      - 64
+      lr: 0.001
+      weight_decay: 0.0001
+      epochs: 150
+      scheduler_patience: 75
+      scheduler_factor: 0.3
+      early_stop_patience: 3
+      log_name: marginal_encoder
+baseline_model:
+  use: false
+  filename: ''
+sequential_training:
+  early_stop_criterion: volume_ratio
+  learning_rate: 0.0001
+  scheduler_patience: 80
+  scheduler_factor: 0.3
+  early_stop_patience: 100
+  early_stop_min_delta: 0.001
+  early_stop_threshold: 0.999
+joint_training:
+  ae_warmup_epochs: 0
+  lr_ae: 0.0001
+  lr_nre: 0.0001
+  ae_weight_decay: 1.0e-05
+  freeze_ae_after_warmup: false
+  transfer_classifiers_across_rounds: false
+  transfer_data_summary_across_rounds: true
+  reinit_truncated_classifiers: false
+  reinit_plateaued_classifiers: false
+  reinit_on_prior_shrink: true
+  prior_shrink_reinit:
+    shrink_factor: 100
+  checkpoint_every_n_epochs: 10
+  ae_scheduler:
+    enabled: true
+    monitor: val_nre_loss
+    mode: min
+    factor: 0.5
+    patience: 30
+    min_lr: 1.0e-05
+    start_epoch: 0
+  nre_scheduler:
+    enabled: true
+    monitor: val_nre_loss
+    mode: min
+    factor: 0.5
+    patience: 20
+    min_lr: 1.0e-05
+  early_stop_criterion: volume_ratio
+  accuracy_early_stop:
+    patience: 90
+    min_delta: 0.001
+    threshold: 0.999
+  diff_entropy_early_stop:
+    warmup_epochs: 50
+    patience: 30
+    rel_tol: 0.1
+    ema_alpha: 0.3
+volume_ratio_early_stop:
+  warmup_epochs: 10
+  patience: 20
+  rel_tol: 0.02
+  ema_alpha: 0.3
+  min_ratio_threshold: 0.5
+rom_use_pinned_memory: false
+rom_prefetch_batches: 4
+fisher_prior:
+  enabled: false
+  event_idx: 0
+  varying_params:
+  - logMchirp
+  - q
+  - chi_eff
+  - chi_diff
+  - dist
+  - lambda
+  - sinbeta
+  - Deltat
+  - psi
+  - phi
+  - cosinc
+  fixed_params: []
+  n_sigma: 5.0
+  param_n_sigma: {}
+  step_frac: 0.001
+calibration_monitor:
+  enabled: true
+  test_n: 50
+  test_batch_size: 100
+  ngrid_points: 50
+  warmup_epochs: 100
+  run_every_n_epochs: 1
+  ema_alpha: 0.3
+  d_threshold: 0.2
+  t_threshold: 0.05
+  t_quantile: 0.05
+  print_every: 20
+  lambda_tau:
+    enabled: true
+    fisher_backend: cuda12x
+    chunk_size: 4
+    warmup_epochs: 0
+bnre:
+  enabled: false
+  lambda: 0.0
+classifier_dropout: 0.0
+chain_convergence:
+  enabled: true
+  eps_nats: 0.1
+  patience: 2
+  require_not_threshold: true
+streaming:
+  enabled: true
+  storage: disk
+  n_buffers: 3
+  buffer_size: 1000
+  samples_per_epoch: 2000
+  reuse_threshold: 1
+  gen_batch_size: 150
+  val_size: 200
+  num_workers: 8
+  prefetch_factor: 4
+lambda_tau:
+  enabled: true
+truncation_veto:
+  eps_1d: 0.0001
+  dilation_1d: 1.0
+coverage_guard:
+  min_coverage: 0.98
+  n_coverage: 300
+  seed: 0
+truncation:
+  mode: mask
+  credible_level_1d: 0.9999
+  dilation_1d: 1.0
+  credible_level_2d: 0.999
+  dilation_2d: 1.1
+  ngrid_1d: 100
+  ngrid_2d: 200
+  ngrid_1d_refined: 128
+  ngrid_2d_refined: 64
+  zero_outside_prev_mask: hard
+  hysteresis_weight: 0.1
+  enforce_monotonic_regions: true

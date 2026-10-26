@@ -377,7 +377,7 @@ class DiskStreamingDataModule(L.LightningDataModule):
         nf, td = self.noise_factor, self.td_params
         return lambda b: mbhb_collate_fn(b, self.noise_scale, nf, noise_shuffling=shuffle,
                                          td_params=td, n_noise_realisations=n_noise,
-                                         gpu_noise=True)
+                                         gpu_noise=True, noise_model=self.sim.noise_model)
 
     def _release_active(self):
         """Close this process's handles and release every buffer locked for the

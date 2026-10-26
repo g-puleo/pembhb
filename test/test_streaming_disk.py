@@ -38,6 +38,7 @@ class FakeSim:
         self.asd = np.ones((C, F))
         self.df = 1.0
         self.freqs = np.arange(F)
+        self.noise_model = None
         self._k = 0     # bumped per call -> distinguishable wave fills (overwrite test)
         self._row = 0   # running global row id -> every row unique (distinct test)
 

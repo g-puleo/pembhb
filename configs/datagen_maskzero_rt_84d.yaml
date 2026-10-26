@@ -1,0 +1,52 @@
+# Baseline prior and injection, round-trip simulator (bbhx on [t_obs_start - lookback, t_obs_end] -> irfft
+# -> cut -> Tukey -> rfft on k/T). The timeline is shifted by one sidereal year (YRSID_SI) so the generation
+# window starts at t > 0; the orbits are periodic in YRSID_SI.
+waveform_params:
+  channels: "AE"
+  modes: [[2,2], [2,1], [3,3], [3,2], [4,4], [4,3]]
+  noise: "sangria"
+  duration: 12
+  freq_spacing: "linear"
+  n_freq_bins: 4096
+  fmin: 1.0e-4
+  downsamplefactor: 1
+  t_obs_start: 288.25636300400004   # = 1-wk config t_obs_start - 77 d: both cuts end at the same t_obs_end
+  td:
+    dt: 5.0
+    round_trip: true
+    lookback_days: 180
+    taper_days: 1.0
+    bbhx_length: 4096
+    chunk: 2
+
+prior:
+  logMchirp: [5.2, 5.3]
+  q:         [1, 5]
+  chi_eff:   [-0.97, 0.97]
+  chi_diff:  [-0.97, 0.97]
+  dist:      [1.0, 20.0]
+  phi:       [0, 6.283185307179586]
+  cosinc:    [-1.0, 1.0]
+  lambda:    [0, 6.283185307179586]
+  sinbeta:   [-1.0, 1.0]
+  psi:       [0, 3.14159265358979]
+  Deltat:    [-2.55, -2.45]
+
+prior_dist_volumetric: true
+
+injection:
+  logMchirp: 5.25
+  q:         3.0
+  chi_eff:   0.0
+  chi_diff:  0.0
+  dist:      10.0
+  phi:       3.1415
+  cosinc:    0.5
+  lambda:    3.14159265358979
+  sinbeta:   0.2
+  psi:       1.0
+  Deltat:    -2.5
+
+spin_param_basis: "chieff_chidiff"
+
+backend: "cuda12x"

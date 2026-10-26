@@ -43,12 +43,11 @@ def psd_null_bands(freqs, psd, K=10.0, env_bins=201):
 
 
 def bin_widths(f):
-    """Midpoint-rule per-bin width. Bridges gaps left by deleted bins.
+    """Midpoint-rule per-bin width, for non-uniform (log, subsampled) grids.
 
-    Endpoints get the *full* adjacent gap, not half: each bin represents a
-    df-wide chunk, as in the standard FFT/GW convention. The integrand
-    vanishes at both ends of the band, so the choice is numerically moot
-    (1e-15 on SNR) — but it is the convention every stored dataset uses.
+    Endpoints get the *full* adjacent gap, not half. Not for linear 1/T grids
+    with veto gaps: there each bin is one DFT coefficient of width 1/T, and
+    bridging a gap would weight a single noise draw by up to ~130x.
     """
     d = np.diff(f)
     w = np.empty(f.size)

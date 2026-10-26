@@ -1329,9 +1329,13 @@ def materialize_gpu_noise(batch):
         if "wave_td" in batch:
             batch["wave_td"] = batch["wave_td"].repeat(n, 1, 1)
     Bn, C, Fr = wave.shape
-    re = torch.randn(Bn, C, Fr, device=wave.device, dtype=ns.dtype)
-    im = torch.randn(Bn, C, Fr, device=wave.device, dtype=ns.dtype)
-    batch["noise_fd"] = nf * torch.complex(re, im) * ns.unsqueeze(0)
+    if batch.get("_noise_model") is not None:
+        from pembhb.tapered_noise import lookup
+        batch["noise_fd"] = nf * lookup(batch["_noise_model"]).draw(Bn, device=wave.device, dtype=ns.dtype)
+    else:
+        re = torch.randn(Bn, C, Fr, device=wave.device, dtype=ns.dtype)
+        im = torch.randn(Bn, C, Fr, device=wave.device, dtype=ns.dtype)
+        batch["noise_fd"] = nf * torch.complex(re, im) * ns.unsqueeze(0)
     batch["wave_fd"] = wave
     batch["source_parameters"] = params
     return batch
@@ -1355,7 +1359,7 @@ class GPUNoiseMixin:
 
 
 def mbhb_collate_fn(batch, noise_scale, noise_factor, noise_shuffling=True, td_params=None,
-                    n_noise_realisations=1, gpu_noise=False):
+                    n_noise_realisations=1, gpu_noise=False, noise_model=None):
     """Collate a batch, generating FD (and optionally TD) noise on the fly.
 
     :param batch: list of sample dicts from MBHBDataset.__getitem__
@@ -1393,6 +1397,9 @@ def mbhb_collate_fn(batch, noise_scale, noise_factor, noise_shuffling=True, td_p
         the model valid. Defaults to 1 (no expansion). Ignored when the batch
         carries stored noise, so observation/test data with persisted noise is
         never expanded.
+    :param noise_model: optional :class:`pembhb.tapered_noise.TaperedNoise`; when
+        set, fresh noise is the tapered circle noise it draws instead of the
+        diagonal ``(re + j im) * noise_scale`` (whose variance it matches).
     """
     B = len(batch)
     wave_fd = torch.stack([b["wave_fd"] for b in batch])
@@ -1422,6 +1429,8 @@ def mbhb_collate_fn(batch, noise_scale, noise_factor, noise_shuffling=True, td_p
                 "_n_noise": n,
                 "_noise_factor": float(noise_factor),
             }
+            if noise_model is not None:
+                out["_noise_model"] = noise_model.key    # resolved in materialize_gpu_noise
             if has_td:
                 # FD-only pipelines (FMPE) don't use this, but keep it untiled
                 # for completeness; TD noise is not generated in this path.
@@ -1430,10 +1439,13 @@ def mbhb_collate_fn(batch, noise_scale, noise_factor, noise_shuffling=True, td_p
         # Draw an *independent* coloured complex Gaussian noise realisation for
         # every (copy, waveform) slot in the expanded batch:
         # z = (re + j im) * noise_scale, with re, im ~ N(0, 1) i.i.d.
-        C, F = noise_scale.shape
-        re = torch.randn(n * B, C, F, dtype=noise_scale.dtype)
-        im = torch.randn(n * B, C, F, dtype=noise_scale.dtype)
-        noise_fd = noise_factor * torch.complex(re, im) * noise_scale.unsqueeze(0)  # (n*B, C, F)
+        if noise_model is not None:
+            noise_fd = noise_factor * noise_model.draw(n * B, dtype=noise_scale.dtype)
+        else:
+            C, F = noise_scale.shape
+            re = torch.randn(n * B, C, F, dtype=noise_scale.dtype)
+            im = torch.randn(n * B, C, F, dtype=noise_scale.dtype)
+            noise_fd = noise_factor * torch.complex(re, im) * noise_scale.unsqueeze(0)  # (n*B, C, F)
 
         wave_td = torch.stack([b["wave_td"] for b in batch]) if has_td else None
         # Tile n copies of the batch ([batch | batch | ...]) so that example
@@ -1640,6 +1652,8 @@ def generate_waveforms_at(simulator, tmnre_batch):
     bbhx_batch = simulator.sampler.samples_to_bbhx_input(
         tmnre_batch, t_obs_end=simulator.t_obs_end_SI
     )
+    if getattr(simulator, "round_trip", False):
+        return simulator.waveform(bbhx_batch)
     # Pin "freqs" explicitly rather than reuse simulator.generate so the result
     # is immune to any in-place slicing of waveform_kwargs (e.g. high_freq_only
     # in the emcee path) that would otherwise desync the grid from asd/df.
