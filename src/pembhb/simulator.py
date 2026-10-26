@@ -16,6 +16,7 @@ from pembhb import ROOT_DIR, FMIN_FLOOR
 from pembhb import get_numpy_dtype, get_numpy_complex_dtype
 from pembhb.sampler import UniformSampler
 from pembhb.psd_veto import bin_widths, bands_to_mask, reference_veto_bands, REF_FMAX
+from pembhb.heterodyne import Heterodyne, HeterodynedNoise
 from pembhb.tapered_noise import TaperedNoise, tukey
 
 
@@ -190,6 +191,7 @@ class MBHBSimulatorFD:
         if td is not None and not self.round_trip and td.get("taper_days", 0):
             raise ValueError("td.taper_days needs td.round_trip: true (the taper acts in the time domain)")
         self.noise_model = None
+        self.het = None
         self.taper_w2 = 1.0
 
         if td is not None:
@@ -266,6 +268,10 @@ class MBHBSimulatorFD:
                 f"{n_masked} bins below {self.psd_fmin_mask:.3e} Hz "
                 f"(out of {len(self.freqs)} total)."
             )
+        # the round trip cuts on this grid; with td.heterodyne, freqs / df / asd become the binned grid
+        self.fine_freqs, self.fine_df, self.fine_asd = self.freqs, self.df, self.asd
+        if td is not None and td.get("heterodyne") is not None:
+            self._setup_heterodyne(td["heterodyne"])
 
         # BBHx waveform generator
         self.wfd = setup_bbhx(self.backend_name)
@@ -299,6 +305,9 @@ class MBHBSimulatorFD:
             "fmax": float(self.fmax),
             "taper_w2": self.taper_w2,
         }
+        if self.het is not None:
+            self.info["heterodyne"] = {"file": self.td["heterodyne"]["file"], "n_bins": self.n_freq_bins,
+                                       "eps": self.het.eps, "n_fine_bins": int(self.fine_freqs.size)}
 
     # -----------------------------------------
     def _setup_round_trip(self, td, noise_model):
@@ -325,6 +334,22 @@ class MBHBSimulatorFD:
             self.noise_model = TaperedNoise(sigma, self.window, self.keep_idx, self.dt)
         self._dev_cache = None
 
+    def _setup_heterodyne(self, het_conf):
+        """Publish the relative-binned grid of ``het_conf['file']`` (heterodyne.py) as freqs / df / asd."""
+        if not (self.round_trip and self.noise_model is not None):
+            raise ValueError("td.heterodyne needs td.round_trip: true and td.taper_days > 0")
+        if self.psd_fmin_mask is not None:
+            raise ValueError("td.heterodyne does not support psd_fmin_mask")
+        self.het = Heterodyne.load(os.path.expandvars(het_conf["file"]))
+        if not np.array_equal(self.het.fine_freqs, self.freqs):
+            raise ValueError(f"{het_conf['file']} was built on a different fine grid")
+        self.freqs, self.df, self.asd = self.het.freqs, self.het.df, self.het.asd
+        self.filtered_asd = self.asd.copy()
+        self.n_freq_bins = self.het.n_bins
+        self.noise_model = HeterodynedNoise(self.noise_model, self.het, het_conf.get("noise_chunk", 16))
+        print(f"[MBHBSimulatorFD] heterodyne: {self.fine_freqs.size} fine bins -> {self.n_freq_bins} "
+              f"(eps {self.het.eps:.3f}, {het_conf['file']})")
+
     def td_signal(self, inj, t_start):
         """bbhx on the full band of the DFT grid of [t_start, t_obs_end] -> irfft.
 
@@ -347,11 +372,11 @@ class MBHBSimulatorFD:
         """Last T_obs of x (ending at t_obs_end) -> taper -> dt * rfft -> kept bins, absolute-time phase."""
         xp = np if isinstance(x, np.ndarray) else self.xp
         if xp is np:
-            win, keep, phase = self.window, self.keep_idx, np.exp(-2j * np.pi * self.freqs * self.t_obs_start_SI)
+            win, keep, phase = self.window, self.keep_idx, np.exp(-2j * np.pi * self.fine_freqs * self.t_obs_start_SI)
         else:
             if self._dev_cache is None:
                 self._dev_cache = (xp.asarray(self.window), xp.asarray(self.keep_idx),
-                                   xp.exp(-2j * np.pi * xp.asarray(self.freqs) * self.t_obs_start_SI))
+                                   xp.exp(-2j * np.pi * xp.asarray(self.fine_freqs) * self.t_obs_start_SI))
             win, keep, phase = self._dev_cache
         X = self.dt * xp.fft.rfft(x[..., -self.n_time:] * win, axis=-1)
         return X[..., keep] * phase
@@ -359,11 +384,12 @@ class MBHBSimulatorFD:
     def _device_waveform(self, inj):
         """(n_obs, n_channels, n_freq_bins) on the backend, before any host copy.
 
-        Heterodyne hook: a binning step on this fine grid goes between here and generate()'s tail.
+        With td.heterodyne each chunk is binned right after the cut, so the fine grid never piles up.
         """
         if not self.round_trip:
             return self.wfd(*inj.copy(), **self.waveform_kwargs)[:, self.channels_idx]
-        parts = [self.cut_to_fd(self.td_signal(inj[:, i:i + self.chunk], self.t_gen_start_SI))
+        binned = (lambda x: x) if self.het is None else self.het.bin
+        parts = [binned(self.cut_to_fd(self.td_signal(inj[:, i:i + self.chunk], self.t_gen_start_SI)))
                  for i in range(0, inj.shape[1], self.chunk)]
         return parts[0] if len(parts) == 1 else self.xp.concatenate(parts, axis=0)
 

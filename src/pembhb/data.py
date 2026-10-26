@@ -1,7 +1,7 @@
 from torch.utils.data import Dataset, random_split, DataLoader, Subset 
 import lightning as L
 from pembhb.utils import mbhb_collate_fn, parse_periodic_bc_spec
-from pembhb.tapered_noise import TaperedNoise
+from pembhb.heterodyne import load_noise_model
 from pembhb import get_torch_dtype, get_torch_complex_dtype
 import torch
 import numpy as np
@@ -50,7 +50,7 @@ class MBHBDataset(Dataset):
             else:
                 raise ValueError("Dataset file must contain 'asd', but doesn't.")
             # Tapered circle noise for round-trip files with a taper (None otherwise).
-            self.noise_model = TaperedNoise.from_h5(f)
+            self.noise_model = load_noise_model(f)
 
             # TD params (dt, n_time) needed for on-the-fly TD noise via IFFT
             if self.has_td and "times_SI" in f:

@@ -725,8 +725,8 @@ class SequentialTrainerJoint:
         """Fit the encoder's input normalisation on the current round's data:
         whitening scale (if whiten) + amplitude scale / mean (if either flag)."""
         self._reset_whitening(model)
-        if getattr(model, "amplitude_normalise", False) or getattr(
-                model, "subtract_mean_whitened", False):
+        if any(getattr(model, k, False) for k in
+               ("amplitude_normalise", "subtract_mean_whitened", "per_bin_std")):
             norm_loader = self.data_module.train_dataloader(shuffle=False, num_workers=0,
                                                             single_chunk=True)
             model.fit_white_normalisation(norm_loader)
@@ -856,6 +856,7 @@ class SequentialTrainerJoint:
                 whiten=cfg.get("whiten", True),
                 amplitude_normalise=cfg.get("amplitude_normalise", True),
                 subtract_mean_whitened=cfg.get("subtract_mean_whitened", True),
+                per_bin_std=cfg.get("per_bin_std", False),
                 dropout=cfg.get("dropout", 0.0),
             )
             if cfg.get("encoder", "mlp") == "conv":

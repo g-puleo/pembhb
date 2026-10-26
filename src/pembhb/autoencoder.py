@@ -1471,6 +1471,7 @@ class ChannelizedMLPCompressor(nn.Module):
         whiten: bool = True,
         amplitude_normalise: bool = True,
         subtract_mean_whitened: bool = True,
+        per_bin_std: bool = False,
         dropout: float = 0.0,
     ):
         super().__init__()
@@ -1478,12 +1479,17 @@ class ChannelizedMLPCompressor(nn.Module):
             raise NotImplementedError(
                 "ChannelizedMLPCompressor only supports representation='real_imag'."
             )
+        if per_bin_std and amplitude_normalise:
+            raise ValueError("per_bin_std and amplitude_normalise are mutually exclusive.")
+        if per_bin_std and not subtract_mean_whitened:
+            raise ValueError("per_bin_std requires subtract_mean_whitened.")
         self.n_channels = n_channels
         self.n_freqs = n_freqs
         self.representation = representation
         self.whiten = whiten
         self.amplitude_normalise = amplitude_normalise
         self.subtract_mean_whitened = subtract_mean_whitened
+        self.per_bin_std = per_bin_std
         self.dropout = float(dropout)
 
         self.n_real_channels = n_channels * 2  # re + im per TDI channel
@@ -1514,6 +1520,10 @@ class ChannelizedMLPCompressor(nn.Module):
         self.register_buffer(
             "mean_whitened",
             torch.zeros(self.n_real_channels, n_freqs, dtype=get_torch_dtype()),
+        )
+        self.register_buffer(
+            "std_whitened",
+            torch.ones(self.n_real_channels, n_freqs, dtype=get_torch_dtype()),
         )
 
     def _build_encoder(self):
@@ -1562,10 +1572,11 @@ class ChannelizedMLPCompressor(nn.Module):
                 "nor subtract_mean_whitened is set."
             )
         device = next(self.parameters()).device
+        # float64: in loud bins E[x^2] ~ 1e4 while Var ~ 1-10
         running_sum = torch.zeros(
-            self.n_real_channels, self.n_freqs, device=device,
-            dtype=self.mean_whitened.dtype,
+            self.n_real_channels, self.n_freqs, device=device, dtype=torch.float64,
         )
+        noisy_sum, noisy_sq = torch.zeros_like(running_sum), torch.zeros_like(running_sum)
         n_samples = 0
         with torch.no_grad():
             for batch in dataloader:
@@ -1574,12 +1585,26 @@ class ChannelizedMLPCompressor(nn.Module):
                 real = self._prewhiten_real(wave_fd)
                 n_samples += real.shape[0]
                 if self.subtract_mean_whitened:
-                    running_sum += real.sum(dim=0)
+                    running_sum += real.double().sum(dim=0)
+                if self.per_bin_std:
+                    # the network sees wave_fd + noise_fd (noise is not in wave_fd)
+                    if "noise_fd" in batch:
+                        wave_fd = wave_fd + batch["noise_fd"].to(device)
+                    noisy = self._prewhiten_real(wave_fd).double()
+                    noisy_sum += noisy.sum(dim=0)
+                    noisy_sq += (noisy ** 2).sum(dim=0)
         if self.subtract_mean_whitened:
             self.mean_whitened.copy_(running_sum / n_samples)
             print(
                 f"[ChannelizedMLP] mean_whitened fitted on {n_samples} samples"
             )
+        if self.per_bin_std:
+            mean = noisy_sum / n_samples
+            std = (noisy_sq / n_samples - mean ** 2).clamp_min(0).sqrt()
+            std[std == 0] = 1.0
+            self.std_whitened.copy_(std)
+            print(f"[ChannelizedMLP] std_whitened fitted: range=[{std.min().item():.3e}, "
+                  f"{std.max().item():.3e}]")
 
         if not self.amplitude_normalise:
             return
@@ -1603,6 +1628,8 @@ class ChannelizedMLPCompressor(nn.Module):
         real = self._prewhiten_real(z)
         if self.subtract_mean_whitened:
             real = real - self.mean_whitened
+        if self.per_bin_std:
+            real = real / self.std_whitened
         if self.amplitude_normalise:
             real = real / self.amplitude_scale
         return real

@@ -1,0 +1,81 @@
+# configs/datagen_maskzero_rt_84d.yaml heterodyned on /data/gpuleo/mbhb/long_tobs_heterodyne/het8000/het_8000.npz (scripts/build_heterodyne.py); prior = /data/gpuleo/mbhb/2026/10/15/channelizedmlp_maskzero_mlp60k/prior_after_round_26.yaml
+waveform_params:
+  channels: AE
+  modes:
+  - - 2
+    - 2
+  - - 2
+    - 1
+  - - 3
+    - 3
+  - - 3
+    - 2
+  - - 4
+    - 4
+  - - 4
+    - 3
+  noise: sangria
+  duration: 12
+  freq_spacing: linear
+  n_freq_bins: 4096
+  fmin: 0.0001
+  downsamplefactor: 1
+  t_obs_start: 288.25636300400004
+  td:
+    dt: 5.0
+    round_trip: true
+    lookback_days: 180
+    taper_days: 1.0
+    bbhx_length: 4096
+    chunk: 2
+    heterodyne:
+      file: ${PEMBHB_DATA_DIR}/long_tobs_heterodyne/het8000/het_8000.npz
+prior:
+  Deltat:
+  - -2.500119347876031
+  - -2.4998839734468516
+  chi_diff:
+  - -0.002938038060756561
+  - 0.005256800358449245
+  chi_eff:
+  - -0.0021531288336650413
+  - 0.003462194050631073
+  cosinc:
+  - 0.49400191113708514
+  - 0.5060065066617634
+  dist:
+  - 9.7308866467033
+  - 10.099194697777126
+  lambda:
+  - 3.064172465299809
+  - 3.1704116736726213
+  logMchirp:
+  - 5.249976279011481
+  - 5.250037727685287
+  phi:
+  - 3.129014235508696
+  - 3.159246263802596
+  psi:
+  - 0.9674703947933085
+  - 1.0124439703868
+  q:
+  - 2.9824562458745607
+  - 3.0296340822277177
+  sinbeta:
+  - 0.13366480876044212
+  - 0.2314587421702088
+prior_dist_volumetric: true
+injection:
+  logMchirp: 5.25
+  q: 3.0
+  chi_eff: 0.0
+  chi_diff: 0.0
+  dist: 10.0
+  phi: 3.1415
+  cosinc: 0.5
+  lambda: 3.14159265358979
+  sinbeta: 0.2
+  psi: 1.0
+  Deltat: -2.5
+spin_param_basis: chieff_chidiff
+backend: cuda12x

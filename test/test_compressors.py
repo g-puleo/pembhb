@@ -18,3 +18,32 @@ def test_conv_is_channelized_variant():
         model.eval()
         out = model.encode(model.preprocess(z))
         assert out.shape == (3, dim) and model.bottleneck_dim == dim
+
+
+
+def test_per_bin_std_standardises_each_bin():
+    torch.manual_seed(0)
+    mlp = ChannelizedMLPCompressor(N_CH, N_F, hidden_dim_per_channel=16, out_dim_per_channel=8,
+                                   amplitude_normalise=False, per_bin_std=True)
+    offset = 100 * torch.rand(N_CH, N_F)
+    scale = torch.logspace(-1, 2, N_F)
+    cplx = lambda re, im: torch.complex(re, im)
+    batches = [{"wave_fd": cplx(offset + scale * torch.randn(500, N_CH, N_F),
+                                -offset + scale * torch.randn(500, N_CH, N_F)),
+                "noise_fd": cplx(torch.randn(500, N_CH, N_F), torch.randn(500, N_CH, N_F))}
+               for _ in range(4)]
+    mlp.fit_white_normalisation(batches)
+    # the std is that of the network input wave_fd + noise_fd
+    x = torch.cat([mlp.preprocess(b["wave_fd"] + b["noise_fd"]) for b in batches])
+    assert x.mean(0).abs().max() < 0.1
+    torch.testing.assert_close(x.std(0, correction=0), torch.ones(2 * N_CH, N_F),
+                               rtol=1e-4, atol=1e-4)
+
+
+def test_per_bin_std_flag_checks():
+    import pytest
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        ChannelizedMLPCompressor(N_CH, N_F, amplitude_normalise=True, per_bin_std=True)
+    with pytest.raises(ValueError, match="requires subtract_mean_whitened"):
+        ChannelizedMLPCompressor(N_CH, N_F, amplitude_normalise=False,
+                                 subtract_mean_whitened=False, per_bin_std=True)

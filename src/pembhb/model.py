@@ -1975,6 +1975,7 @@ class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
                 whiten=cm_conf.get("whiten", True),
                 amplitude_normalise=cm_conf.get("amplitude_normalise", True),
                 subtract_mean_whitened=cm_conf.get("subtract_mean_whitened", True),
+                per_bin_std=cm_conf.get("per_bin_std", False),
                 dropout=cm_conf.get("dropout", 0.0),
                 **cm_conf.get("conv", {}),
             )
@@ -2004,6 +2005,7 @@ class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
                 whiten=cm_conf.get("whiten", True),
                 amplitude_normalise=cm_conf.get("amplitude_normalise", True),
                 subtract_mean_whitened=cm_conf.get("subtract_mean_whitened", True),
+                per_bin_std=cm_conf.get("per_bin_std", False),
                 dropout=cm_conf.get("dropout", 0.0),
             )
         elif ds_type == "MarginalEncoder":
@@ -2119,7 +2121,8 @@ class JointAEInferenceNetwork(GPUNoiseMixin, LightningModule):
         # Old checkpoints predate some normalisation buffers (identity-init
         # defaults are correct for the whiten path); tolerate their absence.
         allowed_missing = {"encoder_model.mean_whitened",
-                           "encoder_model.amplitude_scale_std"}
+                           "encoder_model.amplitude_scale_std",
+                           "encoder_model.std_whitened"}
         # The per-bin standardisation buffers were removed; older checkpoints
         # may still carry them — ignore them on load.
         allowed_unexpected = {"encoder_model.mean_vec",
