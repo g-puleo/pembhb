@@ -110,7 +110,7 @@ def eval_nre_1d(model, dataloader, in_param_idx, out_param_idx, low, high, ngrid
     )
     grid_1d = grid[:, 0]
     dp = grid_1d[1] - grid_1d[0]
-    ratios = np.exp(logratios[0])
+    ratios = np.exp(logratios[0] - np.max(logratios[0]))
     norm1d = ratios / np.sum(ratios * dp)
     return grid_1d, norm1d, float(inj_params[0])
 
