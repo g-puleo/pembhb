@@ -1,8 +1,12 @@
 #!/bin/bash
 # Production TMNRE run on Leonardo Booster: conv encoder, 60k bins (fmax 0.1),
-# GPU-resident streaming ring, the mlp60k observation. Normal QOS caps a job at
-# 24 h, so queue a chain of jobs; each one picks up the run where the last stopped.
-# Submit from the repo root, e.g. 5 chained jobs:
+# GPU-resident streaming ring. Argument: the simulator,
+#   fd (default)  plain bbhx FD, the mlp60k observation        -> run conv60k_gpustream
+#   rt            round trip (77 d lookback, 1-d Tukey taper),
+#                 obs_nested_rt/obs_7d_withnoise.h5             -> run conv60k_rt_gpustream
+# e.g. sbatch -J conv60k_rt slurm/conv60k.sbatch rt   (pass the same argument to every job of a chain).
+# Normal QOS caps a job at 24 h, so queue a chain of jobs; each one picks up the
+# run where the last stopped. Submit from the repo root, e.g. 5 chained jobs:
 #   jid=$(sbatch --parsable slurm/conv60k.sbatch)
 #   for i in 2 3 4 5; do jid=$(sbatch --parsable --dependency=afterany:$jid slurm/conv60k.sbatch); done
 # or 4-day jobs on the long-production QOS (same chaining):
@@ -13,7 +17,8 @@
 # unfinished, and resumes for the rounds still missing up to MAX_ROUNDS. It exits
 # at once when the chain has converged or MAX_ROUNDS are done, and with an error
 # when the coverage guard rejected a truncation (inspect it, then resubmit).
-# Needs, under $PEMBHB_DATA_DIR: obs_maskzero_baseline_fmax1e-1_withnoise.{h5,yaml}
+# Needs, under $PEMBHB_DATA_DIR: obs_maskzero_baseline_fmax1e-1_withnoise.{h5,yaml} (fd)
+# or obs_nested_rt/obs_7d_withnoise.{h5,yaml} (rt; bbhx needs the tstart patch)
 # Outputs: slurm/logs/<name>_<jobid>.{out,err} (Slurm), slurm/logs/<name>_<jobid>/ (gpu.csv, spin/mask logs, summary)
 
 #SBATCH --job-name=conv60k
@@ -33,11 +38,18 @@ cd "$REPO"
 source "$REPO/activate_venv.sh"   # modules + venv + PEMBHB_* dirs
 set -uo pipefail
 
-RUN_NAME=conv60k_gpustream
 MAX_ROUNDS=80
 TRAIN_CONFIG=train_conv60k_gpustream.yaml
-DATAGEN_CONFIG=datagen_maskzero_baseline_fmax1e-1.yaml
-OBS=$PEMBHB_DATA_DIR/obs_maskzero_baseline_fmax1e-1_withnoise.h5
+SIM=${1:-fd}
+case $SIM in
+    fd) RUN_NAME=conv60k_gpustream
+        DATAGEN_CONFIG=datagen_maskzero_baseline_fmax1e-1.yaml
+        OBS=$PEMBHB_DATA_DIR/obs_maskzero_baseline_fmax1e-1_withnoise.h5 ;;
+    rt) RUN_NAME=conv60k_rt_gpustream
+        DATAGEN_CONFIG=datagen_maskzero_rt_1w.yaml
+        OBS=$PEMBHB_DATA_DIR/obs_nested_rt/obs_7d_withnoise.h5 ;;
+    *)  echo "usage: sbatch slurm/conv60k.sbatch [fd|rt]" >&2; exit 2 ;;
+esac
 JOBDIR=$REPO/slurm/logs/${SLURM_JOB_NAME}_${SLURM_JOB_ID}
 mkdir -p "$JOBDIR" "$PEMBHB_DATA_DIR/tmp"
 export TMPDIR=$PEMBHB_DATA_DIR/tmp   # checkpoint saves stage through TMPDIR
