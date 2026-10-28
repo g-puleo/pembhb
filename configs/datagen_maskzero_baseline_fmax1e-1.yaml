@@ -1,0 +1,43 @@
+# Prior and injection of the 2026/07/23 channelizedmlp_maskzero baseline, current key names.
+waveform_params:
+  channels: "AE"
+  modes: [[2,2], [2,1], [3,3], [3,2], [4,4], [4,3]]
+  noise: "sangria"
+  duration: 1
+  freq_spacing: "linear"
+  n_freq_bins: 4096
+  fmin: 1.0e-4
+  fmax: 1.0e-1
+  downsamplefactor: 1
+
+prior:
+  logMchirp: [5.2, 5.3]
+  q:         [1, 5]
+  chi_eff:   [-0.97, 0.97]
+  chi_diff:  [-0.97, 0.97]
+  dist:      [1.0, 20.0]
+  phi:       [0, 6.283185307179586]
+  cosinc:    [-1.0, 1.0]
+  lambda:    [0, 6.283185307179586]
+  sinbeta:   [-1.0, 1.0]
+  psi:       [0, 3.14159265358979]
+  Deltat:    [-2.55, -2.45]
+
+prior_dist_volumetric: true
+
+injection:
+  logMchirp: 5.25
+  q:         3.0
+  chi_eff:   0.0
+  chi_diff:  0.0
+  dist:      10.0
+  phi:       3.1415
+  cosinc:    0.5
+  lambda:    3.14159265358979
+  sinbeta:   0.2
+  psi:       1.0
+  Deltat:    -2.5
+
+spin_param_basis: "chieff_chidiff"
+
+backend: "cuda12x"
