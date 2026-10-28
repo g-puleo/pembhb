@@ -65,7 +65,7 @@ def resolve_loss_band(freqs, ae_conf):
 class ResidualConvBlock(nn.Module):
     """Single strided conv layer with a residual shortcut.
 
-    ``output = LeakyReLU( BN(Conv(x)) + shortcut(x) )``
+    ``output = LeakyReLU( LN(Conv(x)) + shortcut(x) )``
 
     A 1×1 convolution is used as the shortcut whenever the channel count or
     spatial dimension changes (i.e. ``in_ch != out_ch`` or ``stride != 1``).
@@ -75,12 +75,12 @@ class ResidualConvBlock(nn.Module):
         super().__init__()
         self.main = nn.Sequential(
             nn.Conv1d(in_ch, out_ch, kernel_size, stride, padding=kernel_size // 2),
-            nn.BatchNorm1d(out_ch),
+            nn.GroupNorm(1, out_ch),
         )
         if in_ch != out_ch or stride != 1:
             self.shortcut = nn.Sequential(
                 nn.Conv1d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm1d(out_ch),
+                nn.GroupNorm(1, out_ch),
             )
         else:
             self.shortcut = nn.Identity()
@@ -98,7 +98,7 @@ class ConvEncoder(nn.Module):
 
     Architecture:
         Input (B, C_in, L)
-        → [Conv1d + BN + LeakyReLU + Dropout] × N_layers (with stride=2 downsampling)
+        → [Conv1d + LayerNorm (GroupNorm(1, C)) + LeakyReLU + Dropout] × N_layers (with stride=2 downsampling)
         → Flatten
         → Linear → bottleneck (B, bottleneck_dim)
 
@@ -135,7 +135,7 @@ class ConvEncoder(nn.Module):
             for out_ch in hidden_channels:
                 layers.extend([
                     nn.Conv1d(in_ch, out_ch, kernel_size, stride, padding=kernel_size // 2),
-                    nn.BatchNorm1d(out_ch),
+                    nn.GroupNorm(1, out_ch),
                     nn.LeakyReLU(0.2, inplace=True),
                 ])
                 if dropout > 0:

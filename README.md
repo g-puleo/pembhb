@@ -113,7 +113,7 @@ It then encodes the result with one of two variants, chosen by `ChannelizedMLP.e
 | `encoder` | class | how it encodes | summary size |
 |---|---|---|---|
 | `mlp` (default) | `ChannelizedMLPCompressor` | an independent 2-layer MLP per real channel (`n_freqs → hidden_dim_per_channel → out_dim_per_channel`); outputs concatenated | `2 · n_channels · out_dim_per_channel` (256) |
-| `conv` | `ConvCompressor` | one 1D CNN over all real channels together: stride-2 conv layers (`hidden_channels`, `kernel_size`, optional residual shortcuts), then a linear layer | `conv.bottleneck_dim` (256) |
+| `conv` | `ConvCompressor` | one 1D CNN over all real channels together: stride-2 conv layers (`hidden_channels`, `kernel_size`, optional residual shortcuts; per-sample LayerNorm, `GroupNorm(1, C)`, after each conv), then a linear layer | `conv.bottleneck_dim` (256) |
 
 `conv` shares the preprocessing and the training of `mlp`; only the encoder
 differs. The MLP's first layer sees every frequency bin at once, so its size

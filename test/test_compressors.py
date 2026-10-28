@@ -20,6 +20,22 @@ def test_conv_is_channelized_variant():
         assert out.shape == (3, dim) and model.bottleneck_dim == dim
 
 
+def test_conv_encoder_has_no_running_stats():
+    # LayerNorm (GroupNorm(1, C)): train and eval compute the same function, so a
+    # single observation is summarised identically in both modes.
+    torch.manual_seed(0)
+    for residual in (False, True):
+        conv = ConvCompressor(N_CH, N_F, bottleneck_dim=32, hidden_channels=(8, 16),
+                              kernel_size=5, residual=residual)
+        assert not any(isinstance(m, torch.nn.modules.batchnorm._BatchNorm)
+                       for m in conv.modules())
+        x = conv.preprocess(torch.randn(4, N_CH, N_F, dtype=torch.complex64))
+        conv.train()
+        out_train = conv.encode(x)
+        conv.eval()
+        torch.testing.assert_close(conv.encode(x), out_train)
+        torch.testing.assert_close(conv.encode(x[:1]), out_train[:1])
+
 
 def test_per_bin_std_standardises_each_bin():
     torch.manual_seed(0)
