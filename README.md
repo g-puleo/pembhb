@@ -176,6 +176,12 @@ relative to its domain. That is the fixed point of the rule, not a stall.
 A mode that wraps around λ = 0/2π is evaluated on a window spanning the full
 period, i.e. at coarser resolution than the other modes.
 
+At round end, a coverage guard (`coverage_guard`, mask mode) builds the same
+proposal from each of `n_coverage` validation simulations and checks how often
+it contains the simulation's true parameters. Expected coverage is the
+credible level; below `min_coverage` (0.98) the run stops with a report instead
+of truncating.
+
 `mode: rectangle` keeps the legacy behaviour, which shrinks a box per parameter.
 
 ## 4. Train: `scripts/tmnre_joint.py`

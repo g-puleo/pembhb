@@ -72,3 +72,93 @@ def test_propose_is_pure_and_commit_restore_round_trip(tmp_path):
     assert np.ravel(restored.prev_accepted[(0,)]["intervals"]) == pytest.approx([0.0, 0.5])
     a, b = tr.prev_accepted[(1, 2)]["region"], restored.prev_accepted[(1, 2)]["region"]
     assert b.volume() == pytest.approx(a.volume())
+
+
+# ----------------------------------------------------------------------
+# proposal_coverage: the next-round proposal built per simulation
+# ----------------------------------------------------------------------
+def _fake_ratios(centres_by_sim, sigma, calls):
+    """Stand-in for truncator._ratios_1d: a Gaussian per simulation, centred at
+    that simulation's posterior centre; records the batch size of each call."""
+    import torch
+
+    def ratios(model, loader, in_idx, out_idx, bounds, n):
+        c = _centres(*bounds, n)
+        mu = torch.cat([b["post_centre"] for b in loader]).numpy()
+        calls.append(len(mu))
+        return np.exp(-0.5 * ((c[None, :] - mu[:, None]) / sigma) ** 2), (c,)
+    return ratios
+
+
+def test_proposal_coverage_counts_truths_inside_each_simulation_proposal(monkeypatch):
+    import torch
+    from pembhb import truncator as tmod
+
+    truths = np.array([0.40, 0.50, 0.55, 0.45, 0.50])
+    centres = truths.copy()
+    centres[1] = 0.80          # one overconfident, displaced posterior
+    sims = {"source_parameters": torch.tensor(truths[:, None]),
+            "post_centre": torch.tensor(centres)}
+    calls = []
+    monkeypatch.setattr(tmod, "_ratios_1d", _fake_ratios(centres, 0.01, calls))
+
+    tr = Truncator({"mode": "mask", "credible_level_1d": 0.9999, "dilation_1d": 1.0,
+                    "ngrid_1d_refined": 128}, {}, ["a"])
+    tr.prev_accepted[(0,)] = {"kind": "1d", "intervals": [[0.3, 0.9]]}
+    cov = tmod.proposal_coverage(tr, None, sims, [((0,), 0)], {"a": [0.0, 1.0]})
+
+    assert cov[(0,)] == (0.8, 4, 5)
+    # with a domain every window is shared: one batched call for all simulations
+    assert calls == [5]
+
+
+def test_proposal_coverage_round_one_refines_per_simulation(monkeypatch):
+    import torch
+    from pembhb import truncator as tmod
+
+    truths = np.array([0.2, 0.7, 0.45])
+    sims = {"source_parameters": torch.tensor(truths[:, None]),
+            "post_centre": torch.tensor(truths)}
+    calls = []
+    monkeypatch.setattr(tmod, "_ratios_1d", _fake_ratios(truths, 0.02, calls))
+
+    tr = Truncator({"mode": "mask", "credible_level_1d": 0.9999, "dilation_1d": 1.0,
+                    "ngrid_1d": 100, "ngrid_1d_refined": 128}, {}, ["a"])
+    cov = tmod.proposal_coverage(tr, None, sims, [((0,), 0)], {"a": [0.0, 1.0]})
+
+    assert cov[(0,)] == (1.0, 3, 3)
+    # the coarse box pass is shared; each simulation's own modes are refined alone
+    assert calls[0] == 3 and all(n == 1 for n in calls[1:]) and len(calls) > 1
+
+
+def test_proposal_coverage_matches_the_real_proposal(monkeypatch):
+    # The per-simulation region must be exactly what Truncator.propose would build
+    # if that simulation were the observation.
+    import torch
+    from pembhb import truncator as tmod
+
+    truths = np.array([0.42, 0.61])
+    sims = {"source_parameters": torch.tensor(truths[:, None]),
+            "post_centre": torch.tensor(truths)}
+    monkeypatch.setattr(tmod, "_ratios_1d", _fake_ratios(truths, 0.015, []))
+    conf = {"mode": "mask", "credible_level_1d": 0.999, "dilation_1d": 1.0,
+            "ngrid_1d_refined": 128}
+    tr = Truncator(conf, {}, ["a"])
+    tr.prev_accepted[(0,)] = {"kind": "1d", "intervals": [[0.3, 0.8]]}
+
+    regions = []
+    real = tr._mask_region
+
+    def spy(*args, **kwargs):
+        region, kept = real(*args, **kwargs)
+        regions.append(region)
+        return region, kept
+    monkeypatch.setattr(tr, "_mask_region", spy)
+    tmod.proposal_coverage(tr, None, sims, [((0,), 0)], {"a": [0.0, 1.0]})
+
+    for s, region in enumerate(regions):
+        expected, _ = real(None, None, (0,), 0, {"a": [0.0, 1.0]}, False,
+                           evaluate=lambda b, n, s=s: (tmod._ratios_1d(
+                               None, [{"post_centre": sims["post_centre"][s:s + 1]}],
+                               0, 0, b, n)[0][0], (_centres(*b, n),)))
+        assert np.ravel(region.intervals()) == pytest.approx(np.ravel(expected.intervals()))

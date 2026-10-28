@@ -22,6 +22,7 @@ import copy
 from dataclasses import dataclass, field
 
 import numpy as np
+import torch
 
 from pembhb import utils
 from pembhb.mask_truncation import _MASK_PERIOD_BY_NAME
@@ -122,8 +123,12 @@ class Truncator:
                 self._rectangle(model, obs_loader, key, out_idx, proposal.prior)
         return proposal
 
-    def _mask_region(self, model, obs_loader, key, out_idx, prior, verbose):
-        """``(MultiRegion, kept)`` of one marginal (mask mode)."""
+    def _mask_region(self, model, obs_loader, key, out_idx, prior, verbose, evaluate=None):
+        """``(MultiRegion, kept)`` of one marginal (mask mode).
+
+        ``evaluate(bounds, n)`` defaults to the network at ``obs_loader``'s single
+        observation; :func:`proposal_coverage` injects cached rows instead.
+        """
         prev = self.prev_accepted.get(key)
         names = [self.prior_keys[i] for i in key]
         periods = tuple(_MASK_PERIOD_BY_NAME.get(n) for n in names)
@@ -134,8 +139,9 @@ class Truncator:
                                   128 if ndim == 1 else 64))
 
         region = _seed_from_prev(prev, n_ref)
-        evaluate =(_evaluator_1d(model, obs_loader, key[0], out_idx) if ndim == 1
-                    else _evaluator_2d(model, obs_loader, key, out_idx))
+        if evaluate is None:
+            evaluate = (_evaluator_1d(model, obs_loader, key[0], out_idx) if ndim == 1
+                        else _evaluator_2d(model, obs_loader, key, out_idx))
         if region is None:
             # Round 1 (no domain): coarse pass over the prior box finds the modes.
             box = tuple(tuple(prior[n]) for n in names)
@@ -218,6 +224,25 @@ def _centres(lo, hi, n):
     return lo + (np.arange(n) + 0.5) * (hi - lo) / n
 
 
+def _ratios_1d(model, loader, in_idx, out_idx, bounds, n):
+    """Raw 1D ratios on ``n`` cell centres in ``bounds``, one row per observation."""
+    c = _centres(*bounds, n)
+    logratios, _inj, _grid = utils.get_logratios_grid(
+        loader, model, ngrid_points=int(n), in_param_idx=in_idx,
+        out_param_idx=out_idx, low=float(c[0]), high=float(c[-1]), grid_chunk_size=int(n))
+    return np.exp(logratios), (c,)
+
+
+def _ratios_2d(model, loader, in_idx, out_idx, bounds, n):
+    """Raw 2D ratios on ``n``×``n`` cell centres in ``bounds``, one map per observation."""
+    cx, cy = _centres(*bounds[0], n), _centres(*bounds[1], n)
+    logratios, _inj, _gx, _gy = utils.get_logratios_grid_2d(
+        loader, model, ngrid_points=int(n), out_param_idx=out_idx,
+        in_param_idx=tuple(in_idx), bounds_0=(float(cx[0]), float(cx[-1])),
+        bounds_1=(float(cy[0]), float(cy[-1])), grid_chunk_size=int(n) ** 2)
+    return np.exp(logratios), (cx, cy)
+
+
 def _evaluator_1d(model, obs_loader, in_idx, out_idx):
     """``evaluate(bounds, n)`` for :func:`refine_region` — raw 1D ratios.
 
@@ -225,24 +250,76 @@ def _evaluator_1d(model, obs_loader, in_idx, out_idx):
     threshold, so each must stay on the common scale.
     """
     def _evaluate(bounds, n):
-        c = _centres(*bounds, n)
-        logratios, _inj, _grid = utils.get_logratios_grid(
-            obs_loader, model, ngrid_points=int(n), in_param_idx=in_idx,
-            out_param_idx=out_idx, low=float(c[0]), high=float(c[-1]))
-        return np.exp(logratios[0]), (c,)
+        density, grids = _ratios_1d(model, obs_loader, in_idx, out_idx, bounds, n)
+        return density[0], grids
     return _evaluate
 
 
 def _evaluator_2d(model, obs_loader, in_idx, out_idx):
     """``evaluate(bounds, n)`` for :func:`refine_region` — raw 2D ratios."""
     def _evaluate(bounds, n):
-        cx, cy = _centres(*bounds[0], n), _centres(*bounds[1], n)
-        logratios, _inj, _gx, _gy = utils.get_logratios_grid_2d(
-            obs_loader, model, ngrid_points=int(n), out_param_idx=out_idx,
-            in_param_idx=tuple(in_idx), bounds_0=(float(cx[0]), float(cx[-1])),
-            bounds_1=(float(cy[0]), float(cy[-1])))
-        return np.exp(logratios[0]), (cx, cy)
+        density, grids = _ratios_2d(model, obs_loader, in_idx, out_idx, bounds, n)
+        return density[0], grids
     return _evaluate
+
+
+def proposal_coverage(truncator, model, sims, marginals, prior):
+    """Coverage of the next-round proposal over labelled simulations.
+
+    For every simulation, build the proposal from its own data with exactly the
+    code that builds the real one (:meth:`Truncator._mask_region` on the current
+    domain) and test whether its true parameters fall inside. Returns
+    ``{marginal_key: (coverage, n_inside, n_total)}``.
+
+    ``sims`` is one materialised batch (fixed noise: every window of a
+    simulation must see the same data). Network evaluations are batched: a
+    window requested by every simulation (the domain's modes; in round 1 the
+    coarse pass over the box) is evaluated once for all of them and each
+    simulation reads its own row. Round 1's refined windows depend on each
+    simulation's own modes and are evaluated for that simulation alone.
+    """
+    if truncator.mode != "mask":
+        raise ValueError("proposal_coverage supports truncation.mode='mask' only")
+    n_total = int(sims["source_parameters"].shape[0])
+    truths = sims["source_parameters"].detach().cpu().numpy()
+    all_sims = [sims]
+    coverage = {}
+    for key, out_idx in marginals:
+        ndim = len(key)
+        ratios = _ratios_1d if ndim == 1 else _ratios_2d
+        in_idx = key[0] if ndim == 1 else key
+        has_domain = truncator.prev_accepted.get(key) is not None
+        cache = {}
+
+        def _key(bounds, n):
+            flat = np.asarray(bounds, dtype=float).reshape(-1)
+            return (tuple(np.round(flat, 15)), int(n))
+
+        n_inside = 0
+        for s in range(n_total):
+            calls = [0]
+
+            def evaluate(bounds, n, s=s, calls=calls):
+                k = _key(bounds, n)
+                shared = has_domain or calls[0] == 0
+                calls[0] += 1
+                if k in cache:
+                    density, grids = cache[k]
+                    return density[s], grids
+                if shared:
+                    cache[k] = ratios(model, all_sims, in_idx, out_idx, bounds, n)
+                    return cache[k][0][s], cache[k][1]
+                one = [{name: v[s:s + 1] if torch.is_tensor(v) else v
+                        for name, v in sims.items()}]
+                density, grids = ratios(model, one, in_idx, out_idx, bounds, n)
+                return density[0], grids
+
+            region, _kept = truncator._mask_region(
+                model, None, key, out_idx, prior, verbose=False, evaluate=evaluate)
+            point = truths[s, list(key)].reshape(ndim, 1)
+            n_inside += int(region.contains(point)[0])
+        coverage[key] = (n_inside / n_total, n_inside, n_total)
+    return coverage
 
 
 def proposal_modes(prev):
@@ -289,4 +366,4 @@ def box_volume(prior, key, prior_keys):
 
 
 __all__ = ["Proposal", "Truncator", "volume_ratio", "proposal_modes", "box_volume",
-           "prev_keep_mask"]
+           "prev_keep_mask", "proposal_coverage"]

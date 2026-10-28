@@ -26,8 +26,7 @@ from torch.utils.data import DataLoader
 from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from pembhb.regions import (
-    Region, region_from_equal_tailed, region_from_main_mode, region_from_hpd,
-    prev_keep_mask, truncation_region
+    Region, region_from_main_mode, prev_keep_mask, truncation_region
 )
 from pembhb.mask_truncation import _MASK_PERIOD_BY_NAME
 from datetime import datetime, timedelta
@@ -1017,71 +1016,6 @@ class DifferentialEntropyEarlyStopping(Callback):
             self.stop_reason = triggered_reason
             print(f"[EntropyES] Stopping at {tag_kind} {tag}: {triggered_reason}")
             trainer.should_stop = True
-
-
-def compute_truncation_coverage(
-    model, loader, marginals_1d_info, marginals_2d_info,
-    eps_1d=1e-4, sky_credible_level=0.999, sky_dilation=1.1,
-    ngrid_1d=100, ngrid_2d=100, dilation_1d=1.0,
-):
-    """Empirical coverage of each marginal's truncation region over a labelled set.
-
-    For every marginal, per sample, build the accepted :class:`~pembhb.regions.Region`
-    the round-end truncation would build and count how many samples' ground truths
-    fall inside their own region (``Region.contains``). Returns
-    ``{marginal_key_tuple: (coverage, n_inside, n_total)}``.
-
-    This is the signal for the coverage-gated truncation veto (see
-    ``tmnre_joint.SequentialTrainerJoint.run``): a region that is nominally
-    ``1 - eps`` credible but empirically covers far fewer truths means the network
-    is overconfident for that parameter, so its truncation should be vetoed rather
-    than discard the true value.
-
-    * 1D: equal-tailed ``[eps_1d/2, 1-eps_1d/2]`` interval
-      (:func:`~pembhb.regions.region_from_equal_tailed`).
-    * 2D: all components of the HPD level set (:func:`~pembhb.regions.region_from_hpd`),
-      as mask-mode truncation keeps them, with each axis's periodicity resolved
-      from its parameter name.
-
-    Membership is the true accepted-mask test, not a bounding-box test: a truth
-    that lands in a gap between components (inside the box but outside the mask)
-    correctly counts as NOT covered.
-    """
-    coverage = {}
-
-    for _label, in_idx, out_idx in marginals_1d_info:
-        logratios, inj, grid = get_logratios_grid(
-            loader, model, ngrid_1d, in_param_idx=in_idx, out_param_idx=out_idx)
-        g1d = grid[:, 0]
-        n_total = logratios.shape[0]
-        n_inside = 0
-        for s in range(n_total):
-            region = region_from_equal_tailed(
-                np.exp(logratios[s]), (g1d,), eps=eps_1d, dilation=dilation_1d)
-            n_inside += int(region.contains(np.array([float(inj[s])]))[0])
-        coverage[(in_idx,)] = (n_inside / n_total, n_inside, n_total)
-
-    for _label, in_pair, out_idx in marginals_2d_info:
-        norm2d, inj, gx, gy = eval_posterior_2d(
-            model, loader, in_pair, out_idx,
-            ngrid_points=ngrid_2d, keep_batch_dim=True)
-        gx_1d, gy_1d = gx[0, :], gy[:, 0]
-        # Periodic axes resolved per parameter from the "<name0>__<name1>" label.
-        names = str(_label).split("__")
-        periods = (_MASK_PERIOD_BY_NAME.get(names[0]) if len(names) > 0 else None,
-                   _MASK_PERIOD_BY_NAME.get(names[1]) if len(names) > 1 else None)
-        n_total = norm2d.shape[0]
-        n_inside = 0
-        for s in range(n_total):
-            region = region_from_hpd(
-                norm2d[s], (gx_1d, gy_1d),
-                credible_level=sky_credible_level, dilation_factor=sky_dilation,
-                periods=periods)
-            n_inside += int(region.contains(
-                np.array([[float(inj[s, 0])], [float(inj[s, 1])]]))[0])
-        coverage[tuple(in_pair)] = (n_inside / n_total, n_inside, n_total)
-
-    return coverage
 
 
 class ChainConvergenceMonitor:

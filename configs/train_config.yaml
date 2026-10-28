@@ -289,17 +289,23 @@ lambda_tau:
   enabled: true
 
 truncation_veto:
-  enabled: false       # veto OFF: never gates truncation.
-  log_coverage: true   # ...but still compute + print coverage each round.
-                       # NB in mask mode these numbers describe the bounding
-                       # BOX, not the mask that is actually sampled -> they are
-                       # an upper bound on true coverage.
-  min_coverage: 0.999
-  n_coverage: 1000
-  # 1D truncation box: 99.999% CI (eps=1e-5) inflated 1.1x. Read by the
-  # PlotPosteriorCallback regardless of `enabled` (veto off here).
+  # Rectangle-mode truncation settings (truncation.mode: rectangle), also used
+  # by PlotPosteriorCallback for its 1D box overlay: 1-eps equal-tailed
+  # interval, then dilated.
   eps_1d: 1.0e-4
   dilation_1d: 1.0
+
+# Round-end proposal-coverage guard (truncation.mode: mask). For n_coverage
+# val-pool simulations the next-round proposal is built from each one's own data
+# with the same code as the real proposal (HPD masks on the refined windows of
+# the current domain, 1D and 2D), and its truth is tested for membership.
+# Expected coverage is the credible level (~0.9999 1D, ~0.999 2D); below
+# min_coverage for a marginal being truncated, the run stops with a report and
+# writes rejected_truncation_round_N.* instead of prior_after_round_N.
+coverage_guard:
+  min_coverage: 0.98
+  n_coverage: 300
+  seed: 0
 
 # ---------------------------------------------------------------------------
 # Prior truncation scheme.

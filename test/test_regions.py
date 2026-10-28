@@ -314,7 +314,7 @@ def test_draw_1d_lands_inside():
 
 
 # ----------------------------------------------------------------------
-# veto inner-loop semantics (compute_truncation_coverage now builds these)
+# per-sample region membership semantics (mask, not bounding box)
 # ----------------------------------------------------------------------
 def test_veto_2d_nonsky_uses_mask_not_bbox():
     # The migrated veto builds region_from_main_mode per 2D sample and tests

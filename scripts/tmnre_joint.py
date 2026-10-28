@@ -50,7 +50,7 @@ from pembhb.callbacks import (
     PlotPosteriorCallback, TruncationMonitor, VolumeRatioEarlyStopping,
     DifferentialEntropyEarlyStopping, PeriodicProgressCallback,
     WarmupEarlyStopping, CalibrationMonitor, ChainConvergenceMonitor,
-    compute_truncation_coverage, StreamReuseLogger,
+    StreamReuseLogger,
 )
 from pembhb.utils import _ORDERED_PRIOR_KEYS as _PPKS_ORDERED_PRIOR_KEYS
 from pembhb.utils import eval_posterior_2d
@@ -58,7 +58,7 @@ from pembhb.mask_truncation import (
     eval_posterior_1d, MaskRejectSampler,
     save_truncation, load_truncation, truth_violations, format_violations, _MASK_PERIOD_BY_NAME
 )
-from pembhb.truncator import Truncator
+from pembhb.truncator import Truncator, proposal_coverage
 from pembhb.diagnostics import AutoencoderDiagnosticsCallback
 
 # Physical period of the angular parameters, keyed by prior-key name (spin-basis
@@ -391,16 +391,26 @@ class SequentialTrainerJoint:
         self._cr_reference_vol = {}   # {marginal_tuple: float}
         self._cr_level = {}           # {marginal_tuple: int}
         self._cr_history = []         # provenance: list of reset events
-        # Per-marginal empirical coverage from the previous round's final model,
-        # {marginal_tuple: (coverage, n_inside, n_total)}; drives the truncation
-        # veto. Recomputed each round, so no resume state needed.
+        # Per-marginal coverage of the next-round proposal from the round's final
+        # model, {marginal_tuple: (coverage, n_inside, n_total)}; checked by the
+        # coverage guard in run(). Recomputed each round, so no resume state needed.
         self._last_coverage = {}
+        # Round-end facts the coverage-guard error reports (epoch, stop reason,
+        # LRs, val losses, checkpoint paths); filled by _train_joint.
+        self._last_round_info = {}
         # Truncation: owns the domain (previous round's accepted set, used for
         # §2 zeroing) and the proposal procedure shared with TruncationMonitor.
         self.truncator = Truncator(
             self.train_conf.get("truncation", {}),
             self.train_conf.get("truncation_veto", {}),
             utils.ordered_prior_keys(self.datagen_conf.get("spin_param_basis", "chi1chi2")))
+        retired = {"enabled", "log_coverage", "min_coverage", "n_coverage"} & set(
+            self.train_conf.get("truncation_veto", {}))
+        if retired:
+            raise ValueError(
+                f"truncation_veto keys {sorted(retired)} were removed: the round-end "
+                "coverage check is now `coverage_guard: {min_coverage, n_coverage, seed}` "
+                "(mask mode). truncation_veto keeps only the rectangle-mode settings.")
         self._current_normalisation = None
         cc_conf = self.train_conf.get("chain_convergence", {})
         self.chain_monitor = None
@@ -1229,66 +1239,140 @@ class SequentialTrainerJoint:
                 _yaml.safe_dump(cov_payload, f)
 
     # -----------------------------------------------------------------
-    # Truncation-veto coverage
+    # Proposal coverage (coverage guard)
     # -----------------------------------------------------------------
 
     def _compute_round_coverage(self, round_idx):
-        """Empirical coverage of each marginal's truncation box at round end.
+        """Coverage of the next-round proposal over the val pool, per marginal.
 
-        For the coverage-gated truncation veto: evaluate the final model on up to
-        ``truncation_veto.n_coverage`` held-out val-pool samples and, per marginal,
-        count how many ground truths fall inside their own credible box (same box
-        the truncation builds). Returns ``{marginal_tuple: (coverage, n_in, n_tot)}``
-        or ``{}`` when neither enforcement nor logging is requested.
-
-        ``enabled`` and ``log_coverage`` are independent: ``log_coverage`` computes
-        and prints the numbers without gating any truncation (enforcement is gated
-        separately on ``veto_enabled`` in ``run``), so a run can be monitored
-        before deciding whether to switch the veto on.
-
-        NB in mask mode these numbers still describe the *bounding box*, not the
-        mask that is actually sampled -- i.e. an upper bound on true coverage.
+        For each of ``coverage_guard.n_coverage`` val-pool simulations the
+        proposal is built from its own data by the same code that builds the
+        real one (:func:`pembhb.truncator.proposal_coverage`: HPD masks on the
+        refined windows of the current domain, 1D and 2D alike), and its truth
+        is tested for membership. Expected coverage is the credible level
+        (``truncation.credible_level_1d`` / ``_2d``); ``run`` raises below
+        ``coverage_guard.min_coverage``. Noise is drawn once with
+        ``coverage_guard.seed``. Mask mode only: returns ``{}`` otherwise.
         """
-        veto_conf = self.train_conf.get("truncation_veto", {})
-        if not (veto_conf.get("enabled", False)
-                or veto_conf.get("log_coverage", False)):
+        if self.truncator.mode != "mask":
+            if round_idx == 1:
+                print("[CoverageGuard] truncation.mode is not 'mask': proposal "
+                      "coverage guard unavailable.", flush=True)
             return {}
+        import time
         from torch.utils.data import Subset, DataLoader as _DL
+        from pembhb.utils import materialize_gpu_noise
+        guard_conf = self.train_conf.get("coverage_guard", {})
         test_ds = self.data_module.test
-        n_cov = min(int(veto_conf.get("n_coverage", 1000)), len(test_ds))
-        base_loader = self.data_module.test_dataloader()
-        cov_loader = _DL(
-            Subset(test_ds, list(range(n_cov))),
-            batch_size=base_loader.batch_size, shuffle=False,
-            num_workers=0, collate_fn=base_loader.collate_fn,
-        )
+        n_cov = min(int(guard_conf.get("n_coverage", 300)), len(test_ds))
+        collate = self.data_module.test_dataloader().collate_fn
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(int(guard_conf.get("seed", 0)))
+            sims = materialize_gpu_noise(next(iter(_DL(
+                Subset(test_ds, list(range(n_cov))), batch_size=n_cov,
+                shuffle=False, num_workers=0, collate_fn=collate))))
         keys = utils.ordered_prior_keys(
             self.datagen_conf.get("spin_param_basis", "chi1chi2"))
-        m1d, m2d = [], []
-        for out_idx, marginal in enumerate(self.model.marginals_list):
-            if len(marginal) == 1:
-                m1d.append((keys[marginal[0]], marginal[0], out_idx))
-            elif len(marginal) == 2:
-                m2d.append((f"{keys[marginal[0]]}__{keys[marginal[1]]}",
-                            (marginal[0], marginal[1]), out_idx))
+        marginals = [(tuple(m), out_idx) for out_idx, m in enumerate(self.model.marginals_list)]
+        t0 = time.time()
         was_training = self.model.training
         self.model.eval()
         try:
-            cov = compute_truncation_coverage(
-                self.model, cov_loader, m1d, m2d,
-                eps_1d=float(veto_conf.get("eps_1d", 1e-4)),
-                sky_credible_level=float(veto_conf.get("sky_credible_level", 0.999)),
-                sky_dilation=float(veto_conf.get("sky_dilation", 1.1)),
-                dilation_1d=float(veto_conf.get("dilation_1d", 1.0)),
-            )
+            cov = proposal_coverage(self.truncator, self.model, sims, marginals,
+                                    self.datagen_conf["prior"])
         finally:
             if was_training:
                 self.model.train()
         for key, (c, n_in, n_tot) in sorted(cov.items()):
             name = "-".join(keys[i] for i in key)
-            print(f"[TruncVeto] round {round_idx} coverage {name}: "
+            print(f"[CoverageGuard] round {round_idx} proposal coverage {name}: "
                   f"{c:.3f} ({n_in}/{n_tot})", flush=True)
+        print(f"[CoverageGuard] round {round_idx}: {n_cov} simulations in "
+              f"{time.time() - t0:.1f}s", flush=True)
         return cov
+
+    def _check_coverage(self, round_idx, to_truncate, proposal):
+        """Raise before the proposal is committed if a truncated marginal's
+        coverage is below ``coverage_guard.min_coverage``.
+
+        The rejected proposal and the coverage table are saved next to the run's
+        other round files; nothing is written to ``prior_after_round_{i}``.
+        """
+        if not self._last_coverage:
+            return
+        import yaml as _yaml
+        guard_conf = self.train_conf.get("coverage_guard", {})
+        min_cov = float(guard_conf.get("min_coverage", 0.98))
+        keys = utils.ordered_prior_keys(
+            self.datagen_conf.get("spin_param_basis", "chi1chi2"))
+        name_of = lambda k: "-".join(keys[j] for j in k)
+        failing = [k for k, _ in to_truncate
+                   if k in self._last_coverage and self._last_coverage[k][0] < min_cov]
+        if not failing:
+            return
+
+        base = os.path.join(DATA_ROOT_DIR, TIME_OF_EXECUTION)
+        rej_yaml = os.path.join(base, f"rejected_truncation_round_{round_idx}.yaml")
+        rej_npz = os.path.join(base, f"rejected_truncation_round_{round_idx}.npz")
+        save_truncation(rej_yaml, rej_npz, proposal.prior, proposal.intervals_1d,
+                        proposal.masks_2d, mode=self.truncator.mode)
+        cov_path = os.path.join(base, f"rejected_truncation_round_{round_idx}_coverage.yaml")
+        with open(cov_path, "w") as f:
+            _yaml.safe_dump({
+                "round": int(round_idx), "min_coverage": min_cov,
+                "failing": [name_of(k) for k in failing],
+                "coverage": {name_of(k): {"coverage": float(c), "n_inside": int(n_in),
+                                          "n_total": int(n_tot)}
+                             for k, (c, n_in, n_tot) in self._last_coverage.items()},
+            }, f)
+
+        info = self._last_round_info
+        tconf = self.train_conf.get("truncation", {})
+        expected = {1: float(tconf.get("credible_level_1d", 0.997)),
+                    2: float(tconf.get("credible_level_2d", 0.997))}
+        last, best = info.get("val_last", {}), info.get("val_best", {})
+
+        def _val(metric):
+            b = best.get(metric)
+            l = last.get(metric)
+            return (f"last {l:.4f}" if l is not None else "last n/a") + (
+                f", best {b[0]:.4f} @ epoch {b[1]}" if b is not None else ", best n/a")
+
+        lines = [f"[CoverageGuard] Round {round_idx}: the proposal for round "
+                 f"{round_idx + 1} covers too few truths for {len(failing)} "
+                 f"marginal(s); truncation NOT applied.", ""]
+        for k in failing:
+            c, n_in, n_tot = self._last_coverage[k]
+            vr = self._last_volume_ratios.get(k)
+            lines.append(
+                f"  {name_of(k)}: coverage {c:.4f} ({n_in}/{n_tot}), floor {min_cov}, "
+                f"expected ~{expected[len(k)]}; volume ratio "
+                f"{'n/a' if vr is None else f'{vr:.4f}'}; "
+                f"val loss {_val('val_loss_' + '_'.join(keys[j] for j in k))}")
+        lines += [
+            "",
+            f"  Round end: epoch {info.get('epoch', 'n/a')}, reason: "
+            f"{info.get('stop_reason', 'n/a')}, {info.get('lr_info', 'n/a')}",
+            f"  val NRE loss: {_val('val_nre_loss')}",
+            f"  Truncation weights (final epoch): {info.get('trunc_path', 'n/a')}",
+            f"  Best checkpoint (val_loss {info.get('best_score', 'n/a')}): "
+            f"{info.get('best_ckpt', 'n/a')}",
+            f"  Rejected proposal: {rej_yaml} / {rej_npz}",
+            f"  Coverage of every marginal: {cov_path}",
+            "",
+            "  Known causes: an overconfident network (val loss well above its best,",
+            "  e.g. a burst at the round end), a learning-rate restart shortly before",
+            "  the round ended, or a stop fired by a spurious volume-ratio drop.",
+            "  Options: redo this round (move "
+            f"{os.path.dirname(os.path.dirname(info.get('trunc_path', '')))} aside, then --resume:",
+            f"  it restarts round {round_idx} from prior_after_round_{round_idx - 1}),",
+            "  e.g. with more epochs or a lower LR; re-truncate from the best",
+            "  checkpoint; or, after inspecting the rejected proposal, accept the cut",
+            "  by hand.",
+            f"  Do NOT --resume as is: round {round_idx} has checkpoints but no "
+            f"prior_after_round_{round_idx}.",
+        ]
+        raise RuntimeError("\n".join(lines))
 
     # -----------------------------------------------------------------
     # Joint training
@@ -1576,8 +1660,27 @@ class SequentialTrainerJoint:
             print(f"[PlotPosterior] skipping first {ae_warmup_epochs} epochs (AE warmup)")
 
         # The early stops read TruncationMonitor's history, so it comes first.
+        class ValLossTracker(Callback):
+            """Last and best (value, epoch) of every epoch-level val loss, for
+            the coverage-guard report."""
+            def __init__(self):
+                self.last, self.best = {}, {}
+
+            def on_validation_end(self, trainer, pl_module):
+                if trainer.sanity_checking:
+                    return
+                for k, v in trainer.callback_metrics.items():
+                    if not k.startswith("val_") or "loss" not in k or k.endswith("_step"):
+                        continue
+                    k, v = k.removesuffix("_epoch"), float(v)
+                    self.last[k] = v
+                    if v < self.best.get(k, (float("inf"), None))[0]:
+                        self.best[k] = (v, trainer.current_epoch)
+
+        val_loss_tracker = ValLossTracker()
         callbacks_list = [checkpoint_callback,
                           periodic_checkpoint_callback,
+                          val_loss_tracker,
                           truncation_monitor,
                           plot_posterior_callback,
                           PeriodicProgressCallback(print_every=20, label="Joint",
@@ -1834,14 +1937,6 @@ class SequentialTrainerJoint:
         # history that drives entropy-plateau (cold-restart) reinit.
         for k, h in _round_entropies(truncation_monitor).items():
             self._entropy_history.setdefault(k, []).append(float(h))
-        # Round-end empirical coverage of each marginal's truncation box over the
-        # (up to) 1000-sample val pool — drives the truncation veto in run().
-        torch.cuda.reset_peak_memory_stats()
-        self._last_coverage = self._compute_round_coverage(round_idx)
-        if self.train_conf.get("profile_gpu_memory", False):
-            print(f"[GPUMem] round {round_idx} coverage peak alloc GB: "
-                  f"{torch.cuda.max_memory_allocated() / 2**30:.2f}", flush=True)
-        self._persist_round_state(round_idx)
         opt = self.model.optimizers()
         if isinstance(opt, list):
             opt = opt[0]
@@ -1850,6 +1945,21 @@ class SequentialTrainerJoint:
                        f"lr_nre={opt.param_groups[1]['lr']:.2e}")
         else:
             lr_info = f"lr={opt.param_groups[0]['lr']:.2e}"
+        best_score = checkpoint_callback.best_model_score
+        self._last_round_info = {
+            "epoch": trainer.current_epoch, "stop_reason": stop_reason, "lr_info": lr_info,
+            "trunc_path": trunc_path, "best_ckpt": checkpoint_callback.best_model_path,
+            "best_score": None if best_score is None else f"{float(best_score):.4f}",
+            "val_last": dict(val_loss_tracker.last), "val_best": dict(val_loss_tracker.best),
+        }
+        # Round-end coverage of the next-round proposal over the val pool;
+        # checked by the coverage guard in run().
+        torch.cuda.reset_peak_memory_stats()
+        self._last_coverage = self._compute_round_coverage(round_idx)
+        if self.train_conf.get("profile_gpu_memory", False):
+            print(f"[GPUMem] round {round_idx} coverage peak alloc GB: "
+                  f"{torch.cuda.max_memory_allocated() / 2**30:.2f}", flush=True)
+        self._persist_round_state(round_idx)
         summary = (f"[Round {round_idx}] Stopped after epoch {trainer.current_epoch}. "
                    f"Reason: {stop_reason}. Final {lr_info}.")
         print(summary)
@@ -1920,65 +2030,23 @@ class SequentialTrainerJoint:
                 torch.cuda.empty_cache()
 
             out_idx = 0
-            # Parameter names follow the run's spin basis (slots 2,3). The prior
-            # dict is keyed with these names, so truncation must write the same.
-            prior_keys = utils.ordered_prior_keys(
-                self.datagen_conf.get("spin_param_basis", "chi1chi2"))
-            # Coverage-gated truncation veto: skip narrowing a parameter whose
-            # round-end box coverage over the val pool is below threshold (the
-            # network is overconfident, so its box would risk excluding the truth).
-            veto_conf = self.train_conf.get("truncation_veto", {})
-            veto_enabled = veto_conf.get("enabled", False)
-            min_cov = float(veto_conf.get("min_coverage", 0.95))
-            vetoed_this_round = []   # marginals whose truncation was skipped
             truncation_mode = self.truncator.mode
-            to_truncate = []    # (marginal_key, out_idx) not vetoed this round
+            to_truncate = []    # (marginal_key, out_idx)
             for key, marginal_list in self.train_conf["marginals"].items():
                 for marginal in marginal_list:
-                    marginal_key = tuple(marginal)
-                    cov_entry = self._last_coverage.get(marginal_key)
-                    if (veto_enabled and cov_entry is not None
-                            and cov_entry[0] < min_cov):
-                        name = "-".join(prior_keys[j] for j in marginal_key)
-                        print(f"[TruncVeto] round {i}: keeping prior for {name} "
-                              f"(coverage {cov_entry[0]:.3f} < {min_cov}); "
-                              f"truncation skipped.", flush=True)
-                        vetoed_this_round.append({
-                            "name": name,
-                            "marginal": list(marginal_key),
-                            "coverage": float(cov_entry[0]),
-                            "n_inside": int(cov_entry[1]),
-                            "n_total": int(cov_entry[2]),
-                        })
-                    else:
-                        to_truncate.append((marginal_key, out_idx))
+                    to_truncate.append((tuple(marginal), out_idx))
                     out_idx += 1
             proposal = self.truncator.propose(
                 self.model, self.dataloader_obs, to_truncate,
                 self.datagen_conf["prior"], verbose=True)
+            # Raises (before anything is committed or saved as the next prior) if
+            # the proposal covers too few val-pool truths.
+            self._check_coverage(i, to_truncate, proposal)
             self.truncator.commit(proposal)
             self.datagen_conf["prior"] = proposal.prior
             intervals_1d, masks_2d = proposal.intervals_1d, proposal.masks_2d
 
             print(f"Updated prior after round {i}: {self.datagen_conf['prior']}")
-
-            # Log which marginals had their truncation vetoed this round (empty
-            # list when the veto is off or nothing was vetoed) for review.
-            if veto_enabled:
-                names = [v["name"] for v in vetoed_this_round]
-                print(f"[TruncVeto] round {i}: vetoed {len(vetoed_this_round)} "
-                      f"marginal(s): {names}", flush=True)
-                import yaml as _yaml
-                veto_save_path = os.path.join(
-                    DATA_ROOT_DIR, TIME_OF_EXECUTION,
-                    f"vetoed_params_after_round_{i}.yaml")
-                os.makedirs(os.path.dirname(veto_save_path), exist_ok=True)
-                with open(veto_save_path, "w") as _f:
-                    _yaml.safe_dump({
-                        "round": int(i),
-                        "min_coverage": min_cov,
-                        "vetoed": vetoed_this_round,
-                    }, _f)
 
             # Build the proposal for round i+1. In mask mode the masks -- not
             # the bounding box -- define it, so the sampler is stashed on self

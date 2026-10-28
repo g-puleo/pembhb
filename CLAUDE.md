@@ -166,6 +166,15 @@ round 1 uses the coarse box grid (`ngrid_1d`, `ngrid_2d`). The proposal keeps
   re-test domain membership on misaligned grids and dropped mass at the domain
   edge (sky round 11 of the conv run: kept 0.9998 → 0.9945 at depth 4).
 - A mode wrapping λ = 0/2π gets a full-period window (coarser).
+- **Coverage guard** (`coverage_guard: {min_coverage: 0.98, n_coverage: 300, seed: 0}`,
+  mask mode): at round end `truncator.proposal_coverage` builds the proposal
+  from each of `n_coverage` val-pool simulations with the same code
+  (`Truncator._mask_region`, cached batched network evaluations) and tests its
+  truth for membership. Below `min_coverage` for a truncated marginal, `run()`
+  raises a report before committing and writes `rejected_truncation_round_N.*`
+  instead of `prior_after_round_N`. The old `truncation_veto`
+  `enabled`/`log_coverage`/`min_coverage`/`n_coverage` keys are rejected;
+  `truncation_veto` keeps only the rectangle-mode `eps_1d`/`dilation_1d`.
 
 ## Training Output & Nomenclature
 

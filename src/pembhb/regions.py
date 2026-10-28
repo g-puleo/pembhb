@@ -598,8 +598,7 @@ def region_from_level(density, grids, threshold, dilation_factor=1.0,
 
 
 def region_from_equal_tailed(density, grids, eps, dilation=1.0):
-    """Equal-tailed 1D interval (replaces ``get_widest_interval_1d`` and its
-    inline copy in ``compute_truncation_coverage``).
+    """Equal-tailed 1D interval (replaces ``get_widest_interval_1d``).
 
     ``density`` need not be normalised.  The ``[eps/2, 1-eps/2]`` interval is
     rasterised onto the grid rounding **outward** (floor the low edge, ceil the
