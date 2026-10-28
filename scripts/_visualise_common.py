@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader, Subset
 
 from pembhb.data import MBHBDataset
 from pembhb.model import InferenceNetwork, load_inference_network
+from pembhb.obs_hash import obs_hash
 from pembhb.utils import _ORDERED_PRIOR_KEYS, eval_posterior_2d, ordered_prior_keys, mbhb_collate_fn
 
 
@@ -49,10 +50,11 @@ def resolve_obs_path(name: str, obs_path: str | None = None) -> str:
     a different one raises, since the posterior would not belong to it.
     """
     record = os.path.join(DATA_ROOT_DIR, name, "observation_used.yaml")
-    used = None
+    used = used_hash = None
     if os.path.exists(record):
         with open(record) as f:
-            used = (yaml.safe_load(f) or {}).get("obs_path")
+            rec = yaml.safe_load(f) or {}
+        used, used_hash = rec.get("obs_path"), rec.get("obs_hash")
     if used is None:
         if obs_path is None:
             raise FileNotFoundError(
@@ -63,9 +65,13 @@ def resolve_obs_path(name: str, obs_path: str | None = None) -> str:
         if not os.path.exists(used):
             raise FileNotFoundError(f"observation {used} recorded for '{name}' no longer exists; pass it explicitly.")
         return used
-    if os.path.exists(used) and not _same_observation(obs_path, used):
+    if os.path.exists(used):
+        if not _same_observation(obs_path, used):
+            raise ValueError(
+                f"{obs_path} is not the observation run '{name}' was trained on ({used}).")
+    elif used_hash is not None and (h := obs_hash(obs_path)) != used_hash:
         raise ValueError(
-            f"{obs_path} is not the observation run '{name}' was trained on ({used}).")
+            f"{obs_path} has obs_hash {h}, but run '{name}' was trained on {used_hash} ({used}).")
     return obs_path
 
 
@@ -140,7 +146,9 @@ def find_round_dirs(name: str, base_log_dir: str = BASE_LOG_DIR) -> list:
         chosen = None
         for v in versions:
             vdir = os.path.join(d, f"version_{v}")
-            if sidecar_ok and glob(os.path.join(vdir, "checkpoints", "*.ckpt")):
+            has_ckpt = (os.path.isfile(os.path.join(vdir, "truncation.ckpt"))
+                        or glob(os.path.join(vdir, "checkpoints", "*.ckpt")))
+            if sidecar_ok and has_ckpt:
                 chosen = vdir
                 break
         if chosen:
@@ -208,7 +216,7 @@ def load_model(ckpt_dir: str) -> InferenceNetwork:
     if override and os.path.exists(override):
         print(f"[load_model] override: loading {override}")
         return load_inference_network(override)
-    trunc = os.path.join(ckpt_dir, "../truncation.ckpt")
+    trunc = os.path.join(os.path.dirname(os.path.normpath(ckpt_dir)), "truncation.ckpt")
     if os.path.exists(trunc):
         return load_inference_network(trunc)
     print(f"WARNING: truncation.ckpt not found in {os.path.dirname(ckpt_dir)}; "

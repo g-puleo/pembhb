@@ -12,8 +12,9 @@ Figures (``$PEMBHB_PLOTS_DIR/<run>/posterior_round_<N>/``):
   re-evaluated on a fine grid over its credible region (as in
   ``visualise_sky_truncation.py``), optionally against MCMC;
 * ``modes_<param>.pdf`` — when the region round N was trained on (round N-1's
-  accepted set) has several modes, refined: the posterior on each mode's own
-  grid, with its mass normalised over that region (the masses sum to 1).
+  accepted set) has several modes: the posterior on each mode's own grid, with
+  its mass normalised over that region (the masses sum to 1). With
+  ``--mcmc-file`` the MCMC is overlaid on the mode nearest its median.
 
 ``--proposal`` overlays the truncation this posterior produced, i.e. the prior
 of round N+1: interval bounds in 1-D, the accepted-region contour in 2-D, and
@@ -31,7 +32,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import yaml
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from matplotlib.ticker import MaxNLocator
@@ -432,17 +432,6 @@ def load_proposal(name, round_number, keys):
     return intervals, regions
 
 
-def refine_enabled(round_dir):
-    """``truncation.refine`` as recorded in the round's hparams.yaml."""
-    path = os.path.join(round_dir, "hparams.yaml")
-    if not os.path.exists(path):
-        return False
-    with open(path) as f:
-        hp = yaml.safe_load(f) or {}
-    trunc = (hp.get("train_conf") or hp).get("truncation") or {}
-    return bool(trunc.get("refine", False))
-
-
 MASS_NGRID_1D = 2000   # points per interval
 MASS_NGRID_2D = 256    # points per axis and window
 
@@ -541,36 +530,115 @@ def _kept_note(kept):
     return "" if kept is None else f"\nnext-round proposal (green) keeps {kept:.4f} of the posterior"
 
 
+def _nearest_box(point, boxes):
+    """Index of the box (``[(lo, hi), ...]`` per axis) nearest to ``point``;
+    distance 0 inside a box."""
+    d = [np.hypot.reduce([max(lo - p, 0.0, p - hi) for p, (lo, hi) in zip(point, box)])
+         for box in boxes]
+    return int(np.argmin(d))
+
+
+def _mcmc_note(k):
+    return "" if k is None else f"\nMCMC (grey) on mode {k + 1}, the nearest to its median"
+
+
+HPD_LEVELS = (0.68, 0.95)
+
+
+def _hpd_levels(h, levels=HPD_LEVELS):
+    """Density values enclosing ``levels`` of the mass of ``h`` (nan = outside),
+    increasing; None if ``h`` carries no mass."""
+    flat = np.sort(h[np.isfinite(h)].ravel())[::-1]
+    if flat.sum() <= 0:
+        return None
+    cum = np.cumsum(flat) / flat.sum()
+    return sorted({float(flat[min(np.searchsorted(cum, lev), flat.size - 1)]) for lev in levels})
+
+
+def _identity_2d(x, y):
+    return np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+
+
+def _sky_to_deg(lam, sinbeta):
+    """(lambda, sin beta) -> (ecliptic longitude, latitude) in degrees."""
+    return np.degrees(np.asarray(lam, dtype=float)), np.degrees(np.arcsin(np.clip(sinbeta, -1, 1)))
+
+
+def _mcmc_contours(ax, xy, bx, by, to_disp=_identity_2d, nbins=60):
+    """HPD contours of the samples falling in the window ``bx`` x ``by``, drawn
+    in display coordinates."""
+    from scipy.ndimage import gaussian_filter
+    h, ex, ey = np.histogram2d(xy[:, 0], xy[:, 1], bins=nbins, range=(bx, by))
+    h = gaussian_filter(h.T, 1.5)
+    lv = _hpd_levels(h)
+    if lv is None:
+        return
+    cx, cy = to_disp(0.5 * (ex[1:] + ex[:-1]), 0.5 * (ey[1:] + ey[:-1]))
+    ax.contour(cx, cy, h, levels=lv, colors="0.3", linewidths=1.2)
+
+
 def plot_modes_1d(model, dataloader, label, in_idx, domain, masses, kept, proposal,
-                  ngrid, inj, outdir, round_number):
-    """One panel per interval of the domain: the posterior on that interval."""
+                  ngrid, inj, outdir, round_number, mcmc_vals=None, transforms=None):
+    """One panel per interval of the domain: the posterior on that interval.
+
+    ``mcmc_vals`` (raw MCMC samples of this parameter) is drawn on the interval
+    nearest its median; ``transforms`` = ``(nre_to_x, mcmc_to_x, x_label)`` maps
+    both to the display axis (see :func:`_axis_transforms_for`).
+    """
+    from scipy.stats import gaussian_kde
+    nre_to_x, mcmc_to_x, x_label = transforms or _axis_transforms_for(label, None, None, None)
     out_idx = find_out_param_idx(model, in_idx)
+    best = mcmc_x = None
+    if mcmc_vals is not None:
+        mcmc_x = mcmc_to_x(mcmc_vals)
+        best = _nearest_box([np.median(mcmc_x)], [[tuple(nre_to_x(np.array(iv)))] for iv in domain])
     fig, axes = plt.subplots(1, len(domain), squeeze=False,
                              figsize=(2.6 * len(domain), 2.2), constrained_layout=True)
     for k, ((lo, hi), mass) in enumerate(zip(domain, masses)):
         ax = axes[0, k]
         grid, dens, _ = eval_nre_1d(model, dataloader, in_idx, out_idx, lo, hi, ngrid)
-        ax.plot(grid, dens, color="C0", lw=1.5)
-        ax.fill_between(grid, dens, alpha=0.2, color="C0")
+        x = nre_to_x(grid)
+        dx = abs(float(x[1] - x[0]))
+        y = dens / max(np.sum(dens) * dx, 1e-300)
+        ax.plot(x, y, color="C0", lw=1.5)
+        ax.fill_between(x, y, alpha=0.2, color="C0")
+        if k == best:
+            m = gaussian_kde(mcmc_x)(x)
+            m = m / max(np.sum(m) * dx, 1e-300)
+            ax.plot(x, m, color="grey", lw=1.5)
+            ax.fill_between(x, m, alpha=0.15, color="grey")
         for p_lo, p_hi in _intersect(proposal or [], [(lo, hi)]):
-            for v in (p_lo, p_hi):
+            for v in nre_to_x(np.array([p_lo, p_hi])):
                 ax.axvline(v, color="C2", ls=":", lw=1.2)
         if lo <= inj <= hi:
-            ax.axvline(inj, color="red", ls="--", lw=1.5)
+            ax.axvline(float(nre_to_x(np.array([inj]))[0]), color="red", ls="--", lw=1.5)
         ax.set_title(f"mode {k + 1}: mass {mass:.3f}", pad=3)
-        ax.set_xlabel(_panel_title(label))
+        ax.set_xlabel(x_label if label == "Deltat" else _panel_title(label))
         ax.set_yticks([])
         ax.xaxis.set_major_locator(MaxNLocator(nbins=3))
     fig.suptitle(f"round {round_number}: {latex_label(label)} on the {len(domain)} "
-                 f"modes it was trained on{_kept_note(kept)}")
+                 f"modes it was trained on{_kept_note(kept)}{_mcmc_note(best)}")
     return save_figure(fig, outdir, f"modes_{label}")
 
 
 def plot_modes_2d(model, dataloader, pair, domain, masses, kept, proposal, keys, ngrid,
-                  inj, outdir, round_number):
-    """One panel per part of the domain: the posterior on that part's subgrid."""
+                  inj, outdir, round_number, mcmc_xy=None):
+    """One panel per part of the domain: 68/95% HPD contours of the posterior on
+    that part's subgrid. The sky pair is drawn in degrees (longitude, latitude);
+    HPD levels are taken on the native (lambda, sin beta) grid, whose cells are
+    equal solid angle.
+
+    ``mcmc_xy`` (raw MCMC samples, N x 2) is drawn as 68/95% contours on the
+    part nearest its median."""
     i, j = pair
     parts = domain.parts
+    sky = (keys[i], keys[j]) == ("lambda", "sinbeta")
+    to_disp = _sky_to_deg if sky else _identity_2d
+    xlabel, ylabel = ((r"$\lambda$ [deg]", r"$\beta$ [deg]") if sky
+                      else (latex_label(keys[i]), latex_label(keys[j])))
+    best = None
+    if mcmc_xy is not None:
+        best = _nearest_box(np.median(mcmc_xy, axis=0), [_part_window(p) for p in parts])
     fig, axes = plt.subplots(1, len(parts), squeeze=False,
                              figsize=(3.0 * len(parts), 2.8), constrained_layout=True)
     for k, (part, mass) in enumerate(zip(parts, masses)):
@@ -578,21 +646,40 @@ def plot_modes_2d(model, dataloader, pair, domain, masses, kept, proposal, keys,
         bx, by = _part_window(part)
         lr, gx, gy, _ = _eval_window_2d(model, dataloader, pair, bx, by, ngrid)
         inside = part.contains_grid((gx, gy))
-        ax.pcolormesh(gx, gy, np.where(inside, np.exp(lr - lr[inside].max()), np.nan),
-                      shading="auto", cmap="Blues")
-        ax.contour(gx, gy, inside.astype(float), levels=[0.5], colors="0.4",
+        acc = proposal.contains_grid((gx, gy)) if proposal is not None else None
+        # a mode across lambda = 0/2pi has a full-period window: recentre on 0
+        wrap = sky and bx[1] - bx[0] > 0.99 * 2 * np.pi
+        shift = (lambda v: np.where(v > np.pi, v - 2 * np.pi, v)) if wrap else (lambda v: v)
+        if wrap:
+            order = np.argsort(shift(gx))
+            gx, lr, inside = shift(gx)[order], lr[:, order], inside[:, order]
+            acc = acc[:, order] if acc is not None else None
+        dens = np.where(inside, np.exp(lr - lr[inside].max()), np.nan)
+        dx, dy = to_disp(gx, gy)
+        lv = _hpd_levels(dens)
+        if lv is not None:
+            ax.contour(dx, dy, np.nan_to_num(dens), levels=lv, colors="C0", linewidths=1.5)
+        ax.contour(dx, dy, inside.astype(float), levels=[0.5], colors="0.4",
                    linewidths=1.0, linestyles="dashed")
-        if proposal is not None:
-            acc = proposal.contains_grid((gx, gy)).astype(float)
-            if acc.any():
-                ax.contour(gx, gy, acc, levels=[0.5], colors="C2", linewidths=1.2)
+        if acc is not None and acc.any():
+            ax.contour(dx, dy, acc.astype(float), levels=[0.5], colors="C2", linewidths=1.2)
+        if k == best:
+            xy = np.column_stack([shift(mcmc_xy[:, 0]), mcmc_xy[:, 1]])
+            _mcmc_contours(ax, xy, (float(gx[0]), float(gx[-1])), by, to_disp)
         if inj is not None and bx[0] <= inj[0] <= bx[1] and by[0] <= inj[1] <= by[1]:
-            ax.plot(inj[0], inj[1], "r+", markersize=9, markeredgewidth=1.5)
+            ix, iy = to_disp(shift(inj[0]), inj[1])
+            ax.plot(ix, iy, "r+", markersize=9, markeredgewidth=1.5)
+        cols = np.flatnonzero(inside.any(axis=0))
+        if wrap and cols.size:
+            pad = 2 * abs(float(dx[1] - dx[0]))
+            ax.set_xlim(dx[cols[0]] - pad, dx[cols[-1]] + pad)
         ax.set_title(f"mode {k + 1}: mass {mass:.3f}", pad=3)
-        ax.set_xlabel(latex_label(keys[i]))
-        ax.set_ylabel(latex_label(keys[j]))
-    fig.suptitle(f"round {round_number}: ({latex_label(keys[i])}, {latex_label(keys[j])}) "
-                 f"on the {len(parts)} modes it was trained on{_kept_note(kept)}")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+    name = "sky" if sky else f"({latex_label(keys[i])}, {latex_label(keys[j])})"
+    fig.suptitle(f"round {round_number}: {name}, {len(parts)} trained modes, NRE 68/95% (blue)"
+                 f"{_kept_note(kept)}"
+                 + ("" if best is None else f"\nMCMC 68/95% (grey) on mode {best + 1}, nearest its median"))
     return save_figure(fig, outdir, f"modes_{keys[i]}_{keys[j]}")
 
 
@@ -698,13 +785,16 @@ def main():
                            fontsize=args.fontsize)
 
     # Per-mode figures: modes of the domain (round r-1's accepted set), when it
-    # has several and they were refined.
+    # has several.
     multi_1d = {lbl: ivs for lbl, ivs in prev_intervals.items() if len(ivs) > 1}
     multi_2d = {pair: reg for pair, reg in prev_regions.items() if len(reg.parts) > 1}
-    if (multi_1d or multi_2d) and not refine_enabled(round_dirs[-2]):
-        print("[modes] the domain has several modes but truncation.refine was off: "
-              "no refined per-mode grids to show.")
-    elif multi_1d or multi_2d:
+
+    def mcmc_col(label):
+        if mcmc_samples is None or label not in mcmc_names:
+            return None
+        return mcmc_samples[:, mcmc_names.index(label)]
+
+    if multi_1d or multi_2d:
         by_label = {pi[0]: pi for pi in params}
         for label, domain in multi_1d.items():
             pi = by_label.get(label)
@@ -715,8 +805,11 @@ def main():
                                             MASS_NGRID_1D, proposal)
             print(f"[modes] {label}: masses {np.round(masses, 4).tolist()}"
                   + ("" if kept is None else f", proposal keeps {kept:.4f}"))
+            inj = densities[label][2]
             plot_modes_1d(model, dataloader, label, pi[2], domain, masses, kept, proposal,
-                          args.ngrid_mode, densities[label][2], outdir, r)
+                          args.ngrid_mode, inj, outdir, r, mcmc_vals=mcmc_col(label),
+                          transforms=_axis_transforms_for(label, inj, data["duration_weeks"],
+                                                          args.mcmc_file))
         for pair, domain in multi_2d.items():
             i, j = pair
             proposal = regions.get(pair) if args.proposal else None
@@ -725,8 +818,12 @@ def main():
             print(f"[modes] {keys[i]}-{keys[j]}: masses {np.round(masses, 4).tolist()}"
                   + ("" if kept is None else f", proposal keeps {kept:.4f}"))
             inj = inj_sky if pair == (7, 8) else None
+            cols = [mcmc_col(keys[i]), mcmc_col(keys[j])]
+            # Deltat is stored in different units by NRE and MCMC: no 2-D overlay
+            mcmc_xy = (np.column_stack(cols) if all(c is not None for c in cols)
+                       and "Deltat" not in (keys[i], keys[j]) else None)
             plot_modes_2d(model, dataloader, pair, domain, masses, kept, proposal, keys,
-                          args.ngrid_mode, inj, outdir, r)
+                          args.ngrid_mode, inj, outdir, r, mcmc_xy=mcmc_xy)
     print(f"[done] figures in {outdir}")
 
 
