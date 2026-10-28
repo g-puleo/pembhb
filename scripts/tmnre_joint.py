@@ -571,6 +571,10 @@ class SequentialTrainerJoint:
             self.data_module = None
             self._producer = None
             self._ring = None
+            # Lightning never detaches a module from its trainer: the previous
+            # round's model still reaches trainer -> datamodule -> ring.
+            if getattr(self, "model", None) is not None:
+                self.model.trainer = None
             gc.collect()
             torch.cuda.empty_cache()
 
