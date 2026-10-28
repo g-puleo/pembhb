@@ -205,8 +205,10 @@ def _check_obs_matches_datagen(obs_path, datagen_conf):
         )
     with open(sidecar) as f:
         obs_meta = _yaml.safe_load(f)
-    obs_wp = (obs_meta or {}).get("conf", {}).get("waveform_params", {}) or {}
-    train_wp = datagen_conf.get("waveform_params", {}) or {}
+    obs_wp = copy.deepcopy((obs_meta or {}).get("conf", {}).get("waveform_params", {}) or {})
+    train_wp = copy.deepcopy(datagen_conf.get("waveform_params", {}) or {})
+    for wp in (obs_wp, train_wp):
+        (wp.get("td") or {}).pop("chunk", None)   # batching only, not physics
 
     diffs = []
     for key in sorted(set(obs_wp) | set(train_wp)):
@@ -292,12 +294,14 @@ class SequentialTrainerJoint:
                 dataset_obs_path[:-3] + ".yaml"
                 if dataset_obs_path.endswith(".h5") else dataset_obs_path + ".yaml"
             )
+            from pembhb.obs_hash import obs_hash
             with open(os.path.join(_obs_log_dir, "observation_used.yaml"), "w") as _f:
                 _yaml.safe_dump(
                     {
                         "obs_path": os.path.abspath(dataset_obs_path),
                         "obs_sidecar": os.path.abspath(_obs_sidecar),
                         "has_stored_noise": True,
+                        "obs_hash": obs_hash(dataset_obs_path),
                     },
                     _f,
                 )
