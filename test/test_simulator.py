@@ -170,6 +170,24 @@ def test_tapered_noise_statistics():
     np.testing.assert_array_equal(z, z2)
 
 
+def test_tukey_sides():
+    from pembhb.tapered_noise import tukey
+    n, ramp = 100, 10
+    both, start, end = tukey(n, ramp), tukey(n, ramp, "start"), tukey(n, ramp, "end")
+    np.testing.assert_array_equal(start[:ramp], both[:ramp])
+    np.testing.assert_array_equal(end[-ramp:], both[-ramp:])
+    assert np.all(start[ramp:] == 1) and np.all(end[:-ramp] == 1)
+    with pytest.raises(ValueError):
+        tukey(n, ramp, "left")
+
+
+def test_round_trip_one_sided_taper(conf):
+    s = _build(_td(conf, t_obs_start=7.0, round_trip=True, lookback_days=7, taper_days=0.5, taper_sides="start"))
+    assert s.window[0] == 0 and s.window[-1] == 1
+    assert s.noise_model is not None and s.taper_w2 > _build(
+        _td(conf, t_obs_start=7.0, round_trip=True, lookback_days=7, taper_days=0.5)).taper_w2
+
+
 def test_round_trip_taper_store_and_collate(conf, tmp_path):
     import torch
     from pembhb.utils import mbhb_collate_fn, materialize_gpu_noise

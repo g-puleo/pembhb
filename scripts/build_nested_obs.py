@@ -7,7 +7,12 @@ Each --configs entry is a round-trip datagen config (waveform_params.td, taper >
         configs/datagen_maskzero_rt_84d.yaml --out-dir /data/gpuleo/mbhb/obs_nested_rt
 
 Writes obs_long.h5 (TD streams, transferable) and obs_{cut}d_withnoise.h5 (+ .yaml) per config, in the
-format tmnre_joint.py --obs-path expects. The long stream is the injection generated over --long-days
+format tmnre_joint.py --obs-path expects (obs_{cut}d_taper{start,end}_withnoise.h5 for a one-sided taper).
+With --long-stream an existing obs_long.h5 is cut instead, so new windows share its signal and noise:
+
+    python scripts/build_nested_obs.py --configs configs/datagen_maskzero_rt_8d_taperstart.yaml \
+        --long-stream /data/gpuleo/mbhb/obs_nested_rt/obs_long.h5 --out-dir /data/gpuleo/mbhb/obs_nested_rt
+ The long stream is the injection generated over --long-days
 (default: the longest duration + lookback) plus stationary noise drawn on that circle; the wrap-around of
 the circle lies outside every cut.
 """
@@ -28,6 +33,8 @@ parser.add_argument("--out-dir", required=True)
 parser.add_argument("--long-days", type=float, default=None)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--noise-seed", type=int, default=0)
+parser.add_argument("--long-stream", default=None,
+                    help="cut from this existing obs_long.h5 (same signal and noise) instead of drawing a new one")
 args = parser.parse_args()
 
 sims, confs = [], []
@@ -52,46 +59,61 @@ for s, c in zip(sims[1:], confs[1:]):
 
 t_end, dt = ref.t_obs_end_SI, ref.dt
 need = max(s.t_obs_end_SI - s.t_gen_start_SI for s in sims) / DAY_SI
-long_days = args.long_days or need
-if long_days < need:
-    raise ValueError(f"--long-days {long_days} < longest duration + lookback = {need:.2f} d")
-n_long = int(round(long_days * DAY_SI / dt))
-t0 = t_end - n_long * dt
-if t0 < 0:
-    raise ValueError(f"stream would start at t = {t0 / DAY_SI:.1f} d < 0; shift t_obs_start by a year")
 
-out = ref.sample(1)
-params, bbhx = out["parameters"], out["bbhx_parameters"]
-x = ref.td_signal(bbhx, t0)
-signal_td = np.asarray(x.get() if hasattr(x, "get") else x)[0]
+if args.long_stream:
+    with h5py.File(args.long_stream, "r") as f:
+        signal_td, noise_td = f["signal_td"][()], f["noise_td"][()]
+        params, bbhx = f["source_parameters"][()][:, None], f["bbhx_parameters"][()][:, None]
+        t0, noise_seed = float(f.attrs["t0"]), int(f.attrs["noise_seed"])
+        assert float(f.attrs["dt"]) == dt and abs(float(f.attrs["t_end"]) - t_end) < 1e-3, \
+            f"{args.long_stream} has a different dt or t_end than the configs"
+    assert np.allclose(params[:, 0], ref.sample(1)["parameters"][:, 0]), "injection differs from the long stream's"
+    if (t_end - t0) / DAY_SI < need:
+        raise ValueError(f"{args.long_stream} covers {(t_end - t0) / DAY_SI:.2f} d < duration + lookback = {need:.2f} d")
+    print(f"reusing {args.long_stream}: [{t0 / DAY_SI:.2f}, {t_end / DAY_SI:.2f}] d, noise seed {noise_seed}")
+else:
+    long_days = args.long_days or need
+    if long_days < need:
+        raise ValueError(f"--long-days {long_days} < longest duration + lookback = {need:.2f} d")
+    n_long = int(round(long_days * DAY_SI / dt))
+    t0 = t_end - n_long * dt
+    if t0 < 0:
+        raise ValueError(f"stream would start at t = {t0 / DAY_SI:.1f} d < 0; shift t_obs_start by a year")
 
-rng = np.random.default_rng(args.noise_seed)
-f_long = np.fft.rfftfreq(n_long, dt)
-sigma = np.zeros((ref.n_channels, f_long.size))
-sigma[:, 1:] = build_asd(f_long[1:], ref.channels, confs[0]["waveform_params"]["noise"]) * np.sqrt(n_long * dt / 4)
-z = rng.normal(size=sigma.shape) + 1j * rng.normal(size=sigma.shape)
-noise_td = np.fft.irfft(z * sigma, n=n_long, axis=-1) / dt
+    out = ref.sample(1)
+    params, bbhx = out["parameters"], out["bbhx_parameters"]
+    x = ref.td_signal(bbhx, t0)
+    signal_td = np.asarray(x.get() if hasattr(x, "get") else x)[0]
 
-os.makedirs(args.out_dir, exist_ok=True)
-with h5py.File(os.path.join(args.out_dir, "obs_long.h5"), "w") as f:
-    f.create_dataset("signal_td", data=signal_td)
-    f.create_dataset("noise_td", data=noise_td)
-    f.create_dataset("source_parameters", data=params[:, 0])
-    f.create_dataset("bbhx_parameters", data=bbhx[:, 0])
-    f.attrs.update(dt=dt, t0=t0, t_end=t_end, channels=ref.channels, noise_seed=args.noise_seed,
-                   configs=[yaml.safe_dump(c) for c in confs])
-print(f"long stream: {long_days:.1f} d, {n_long} samples, [{t0 / DAY_SI:.2f}, {t_end / DAY_SI:.2f}] d")
+    noise_seed = args.noise_seed
+    rng = np.random.default_rng(noise_seed)
+    f_long = np.fft.rfftfreq(n_long, dt)
+    sigma = np.zeros((ref.n_channels, f_long.size))
+    sigma[:, 1:] = build_asd(f_long[1:], ref.channels, confs[0]["waveform_params"]["noise"]) * np.sqrt(n_long * dt / 4)
+    z = rng.normal(size=sigma.shape) + 1j * rng.normal(size=sigma.shape)
+    noise_td = np.fft.irfft(z * sigma, n=n_long, axis=-1) / dt
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    with h5py.File(os.path.join(args.out_dir, "obs_long.h5"), "w") as f:
+        f.create_dataset("signal_td", data=signal_td)
+        f.create_dataset("noise_td", data=noise_td)
+        f.create_dataset("source_parameters", data=params[:, 0])
+        f.create_dataset("bbhx_parameters", data=bbhx[:, 0])
+        f.attrs.update(dt=dt, t0=t0, t_end=t_end, channels=ref.channels, noise_seed=noise_seed,
+                       configs=[yaml.safe_dump(c) for c in confs])
+    print(f"long stream: {long_days:.1f} d, {n_long} samples, [{t0 / DAY_SI:.2f}, {t_end / DAY_SI:.2f}] d")
 
 for s in sims:
     cut_days = s.obs_length / DAY_SI
     h = s.cut_to_fd(signal_td[None])
     n = s.cut_to_fd(noise_td[None])
-    fname = os.path.join(args.out_dir, f"obs_{cut_days:g}d_withnoise.h5")
+    sides = s.td.get("taper_sides", "both")
+    fname = os.path.join(args.out_dir, f"obs_{cut_days:g}d{'' if sides == 'both' else '_taper' + sides}_withnoise.h5")
     with h5py.File(fname, "w") as f:
         ds = s._create_datasets(f, 1, store_noise=True)
         s._write_batch(ds, 0, params, bbhx, h, n)
-        f.attrs["noise_seed"] = args.noise_seed
-        f.attrs["long_stream"] = "obs_long.h5"
+        f.attrs["noise_seed"] = noise_seed
+        f.attrs["long_stream"] = os.path.basename(args.long_stream or "obs_long.h5")
     s.save_info_yaml(filename=fname, overwrite=True)
 
     w = 4 * s.df / s.asd ** 2

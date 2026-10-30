@@ -4,6 +4,8 @@
 #   fd (default)  plain bbhx FD, the mlp60k observation        -> run conv60k_gpustream
 #   rt            round trip (77 d lookback, 1-d Tukey taper),
 #                 obs_nested_rt/obs_7d_withnoise.h5             -> run conv60k_rt_gpustream
+#   rt8           round trip on 8 days, 1-d taper on the first day only,
+#                 obs_nested_rt/obs_8d_taperstart_withnoise.h5  -> run conv60k_rt8d_taperstart_gpustream
 # e.g. sbatch -J conv60k_rt slurm/conv60k.sbatch rt   (pass the same argument to every job of a chain).
 # Normal QOS caps a job at 24 h, so queue a chain of jobs; each one picks up the
 # run where the last stopped. Submit from the repo root, e.g. 5 chained jobs:
@@ -18,7 +20,8 @@
 # at once when the chain has converged or MAX_ROUNDS are done, and with an error
 # when the coverage guard rejected a truncation (inspect it, then resubmit).
 # Needs, under $PEMBHB_DATA_DIR: obs_maskzero_baseline_fmax1e-1_withnoise.{h5,yaml} (fd)
-# or obs_nested_rt/obs_7d_withnoise.{h5,yaml} (rt; bbhx needs the tstart patch)
+# or obs_nested_rt/obs_7d_withnoise.{h5,yaml} (rt), obs_nested_rt/obs_8d_taperstart_withnoise.{h5,yaml}
+# (rt8); rt and rt8 need the bbhx tstart patch
 # Outputs: slurm/logs/<name>_<jobid>.{out,err} (Slurm), slurm/logs/<name>_<jobid>/ (gpu.csv, spin/mask logs, summary)
 
 #SBATCH --job-name=conv60k
@@ -48,8 +51,12 @@ case $SIM in
     rt) RUN_NAME=conv60k_rt_gpustream
         DATAGEN_CONFIG=datagen_maskzero_rt_1w.yaml
         OBS=$PEMBHB_DATA_DIR/obs_nested_rt/obs_7d_withnoise.h5 ;;
-    *)  echo "usage: sbatch slurm/conv60k.sbatch [fd|rt]" >&2; exit 2 ;;
+    rt8) RUN_NAME=conv60k_rt8d_taperstart_gpustream
+        DATAGEN_CONFIG=datagen_maskzero_rt_8d_taperstart.yaml
+        OBS=$PEMBHB_DATA_DIR/obs_nested_rt/obs_8d_taperstart_withnoise.h5 ;;
+    *)  echo "usage: sbatch slurm/conv60k.sbatch [fd|rt|rt8]" >&2; exit 2 ;;
 esac
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # rt8: 68.5k bins, ~59 of 65 GB
 JOBDIR=$REPO/slurm/logs/${SLURM_JOB_NAME}_${SLURM_JOB_ID}
 mkdir -p "$JOBDIR" "$PEMBHB_DATA_DIR/tmp"
 export TMPDIR=$PEMBHB_DATA_DIR/tmp   # checkpoint saves stage through TMPDIR
