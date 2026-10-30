@@ -326,7 +326,8 @@ class MBHBSimulatorFD:
         self.gen_band = np.flatnonzero(self.f_gen >= F_GEN_MIN)
         self.chunk = int(td.get("chunk", 8))
         self.window = tukey(self.n_time, int(round(td["taper_days"] * DAY_SI / self.dt)),
-                            td.get("taper_sides", "both"))
+                            td.get("taper_sides", "both"),
+                            int(round(td.get("taper_days_end", td["taper_days"]) * DAY_SI / self.dt)))
         self.taper_w2 = float(np.mean(self.window ** 2))
         if td["taper_days"] > 0:
             f_dft = np.fft.rfftfreq(self.n_time, self.dt)

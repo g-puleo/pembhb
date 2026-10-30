@@ -177,6 +177,10 @@ def test_tukey_sides():
     np.testing.assert_array_equal(start[:ramp], both[:ramp])
     np.testing.assert_array_equal(end[-ramp:], both[-ramp:])
     assert np.all(start[ramp:] == 1) and np.all(end[:-ramp] == 1)
+    short_end = tukey(n, ramp, n_ramp_end=3)
+    np.testing.assert_array_equal(short_end[:ramp], both[:ramp])
+    np.testing.assert_array_equal(short_end[-3:], tukey(n, 3)[-3:])
+    assert np.all(short_end[ramp:-3] == 1)
     with pytest.raises(ValueError):
         tukey(n, ramp, "left")
 

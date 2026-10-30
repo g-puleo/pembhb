@@ -17,17 +17,18 @@ def lookup(key):
     return _REGISTRY[key]
 
 
-def tukey(n, n_ramp, sides="both"):
-    """Cosine ramps of n_ramp samples at the start, the end or both; n_ramp = 0 is a box."""
+def tukey(n, n_ramp, sides="both", n_ramp_end=None):
+    """Cosine ramps at the start (n_ramp samples), the end (n_ramp_end, default n_ramp) or both;
+    a ramp of 0 samples is a box edge."""
     if sides not in ("both", "start", "end"):
         raise ValueError(f"taper sides must be 'both', 'start' or 'end', not {sides!r}")
+    n_end = n_ramp if n_ramp_end is None else n_ramp_end
+    ramp = lambda m: 0.5 * (1 - np.cos(np.pi * np.arange(m) / m))
     win = np.ones(n)
-    if n_ramp:
-        ramp = 0.5 * (1 - np.cos(np.pi * np.arange(n_ramp) / n_ramp))
-        if sides != "end":
-            win[:n_ramp] = ramp
-        if sides != "start":
-            win[-n_ramp:] = ramp[::-1]
+    if n_ramp and sides != "end":
+        win[:n_ramp] = ramp(n_ramp)
+    if n_end and sides != "start":
+        win[-n_end:] = ramp(n_end)[::-1]
     return win
 
 

@@ -108,7 +108,10 @@ for s in sims:
     h = s.cut_to_fd(signal_td[None])
     n = s.cut_to_fd(noise_td[None])
     sides = s.td.get("taper_sides", "both")
-    fname = os.path.join(args.out_dir, f"obs_{cut_days:g}d{'' if sides == 'both' else '_taper' + sides}_withnoise.h5")
+    tag = "" if sides == "both" else "_taper" + sides
+    if sides != "start" and s.td.get("taper_days_end", s.td["taper_days"]) != s.td["taper_days"]:
+        tag += f"_taperend{s.td['taper_days_end'] * 24:g}h"
+    fname = os.path.join(args.out_dir, f"obs_{cut_days:g}d{tag}_withnoise.h5")
     with h5py.File(fname, "w") as f:
         ds = s._create_datasets(f, 1, store_noise=True)
         s._write_batch(ds, 0, params, bbhx, h, n)

@@ -1,0 +1,54 @@
+# configs/datagen_maskzero_rt_8d_taperstart.yaml with a 6-hour cosine ramp at the end as well: the first day
+# is tapered (inspiral 5.5-4.5 d before the merger), the merger (2.5 d before the end) and the ringdown keep full
+# weight, and the short end ramp stops very-low-frequency noise leaking into the bins below ~1 mHz, which the
+# untapered end lets through. Same 8-day grid (68.5k bins); observation cut from the same obs_long.h5.
+waveform_params:
+  channels: "AE"
+  modes: [[2,2], [2,1], [3,3], [3,2], [4,4], [4,3]]
+  noise: "sangria"
+  duration: 1.1428571428571428   # weeks = 8 days
+  freq_spacing: "linear"
+  n_freq_bins: 4096
+  fmin: 1.0e-4
+  downsamplefactor: 1
+  t_obs_start: 364.25636300400004
+  td:
+    dt: 5.0
+    round_trip: true
+    lookback_days: 77
+    taper_days: 1.0
+    taper_days_end: 0.25   # 6 h: suppresses low-frequency noise leakage, 2.25 d after the merger
+    bbhx_length: 4096
+    chunk: 8
+
+prior:
+  logMchirp: [5.2, 5.3]
+  q:         [1, 5]
+  chi_eff:   [-0.97, 0.97]
+  chi_diff:  [-0.97, 0.97]
+  dist:      [1.0, 20.0]
+  phi:       [0, 6.283185307179586]
+  cosinc:    [-1.0, 1.0]
+  lambda:    [0, 6.283185307179586]
+  sinbeta:   [-1.0, 1.0]
+  psi:       [0, 3.14159265358979]
+  Deltat:    [-2.55, -2.45]
+
+prior_dist_volumetric: true
+
+injection:
+  logMchirp: 5.25
+  q:         3.0
+  chi_eff:   0.0
+  chi_diff:  0.0
+  dist:      10.0
+  phi:       3.1415
+  cosinc:    0.5
+  lambda:    3.14159265358979
+  sinbeta:   0.2
+  psi:       1.0
+  Deltat:    -2.5
+
+spin_param_basis: "chieff_chidiff"
+
+backend: "cuda12x"
