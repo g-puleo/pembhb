@@ -160,7 +160,7 @@ def test_tapered_noise_statistics():
     n, ramp = 512, 64
     w = tukey(n, ramp)
     keep = np.arange(20, 200)
-    tn = TaperedNoise(np.ones((1, n // 2 + 1)), w, keep, dt=1.0)
+    tn = TaperedNoise(np.ones((1, n // 2 + 1)), w, keep, dt=1.0, t_obs_start_SI=0.0)
     z = tn.draw(4000, dtype=torch.float64, generator=torch.Generator().manual_seed(0)).numpy()[:, 0]
     W2 = np.fft.fft(w ** 2)
     assert abs(np.mean(z.real ** 2) - np.mean(w ** 2)) < 0.03
@@ -168,6 +168,30 @@ def test_tapered_noise_statistics():
     assert abs(adj - (W2[1] / W2[0]).real) < 0.02
     z2 = tn.draw(4000, dtype=torch.float64, generator=torch.Generator().manual_seed(0)).numpy()[:, 0]
     np.testing.assert_array_equal(z, z2)
+
+
+def test_tapered_noise_matches_cut_of_long_stream(tmp_path):
+    # cut_to_fd on a long white stream: window at absolute t0, taper, rfft, keep, exp(-2 pi i f t0)
+    from pembhb.tapered_noise import TaperedNoise, tukey
+    import torch
+    n, dt, B = 256, 1.0, 4000
+    t0 = 5 * n + n // 4                         # t0 mod T = T/4: adjacent-bin correlation rotated by pi/2
+    w = tukey(n, n // 4, "start")
+    keep = np.arange(10, 100)
+    rng = np.random.default_rng(0)
+    stream = rng.normal(size=(B, t0 + n))       # unit-variance samples = unit sigma per bin on the circle
+    X = (dt * np.fft.rfft(stream[:, t0:] * w, axis=-1))[:, keep] * np.exp(-2j * np.pi * keep / n * t0)
+    tn = TaperedNoise(np.ones((1, n // 2 + 1)) * np.sqrt(n / 2), w, keep, dt, t0)
+    Z = tn.draw(B, dtype=torch.float64, generator=torch.Generator().manual_seed(0)).numpy()[:, 0]
+    adj = lambda a: np.mean(a[:, :-1] * np.conj(a[:, 1:])) / np.mean(np.abs(a) ** 2)
+    assert abs(adj(Z) - adj(X)) < 0.03
+    assert abs(adj(Z) - adj(X) * np.exp(-2j * np.pi * t0 / n)) > 0.15    # the pre-fix (no phase) draw fails
+    with h5py.File(tmp_path / "n.h5", "w") as f:
+        tn.to_h5(f)
+    with h5py.File(tmp_path / "n.h5", "r") as f:
+        tn2 = TaperedNoise.from_h5(f)
+    Z2 = tn2.draw(B, dtype=torch.float64, generator=torch.Generator().manual_seed(0)).numpy()[:, 0]
+    np.testing.assert_array_equal(Z, Z2)
 
 
 def test_tukey_sides():

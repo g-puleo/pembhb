@@ -333,7 +333,7 @@ class MBHBSimulatorFD:
             f_dft = np.fft.rfftfreq(self.n_time, self.dt)
             sigma = np.zeros((self.n_channels, f_dft.size))
             sigma[:, 1:] = build_asd(f_dft[1:], self.channels, noise_model) * np.sqrt(self.obs_length / 4)
-            self.noise_model = TaperedNoise(sigma, self.window, self.keep_idx, self.dt)
+            self.noise_model = TaperedNoise(sigma, self.window, self.keep_idx, self.dt, self.t_obs_start_SI)
         self._dev_cache = None
 
     def _setup_heterodyne(self, het_conf):

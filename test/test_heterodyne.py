@@ -60,7 +60,7 @@ def test_npz_and_h5_round_trip(tmp_path):
 def test_binned_noise_variance_without_taper():
     # box window: fine noise is diagonal with Var(Re n_k) = sigma_k^2 and w = 1 / sigma^2, so Var(Re r_bar) B = 1
     het, _, sigma, keep = _setup()
-    fine = TaperedNoise(sigma, tukey(N_T, 0), keep, dt=1.0)
+    fine = TaperedNoise(sigma, tukey(N_T, 0), keep, dt=1.0, t_obs_start_SI=0.0)
     noise = HeterodynedNoise(fine, het, chunk=7)
     n = noise.draw(20000, dtype=torch.float64, generator=torch.Generator().manual_seed(0)).numpy()
     assert n.shape == (20000, 2, het.n_bins)
@@ -72,7 +72,7 @@ def test_binned_noise_variance_without_taper():
 
 def test_load_noise_model_dispatch(tmp_path):
     het, _, sigma, keep = _setup()
-    fine = TaperedNoise(sigma, tukey(N_T, 16), keep, dt=1.0)
+    fine = TaperedNoise(sigma, tukey(N_T, 16), keep, dt=1.0, t_obs_start_SI=0.0)
     with h5py.File(tmp_path / "a.h5", "w") as f:
         HeterodynedNoise(fine, het).to_h5(f)
     with h5py.File(tmp_path / "b.h5", "w") as f:
