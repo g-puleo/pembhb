@@ -8,6 +8,8 @@
 #                 obs_nested_rt/obs_8d_taperstart_withnoise.h5  -> run conv60k_rt8d_taperstart_gpustream
 #   rt8e          as rt8, plus a 6-h taper at the end,
 #                 obs_nested_rt/obs_8d_taperend6h_withnoise.h5  -> run conv60k_rt8d_taperend6h_gpustream
+#   rt8e_fix      rt8e rerun with the TaperedNoise phase fix (same configs and obs)
+#                                                               -> run conv60k_rt8d_taperend6h_noisefix_gpustream
 # e.g. sbatch -J conv60k_rt slurm/conv60k.sbatch rt   (pass the same argument to every job of a chain).
 # Normal QOS caps a job at 24 h, so queue a chain of jobs; each one picks up the
 # run where the last stopped. Submit from the repo root, e.g. 5 chained jobs:
@@ -59,7 +61,10 @@ case $SIM in
     rt8e) RUN_NAME=conv60k_rt8d_taperend6h_gpustream
         DATAGEN_CONFIG=datagen_maskzero_rt_8d_taper1d_6h.yaml
         OBS=$PEMBHB_DATA_DIR/obs_nested_rt/obs_8d_taperend6h_withnoise.h5 ;;
-    *)  echo "usage: sbatch slurm/conv60k.sbatch [fd|rt|rt8|rt8e]" >&2; exit 2 ;;
+    rt8e_fix) RUN_NAME=conv60k_rt8d_taperend6h_noisefix_gpustream
+        DATAGEN_CONFIG=datagen_maskzero_rt_8d_taper1d_6h.yaml
+        OBS=$PEMBHB_DATA_DIR/obs_nested_rt/obs_8d_taperend6h_withnoise.h5 ;;
+    *)  echo "usage: sbatch slurm/conv60k.sbatch [fd|rt|rt8|rt8e|rt8e_fix]" >&2; exit 2 ;;
 esac
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # rt8*: 68.5k bins, ~59 of 65 GB
 JOBDIR=$REPO/slurm/logs/${SLURM_JOB_NAME}_${SLURM_JOB_ID}
