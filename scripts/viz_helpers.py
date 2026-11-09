@@ -46,18 +46,24 @@ def deltat_axis_transforms(inj_days: float, duration_weeks: float,
     """Return (nre_to_x, mcmc_to_x, x_label, nre_density_scale) for ``Deltat``.
 
     Both NRE and MCMC are mapped to ``seconds offset from the true merger``.
-    The brutal patch for ``5D_linear_freq*.h5`` files (which already store
-    Deltat in pembhb's native days-from-end convention) is preserved.
+    The MCMC side uses the end of the MCMC's own observation window (attr
+    ``t_obs_end_SI``, eryn_to_flat.py), not the run's: the two windows can differ
+    (the 8-day round-trip runs vs the 7-day FD MCMC). The brutal patch for
+    ``5D_linear_freq*.h5`` files (which already store Deltat in pembhb's native
+    days-from-end convention) is preserved.
     """
-    duration_sec = duration_weeks * 7.0 * SECONDS_PER_DAY
-    tref_true_sec = duration_sec + inj_days * SECONDS_PER_DAY
     nre_to_x  = lambda v: (np.asarray(v, dtype=float) - inj_days) * SECONDS_PER_DAY
-    mcmc_to_x = lambda v: np.asarray(v, dtype=float) - tref_true_sec
-    if (
-        mcmc_samples_path is not None
-        and "5D_linear_freq" in os.path.basename(mcmc_samples_path)
-    ):
-        mcmc_to_x = nre_to_x
+    mcmc_to_x = None
+    if mcmc_samples_path is not None:
+        if "5D_linear_freq" in os.path.basename(mcmc_samples_path):
+            mcmc_to_x = nre_to_x
+        else:
+            with h5py.File(mcmc_samples_path, "r") as f:
+                if "t_obs_end_SI" not in f.attrs:
+                    raise KeyError(f"{mcmc_samples_path} has no t_obs_end_SI attribute: rerun "
+                                   "monte-carlo-code-mbhb/eryn_to_flat.py on its run dir")
+                tref_true_sec = float(f.attrs["t_obs_end_SI"]) + inj_days * SECONDS_PER_DAY
+            mcmc_to_x = lambda v: np.asarray(v, dtype=float) - tref_true_sec
     return nre_to_x, mcmc_to_x, r"$\Delta t - \Delta t_{\rm true}$ [s]", 1.0 / SECONDS_PER_DAY
 
 
